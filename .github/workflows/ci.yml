@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        # go test ./... 会跑到 internal/store 的 testcontainers 用例与 test/e2e
+        # （其 TestMain 自行 docker compose up/down 一套真实 PG），ubuntu-latest
+        # runner 自带 docker 与 compose v2，无需额外安装。
+        timeout-minutes: 20
+        run: go test ./... -race -count=1
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+
+      - name: npm run build
+        working-directory: web
+        run: npm run build
+
+      - name: oxlint
+        working-directory: web
+        run: npx oxlint
