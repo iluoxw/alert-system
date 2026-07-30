@@ -96,73 +96,72 @@ func (f *fakeGroupNotifier) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey
 	return f.err
 }
 
-// fakeTxRunner 是 txRunner 的测试替身：直接以 nil tx 调用 fn，测试里的 fake 仓储/
-// 通知器都不会真的使用 tx。
-type fakeTxRunner struct {
-	err error
-}
-
-func (f *fakeTxRunner) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	if f.err != nil {
-		return f.err
-	}
-	return fn(nil)
-}
-
 func newGroupStageForTest(alerts GroupAlertRepo, sched GroupTimerScheduler, notifier GroupNotifier, clock groupClock) *GroupStage {
-	s := NewGroupStage(&fakeTxRunner{}, alerts, sched, notifier)
+	s := NewGroupStage(alerts, sched, notifier)
 	s.clock = clock
 	return s
 }
 
 func TestGroupStage_Name(t *testing.T) {
-	s := NewGroupStage(&fakeTxRunner{}, &fakeGroupAlertRepo{}, &fakeGroupScheduler{}, &fakeGroupNotifier{})
+	s := NewGroupStage(&fakeGroupAlertRepo{}, &fakeGroupScheduler{}, &fakeGroupNotifier{})
 	if got := s.Name(); got != "group" {
 		t.Fatalf("Name() = %q, want %q", got, "group")
 	}
 }
 
-// ① 未配置 group_by：直发，不写 group_key、不查/注册任何定时器。
-func TestGroupStage_Process_NoGroupBy_DirectDispatch(t *testing.T) {
+// ① 未配置 group_by：退化为单例组（route_id+fingerprint），仍写 group_key、仍按
+// GroupWait 注册组到期定时器——与 Alertmanager 语义一致，不存在脱离组机制的
+// "直发"路径。
+func TestGroupStage_Process_NoGroupBy_SingletonGroup_SchedulesGroupWait(t *testing.T) {
+	alerts := &fakeGroupAlertRepo{}
+	sched := &fakeGroupScheduler{}
+	now := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
+	stage := newGroupStageForTest(alerts, sched, &fakeGroupNotifier{}, &mutableClock{t: now})
+
+	pctx := &PipelineContext{
+		Alert: domain.Alert{ID: "alert-1", TeamID: "team-a", Fingerprint: "fp-1"},
+		Route: RouteResult{RouteID: "r1", TeamID: "team-a", GroupWait: 30 * time.Second, GroupInterval: 300 * time.Second}, // GroupBy 为空
+	}
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	wantKey := singletonGroupKey("r1", "fp-1")
+	if pctx.Alert.GroupKey != wantKey {
+		t.Fatalf("GroupKey = %q, want 单例组键 %q", pctx.Alert.GroupKey, wantKey)
+	}
+	if len(alerts.updateCalls) != 1 || alerts.updateCalls[0].groupKey != wantKey {
+		t.Fatalf("UpdateRouting 调用 = %+v, want groupKey=%q", alerts.updateCalls, wantKey)
+	}
+	key := groupTimerKey(groupTimerKind, wantKey)
+	fireAt, ok := sched.pending[key]
+	if !ok {
+		t.Fatal("未配置 group_by 也应注册一个 pending 组到期定时器（单例组）")
+	}
+	if !fireAt.Equal(now.Add(30 * time.Second)) {
+		t.Fatalf("fire_at = %v, want %v（组首应使用 GroupWait）", fireAt, now.Add(30*time.Second))
+	}
+}
+
+// ② 路由重配从"有 group_by"变为"无 group_by"：应把 group_key 从旧的分组键改写为
+// 新的单例键（而不是清空为空字符串），继续参与组到期定时器机制。
+func TestGroupStage_Process_NoGroupBy_RewritesStaleGroupKeyToSingleton(t *testing.T) {
 	alerts := &fakeGroupAlertRepo{}
 	sched := &fakeGroupScheduler{}
 	stage := newGroupStageForTest(alerts, sched, &fakeGroupNotifier{}, &mutableClock{t: time.Now()})
 
 	pctx := &PipelineContext{
-		Alert: domain.Alert{ID: "alert-1", TeamID: "team-a"},
-		Route: RouteResult{TeamID: "team-a"}, // GroupBy 为空
+		Alert: domain.Alert{ID: "alert-2", TeamID: "team-a", Fingerprint: "fp-2", GroupKey: "stale-key"},
+		Route: RouteResult{RouteID: "r1", TeamID: "team-a", GroupWait: 30 * time.Second},
 	}
 	if err := stage.Process(context.Background(), pctx); err != nil {
 		t.Fatalf("Process() 返回意外错误: %v", err)
 	}
-	if len(alerts.updateCalls) != 0 {
-		t.Fatalf("未配置 group_by 不应调用 UpdateRouting，实际调用 %+v", alerts.updateCalls)
+	wantKey := singletonGroupKey("r1", "fp-2")
+	if len(alerts.updateCalls) != 1 || alerts.updateCalls[0] != (routingUpdateCall{id: "alert-2", teamID: "team-a", groupKey: wantKey}) {
+		t.Fatalf("UpdateRouting 调用 = %+v, want 改写为单例键 %q", alerts.updateCalls, wantKey)
 	}
-	if sched.calls != 0 {
-		t.Fatalf("未配置 group_by 不应查询/注册定时器，实际 ScheduleIfAbsent 调用 %d 次", sched.calls)
-	}
-	if pctx.Alert.GroupKey != "" {
-		t.Fatalf("GroupKey = %q, want 空", pctx.Alert.GroupKey)
-	}
-}
-
-// ② 未配置 group_by 但告警此前有 group_key（路由重配去掉了 group_by）：应清空。
-func TestGroupStage_Process_NoGroupBy_ClearsStaleGroupKey(t *testing.T) {
-	alerts := &fakeGroupAlertRepo{}
-	stage := newGroupStageForTest(alerts, &fakeGroupScheduler{}, &fakeGroupNotifier{}, &mutableClock{t: time.Now()})
-
-	pctx := &PipelineContext{
-		Alert: domain.Alert{ID: "alert-2", TeamID: "team-a", GroupKey: "stale-key"},
-		Route: RouteResult{TeamID: "team-a"},
-	}
-	if err := stage.Process(context.Background(), pctx); err != nil {
-		t.Fatalf("Process() 返回意外错误: %v", err)
-	}
-	if len(alerts.updateCalls) != 1 || alerts.updateCalls[0] != (routingUpdateCall{id: "alert-2", teamID: "team-a", groupKey: ""}) {
-		t.Fatalf("UpdateRouting 调用 = %+v, want 清空 group_key", alerts.updateCalls)
-	}
-	if pctx.Alert.GroupKey != "" {
-		t.Fatalf("GroupKey = %q, want 空", pctx.Alert.GroupKey)
+	if pctx.Alert.GroupKey != wantKey {
+		t.Fatalf("GroupKey = %q, want %q", pctx.Alert.GroupKey, wantKey)
 	}
 }
 
@@ -353,7 +352,7 @@ func TestGroupStage_Handle_NotifiesGroupMembers(t *testing.T) {
 	notifier := &fakeGroupNotifier{}
 	stage := newGroupStageForTest(alerts, &fakeGroupScheduler{}, notifier, &mutableClock{t: time.Now()})
 
-	if err := stage.Handle(context.Background(), "gk-1", nil); err != nil {
+	if err := stage.Handle(context.Background(), nil, "gk-1", nil); err != nil {
 		t.Fatalf("Handle() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].groupKey != "gk-1" || len(notifier.calls[0].alerts) != 2 {
@@ -367,7 +366,7 @@ func TestGroupStage_Handle_NoMembers_NoNotifyCall(t *testing.T) {
 	notifier := &fakeGroupNotifier{}
 	stage := newGroupStageForTest(alerts, &fakeGroupScheduler{}, notifier, &mutableClock{t: time.Now()})
 
-	if err := stage.Handle(context.Background(), "gk-empty", nil); err != nil {
+	if err := stage.Handle(context.Background(), nil, "gk-empty", nil); err != nil {
 		t.Fatalf("Handle() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 0 {
@@ -381,7 +380,7 @@ func TestGroupStage_Handle_ListByGroupKeyError_Propagates(t *testing.T) {
 	alerts := &fakeGroupAlertRepo{listErr: wantErr}
 	stage := newGroupStageForTest(alerts, &fakeGroupScheduler{}, &fakeGroupNotifier{}, &mutableClock{t: time.Now()})
 
-	err := stage.Handle(context.Background(), "gk-1", nil)
+	err := stage.Handle(context.Background(), nil, "gk-1", nil)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("Handle() 错误 = %v, 期望包裹 %v", err, wantErr)
 	}
@@ -394,7 +393,7 @@ func TestGroupStage_Handle_NotifyError_Propagates(t *testing.T) {
 	notifier := &fakeGroupNotifier{err: wantErr}
 	stage := newGroupStageForTest(alerts, &fakeGroupScheduler{}, notifier, &mutableClock{t: time.Now()})
 
-	err := stage.Handle(context.Background(), "gk-1", nil)
+	err := stage.Handle(context.Background(), nil, "gk-1", nil)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("Handle() 错误 = %v, 期望包裹 %v", err, wantErr)
 	}

@@ -86,7 +86,6 @@ func (realHandlerClock) Now() time.Time { return time.Now() }
 //
 // 组状态/告警状态的唯一真相仍是 alerts 表 + timers 表，本类型不维护任何内存态。
 type LifecycleHandlers struct {
-	tx             txRunner // 复用 sender.go 已定义的 txRunner，不重复声明
 	alerts         lifecycleAlertRepo
 	timeline       lifecycleTimelineRepo
 	scheduler      lifecycleScheduler
@@ -96,15 +95,12 @@ type LifecycleHandlers struct {
 	clock          handlerClock
 }
 
-// NewLifecycleHandlers 构造 LifecycleHandlers。tx 通常直接传 *store.Store（结构上
-// 满足 txRunner），供 HandleTTL/HandleRepeat 在到期时各自开独立短事务使用。
-// repeatInterval 是 R6.5 提醒的重复周期：MVP 阶段尚未接入按路由配置化的
-// repeat_interval，先由调用方注入一个固定默认值，配置化留给任务 22/27（policy
-// 编排层）扩展。escalation 可为 nil——此时 TTL 自动恢复时跳过"停止人员升级链"
-// 这一步（例如尚未接入 oncall 的部署）。
-func NewLifecycleHandlers(tx txRunner, alerts lifecycleAlertRepo, timeline lifecycleTimelineRepo, sched lifecycleScheduler, escalation lifecycleEscalationStopper, repeatNotifier RepeatNotifier, repeatInterval time.Duration) *LifecycleHandlers {
+// NewLifecycleHandlers 构造 LifecycleHandlers。repeatInterval 是 R6.5 提醒的重复
+// 周期：MVP 阶段尚未接入按路由配置化的 repeat_interval，先由调用方注入一个固定
+// 默认值，配置化留给任务 22/27（policy 编排层）扩展。escalation 可为 nil——此时
+// TTL 自动恢复时跳过"停止人员升级链"这一步（例如尚未接入 oncall 的部署）。
+func NewLifecycleHandlers(alerts lifecycleAlertRepo, timeline lifecycleTimelineRepo, sched lifecycleScheduler, escalation lifecycleEscalationStopper, repeatNotifier RepeatNotifier, repeatInterval time.Duration) *LifecycleHandlers {
 	return &LifecycleHandlers{
-		tx:             tx,
 		alerts:         alerts,
 		timeline:       timeline,
 		scheduler:      sched,
@@ -116,38 +112,38 @@ func NewLifecycleHandlers(tx txRunner, alerts lifecycleAlertRepo, timeline lifec
 }
 
 // HandleTTL 实现 scheduler.Handler，注册给 TimerKindAlertTTL。refID 是 alert.ID。
-// 幂等：告警不存在（理论上不应发生）或已经 resolved（重投，或已被其他路径
-// resolve）时直接返回成功，不重复处理。
-func (h *LifecycleHandlers) HandleTTL(ctx context.Context, refID string, payload []byte) error {
-	return h.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		alert, err := h.alerts.GetByID(ctx, tx, refID)
-		if err != nil {
-			if errors.Is(err, store.ErrAlertNotFound) {
-				return nil
-			}
-			return fmt.Errorf("notify: 查询告警失败: %w", err)
-		}
-		if alert.Status == domain.StatusResolved {
+// tx 是 scheduler 传入的事务（同一事务内已经把这条定时器标记为 fired），本次
+// Resolve/落时间线/清理其余定时器都复用这个 tx。幂等：告警不存在（理论上不应
+// 发生）或已经 resolved（重投，或已被其他路径 resolve）时直接返回成功，不重复处理。
+func (h *LifecycleHandlers) HandleTTL(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
+	alert, err := h.alerts.GetByID(ctx, tx, refID)
+	if err != nil {
+		if errors.Is(err, store.ErrAlertNotFound) {
 			return nil
 		}
+		return fmt.Errorf("notify: 查询告警失败: %w", err)
+	}
+	if alert.Status == domain.StatusResolved {
+		return nil
+	}
 
-		now := h.clock.Now()
-		resolved, entry, err := domain.Resolve(alert, lifecycleActorTTL, domain.ResolveReasonTTL, now)
-		if err != nil {
-			return fmt.Errorf("notify: TTL 自动恢复状态转移失败: %w", err)
-		}
-		if err := h.alerts.UpdateStatus(ctx, tx, resolved); err != nil {
-			return fmt.Errorf("notify: 更新告警状态失败: %w", err)
-		}
-		if _, err := h.timeline.Append(ctx, tx, entry); err != nil {
-			return fmt.Errorf("notify: 写入时间线失败: %w", err)
-		}
-		return h.CancelLifecycleTimers(ctx, tx, resolved.ID)
-	})
+	now := h.clock.Now()
+	resolved, entry, err := domain.Resolve(alert, lifecycleActorTTL, domain.ResolveReasonTTL, now)
+	if err != nil {
+		return fmt.Errorf("notify: TTL 自动恢复状态转移失败: %w", err)
+	}
+	if err := h.alerts.UpdateStatus(ctx, tx, resolved); err != nil {
+		return fmt.Errorf("notify: 更新告警状态失败: %w", err)
+	}
+	if _, err := h.timeline.Append(ctx, tx, entry); err != nil {
+		return fmt.Errorf("notify: 写入时间线失败: %w", err)
+	}
+	return h.CancelLifecycleTimers(ctx, tx, resolved.ID)
 }
 
 // HandleRepeat 实现 scheduler.Handler，注册给 TimerKindAlertRepeat。refID 是
-// alert.ID。R6.5：告警非 firing（已 Ack/Resolved）或处于静默中
+// alert.ID。tx 是 scheduler 传入的事务，本次记发送意图/续约定时器都复用这个 tx。
+// R6.5：告警非 firing（已 Ack/Resolved）或处于静默中
 // （len(alert.SilencedBy) > 0）时不发不续约——静默只是暂停当前这一轮 repeat 链，
 // 不清空任何字段；解除静默后由管道下一次 Process 重新走一遍分组/静默判断，若
 // 该告警仍 firing，路由/通知编排会重新驱动通知，无需本 handler 关心"恢复"。
@@ -155,27 +151,25 @@ func (h *LifecycleHandlers) HandleTTL(ctx context.Context, refID string, payload
 //
 // 首个 repeat 定时器的注册不归本 handler：由任务 22 的首次通知编排在发出首次
 // 通知时负责注册，本 handler 只处理"已经到期一次之后"的后续续约。
-func (h *LifecycleHandlers) HandleRepeat(ctx context.Context, refID string, payload []byte) error {
-	return h.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		alert, err := h.alerts.GetByID(ctx, tx, refID)
-		if err != nil {
-			if errors.Is(err, store.ErrAlertNotFound) {
-				return nil
-			}
-			return fmt.Errorf("notify: 查询告警失败: %w", err)
-		}
-		if alert.Status != domain.StatusFiring || len(alert.SilencedBy) > 0 {
+func (h *LifecycleHandlers) HandleRepeat(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
+	alert, err := h.alerts.GetByID(ctx, tx, refID)
+	if err != nil {
+		if errors.Is(err, store.ErrAlertNotFound) {
 			return nil
 		}
-		if err := h.repeatNotifier.NotifyRepeat(ctx, tx, alert); err != nil {
-			return fmt.Errorf("notify: 记录 repeat 通知意图失败: %w", err)
-		}
-		fireAt := h.clock.Now().Add(h.repeatInterval)
-		if err := h.scheduler.Schedule(ctx, tx, TimerKindAlertRepeat, alert.ID, fireAt, nil); err != nil {
-			return fmt.Errorf("notify: 续约 repeat 定时器失败: %w", err)
-		}
+		return fmt.Errorf("notify: 查询告警失败: %w", err)
+	}
+	if alert.Status != domain.StatusFiring || len(alert.SilencedBy) > 0 {
 		return nil
-	})
+	}
+	if err := h.repeatNotifier.NotifyRepeat(ctx, tx, alert); err != nil {
+		return fmt.Errorf("notify: 记录 repeat 通知意图失败: %w", err)
+	}
+	fireAt := h.clock.Now().Add(h.repeatInterval)
+	if err := h.scheduler.Schedule(ctx, tx, TimerKindAlertRepeat, alert.ID, fireAt, nil); err != nil {
+		return fmt.Errorf("notify: 续约 repeat 定时器失败: %w", err)
+	}
+	return nil
 }
 
 // CancelLifecycleTimers 取消 alertID 名下全部"生命周期收尾"类定时器：

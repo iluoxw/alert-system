@@ -345,11 +345,14 @@ func TestAlertsAck_Firing_TransitionsAndStopsEscalation(t *testing.T) {
 	if resp.Alert.Status != domain.StatusAcknowledged {
 		t.Errorf("status = %s, want acknowledged", resp.Alert.Status)
 	}
-	if resp.Alert.AckedBy != "member1" {
-		t.Errorf("acked_by = %q, want member1（actor 取会话用户名）", resp.Alert.AckedBy)
+	if resp.Alert.AckedBy != "u1" {
+		t.Errorf("acked_by = %q, want u1（actor 取会话用户 ID，进 UUID 列）", resp.Alert.AckedBy)
 	}
 	if len(timeline.entries["a1"]) != 1 || timeline.entries["a1"][0].Action != domain.TimelineActionAck {
 		t.Errorf("timeline = %+v, want 1 条 ack", timeline.entries["a1"])
+	}
+	if timeline.entries["a1"][0].Actor != "member1" {
+		t.Errorf("timeline actor = %q, want member1（展示用取会话用户名）", timeline.entries["a1"][0].Actor)
 	}
 	if len(escalation.stopped) != 1 || escalation.stopped[0] != "a1" {
 		t.Errorf("escalation.stopped = %v, want [a1]", escalation.stopped)

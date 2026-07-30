@@ -271,7 +271,7 @@ func (h *alertsHandler) ack(c *gin.Context) {
 		}
 
 		if alert.Status == domain.StatusFiring {
-			updated, entry, ackErr := domain.Ack(alert, rbac.Username, now)
+			updated, entry, ackErr := domain.Ack(alert, rbac.UserID, rbac.Username, now)
 			if ackErr != nil {
 				return ackErr
 			}

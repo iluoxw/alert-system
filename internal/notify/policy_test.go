@@ -158,7 +158,7 @@ func (f *fakeDispatcher) DispatchStep(ctx context.Context, tx pgx.Tx, alert doma
 
 // newTestEngine 组装一个用于测试的 Engine，各依赖均为内存 fake，clock 可注入。
 func newTestEngine(alerts *fakePolicyAlertRepo, timeline *fakePolicyTimeline, policies *fakePolicyRepo, sched *fakePolicyScheduler, dispatcher *fakeDispatcher, clock Clock) *Engine {
-	e := NewEngine(fakeTx{}, alerts, timeline, policies, sched, dispatcher)
+	e := NewEngine(alerts, timeline, policies, sched, dispatcher)
 	e.clock = clock
 	return e
 }
@@ -348,7 +348,7 @@ func TestEngine_WarningScenario_EmailThenIM(t *testing.T) {
 	}
 
 	// 模拟第 0 级到期：Handle 触发，应发 email，并注册第 1 级（5min 后）定时器。
-	if err := e.Handle(context.Background(), alert.ID, first.payload); err != nil {
+	if err := e.Handle(context.Background(), nil, alert.ID, first.payload); err != nil {
 		t.Fatalf("Handle(step0) 返回意外错误: %v", err)
 	}
 	if len(dispatcher.calls) != 1 || dispatcher.calls[0].step != 0 {
@@ -368,7 +368,7 @@ func TestEngine_WarningScenario_EmailThenIM(t *testing.T) {
 
 	// 模拟第 1 级到期（5min 未 Ack）：Handle 触发，应发 IM，且已到序列末级不再注册定时器。
 	clock.t = wantFireAt
-	if err := e.Handle(context.Background(), alert.ID, second.payload); err != nil {
+	if err := e.Handle(context.Background(), nil, alert.ID, second.payload); err != nil {
 		t.Fatalf("Handle(step1) 返回意外错误: %v", err)
 	}
 	if len(dispatcher.calls) != 2 || dispatcher.calls[1].step != 1 {
@@ -405,7 +405,7 @@ func TestEngine_CriticalScenario_IMThenPhone(t *testing.T) {
 		t.Fatalf("Start() 返回意外错误: %v", err)
 	}
 	step0 := sched.lastScheduled()
-	if err := e.Handle(context.Background(), alert.ID, step0.payload); err != nil {
+	if err := e.Handle(context.Background(), nil, alert.ID, step0.payload); err != nil {
 		t.Fatalf("Handle(step0) 返回意外错误: %v", err)
 	}
 	if got := dispatcher.calls[0].channels; len(got) != 1 || got[0] != "im" {
@@ -418,7 +418,7 @@ func TestEngine_CriticalScenario_IMThenPhone(t *testing.T) {
 	}
 
 	clock.t = wantFireAt
-	if err := e.Handle(context.Background(), alert.ID, step1.payload); err != nil {
+	if err := e.Handle(context.Background(), nil, alert.ID, step1.payload); err != nil {
 		t.Fatalf("Handle(step1) 返回意外错误: %v", err)
 	}
 	if len(dispatcher.calls) != 2 {

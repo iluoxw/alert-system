@@ -57,6 +57,15 @@ type SendRequest struct {
 	ChannelKind string
 	Target      string
 	Msg         Message
+
+	// Round 区分"同一个 (AlertID/GroupKey, Step, Channel, Target) 元组下的第几次发送
+	// 意图"：调用方（internal/app 的 notifyOutbox）在构造 SendRequest 时用当时的
+	// o.now().UnixNano() 赋值一次，随请求整体序列化进 outbox 的 notify_send 定时器
+	// payload 持久化下来——绝不能在 Sender.Send 内部重新取 now() 现算，否则同一条
+	// notify_send 定时器崩溃重投时 payload 不变但 Round 变了，会让幂等去重失效。
+	// 没有这个字段时，重复提醒/组重复通知等"合法的下一轮发送"会被幂等键误判为
+	// "同一次发送的重投"而永久不再发送（R6.5 要求的 repeat_interval 重发）。
+	Round int64
 }
 
 // Sender 是可靠发送的编排层（R6.1/R6.3/R13.6）：占位写入 notification_log 做幂等去重，
@@ -91,9 +100,11 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 	}
 }
 
-// idempotencyKey 拼接出确定性的幂等键：同一次"发送尝试"（同一告警/分组 + 同一级 +
-// 同一渠道 + 同一 target）无论调用方重试多少次、进程崩溃后重投多少次，都能算出同一个
-// 键，从而命中 notification_log 的 UNIQUE(idempotency_key) 去重。
+// idempotencyKey 拼接出确定性的幂等键：同一告警/分组 + 同一级 + 同一渠道 + 同一
+// target + 同一 Round（同一次"发送意图"，见 SendRequest.Round 的文档），无论调用方
+// 重试多少次、进程崩溃后重投多少次，都能算出同一个键，从而命中 notification_log 的
+// UNIQUE(idempotency_key) 去重；而下一轮 repeat/升级会带上不同的 Round，天然算出
+// 不同的键，不会被误判为重投。
 func idempotencyKey(req SendRequest) string {
 	resourceKey := req.AlertID
 	if resourceKey == "" {
@@ -103,7 +114,7 @@ func idempotencyKey(req SendRequest) string {
 	if req.Step != nil {
 		step = strconv.Itoa(*req.Step)
 	}
-	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target}, idempotencyKeySep)
+	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target, strconv.FormatInt(req.Round, 10)}, idempotencyKeySep)
 }
 
 // Send 执行一次可靠发送。流程：
@@ -112,6 +123,15 @@ func idempotencyKey(req SendRequest) string {
 //     崩溃恢复重投的意义：之前那次要么没真正发出去，要么发送后没能确认成功）。
 //  2. 查渠道、发送 + 指数退避重试——这是外部 IO，不放在数据库事务里。
 //  3. 按发送结果回写状态（sent 或 failed），失败且是告警级发送时补一条时间线记录。
+//
+// 幂等键（含 Round，见 SendRequest.Round）实际兜的是"同一条 notify_send 定时器被
+// scheduler 逻辑性地重复调度"这一类重复（如 pipeline 侧多次 ScheduleIfAbsent/Schedule
+// 命中同一个业务元组），不是"进程崩溃窗口内的重投"——在当前 per-timer 事务模型下，
+// notification_log 占位写入与该定时器的 markFired 同属一个事务提交，一旦事务已提交、
+// Sender.Send 正在执行外部 IO（HTTP/短信）时进程崩溃，下次重投会看到 status=pending
+// 而不是 sent，从而真的把这条消息再发一次——这是 at-least-once 语义 + 外部 IO
+// 无法参与数据库事务的固有代价，MVP 阶段已经过 team-lead 裁决接受，不指望唯一键堵住
+// 这个窗口。
 func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 	key := idempotencyKey(req)
 

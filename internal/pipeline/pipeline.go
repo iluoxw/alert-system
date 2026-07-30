@@ -20,8 +20,9 @@ const defaultBatchSize = 20
 // 的固定 tick 更快感知到新事件（不像 scheduler 那样用固定周期的 ticker）。
 const idleBackoff = 200 * time.Millisecond
 
-// Stage 是管道处理阶段的统一接口。去重/分组/静默/抑制/路由等具体 stage
-// （internal/pipeline/stage_*.go，均属于本包，由后续任务实现）都实现该接口。
+// Stage 是管道处理阶段的统一接口。去重/路由/分组/静默/抑制（实际执行顺序，见
+// cmd/server/main.go 装配处的注释）等具体 stage（internal/pipeline/stage_*.go，
+// 均属于本包，由后续任务实现）都实现该接口。
 // 编排器本身只依赖这个接口，不引用任何具体 stage 类型：由 main 在启动时组装好
 // []Stage 传给 New，新增/替换/调整 stage 顺序都不需要改动编排器（D6 可插拔）。
 type Stage interface {

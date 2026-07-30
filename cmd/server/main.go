@@ -1,14 +1,9 @@
 // Command server 是告警管理系统的主入口：组装 ingest/pipeline/scheduler/notify/oncall/api
 // 全部依赖并启动 HTTP 服务与两个后台 worker（scheduler 轮询、pipeline 处理事件队列）。
 //
-// 六个 scheduler 定时器 kind 的绑定全部集中在这里（唯一同时知道全部六个 kind 字符串的
-// 装配层，各业务包只知道自己关心的那一个）：
-//   - "alert_ttl"            -> notify.LifecycleHandlers.HandleTTL
-//   - "alert_repeat"         -> notify.LifecycleHandlers.HandleRepeat
-//   - "personnel_escalation" -> oncall.Chain.Handle
-//   - "group_wait"           -> pipeline.GroupStage.Handle
-//   - "channel_escalation"   -> notify.Engine.Handle
-//   - "notify_send"          -> notifySendPayloadHandler（wiring.go，outbox 的发送适配）
+// pipeline/notify/oncall 的装配（含六个 scheduler 定时器 kind 的绑定）收拢在
+// internal/app.Build 里，与 test/e2e/harness.go 共用同一份逻辑——本文件只负责生产
+// 独有的部分：真实通知渠道注册、真实 http.Server、三个 ingest adapter（含 Grafana）。
 package main
 
 import (
@@ -24,14 +19,11 @@ import (
 	"time"
 
 	"alert-system/internal/api"
+	"alert-system/internal/app"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
-	"alert-system/internal/hook"
 	"alert-system/internal/ingest"
 	"alert-system/internal/notify"
-	"alert-system/internal/oncall"
-	"alert-system/internal/pipeline"
-	"alert-system/internal/scheduler"
 	"alert-system/internal/store"
 )
 
@@ -90,58 +82,24 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	sessions := store.NewSessionRepo()
 	memberships := store.NewMembershipRepo()
 
-	// ---- 定时器：pipeline/notify/oncall 共用的唯一 scheduler 实例 ----
-	sched := scheduler.New(st, cfg.SchedulerPollInterval)
-
 	// ---- 生产通知渠道（E2E 用 mock_channel.go 顶替，notify.Register 对同 kind 是
 	// 覆盖语义，测试装配不会调用这个函数）----
 	registerNotifyChannels(cfg)
 
-	// ---- 通知发送 outbox：四个通知意图接口（oncall.Notifier、pipeline.GroupNotifier、
-	// notify.RepeatNotifier、notify.Dispatcher）与实际发送解耦的适配器（见 wiring.go）。
-	// outbox 依赖 chain/engine，chain/engine 又依赖 outbox 作为通知意图的实现——用零值
-	// 字段构造 outbox 打破这个环：NotifyEscalation/NotifyRepeat/DispatchStep 不touch
-	// o.engine/o.chain，真正用到它们的 NotifyGroup 要到 pipeline 起转后才会被调用，
-	// 那时 engine/chain 已经赋值完毕。----
-	sender := notify.NewSender(st, notificationLogs, timeline)
-	outbox := &notifyOutbox{
-		scheduler:      sched,
-		repeatInterval: cfg.RepeatInterval,
-		now:            time.Now,
-	}
-
-	resolver := oncall.NewResolver(schedules, shifts)
-	chain := oncall.NewChain(st, alerts, timeline, escalationPolicies, resolver, sched, outbox)
-	engine := notify.NewEngine(st, alerts, timeline, notificationPolicies, sched, outbox)
-	outbox.engine = engine
-	outbox.chain = chain
-
-	stopper := newCompositeStopper(chain, engine)
-	lifecycle := notify.NewLifecycleHandlers(st, alerts, timeline, sched, stopper, outbox, cfg.RepeatInterval)
-
-	// ---- 管道 stage：顺序 dedup -> route -> group -> silence -> inhibit（route 必须
-	// 先于 group——group stage 读取 pctx.Route.GroupBy/GroupWait/GroupInterval，这三个
-	// 字段由 route stage 填充；stage_inhibit.go 顺序注释与代码依赖一致，pipeline.go 头
-	// 部注释顺序已过时，不采信）----
-	eventQueue := store.NewEventQueue()
-	hooks := hook.New()
-	dedupStage := pipeline.NewDedupStage(alerts, timeline, sched, nil)
-	routeStage := pipeline.NewRouteStage(routes, alerts, defaultTeamID)
-	groupStage := pipeline.NewGroupStage(st, alerts, sched, outbox)
-	silenceStage := pipeline.NewSilenceStage(silences, alerts)
-	inhibitStage := pipeline.NewInhibitStage()
-
-	pl := pipeline.New(st, eventQueue, hooks, []pipeline.Stage{
-		dedupStage, routeStage, groupStage, silenceStage, inhibitStage,
-	})
-
-	// ---- 六个 scheduler kind 全部在这里绑定 ----
-	sched.RegisterHandler(notify.TimerKindAlertTTL, lifecycle.HandleTTL)
-	sched.RegisterHandler(notify.TimerKindAlertRepeat, lifecycle.HandleRepeat)
-	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
-	sched.RegisterHandler("group_wait", groupStage.Handle) // groupTimerKind 未导出（pipeline 包内部常量），字面量需与其保持一致
-	sched.RegisterHandler(notify.TimerKindChannelEscalation, engine.Handle)
-	sched.RegisterHandler(notifySendTimerKind, notifySendPayloadHandler(sender))
+	// ---- pipeline/notify/oncall 全部依赖 + 六个 scheduler kind 的绑定，
+	// 与 test/e2e/harness.go 共用同一份装配逻辑，见 internal/app.Build ----
+	a := app.Build(st, app.Repos{
+		Alerts:               alerts,
+		Timeline:             timeline,
+		Routes:               routes,
+		Schedules:            schedules,
+		Shifts:               shifts,
+		EscalationPolicies:   escalationPolicies,
+		NotificationPolicies: notificationPolicies,
+		Silences:             silences,
+		NotificationLogs:     notificationLogs,
+	}, cfg, defaultTeamID)
+	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
 
 	// ---- ingest：三个上游 adapter，兜底等级统一取 domain.SeverityWarning（与
 	// integrations.default_severity 列的 DEFAULT 对齐；每 integration 各自的
@@ -152,10 +110,10 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
 
-	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发。已知缺口（见任务报告）：这条路径
-	// 目前没有注入点停止 oncall.Chain/notify.Engine 的定时器；REST API
-	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes 下面）已经接好 stopper。----
-	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger)
+	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发，与下面 REST API
+	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes）共用同一套
+	// stopper/lifecycle，保证两条处置路径的"停止升级链/生命周期定时器"不变量一致。----
+	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
 
 	auth := api.NewPasswordAuthenticator(users)
 	router := api.NewRouter(cfg, users, sessions, memberships, st, auth, larkServer.Handler(), logger)

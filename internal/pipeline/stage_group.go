@@ -48,14 +48,6 @@ type GroupNotifier interface {
 	NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey string, alerts []domain.Alert) error
 }
 
-// txRunner 抽象 store.Store.WithTx。scheduler.Handler 签名不带 tx 参数（handler 在
-// pollOnce 自己的事务内被调用，但没有拿到那个 tx 的引用），所以 GroupStage.Handle
-// 必须自己开一个独立的短事务完成"取组内成员 + 记录聚合发送意图"，与
-// internal/oncall.Chain 的 txRunner 是同一模式。
-type txRunner interface {
-	WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error
-}
-
 // groupClock 抽象"当前时间"，供测试注入 fake clock 精确控制定时器基准时间，
 // 与 dedupClock/routeClock 同一模式。
 type groupClock interface {
@@ -67,7 +59,10 @@ type realGroupClock struct{}
 func (realGroupClock) Now() time.Time { return time.Now() }
 
 // GroupStage 是管道的分组 stage（R9）：
-//   - route 未配置 group_by 时直发：不分组、不写 group_key、不注册定时器；
+//   - route 未配置 group_by 时，仍按 Alertmanager 语义形成"单例组"（该 route+该告警
+//     独占一个组，group_key 见 singletonGroupKey），继续走与分组路由完全相同的
+//     UpdateRouting/HasFired/ScheduleIfAbsent 流程——group_wait/group_interval 依旧
+//     生效，不存在脱离组机制之外的"直发"路径；
 //   - 配置了 group_by 时，group_key = route_id + hash(group_by 标签值)（见
 //     computeGroupKey），写回 alerts.group_key；组首（该 group_key 从未触发过
 //     定时器）注册 group_wait 延迟的到期定时器，组内后续加入者若已有 pending
@@ -80,18 +75,15 @@ func (realGroupClock) Now() time.Time { return time.Now() }
 //
 // 组状态的唯一真相是 alerts.group_key 列 + timers 表，本 stage 不维护任何内存态。
 type GroupStage struct {
-	tx        txRunner
 	alerts    GroupAlertRepo
 	scheduler GroupTimerScheduler
 	notifier  GroupNotifier
 	clock     groupClock
 }
 
-// NewGroupStage 构造 GroupStage。tx 通常直接传 *store.Store（结构上满足 txRunner），
-// 供 Handle 在到期时开独立事务使用。
-func NewGroupStage(tx txRunner, alerts GroupAlertRepo, sched GroupTimerScheduler, notifier GroupNotifier) *GroupStage {
+// NewGroupStage 构造 GroupStage。
+func NewGroupStage(alerts GroupAlertRepo, sched GroupTimerScheduler, notifier GroupNotifier) *GroupStage {
 	return &GroupStage{
-		tx:        tx,
 		alerts:    alerts,
 		scheduler: sched,
 		notifier:  notifier,
@@ -117,11 +109,17 @@ func (s *GroupStage) Process(ctx context.Context, pctx *PipelineContext) error {
 	}
 
 	route := pctx.Route
+	var groupKey string
 	if len(route.GroupBy) == 0 {
-		return s.directDispatch(ctx, pctx)
+		// 未配置 group_by：与真实 Alertmanager 一致，这不是一条独立的"直发"路径，
+		// 而是退化为"每条告警各自一个单例组"——下面完全复用分组路径的
+		// UpdateRouting/HasFired/ScheduleIfAbsent 逻辑，group_wait/group_interval
+		// 对未分组路由同样生效。
+		groupKey = singletonGroupKey(route.RouteID, pctx.Alert.Fingerprint)
+	} else {
+		groupKey = computeGroupKey(route.RouteID, route.GroupBy, mergedMatchLabels(pctx.Alert))
 	}
 
-	groupKey := computeGroupKey(route.RouteID, route.GroupBy, mergedMatchLabels(pctx.Alert))
 	if pctx.Alert.GroupKey != groupKey {
 		if err := s.alerts.UpdateRouting(ctx, pctx.Tx, pctx.Alert.ID, pctx.Alert.TeamID, groupKey); err != nil {
 			return fmt.Errorf("group: 写入 group_key 失败: %w", err)
@@ -144,44 +142,37 @@ func (s *GroupStage) Process(ctx context.Context, pctx *PipelineContext) error {
 	return nil
 }
 
-// directDispatch 处理"未配置 group_by"分支：告警不分组，若此前曾经属于某个组
-// （例如路由规则被改配置，去掉了 group_by），清空其 group_key，使其走单告警
-// 通知路径（下游任务 22 处理），不注册/触碰任何组定时器。
-func (s *GroupStage) directDispatch(ctx context.Context, pctx *PipelineContext) error {
-	if pctx.Alert.GroupKey == "" {
+// Handle 实现 scheduler.Handler：refID 是 group_key。tx 是 scheduler 传入的事务
+// （同一事务内已经把这条定时器标记为 fired），取组内全部活跃（非 resolved）成员、
+// 把"该组到期，应聚合发送"的意图交给 GroupNotifier 都复用这个 tx——不做实际发送
+// （见 GroupNotifier 文档的硬约束）。组内成员已全部 resolved/迁移出组时无需通知，
+// 不算错误。
+func (s *GroupStage) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
+	members, err := s.alerts.ListByGroupKey(ctx, tx, refID)
+	if err != nil {
+		return fmt.Errorf("group: 查询组内成员失败: %w", err)
+	}
+	if len(members) == 0 {
 		return nil
 	}
-	if err := s.alerts.UpdateRouting(ctx, pctx.Tx, pctx.Alert.ID, pctx.Alert.TeamID, ""); err != nil {
-		return fmt.Errorf("group: 清空 group_key 失败: %w", err)
+	if err := s.notifier.NotifyGroup(ctx, tx, refID, members); err != nil {
+		return fmt.Errorf("group: 记录组聚合通知意图失败: %w", err)
 	}
-	pctx.Alert.GroupKey = ""
 	return nil
-}
-
-// Handle 实现 scheduler.Handler：refID 是 group_key。独立开一个短事务取出组内
-// 全部活跃（非 resolved）成员，把"该组到期，应聚合发送"的意图交给 GroupNotifier——
-// 不做实际发送（见 GroupNotifier 文档的硬约束）。组内成员已全部 resolved/迁移
-// 出组时无需通知，不算错误。
-func (s *GroupStage) Handle(ctx context.Context, refID string, payload []byte) error {
-	return s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		members, err := s.alerts.ListByGroupKey(ctx, tx, refID)
-		if err != nil {
-			return fmt.Errorf("group: 查询组内成员失败: %w", err)
-		}
-		if len(members) == 0 {
-			return nil
-		}
-		if err := s.notifier.NotifyGroup(ctx, tx, refID, members); err != nil {
-			return fmt.Errorf("group: 记录组聚合通知意图失败: %w", err)
-		}
-		return nil
-	})
 }
 
 // groupKeySep 是 computeGroupKey 哈希输入中取值之间的分隔符，避免相邻取值拼接
 // 产生歧义（与 domain.Fingerprint 的 sep 同一手法，取值不同仅因两者是不同包、
 // 互不依赖对方的私有常量）。
 const groupKeySep = '\x1e'
+
+// singletonGroupKey 计算未配置 group_by 路由的单例组键：route_id + "-single-" +
+// fingerprint，保证同一路由下每条告警各自独占一个组（同一告警的后续更新复用
+// 同一个 key，从而落到同一个 group_wait/group_interval 定时器上）。"-single-"
+// 中缀与 computeGroupKey 的 "%s-%016x" 十六进制哈希格式不会碰撞。
+func singletonGroupKey(routeID, fingerprint string) string {
+	return fmt.Sprintf("%s-single-%s", routeID, fingerprint)
+}
 
 // computeGroupKey 计算 group_key = route_id + "-" + hash(group_by 标签值)：按
 // route.GroupBy 声明的顺序，从 labels 里取出对应值（缺失的 key 取空字符串），

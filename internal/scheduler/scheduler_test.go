@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // 本文件的单元测试（无 build tag，不需要 docker）只覆盖 handler 注册/分发/panic
@@ -27,13 +29,13 @@ func TestScheduler_Invoke_DispatchesToRegisteredHandler(t *testing.T) {
 	s := &Scheduler{handlers: make(map[string]Handler)}
 	var gotRefID string
 	var gotPayload []byte
-	s.RegisterHandler("ttl", func(_ context.Context, refID string, payload []byte) error {
+	s.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, refID string, payload []byte) error {
 		gotRefID = refID
 		gotPayload = payload
 		return nil
 	})
 
-	err := s.invoke(context.Background(), dueTimer{kind: "ttl", refID: "alert-1", payload: []byte(`{"x":1}`)})
+	err := s.invoke(context.Background(), nil, dueTimer{kind: "ttl", refID: "alert-1", payload: []byte(`{"x":1}`)})
 	if err != nil {
 		t.Fatalf("invoke err = %v, want nil", err)
 	}
@@ -47,7 +49,7 @@ func TestScheduler_Invoke_DispatchesToRegisteredHandler(t *testing.T) {
 
 func TestScheduler_Invoke_UnknownKind_ReturnsError(t *testing.T) {
 	s := &Scheduler{handlers: make(map[string]Handler)}
-	if err := s.invoke(context.Background(), dueTimer{kind: "unregistered", refID: "x"}); err == nil {
+	if err := s.invoke(context.Background(), nil, dueTimer{kind: "unregistered", refID: "x"}); err == nil {
 		t.Fatal("未注册 kind 应返回错误，而不是静默成功")
 	}
 }
@@ -55,11 +57,11 @@ func TestScheduler_Invoke_UnknownKind_ReturnsError(t *testing.T) {
 func TestScheduler_Invoke_HandlerError_Propagates(t *testing.T) {
 	s := &Scheduler{handlers: make(map[string]Handler)}
 	wantErr := errors.New("boom")
-	s.RegisterHandler("x", func(_ context.Context, _ string, _ []byte) error {
+	s.RegisterHandler("x", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		return wantErr
 	})
 
-	err := s.invoke(context.Background(), dueTimer{kind: "x"})
+	err := s.invoke(context.Background(), nil, dueTimer{kind: "x"})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("invoke err = %v, want 包含 %v", err, wantErr)
 	}
@@ -67,11 +69,11 @@ func TestScheduler_Invoke_HandlerError_Propagates(t *testing.T) {
 
 func TestScheduler_Invoke_HandlerPanic_RecoveredAsError(t *testing.T) {
 	s := &Scheduler{handlers: make(map[string]Handler)}
-	s.RegisterHandler("x", func(_ context.Context, _ string, _ []byte) error {
+	s.RegisterHandler("x", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		panic("boom")
 	})
 
-	err := s.invoke(context.Background(), dueTimer{kind: "x"})
+	err := s.invoke(context.Background(), nil, dueTimer{kind: "x"})
 	if err == nil {
 		t.Fatal("handler panic 必须被 recover 并转换为 error，而不是继续向上传播、杀死调用方")
 	}
@@ -88,8 +90,8 @@ func TestScheduler_RegisterHandler_ConcurrentSafe(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			kind := fmt.Sprintf("kind-%d", i)
-			s.RegisterHandler(kind, func(_ context.Context, _ string, _ []byte) error { return nil })
-			_ = s.invoke(context.Background(), dueTimer{kind: kind})
+			s.RegisterHandler(kind, func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error { return nil })
+			_ = s.invoke(context.Background(), nil, dueTimer{kind: kind})
 		}(i)
 	}
 	wg.Wait()

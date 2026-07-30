@@ -89,19 +89,10 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
 
-// txRunner 抽象 store.Store.WithTx。scheduler.Handler 签名不带 tx 参数（handler
-// 在 pollOnce 自己的事务内被调用，但没有拿到那个 tx 的引用），所以 Chain.Handle
-// 必须自己开一个独立的短事务来完成"查状态 -> 落时间线 -> 注册下一级定时器"这一组
-// 原子写入，与 notify.Sender 的 placeholder/markFailed 是同一个模式。
-type txRunner interface {
-	WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error
-}
-
 // Chain 是人员升级链的编排层（R5.4）：经 scheduler 逐级推进，每级用 Resolver 求出
 // 当班人，通知意图记账后交给注入的 Notifier；未 Ack 前逐级推进，Ack/Resolved/
 // 静默后停止；无人可通知（班次空洞或链路耗尽）落时间线警告而不中断。
 type Chain struct {
-	tx        txRunner
 	alerts    AlertRepo
 	timeline  TimelineRepo
 	policies  EscalationPolicyRepo
@@ -111,10 +102,9 @@ type Chain struct {
 	clock     Clock
 }
 
-// NewChain 构造 Chain。tx 通常直接传 *store.Store（结构上满足 txRunner）。
-func NewChain(tx txRunner, alerts AlertRepo, timeline TimelineRepo, policies EscalationPolicyRepo, resolver *Resolver, sched TimerScheduler, notifier Notifier) *Chain {
+// NewChain 构造 Chain。
+func NewChain(alerts AlertRepo, timeline TimelineRepo, policies EscalationPolicyRepo, resolver *Resolver, sched TimerScheduler, notifier Notifier) *Chain {
 	return &Chain{
-		tx:        tx,
 		alerts:    alerts,
 		timeline:  timeline,
 		policies:  policies,
@@ -164,18 +154,18 @@ func (c *Chain) Stop(ctx context.Context, tx pgx.Tx, alertID string) error {
 }
 
 // Handle 实现 scheduler.Handler：refID 是 alert.ID，payload 是 escalationPayload 的
-// JSON。内部开独立事务完成一整级的推进，见 txRunner 的文档。
-func (c *Chain) Handle(ctx context.Context, refID string, payload []byte) error {
+// JSON。tx 是 scheduler 传入的事务（同一事务内已经把这条定时器标记为 fired），
+// 本级的查状态/落时间线/注册下一级定时器都复用这个 tx，与 scheduler.Handler 的
+// 文档约定一致。
+func (c *Chain) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
 	var p escalationPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("oncall: 反序列化升级链 payload 失败: %w", err)
 	}
-	return c.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		return c.advance(ctx, tx, refID, p.Level)
-	})
+	return c.advance(ctx, tx, refID, p.Level)
 }
 
-// advance 是 Handle 的核心逻辑，在 Handle 开出的事务内执行。
+// advance 是 Handle 的核心逻辑，在 Handle 传入的事务内执行。
 func (c *Chain) advance(ctx context.Context, tx pgx.Tx, alertID string, level int) error {
 	alert, err := c.alerts.GetByID(ctx, tx, alertID)
 	if err != nil {

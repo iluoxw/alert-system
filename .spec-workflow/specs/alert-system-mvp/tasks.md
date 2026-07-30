@@ -263,7 +263,7 @@
 
 ## J. 端到端验证
 
-- [-] 31. E2E 场景测试与主流程验收
+- [x] 31. E2E 场景测试与主流程验收
   - File: test/e2e/e2e_test.go, test/e2e/docker-compose.yml
   - design.md 三场景：① Alertmanager webhook→去重→路由→mock 飞书收到→Ack→升级取消；② 静默生效零通知→过期恢复 repeat；③ ttl 告警超时自动 resolved；外加 R13 样例（warning email→IM 升级）
   - Purpose: 全链路需求验收

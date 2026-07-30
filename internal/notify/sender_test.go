@@ -169,15 +169,16 @@ func TestSender_RetryExhaustion_MarksFailedAndAppendsTimeline(t *testing.T) {
 	}
 }
 
-// 场景②：同一幂等键二次 Send（模拟进程崩溃后重投），且第一次已经成功发送过，
-// 第二次不应重复调用 Channel.Send。
-func TestSender_SameIdempotencyKey_ResentAfterSent_DoesNotResend(t *testing.T) {
+// 场景②：同一幂等键二次 Send，round 不变（模拟进程崩溃后重投同一条 notify_send
+// 定时器——payload 没变，Round 就没变，见 SendRequest.Round 的文档），且第一次已经
+// 成功发送过，第二次不应重复调用 Channel.Send。
+func TestSender_SameRound_ResentAfterSent_DoesNotResend(t *testing.T) {
 	ch := &fakeChannel{kind: "webhook"}
 	logs := newFakeLogStore()
 	tl := &fakeTimeline{}
 	s := newSenderForTest(logs, tl, ch)
 
-	req := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x"}
+	req := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x", Round: 1000}
 	if err := s.Send(context.Background(), req); err != nil {
 		t.Fatalf("第一次 Send 失败: %v", err)
 	}
@@ -185,12 +186,38 @@ func TestSender_SameIdempotencyKey_ResentAfterSent_DoesNotResend(t *testing.T) {
 		t.Fatalf("第一次发送后期望 Channel.Send 调用 1 次，实际 %d 次", got)
 	}
 
-	// 模拟崩溃重投：同样的 req（同样的幂等键）再次调用 Send。
+	// 模拟崩溃重投：同样的 req（同样的幂等键，round 不变）再次调用 Send。
 	if err := s.Send(context.Background(), req); err != nil {
 		t.Fatalf("第二次（重投）Send 失败: %v", err)
 	}
 	if got := ch.callCount(); got != 1 {
 		t.Fatalf("已 sent 的记录不应重发，期望 Channel.Send 仍为 1 次，实际 %d 次", got)
+	}
+}
+
+// 场景②'：AlertID/Step/Channel/Target 完全相同，但 Round 不同（代表下一轮 repeat/
+// 升级的合法新发送意图，而不是同一条定时器的崩溃重投）时，应当被当成一次全新的
+// 发送——这正是 Bug C 的回归用例：幂等键如果不区分 round，R6.5 要求的重复提醒会
+// 在第一次成功发送之后永久失效。
+func TestSender_DifferentRound_SameOtherFields_SendsAgain(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+
+	req1 := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x", Round: 1000}
+	if err := s.Send(context.Background(), req1); err != nil {
+		t.Fatalf("第一轮 Send 失败: %v", err)
+	}
+
+	req2 := req1
+	req2.Round = 2000
+	if err := s.Send(context.Background(), req2); err != nil {
+		t.Fatalf("第二轮（不同 round）Send 失败: %v", err)
+	}
+
+	if got := ch.callCount(); got != 2 {
+		t.Fatalf("不同 round 应各自发送一次，期望 Channel.Send 调用 2 次，实际 %d 次", got)
 	}
 }
 

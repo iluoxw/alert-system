@@ -90,17 +90,11 @@ type Dispatcher interface {
 	DispatchStep(ctx context.Context, tx pgx.Tx, alert domain.Alert, step int, channels []string) error
 }
 
-// txRunner 复用 sender.go 里已经定义的同名接口（同包，形状一致：抽象
-// store.Store.WithTx）。scheduler.Handler 签名不带 tx 参数，Engine.Handle 必须自己
-// 开一个独立的短事务完成"查状态 -> 落时间线 -> 记发送意图 -> 注册下一级定时器"这一组
-// 原子写入，与 oncall.Chain/pipeline.GroupStage 是同一模式。
-
 // Engine 是渠道升级策略引擎（R13）：三级求值链选出通知策略，按告警 severity 取对应
 // 的渠道升级序列，经 scheduler 逐级推进；未 Ack 前逐级推进，Ack/Resolved/静默命中
 // 后停止；每级的渠道集合按 replace/spread 模式计算，只提高触达强度，不改变告警的
 // severity/status，全过程记入时间线（R13.3）。
 type Engine struct {
-	tx         txRunner
 	alerts     AlertRepo
 	timeline   TimelineRepo
 	policies   PolicyRepo
@@ -109,10 +103,9 @@ type Engine struct {
 	clock      Clock
 }
 
-// NewEngine 构造 Engine。tx 通常直接传 *store.Store（结构上满足 txRunner）。
-func NewEngine(tx txRunner, alerts AlertRepo, timeline TimelineRepo, policies PolicyRepo, sched TimerScheduler, dispatcher Dispatcher) *Engine {
+// NewEngine 构造 Engine。
+func NewEngine(alerts AlertRepo, timeline TimelineRepo, policies PolicyRepo, sched TimerScheduler, dispatcher Dispatcher) *Engine {
 	return &Engine{
-		tx:         tx,
 		alerts:     alerts,
 		timeline:   timeline,
 		policies:   policies,
@@ -180,15 +173,14 @@ func (e *Engine) Stop(ctx context.Context, tx pgx.Tx, alertID string) error {
 }
 
 // Handle 实现 scheduler.Handler：refID 是 alert.ID，payload 是 stepPayload 的 JSON。
-// 内部开独立事务完成一整级的推进，见 txRunner 的文档（复用 sender.go 定义）。
-func (e *Engine) Handle(ctx context.Context, refID string, payload []byte) error {
+// tx 是 scheduler 传入的事务（同一事务内已经把这条定时器标记为 fired），本级的
+// 查状态/落时间线/记发送意图/注册下一级定时器都复用这个 tx。
+func (e *Engine) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
 	var p stepPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("notify: 反序列化渠道升级 payload 失败: %w", err)
 	}
-	return e.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		return e.advance(ctx, tx, refID, p.Step)
-	})
+	return e.advance(ctx, tx, refID, p.Step)
 }
 
 // advance 是 Handle 的核心逻辑，在 Handle 开出的事务内执行。

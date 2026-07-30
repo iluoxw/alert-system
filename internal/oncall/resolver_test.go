@@ -13,14 +13,6 @@ import (
 	"alert-system/internal/store"
 )
 
-// fakeTx 让 WithTx 直接以 nil pgx.Tx 调用 fn：本包测试里的 fake 仓储都不真正使用
-// tx 参数，只是透传满足签名（与 notify/sender_test.go 的 fakeTx 同一模式）。
-type fakeTx struct{}
-
-func (fakeTx) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	return fn(nil)
-}
-
 // settableClock 是 Clock 的可控实现，测试用它精确推进"当前时间"而不依赖 wall-clock。
 type settableClock struct{ t time.Time }
 
@@ -204,7 +196,7 @@ func TestResolver_OnCallAt_NoSchedule(t *testing.T) {
 
 func newTestChain(alerts *fakeAlertRepo, timeline *fakeTimelineRepo, policies *fakeEscalationPolicyRepo,
 	resolver *Resolver, sched *fakeTimerScheduler, notifier *fakeNotifier, now time.Time) *Chain {
-	c := NewChain(fakeTx{}, alerts, timeline, policies, resolver, sched, notifier)
+	c := NewChain(alerts, timeline, policies, resolver, sched, notifier)
 	c.clock = &settableClock{t: now}
 	return c
 }
@@ -237,7 +229,7 @@ func TestChain_ThreeLevelEscalation(t *testing.T) {
 	sched := &fakeTimerScheduler{}
 	notifier := &fakeNotifier{}
 	clock := &settableClock{t: start}
-	chain := NewChain(fakeTx{}, alerts, timeline, policies, resolver, sched, notifier)
+	chain := NewChain(alerts, timeline, policies, resolver, sched, notifier)
 	chain.clock = clock
 
 	// Start：第 0 级 wait=0，应立即注册定时器。
@@ -250,7 +242,7 @@ func TestChain_ThreeLevelEscalation(t *testing.T) {
 
 	// 第 0 级触发：通知 alice，注册第 1 级（+300s）。
 	payload0, _ := json.Marshal(escalationPayload{Level: 0})
-	if err := chain.Handle(context.Background(), alertID, payload0); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
 		t.Fatalf("Handle(level0) error = %v", err)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].level != 0 || !reflect.DeepEqual(notifier.calls[0].userIDs, []string{"alice"}) {
@@ -262,7 +254,7 @@ func TestChain_ThreeLevelEscalation(t *testing.T) {
 	}
 
 	// 幂等：重投同一个 level0 payload（模拟 at-least-once 重投），不应重复通知、不应重复注册。
-	if err := chain.Handle(context.Background(), alertID, payload0); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
 		t.Fatalf("Handle(level0 重投) error = %v", err)
 	}
 	if len(notifier.calls) != 1 {
@@ -275,7 +267,7 @@ func TestChain_ThreeLevelEscalation(t *testing.T) {
 	// 第 1 级触发（仍未 Ack）：通知，注册第 2 级（+600s）。
 	clock.t = wantLevel1FireAt
 	payload1, _ := json.Marshal(escalationPayload{Level: 1})
-	if err := chain.Handle(context.Background(), alertID, payload1); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload1); err != nil {
 		t.Fatalf("Handle(level1) error = %v", err)
 	}
 	if len(notifier.calls) != 2 || notifier.calls[1].level != 1 {
@@ -293,7 +285,7 @@ func TestChain_ThreeLevelEscalation(t *testing.T) {
 
 	clock.t = wantLevel2FireAt
 	payload2, _ := json.Marshal(escalationPayload{Level: 2})
-	if err := chain.Handle(context.Background(), alertID, payload2); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload2); err != nil {
 		t.Fatalf("Handle(level2, acked) error = %v", err)
 	}
 	if len(notifier.calls) != 2 {
@@ -320,7 +312,7 @@ func TestChain_Silenced_Stops(t *testing.T) {
 	chain := newTestChain(alerts, timeline, policies, resolver, sched, notifier, time.Now())
 
 	payload, _ := json.Marshal(escalationPayload{Level: 0})
-	if err := chain.Handle(context.Background(), alertID, payload); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
 	if len(notifier.calls) != 0 || len(sched.scheduleCalls) != 0 || len(timeline.entries[alertID]) != 0 {
@@ -350,7 +342,7 @@ func TestChain_NobodyOnCall_RecordsWarningAndContinues(t *testing.T) {
 	chain := newTestChain(alerts, timeline, policies, resolver, sched, notifier, time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC))
 
 	payload0, _ := json.Marshal(escalationPayload{Level: 0})
-	if err := chain.Handle(context.Background(), alertID, payload0); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
 
@@ -383,7 +375,7 @@ func TestChain_LevelBeyondPolicy_RecordsExhaustedWarning(t *testing.T) {
 	chain := newTestChain(alerts, timeline, policies, resolver, sched, notifier, time.Now())
 
 	payload, _ := json.Marshal(escalationPayload{Level: 5}) // 越界：策略只有 1 级
-	if err := chain.Handle(context.Background(), alertID, payload); err != nil {
+	if err := chain.Handle(context.Background(), nil, alertID, payload); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
 	entries := timeline.entries[alertID]

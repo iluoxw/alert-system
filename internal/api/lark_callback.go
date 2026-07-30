@@ -49,12 +49,17 @@ type Server struct {
 
 	verificationToken string
 	cardHandler       *larkcard.CardActionHandler
+
+	escalation EscalationStopper
+	lifecycle  LifecycleTimerCanceler
 }
 
 // NewServer 构造 Server。verificationToken/encryptKey 来自 internal/config.LarkConfig；
 // 传空字符串表示不启用对应校验（与 SDK 自身约定一致，仅用于本地开发/测试）。logger 为 nil
-// 时使用 slog.Default()。
-func NewServer(alerts AlertStore, timeline TimelineStore, tx TxRunner, verificationToken, encryptKey string, logger *slog.Logger) *Server {
+// 时使用 slog.Default()。escalation/lifecycle 复用 alerts.go 里 REST Ack/Resolve 端点
+// 同款的 EscalationStopper/LifecycleTimerCanceler 接口，让卡片回调与 REST 端点共享同一套
+// "认领/解决后停止升级与生命周期定时器"不变量；传 nil 表示跳过。
+func NewServer(alerts AlertStore, timeline TimelineStore, tx TxRunner, verificationToken, encryptKey string, logger *slog.Logger, escalation EscalationStopper, lifecycle LifecycleTimerCanceler) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -64,6 +69,8 @@ func NewServer(alerts AlertStore, timeline TimelineStore, tx TxRunner, verificat
 		tx:                tx,
 		logger:            logger,
 		verificationToken: verificationToken,
+		escalation:        escalation,
+		lifecycle:         lifecycle,
 	}
 	s.cardHandler = larkcard.NewCardActionHandler(verificationToken, encryptKey, s.handleCardAction)
 	return s
@@ -167,7 +174,10 @@ func (s *Server) handleCardAction(ctx context.Context, action *larkcard.CardActi
 		var entry domain.TimelineEntry
 		switch actionName {
 		case "ack":
-			updated, entry, err = domain.Ack(alert, actor, now)
+			// actorID 传空字符串：本包目前没有"飞书身份 -> 内部 users 记录"的映射能力，
+			// alerts.acked_by 是 UUID 列，无法映射时只能落 NULL（domain.Ack 对空
+			// actorID 的处理约定）；actor（OpenID/UserID）仍完整写入 timeline 展示。
+			updated, entry, err = domain.Ack(alert, "", actor, now)
 		case "resolve":
 			updated, entry, err = domain.Resolve(alert, actor, domain.ResolveReasonManual, now)
 		default:
@@ -180,8 +190,25 @@ func (s *Server) handleCardAction(ctx context.Context, action *larkcard.CardActi
 		if err := s.alerts.UpdateStatus(ctx, tx, updated); err != nil {
 			return err
 		}
-		_, err = s.timeline.Append(ctx, tx, entry)
-		return err
+		if _, err := s.timeline.Append(ctx, tx, entry); err != nil {
+			return err
+		}
+
+		// 与 alerts.go 的 REST ack/resolve 端点同一不变量：状态机成功转移后，无条件尝试
+		// 停止升级链/生命周期定时器（两者均幂等），不依赖"本次是否真的发生了状态转移"
+		// 的历史。actionName 走到这里必为 "ack"/"resolve" 之一（其余分支已在上面的
+		// switch 里提前返回错误）。
+		if s.escalation != nil {
+			if err := s.escalation.Stop(ctx, tx, updated.ID); err != nil {
+				return err
+			}
+		}
+		if actionName == "resolve" && s.lifecycle != nil {
+			if err := s.lifecycle.CancelLifecycleTimers(ctx, tx, updated.ID); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		s.logger.Error("lark_callback: 处理卡片操作失败", "alert_id", alertID, "action", actionName, "err", err)

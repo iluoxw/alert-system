@@ -52,15 +52,15 @@ func TestAck_LegalTransition(t *testing.T) {
 	now := starts.Add(3 * time.Minute)
 	alert := Alert{ID: "a1", Status: StatusFiring, StartsAt: starts}
 
-	updated, entry, err := Ack(alert, "alice", now)
+	updated, entry, err := Ack(alert, "u-1", "alice", now)
 	if err != nil {
 		t.Fatalf("Ack() error = %v", err)
 	}
 	if updated.Status != StatusAcknowledged {
 		t.Errorf("Status = %s, want %s", updated.Status, StatusAcknowledged)
 	}
-	if updated.AckedBy != "alice" || !updated.AckedAt.Equal(now) {
-		t.Errorf("AckedBy/AckedAt = %s/%v, want alice/%v", updated.AckedBy, updated.AckedAt, now)
+	if updated.AckedBy != "u-1" || !updated.AckedAt.Equal(now) {
+		t.Errorf("AckedBy/AckedAt = %s/%v, want u-1/%v", updated.AckedBy, updated.AckedAt, now)
 	}
 	if entry.AlertID != "a1" || entry.Actor != "alice" || entry.Action != TimelineActionAck || !entry.At.Equal(now) {
 		t.Errorf("unexpected timeline entry: %+v", entry)
@@ -79,17 +79,33 @@ func TestAck_LegalTransition(t *testing.T) {
 func TestAck_IllegalTransition(t *testing.T) {
 	for _, from := range []Status{StatusAcknowledged, StatusResolved} {
 		alert := Alert{ID: "a1", Status: from}
-		_, _, err := Ack(alert, "alice", time.Now())
+		_, _, err := Ack(alert, "u-1", "alice", time.Now())
 		if !errors.Is(err, ErrInvalidTransition) {
 			t.Errorf("Ack() from %s: error = %v, want ErrInvalidTransition", from, err)
 		}
 	}
 }
 
-func TestAck_EmptyActor(t *testing.T) {
+func TestAck_EmptyActorName(t *testing.T) {
 	alert := Alert{ID: "a1", Status: StatusFiring}
-	if _, _, err := Ack(alert, "", time.Now()); err == nil {
-		t.Error("Ack() with empty actor: error = nil, want error")
+	if _, _, err := Ack(alert, "u-1", "", time.Now()); err == nil {
+		t.Error("Ack() with empty actorName: error = nil, want error")
+	}
+}
+
+// 外部渠道（如飞书卡片）的操作者若无法映射到内部 users 记录，actorID 允许为空——
+// store 层用 NULLIF 把空字符串落成 NULL，不报 UUID 类型错误。
+func TestAck_EmptyActorID_Allowed(t *testing.T) {
+	alert := Alert{ID: "a1", Status: StatusFiring}
+	updated, entry, err := Ack(alert, "", "ou_lark_user", time.Now())
+	if err != nil {
+		t.Fatalf("Ack() error = %v, want nil（actorID 允许为空）", err)
+	}
+	if updated.AckedBy != "" {
+		t.Errorf("AckedBy = %q, want 空字符串", updated.AckedBy)
+	}
+	if entry.Actor != "ou_lark_user" {
+		t.Errorf("entry.Actor = %q, want ou_lark_user", entry.Actor)
 	}
 }
 

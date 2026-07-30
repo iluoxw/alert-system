@@ -12,19 +12,6 @@ import (
 	"alert-system/internal/store"
 )
 
-// lifecycleFakeTx 是 txRunner 的测试替身：直接以 nil tx 调用 fn，本文件的 fake
-// 仓储/通知器/升级链停止器都不会真的使用 tx。
-type lifecycleFakeTx struct {
-	err error
-}
-
-func (f *lifecycleFakeTx) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	if f.err != nil {
-		return f.err
-	}
-	return fn(nil)
-}
-
 // lifecycleMutableClock 是 handlerClock 的可控实现，测试通过直接改写字段推进时间。
 type lifecycleMutableClock struct {
 	t time.Time
@@ -125,7 +112,7 @@ func (f *fakeRepeatNotifier) NotifyRepeat(ctx context.Context, tx pgx.Tx, alert 
 }
 
 func newLifecycleHandlersForTest(alerts *lifecycleFakeAlerts, timeline *lifecycleFakeTimeline, sched *lifecycleFakeScheduler, escalation lifecycleEscalationStopper, notifier RepeatNotifier, repeatInterval time.Duration, clock handlerClock) *LifecycleHandlers {
-	h := NewLifecycleHandlers(&lifecycleFakeTx{}, alerts, timeline, sched, escalation, notifier, repeatInterval)
+	h := NewLifecycleHandlers(alerts, timeline, sched, escalation, notifier, repeatInterval)
 	h.clock = clock
 	return h
 }
@@ -163,7 +150,7 @@ func TestLifecycleHandlers_HandleTTL_FiringAlert_AutoResolves(t *testing.T) {
 	now := time.Date(2026, 7, 1, 1, 0, 0, 0, time.UTC)
 	h := newLifecycleHandlersForTest(alerts, timeline, sched, escalation, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: now})
 
-	if err := h.HandleTTL(context.Background(), "alert-1", nil); err != nil {
+	if err := h.HandleTTL(context.Background(), nil, "alert-1", nil); err != nil {
 		t.Fatalf("HandleTTL() 返回意外错误: %v", err)
 	}
 
@@ -202,7 +189,7 @@ func TestLifecycleHandlers_HandleTTL_AcknowledgedAlert_AutoResolves(t *testing.T
 	alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{"alert-2": alert}}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, &lifecycleFakeScheduler{}, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleTTL(context.Background(), "alert-2", nil); err != nil {
+	if err := h.HandleTTL(context.Background(), nil, "alert-2", nil); err != nil {
 		t.Fatalf("HandleTTL() 返回意外错误: %v", err)
 	}
 	if len(alerts.updateCalls) != 1 || alerts.updateCalls[0].Status != domain.StatusResolved {
@@ -220,7 +207,7 @@ func TestLifecycleHandlers_HandleTTL_AlreadyResolved_Idempotent(t *testing.T) {
 	escalation := &lifecycleFakeEscalation{}
 	h := newLifecycleHandlersForTest(alerts, timeline, sched, escalation, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleTTL(context.Background(), "alert-3", nil); err != nil {
+	if err := h.HandleTTL(context.Background(), nil, "alert-3", nil); err != nil {
 		t.Fatalf("HandleTTL() 返回意外错误: %v", err)
 	}
 	if len(alerts.updateCalls) != 0 || len(timeline.entries) != 0 || len(sched.cancelCalls) != 0 || len(escalation.stopCalls) != 0 {
@@ -233,7 +220,7 @@ func TestLifecycleHandlers_HandleTTL_AlertNotFound_ReturnsNil(t *testing.T) {
 	alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{}}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, &lifecycleFakeScheduler{}, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleTTL(context.Background(), "missing", nil); err != nil {
+	if err := h.HandleTTL(context.Background(), nil, "missing", nil); err != nil {
 		t.Fatalf("HandleTTL() 对不存在的告警返回了意外错误: %v", err)
 	}
 }
@@ -244,7 +231,7 @@ func TestLifecycleHandlers_HandleTTL_GetByIDError_Propagates(t *testing.T) {
 	alerts := &lifecycleFakeAlerts{getErr: wantErr}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, &lifecycleFakeScheduler{}, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	err := h.HandleTTL(context.Background(), "alert-x", nil)
+	err := h.HandleTTL(context.Background(), nil, "alert-x", nil)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("HandleTTL() 错误 = %v, 期望包裹 %v", err, wantErr)
 	}
@@ -280,7 +267,7 @@ func TestLifecycleHandlers_HandleTTL_DownstreamErrors_Propagate(t *testing.T) {
 			tc.mutate(alerts, timeline, sched, escalation, wantErr)
 			h := newLifecycleHandlersForTest(alerts, timeline, sched, escalation, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-			err := h.HandleTTL(context.Background(), "alert-y", nil)
+			err := h.HandleTTL(context.Background(), nil, "alert-y", nil)
 			if err == nil || !errors.Is(err, wantErr) {
 				t.Fatalf("HandleTTL() 错误 = %v, 期望包裹 %v", err, wantErr)
 			}
@@ -295,7 +282,7 @@ func TestLifecycleHandlers_HandleTTL_NilEscalation_SkipsStopWithoutPanic(t *test
 	sched := &lifecycleFakeScheduler{}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, nil, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleTTL(context.Background(), "alert-z", nil); err != nil {
+	if err := h.HandleTTL(context.Background(), nil, "alert-z", nil); err != nil {
 		t.Fatalf("HandleTTL() 返回意外错误: %v", err)
 	}
 	if len(sched.cancelCalls) != 2 {
@@ -313,7 +300,7 @@ func TestLifecycleHandlers_HandleRepeat_FiringUnsilenced_NotifiesAndReschedules(
 	repeatInterval := 5 * time.Minute
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, repeatInterval, &lifecycleMutableClock{t: now})
 
-	if err := h.HandleRepeat(context.Background(), "alert-4", nil); err != nil {
+	if err := h.HandleRepeat(context.Background(), nil, "alert-4", nil); err != nil {
 		t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].ID != "alert-4" {
@@ -340,7 +327,7 @@ func TestLifecycleHandlers_HandleRepeat_Silenced_DoesNotNotifyOrReschedule(t *te
 	notifier := &fakeRepeatNotifier{}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleRepeat(context.Background(), "alert-5", nil); err != nil {
+	if err := h.HandleRepeat(context.Background(), nil, "alert-5", nil); err != nil {
 		t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 0 || len(sched.scheduleCalls) != 0 {
@@ -359,7 +346,7 @@ func TestLifecycleHandlers_HandleRepeat_UnsilencedAfterward_ResumesNotifying(t *
 	clock := &lifecycleMutableClock{t: time.Date(2026, 7, 1, 3, 0, 0, 0, time.UTC)}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, time.Minute, clock)
 
-	if err := h.HandleRepeat(context.Background(), "alert-6", nil); err != nil {
+	if err := h.HandleRepeat(context.Background(), nil, "alert-6", nil); err != nil {
 		t.Fatalf("静默期间 HandleRepeat() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 0 {
@@ -372,7 +359,7 @@ func TestLifecycleHandlers_HandleRepeat_UnsilencedAfterward_ResumesNotifying(t *
 	alerts.byID["alert-6"] = unsilenced
 	clock.t = clock.t.Add(time.Minute)
 
-	if err := h.HandleRepeat(context.Background(), "alert-6", nil); err != nil {
+	if err := h.HandleRepeat(context.Background(), nil, "alert-6", nil); err != nil {
 		t.Fatalf("解静默后 HandleRepeat() 返回意外错误: %v", err)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].ID != "alert-6" {
@@ -394,7 +381,7 @@ func TestLifecycleHandlers_HandleRepeat_NotFiring_DoesNotNotifyOrReschedule(t *t
 			notifier := &fakeRepeatNotifier{}
 			h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-			if err := h.HandleRepeat(context.Background(), "alert-7", nil); err != nil {
+			if err := h.HandleRepeat(context.Background(), nil, "alert-7", nil); err != nil {
 				t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
 			}
 			if len(notifier.calls) != 0 || len(sched.scheduleCalls) != 0 {
@@ -409,7 +396,7 @@ func TestLifecycleHandlers_HandleRepeat_AlertNotFound_ReturnsNil(t *testing.T) {
 	alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{}}
 	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, &lifecycleFakeScheduler{}, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-	if err := h.HandleRepeat(context.Background(), "missing", nil); err != nil {
+	if err := h.HandleRepeat(context.Background(), nil, "missing", nil); err != nil {
 		t.Fatalf("HandleRepeat() 对不存在的告警返回了意外错误: %v", err)
 	}
 }
@@ -421,7 +408,7 @@ func TestLifecycleHandlers_HandleRepeat_DownstreamErrors_Propagate(t *testing.T)
 		alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{"alert-8": baseFiringAlert("alert-8")}}
 		h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, &lifecycleFakeScheduler{}, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{err: wantErr}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-		err := h.HandleRepeat(context.Background(), "alert-8", nil)
+		err := h.HandleRepeat(context.Background(), nil, "alert-8", nil)
 		if err == nil || !errors.Is(err, wantErr) {
 			t.Fatalf("HandleRepeat() 错误 = %v, 期望包裹 %v", err, wantErr)
 		}
@@ -432,7 +419,7 @@ func TestLifecycleHandlers_HandleRepeat_DownstreamErrors_Propagate(t *testing.T)
 		sched := &lifecycleFakeScheduler{scheduleErr: wantErr}
 		h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, time.Minute, &lifecycleMutableClock{t: time.Now()})
 
-		err := h.HandleRepeat(context.Background(), "alert-9", nil)
+		err := h.HandleRepeat(context.Background(), nil, "alert-9", nil)
 		if err == nil || !errors.Is(err, wantErr) {
 			t.Fatalf("HandleRepeat() 错误 = %v, 期望包裹 %v", err, wantErr)
 		}

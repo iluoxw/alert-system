@@ -90,11 +90,15 @@ func Transition(from, to Status) error {
 }
 
 // Ack 执行认领动作：firing -> acknowledged（R4.1/R4.2）。
+// actorID/actorName 分开是因为 alerts.acked_by 是 UUID 列，只能接受内部 users.id；
+// actorName 是 timeline 展示用的可读标识。actorID 允许为空（外部渠道操作者无法
+// 映射到内部用户账号时用，落库时 store 层用 NULLIF 转成 NULL），但 actorName
+// 必须非空——时间线不能有一条不知道是谁做的 ack 记录。
 // 响应耗时（now - alert.StartsAt）写入 TimelineEntry.Detail["response_time_seconds"]。
 // 纯函数：不修改入参 alert，返回更新后的副本与待落库的 TimelineEntry。
-func Ack(alert Alert, actor string, now time.Time) (Alert, TimelineEntry, error) {
-	if actor == "" {
-		return alert, TimelineEntry{}, fmt.Errorf("state: ack 的 actor 不能为空")
+func Ack(alert Alert, actorID, actorName string, now time.Time) (Alert, TimelineEntry, error) {
+	if actorName == "" {
+		return alert, TimelineEntry{}, fmt.Errorf("state: ack 的 actorName 不能为空")
 	}
 	if err := Transition(alert.Status, StatusAcknowledged); err != nil {
 		return alert, TimelineEntry{}, err
@@ -102,14 +106,14 @@ func Ack(alert Alert, actor string, now time.Time) (Alert, TimelineEntry, error)
 
 	updated := alert
 	updated.Status = StatusAcknowledged
-	updated.AckedBy = actor
+	updated.AckedBy = actorID
 	updated.AckedAt = now
 	updated.UpdatedAt = now
 
 	responseTime := now.Sub(alert.StartsAt)
 	entry := TimelineEntry{
 		AlertID: alert.ID,
-		Actor:   actor,
+		Actor:   actorName,
 		Action:  TimelineActionAck,
 		At:      now,
 		Detail: map[string]any{

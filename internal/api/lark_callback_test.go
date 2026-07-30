@@ -104,7 +104,7 @@ func newTestAlert(id string, status domain.Status) domain.Alert {
 // 场景：url_verification 握手——不带签名头，靠 body 里的 token 与配置核对，匹配则原样
 // 回显 challenge，状态码 200。
 func TestHandleCardCallback_URLVerification_Success(t *testing.T) {
-	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	req := unsignedRequest(challengeBody("verify-tok", "chal-123"))
 	w := httptest.NewRecorder()
@@ -127,7 +127,7 @@ func TestHandleCardCallback_URLVerification_Success(t *testing.T) {
 // 场景：url_verification 请求携带的 token 与配置不匹配——按验签失败处理，返回 401
 // （不使用 SDK 默认的 500）。
 func TestHandleCardCallback_URLVerification_TokenMismatch_Returns401(t *testing.T) {
-	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	req := unsignedRequest(challengeBody("wrong-tok", "chal-123"))
 	w := httptest.NewRecorder()
@@ -142,7 +142,7 @@ func TestHandleCardCallback_URLVerification_TokenMismatch_Returns401(t *testing.
 func TestHandleCardCallback_InvalidSignature_Returns401(t *testing.T) {
 	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-1": newTestAlert("alert-1", domain.StatusFiring)}}
 	timeline := &fakeTimelineStore{}
-	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	body := cardActionBody("ou_test_user", "alert-1", "ack")
 	req := unsignedRequest(body) // 不带任何签名头
@@ -164,7 +164,7 @@ func TestHandleCardCallback_InvalidSignature_Returns401(t *testing.T) {
 func TestHandleCardCallback_ValidSignature_AckCallback(t *testing.T) {
 	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-1": newTestAlert("alert-1", domain.StatusFiring)}}
 	timeline := &fakeTimelineStore{}
-	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	body := cardActionBody("ou_test_user", "alert-1", "ack")
 	req := signedRequest("verify-tok", body)
@@ -179,11 +179,16 @@ func TestHandleCardCallback_ValidSignature_AckCallback(t *testing.T) {
 	if updated.Status != domain.StatusAcknowledged {
 		t.Errorf("Status = %v, want acknowledged", updated.Status)
 	}
-	if updated.AckedBy != "ou_test_user" {
-		t.Errorf("AckedBy = %q, want ou_test_user", updated.AckedBy)
+	// 卡片回调没有"飞书身份 -> 内部 users 记录"的映射能力，AckedBy（UUID 列）留空，
+	// 操作者标识只进 timeline 的 Actor（TEXT 列）。
+	if updated.AckedBy != "" {
+		t.Errorf("AckedBy = %q, want 空字符串（无法映射到内部用户）", updated.AckedBy)
 	}
 	if len(timeline.entries) != 1 || timeline.entries[0].Action != domain.TimelineActionAck {
 		t.Fatalf("期望落 1 条 ack 时间线，实际: %+v", timeline.entries)
+	}
+	if timeline.entries[0].Actor != "ou_test_user" {
+		t.Errorf("timeline actor = %q, want ou_test_user", timeline.entries[0].Actor)
 	}
 }
 
@@ -191,7 +196,7 @@ func TestHandleCardCallback_ValidSignature_AckCallback(t *testing.T) {
 func TestHandleCardCallback_ValidSignature_ResolveCallback(t *testing.T) {
 	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-2": newTestAlert("alert-2", domain.StatusFiring)}}
 	timeline := &fakeTimelineStore{}
-	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	body := cardActionBody("ou_test_user", "alert-2", "resolve")
 	req := signedRequest("verify-tok", body)
@@ -217,7 +222,7 @@ func TestHandleCardCallback_ValidSignature_ResolveCallback(t *testing.T) {
 // 场景：验签通过但告警不存在——业务处理失败，不使用 401（那是验签专用状态码），
 // 落到 SDK 默认的 500。
 func TestHandleCardCallback_ValidSignature_AlertNotFound_Returns500(t *testing.T) {
-	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil)
+	srv := NewServer(&fakeAlertStore{alerts: map[string]domain.Alert{}}, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
 
 	body := cardActionBody("ou_test_user", "does-not-exist", "ack")
 	req := signedRequest("verify-tok", body)
@@ -233,7 +238,7 @@ func TestHandleCardCallback_ValidSignature_AlertNotFound_Returns500(t *testing.T
 // （与 SDK VerifySign 自身的 no-op-when-empty 约定一致）。
 func TestHandleCardCallback_NoVerificationTokenConfigured_SkipsSignatureCheck(t *testing.T) {
 	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-3": newTestAlert("alert-3", domain.StatusFiring)}}
-	srv := NewServer(alerts, &fakeTimelineStore{}, fakeTxRunner{}, "", "", nil)
+	srv := NewServer(alerts, &fakeTimelineStore{}, fakeTxRunner{}, "", "", nil, nil, nil)
 
 	body := cardActionBody("ou_test_user", "alert-3", "ack")
 	req := unsignedRequest(body)
@@ -245,5 +250,93 @@ func TestHandleCardCallback_NoVerificationTokenConfigured_SkipsSignatureCheck(t 
 	}
 	if alerts.alerts["alert-3"].Status != domain.StatusAcknowledged {
 		t.Errorf("Status = %v, want acknowledged", alerts.alerts["alert-3"].Status)
+	}
+}
+
+// fakeEscalationStopper 是 EscalationStopper 的测试替身，记录每次 Stop 调用的 alertID。
+type fakeEscalationStopper struct {
+	calls []string
+}
+
+func (f *fakeEscalationStopper) Stop(ctx context.Context, tx pgx.Tx, alertID string) error {
+	f.calls = append(f.calls, alertID)
+	return nil
+}
+
+// fakeLifecycleTimerCanceler 是 LifecycleTimerCanceler 的测试替身，记录每次
+// CancelLifecycleTimers 调用的 alertID。
+type fakeLifecycleTimerCanceler struct {
+	calls []string
+}
+
+func (f *fakeLifecycleTimerCanceler) CancelLifecycleTimers(ctx context.Context, tx pgx.Tx, alertID string) error {
+	f.calls = append(f.calls, alertID)
+	return nil
+}
+
+// 场景：卡片 Ack 回调成功转移状态后，应无条件调用 EscalationStopper.Stop（不涉及
+// LifecycleTimerCanceler——TTL/repeat 等定时器只在告警进入终态 resolved 时才需要取消）。
+func TestHandleCardCallback_AckCallback_StopsEscalation(t *testing.T) {
+	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-4": newTestAlert("alert-4", domain.StatusFiring)}}
+	escalation := &fakeEscalationStopper{}
+	lifecycle := &fakeLifecycleTimerCanceler{}
+	srv := NewServer(alerts, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, escalation, lifecycle)
+
+	body := cardActionBody("ou_test_user", "alert-4", "ack")
+	req := signedRequest("verify-tok", body)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(escalation.calls) != 1 || escalation.calls[0] != "alert-4" {
+		t.Fatalf("EscalationStopper.Stop 调用 = %+v, want [alert-4]", escalation.calls)
+	}
+	if len(lifecycle.calls) != 0 {
+		t.Fatalf("Ack 不应调用 LifecycleTimerCanceler，实际调用 %+v", lifecycle.calls)
+	}
+}
+
+// 场景：卡片 Resolve 回调成功转移状态后，应无条件调用 EscalationStopper.Stop 与
+// LifecycleTimerCanceler.CancelLifecycleTimers（与 alerts.go 的 REST resolve 端点同一
+// 不变量）。
+func TestHandleCardCallback_ResolveCallback_StopsEscalationAndCancelsLifecycle(t *testing.T) {
+	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-5": newTestAlert("alert-5", domain.StatusFiring)}}
+	escalation := &fakeEscalationStopper{}
+	lifecycle := &fakeLifecycleTimerCanceler{}
+	srv := NewServer(alerts, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, escalation, lifecycle)
+
+	body := cardActionBody("ou_test_user", "alert-5", "resolve")
+	req := signedRequest("verify-tok", body)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(escalation.calls) != 1 || escalation.calls[0] != "alert-5" {
+		t.Fatalf("EscalationStopper.Stop 调用 = %+v, want [alert-5]", escalation.calls)
+	}
+	if len(lifecycle.calls) != 1 || lifecycle.calls[0] != "alert-5" {
+		t.Fatalf("LifecycleTimerCanceler.CancelLifecycleTimers 调用 = %+v, want [alert-5]", lifecycle.calls)
+	}
+}
+
+// 场景：escalation/lifecycle 均为 nil（未接线的调用方）——原有行为不变，不 panic。
+func TestHandleCardCallback_NilEscalationAndLifecycle_NoPanic(t *testing.T) {
+	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-6": newTestAlert("alert-6", domain.StatusFiring)}}
+	srv := NewServer(alerts, &fakeTimelineStore{}, fakeTxRunner{}, "verify-tok", "", nil, nil, nil)
+
+	body := cardActionBody("ou_test_user", "alert-6", "resolve")
+	req := signedRequest("verify-tok", body)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if alerts.alerts["alert-6"].Status != domain.StatusResolved {
+		t.Errorf("Status = %v, want resolved", alerts.alerts["alert-6"].Status)
 	}
 }

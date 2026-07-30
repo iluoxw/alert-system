@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -12,8 +13,9 @@ import (
 	"alert-system/internal/store"
 )
 
-// defaultBatchSize 是每一轮轮询最多取出并处理的到期定时器数量，避免单轮事务
-// 因为一次性锁住过多行而长时间占用连接。
+// defaultBatchSize 是 pollOnce 每次调用最多依次处理的到期定时器条数（每条定时器
+// 各自独立开一个事务，见 pollOnce 文档），避免某一轮到期定时器堆积过多时
+// pollOnce 长时间不返回，导致 Run 迟迟无法检查 ctx 是否已被取消。
 const defaultBatchSize = 50
 
 // Clock 抽象「当前时间」。到期判断（fire_at <= now）在 Go 侧用 Clock.Now() 取值
@@ -30,16 +32,21 @@ func (realClock) Now() time.Time { return time.Now() }
 
 // Handler 处理一个到期定时器。refID 与 payload 就是 Schedule 时写入的原始值，
 // payload 未做任何反序列化，具体格式由注册该 kind 的调用方与 handler 之间自行约定。
+// tx 是 scheduler 已经开好、且已经把这条定时器行标记为 fired 的同一个事务——handler
+// 内部若需要读写数据库（含调用 Schedule/Cancel 给同一个或其他 (kind, refID) 注册/
+// 取消定时器），必须复用这个 tx，不能自己另开事务：既是为了让 handler 的副作用与
+// fired 状态回写在同一原子单元内一起提交/回滚，也是因为 pollOnce 已经用
+// FOR UPDATE SKIP LOCKED 锁住了这一行，handler 若另开事务访问同一张表可能产生
+// 不必要的锁等待甚至死锁。
 //
-// at-least-once 语义：Run 的每一轮轮询都在单个数据库事务内完成「取到期定时器 ->
-// 分发 handler -> 回写 fired/failed」。如果进程在某个 handler 执行成功之后、
-// 事务提交之前崩溃，事务会随进程退出而不会提交，该定时器在数据库里仍是 pending，
-// 下一轮轮询（无论是本进程重启后还是同一进程的下一次 tick）都会把它重新取出、
-// 再次调用一次 handler。因此 Handler 的实现必须是幂等的：同一个
+// at-least-once 语义：pollOnce 对每条到期定时器各自开一个独立事务，事务内先
+// markFired 再调用 handler。如果进程在 handler 执行成功之后、事务提交之前崩溃，
+// 事务会随进程退出而不会提交，该定时器在数据库里仍是 pending，下一轮轮询会把它
+// 重新取出、再次调用一次 handler。因此 Handler 的实现必须是幂等的：同一个
 // (kind, refID, payload) 被调用两次的效果应当与调用一次相同（典型做法是在 handler
 // 内部先查询 refID 当前的实际状态，只有状态仍然符合触发条件时才真正执行副作用，
 // 而不是无条件重复发送通知或推进状态机）。
-type Handler func(ctx context.Context, refID string, payload []byte) error
+type Handler func(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error
 
 // dueTimer 是一条从数据库取出的到期定时器。
 type dueTimer struct {
@@ -161,35 +168,26 @@ func (s *Scheduler) HasFired(ctx context.Context, tx pgx.Tx, kind string, refID 
 	return exists, nil
 }
 
-// fetchDue 在 tx 内取出最多 batchSize 条到期（fire_at <= now）的 pending 定时器并加行锁
+// fetchOneDue 在 tx 内取出一条到期（fire_at <= now）的 pending 定时器并加行锁
 // （FOR UPDATE SKIP LOCKED），跳过已被其他并发事务锁定的行，实现多 worker 并发轮询
-// 时同一条定时器只会被其中一个取到。
-func (s *Scheduler) fetchDue(ctx context.Context, tx pgx.Tx, now time.Time) ([]dueTimer, error) {
-	rows, err := tx.Query(ctx, `
+// 时同一条定时器只会被其中一个取到。found=false 表示当前没有（未被锁定的）到期
+// 定时器了，本轮轮询可以结束。
+func (s *Scheduler) fetchOneDue(ctx context.Context, tx pgx.Tx, now time.Time) (t dueTimer, found bool, err error) {
+	err = tx.QueryRow(ctx, `
 		SELECT id, kind, ref_id, payload
 		FROM timers
 		WHERE status = 'pending' AND fire_at <= $1
 		ORDER BY fire_at
-		LIMIT $2
+		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, now, s.batchSize)
+	`, now).Scan(&t.id, &t.kind, &t.refID, &t.payload)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: 取到期定时器失败: %w", err)
-	}
-	defer rows.Close()
-
-	var due []dueTimer
-	for rows.Next() {
-		var t dueTimer
-		if err := rows.Scan(&t.id, &t.kind, &t.refID, &t.payload); err != nil {
-			return nil, fmt.Errorf("scheduler: 扫描定时器失败: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return dueTimer{}, false, nil
 		}
-		due = append(due, t)
+		return dueTimer{}, false, fmt.Errorf("scheduler: 取到期定时器失败: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: 遍历到期定时器失败: %w", err)
-	}
-	return due, nil
+	return t, true, nil
 }
 
 func markFired(ctx context.Context, tx pgx.Tx, id string) error {
@@ -201,8 +199,8 @@ func markFired(ctx context.Context, tx pgx.Tx, id string) error {
 
 // markFailed 只把 status 置为 failed。timers 表没有像 alert_events.error 那样的
 // 失败原因字段，失败原因（handler 返回的 error 或 recover 到的 panic 信息）只通过
-// pollOnce 里的结构化日志记录，不落库；failed 状态的定时器不会被 fetchDue 再次取出，
-// 需要人工介入排查或走独立的重试路径。
+// pollOnce 里的结构化日志记录，不落库；failed 状态的定时器不会被 fetchOneDue 再次
+// 取出，需要人工介入排查或走独立的重试路径。
 func markFailed(ctx context.Context, tx pgx.Tx, id string) error {
 	if _, err := tx.Exec(ctx, `UPDATE timers SET status = 'failed' WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("scheduler: 标记定时器失败状态失败: %w", err)
@@ -210,11 +208,11 @@ func markFailed(ctx context.Context, tx pgx.Tx, id string) error {
 	return nil
 }
 
-// invoke 分发一条到期定时器给 kind 对应的 handler 并 recover 住其 panic。
-// 返回 nil 表示成功；非 nil 时同时覆盖了三种失败情形：kind 未注册 handler、
-// handler 返回 error、handler panic——三者在上层都被统一当作「failed」处理，
-// 都不会重试（未注册 kind 不会无限重投）。
-func (s *Scheduler) invoke(ctx context.Context, t dueTimer) (failErr error) {
+// invoke 把一条到期定时器分发给 kind 对应的 handler（复用调用方传入的 tx）并
+// recover 住其 panic。返回 nil 表示成功；非 nil 时同时覆盖了三种失败情形：kind
+// 未注册 handler、handler 返回 error、handler panic——三者在上层都被统一当作
+// 「failed」处理，都不会重试（未注册 kind 不会无限重投）。
+func (s *Scheduler) invoke(ctx context.Context, tx pgx.Tx, t dueTimer) (failErr error) {
 	h, ok := s.handlerFor(t.kind)
 	if !ok {
 		return fmt.Errorf("未注册 kind=%q 的 handler", t.kind)
@@ -224,30 +222,76 @@ func (s *Scheduler) invoke(ctx context.Context, t dueTimer) (failErr error) {
 			failErr = fmt.Errorf("handler panic: %v", p)
 		}
 	}()
-	return h(ctx, t.refID, t.payload)
+	return h(ctx, tx, t.refID, t.payload)
 }
 
-// pollOnce 是一轮轮询：在单个事务内取出到期定时器、逐条分发、回写结果。
+// pollOnce 是一轮轮询：依次处理最多 batchSize 条到期定时器，每条各自独立开一个
+// 事务，直到某次处理发现已经没有到期定时器为止。
 func (s *Scheduler) pollOnce(ctx context.Context) error {
-	return s.store.WithTx(ctx, func(tx pgx.Tx) error {
-		due, err := s.fetchDue(ctx, tx, s.clock.Now())
+	for i := 0; i < s.batchSize; i++ {
+		more, err := s.processOneDue(ctx)
 		if err != nil {
 			return err
 		}
-		for _, t := range due {
-			if err := s.invoke(ctx, t); err != nil {
-				log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 执行失败: %v", t.id, t.kind, t.refID, err)
-				if merr := markFailed(ctx, tx, t.id); merr != nil {
-					return merr
-				}
-				continue
-			}
-			if merr := markFired(ctx, tx, t.id); merr != nil {
-				return merr
-			}
+		if !more {
+			return nil
 		}
-		return nil
+	}
+	return nil
+}
+
+// processOneDue 在单个事务内取出（若存在）一条到期定时器并处理。事务内顺序：
+// SELECT ... FOR UPDATE SKIP LOCKED 取出该行 -> **先** markFired -> **再**调用
+// handler（同一事务，把 tx 传给 handler）。这个顺序是关键：handler 内部经常需要
+// 用 Schedule 给同一个 (kind, refID) 重新注册下一次触发（例如升级链推进到下一步、
+// 重复通知安排下一次）；Schedule 的 UPSERT 目标是"同 (kind, refID) 的 pending
+// 记录"——如果不先把当前这条改成 fired，handler 里的 Schedule 会去更新*当前这条
+// 正被本事务持有行锁、尚未提交*的记录，等价于同一事务里自己等自己的锁，死锁；
+// 先 markFired 之后，当前行不再是 pending，handler 的 Schedule 会插入一条全新的
+// pending 记录，不会与当前行冲突。
+//
+// handler 返回 error 或 panic：整个事务（含 markFired）一并回滚，定时器保持
+// pending，下一轮轮询会把它重新取出重试；随后另开一个独立的小事务把该定时器标记
+// 为 failed，避免它被无限重试（这个小事务只有这一条 UPDATE，不含任何业务副作用，
+// 可以安全提交，即使刚才那次业务事务已经回滚）。
+//
+// 返回值 more=true 表示这次确实取到了一条定时器（无论处理成功与否），调用方
+// pollOnce 应当继续下一轮循环；more=false 表示当前已经没有到期定时器，本轮
+// pollOnce 可以结束。
+func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
+	var t dueTimer
+	var found bool
+	var handlerErr error
+
+	txErr := s.store.WithTx(ctx, func(tx pgx.Tx) error {
+		var ferr error
+		t, found, ferr = s.fetchOneDue(ctx, tx, s.clock.Now())
+		if ferr != nil {
+			return ferr
+		}
+		if !found {
+			return nil
+		}
+
+		if err := markFired(ctx, tx, t.id); err != nil {
+			return err
+		}
+		handlerErr = s.invoke(ctx, tx, t)
+		return handlerErr
 	})
+
+	if !found {
+		return false, txErr
+	}
+	if txErr != nil {
+		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 执行失败: %v", t.id, t.kind, t.refID, txErr)
+		if merr := s.store.WithTx(ctx, func(tx pgx.Tx) error {
+			return markFailed(ctx, tx, t.id)
+		}); merr != nil {
+			return true, fmt.Errorf("scheduler: 标记定时器失败状态时出错: %w", merr)
+		}
+	}
+	return true, nil
 }
 
 // Run 启动轮询 worker：按 pollInterval 周期性地把到期的 pending 定时器分发给已注册

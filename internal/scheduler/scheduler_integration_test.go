@@ -188,7 +188,7 @@ func TestScheduler_ScheduleThenDue_Fires(t *testing.T) {
 	sched.clock = clock
 
 	var fired int32
-	sched.RegisterHandler("ttl", func(_ context.Context, _ string, _ []byte) error {
+	sched.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		atomic.AddInt32(&fired, 1)
 		return nil
 	})
@@ -225,7 +225,7 @@ func TestScheduler_Cancel_PreventsFiring(t *testing.T) {
 	clock := newTestClock(time.Now())
 	sched.clock = clock
 
-	sched.RegisterHandler("ttl", func(_ context.Context, _ string, _ []byte) error {
+	sched.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		return nil
 	})
 
@@ -263,7 +263,7 @@ func TestScheduler_ScheduleTwice_ReplacesFireAt(t *testing.T) {
 	clock := newTestClock(base)
 	sched.clock = clock
 
-	sched.RegisterHandler("ttl", func(_ context.Context, _ string, _ []byte) error {
+	sched.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		return nil
 	})
 
@@ -313,7 +313,7 @@ func TestScheduler_RestartRecovery_FiresAlreadyExpiredTimer(t *testing.T) {
 	sched.clock = newTestClock(time.Now()) // "重启后"的当前时间，晚于 past
 
 	var fired int32
-	sched.RegisterHandler("ttl", func(_ context.Context, refID string, _ []byte) error {
+	sched.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, refID string, _ []byte) error {
 		if refID != "alert-4" {
 			return fmt.Errorf("unexpected refID %q", refID)
 		}
@@ -341,10 +341,10 @@ func TestScheduler_HandlerPanic_MarksFailedAndContinuesProcessing(t *testing.T) 
 	sched.clock = clock
 
 	var okFired int32
-	sched.RegisterHandler("boom", func(_ context.Context, _ string, _ []byte) error {
+	sched.RegisterHandler("boom", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		panic("模拟 handler 崩溃")
 	})
-	sched.RegisterHandler("ok", func(_ context.Context, _ string, _ []byte) error {
+	sched.RegisterHandler("ok", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 		atomic.AddInt32(&okFired, 1)
 		return nil
 	})
@@ -394,7 +394,7 @@ func TestScheduler_ConcurrentWorkers_FiresExactlyOnce(t *testing.T) {
 	newWorker := func() *Scheduler {
 		s := New(st, 15*time.Millisecond)
 		s.clock = clock
-		s.RegisterHandler("ttl", func(_ context.Context, _ string, _ []byte) error {
+		s.RegisterHandler("ttl", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error {
 			atomic.AddInt32(&fired, 1)
 			return nil
 		})
