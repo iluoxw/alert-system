@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/alert-system-mvp/tasks.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-29T16:25:37.645Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785342337638_v9njngp69",
+      "approvalTitle": "alert-system-mvp 任务清单评审"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-30T00:10:14.772Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785342337638_v9njngp69",
+      "approvalTitle": "alert-system-mvp 任务清单评审"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "filePath": ".spec-workflow/specs/alert-system-mvp/design.md",
+  "currentVersion": 3,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-29T15:41:41.996Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785339701993_j1rdmhb5j",
+      "approvalTitle": "alert-system-mvp 设计文档评审"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-29T15:47:40.386Z",
+      "trigger": "revision_requested",
+      "approvalId": "approval_1785339701993_j1rdmhb5j",
+      "approvalTitle": "alert-system-mvp 设计文档评审"
+    },
+    {
+      "version": 3,
+      "filename": "snapshot-003.json",
+      "timestamp": "2026-07-29T15:51:29.275Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785340247621_7cmifgo1j",
+      "approvalTitle": "alert-system-mvp 设计文档评审（第 2 轮：术语澄清修订）"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+DROP TABLE IF EXISTS notification_policies;
+DROP TABLE IF EXISTS escalation_policies;
+DROP TABLE IF EXISTS shifts;
+DROP TABLE IF EXISTS schedules;
+DROP TABLE IF EXISTS routes;
+DROP TABLE IF EXISTS memberships;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS teams;

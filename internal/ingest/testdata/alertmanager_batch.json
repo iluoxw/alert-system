@@ -1,0 +1,40 @@
+{
+  "version": "4",
+  "groupKey": "{}:{job=\"node-exporter\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "webhook-alert-system",
+  "groupLabels": {"job": "node-exporter"},
+  "commonLabels": {"job": "node-exporter"},
+  "commonAnnotations": {},
+  "externalURL": "http://alertmanager.example.com",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighCPUUsage",
+        "severity": "critical",
+        "instance": "10.0.0.5:9100",
+        "job": "node-exporter"
+      },
+      "annotations": {"summary": "CPU 使用率过高"},
+      "startsAt": "2026-07-30T02:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus.example.com/graph?g0.expr=cpu",
+      "fingerprint": "abc123"
+    },
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "DiskAlmostFull",
+        "instance": "10.0.0.6:9100",
+        "job": "node-exporter"
+      },
+      "annotations": {"description": "磁盘剩余空间不足 10%"},
+      "startsAt": "2026-07-30T02:05:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus.example.com/graph?g0.expr=disk",
+      "fingerprint": "def456"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# 编译产物
+/server
+/bin/
+
+# 运行时日志
+*.log
+
+# 本地会话与工具运行时文件（spec 文档本身入库，logs/tmp 不入）
+.remember/
+.spec-workflow/logs/
+.spec-workflow/tmp/
+
+# 环境变量（含密钥，永不入库）
+.env
+.env.*
+!.env.example
+
+# 系统文件
+.DS_Store

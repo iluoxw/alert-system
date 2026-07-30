@@ -1,0 +1,77 @@
+import { useQuery } from '@tanstack/react-query'
+import { Form, InputNumber, Select } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
+import { CrudTable } from '../../components/CrudTable'
+import { MatchersEditor } from '../../components/MatchersEditor'
+import type { MatcherSet, RouteConfig, RouteRequest } from '../../api/client'
+import { createRoute, deleteRoute, listRoutes, listTeams, updateRoute } from '../../api/client'
+
+// 命名 RoutesPage 而不是 Routes，避免与 react-router-dom 的 <Routes> 组件重名
+// （App.tsx 同时需要两者）。
+export function RoutesPage() {
+  // target_team_id 用下拉选择而不是让管理员手填 UUID，复用 teams 的查询缓存
+  // （与 Settings/Teams.tsx 共用 queryKey，避免重复请求）。
+  const { data: teamsData } = useQuery({ queryKey: ['admin', 'teams'], queryFn: async () => (await listTeams()).teams })
+  const teamOptions = (teamsData ?? []).map((t) => ({ value: t.id, label: t.name }))
+
+  const columns: ColumnsType<RouteConfig> = [
+    { title: '优先级', dataIndex: 'priority', key: 'priority', width: 90 },
+    {
+      title: 'matchers',
+      dataIndex: 'matchers',
+      key: 'matchers',
+      render: (matchers: MatcherSet) =>
+        matchers.length === 0 ? '（空，匹配全局默认）' : matchers.map((m) => `${m.name}${m.op}${m.value}`).join(', '),
+    },
+    {
+      title: '目标团队',
+      dataIndex: 'target_team_id',
+      key: 'target_team_id',
+      render: (id: string) => teamOptions.find((o) => o.value === id)?.label ?? id,
+    },
+    { title: '分组等待(s)', dataIndex: 'group_wait_seconds', key: 'group_wait_seconds', width: 110 },
+    { title: '分组间隔(s)', dataIndex: 'group_interval_seconds', key: 'group_interval_seconds', width: 110 },
+    { title: '重复间隔(s)', dataIndex: 'repeat_interval_seconds', key: 'repeat_interval_seconds', width: 110 },
+  ]
+
+  return (
+    <CrudTable<RouteConfig, RouteRequest>
+      resourceLabel="路由"
+      queryKey={['admin', 'routes']}
+      fetchList={async () => (await listRoutes()).routes}
+      createFn={createRoute}
+      updateFn={updateRoute}
+      deleteFn={deleteRoute}
+      columns={columns}
+      renderFields={() => (
+        <>
+          <Form.Item
+            name="priority"
+            label="优先级（全局唯一整数，越小越先匹配）"
+            rules={[{ required: true, message: '请输入优先级' }]}
+          >
+            <InputNumber style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item name="matchers" label="matchers（留空表示全局默认路由）">
+            <MatchersEditor />
+          </Form.Item>
+          <Form.Item name="target_team_id" label="目标团队" rules={[{ required: true, message: '请选择目标团队' }]}>
+            <Select options={teamOptions} showSearch optionFilterProp="label" />
+          </Form.Item>
+          <Form.Item name="group_by" label="分组键（group_by，按标签名分组）">
+            <Select mode="tags" tokenSeparators={[',']} open={false} />
+          </Form.Item>
+          <Form.Item name="group_wait_seconds" label="分组等待秒数" initialValue={0}>
+            <InputNumber style={{ width: '100%' }} min={0} />
+          </Form.Item>
+          <Form.Item name="group_interval_seconds" label="分组间隔秒数" initialValue={0}>
+            <InputNumber style={{ width: '100%' }} min={0} />
+          </Form.Item>
+          <Form.Item name="repeat_interval_seconds" label="重复通知间隔秒数" initialValue={0}>
+            <InputNumber style={{ width: '100%' }} min={0} />
+          </Form.Item>
+        </>
+      )}
+    />
+  )
+}

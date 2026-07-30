@@ -1,0 +1,41 @@
+{
+  "version": "1",
+  "groupKey": "{}/{}:{alertname=\"HighMemoryUsage\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "webhook-alert-system",
+  "orgId": 1,
+  "title": "[FIRING:1] HighMemoryUsage",
+  "state": "alerting",
+  "message": "内存使用率过高",
+  "groupLabels": {"alertname": "HighMemoryUsage"},
+  "commonLabels": {"alertname": "HighMemoryUsage", "severity": "warning"},
+  "commonAnnotations": {"summary": "内存使用率过高"},
+  "externalURL": "http://grafana.example.com",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighMemoryUsage",
+        "severity": "warning",
+        "instance": "10.0.0.7:9100",
+        "service": "checkout-api",
+        "namespace": "prod",
+        "pod": "checkout-api-7f8b9c-abcde"
+      },
+      "annotations": {
+        "summary": "内存使用率过高",
+        "description": "checkout-api 内存使用率超过 85%"
+      },
+      "startsAt": "2026-07-30T03:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://grafana.example.com/alerting/grafana/abc/view",
+      "fingerprint": "xyz789",
+      "silenceURL": "http://grafana.example.com/alerting/silence/new?alertmanager=grafana",
+      "dashboardURL": "http://grafana.example.com/d/abc123",
+      "panelURL": "http://grafana.example.com/d/abc123?viewPanel=2",
+      "values": {"B": 87.5},
+      "valueString": "[ var='B' labels={} value=87.5 ]"
+    }
+  ]
+}

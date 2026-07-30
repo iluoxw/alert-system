@@ -1,0 +1,32 @@
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"HighCPUUsage\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "webhook-alert-system",
+  "groupLabels": {"alertname": "HighCPUUsage"},
+  "commonLabels": {"alertname": "HighCPUUsage", "severity": "critical"},
+  "commonAnnotations": {"summary": "CPU 使用率过高"},
+  "externalURL": "http://alertmanager.example.com",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighCPUUsage",
+        "severity": "critical",
+        "instance": "10.0.0.5:9100",
+        "job": "node-exporter",
+        "host": "node-1",
+        "environment": "prod"
+      },
+      "annotations": {
+        "summary": "节点 CPU 使用率超过 90%",
+        "description": "node-1 过去 5 分钟 CPU 使用率持续高于 90%"
+      },
+      "startsAt": "2026-07-30T02:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus.example.com/graph?g0.expr=cpu",
+      "fingerprint": "abc123"
+    }
+  ]
+}

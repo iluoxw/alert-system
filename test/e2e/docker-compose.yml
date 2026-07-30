@@ -1,0 +1,31 @@
+# 任务 31 的 E2E 环境：起一个真实 Postgres 并在启动时跑完全部迁移
+# （000001-000005 的 up 脚本），不 mock 存储/scheduler，只用短时长配置压缩时钟。
+#
+# 用法：
+#   docker compose -f test/e2e/docker-compose.yml up -d --wait
+#   go test ./test/e2e/...
+#   docker compose -f test/e2e/docker-compose.yml down -v
+#
+# TestMain（e2e_test.go）会自动执行上面前后两步，本文件本身不含任何应用代码，
+# 仅用于启动依赖服务。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: alert_system
+      POSTGRES_PASSWORD: alert_system
+      POSTGRES_DB: alert_system
+    ports:
+      - "15432:5432"
+    volumes:
+      # 只读挂载真实迁移目录：initdb 脚本从这里按文件名顺序读取 *.up.sql 执行，
+      # 不复制、不改动 migrations/ 下的任何文件。
+      - ../../migrations:/migrations:ro
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alert_system -d alert_system"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
