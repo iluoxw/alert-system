@@ -155,7 +155,10 @@ func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 
 	if sendErr == nil {
 		return s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-			return s.logs.UpdateStatus(ctx, tx, logID, "sent", totalAttempts, "")
+			if err := s.logs.UpdateStatus(ctx, tx, logID, "sent", totalAttempts, ""); err != nil {
+				return err
+			}
+			return s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifySent, totalAttempts, "sent", "")
 		})
 	}
 	return s.markFailed(ctx, req, logID, totalAttempts, sendErr)
@@ -193,37 +196,75 @@ func (s *Sender) placeholder(ctx context.Context, req SendRequest, key string) (
 	return logID, resumeAttempts, alreadySent, err
 }
 
-// markFailed 把 notification_log 标记为 failed，并在是告警级发送（AlertID 非空）时
-// 补一条时间线记录。分组通知发送失败时该落在组内哪条告警的时间线上语义不清，本任务
-// 不展开拆解，留给策略/编排任务（22/27）按组内告警逐条落时间线时处理。
+// markFailed 把 notification_log 标记为 failed，并按 appendResultTimeline 的扇出规则
+// 补时间线记录（含分组通知——按 Msg.AlertIDs 逐条扇出，不再只处理单告警发送）。
 func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, totalAttempts int, sendErr error) error {
 	lastError := sendErr.Error()
+	// detail 里的 error 截断到 200 字符：时间线是给人看的摘要，不是错误堆栈全文；
+	// notification_log.last_error 保留完整文本供排障，两者用途不同分开处理。
+	detailError := lastError
+	if len(detailError) > 200 {
+		detailError = detailError[:200]
+	}
 	updateErr := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := s.logs.UpdateStatus(ctx, tx, logID, "failed", totalAttempts, lastError); err != nil {
 			return err
 		}
-		if req.AlertID == "" {
-			return nil
-		}
-		_, err := s.timeline.Append(ctx, tx, domain.TimelineEntry{
-			AlertID: req.AlertID,
-			Actor:   "notify-sender",
-			Action:  domain.TimelineActionNotify,
-			At:      time.Now(),
-			Detail: map[string]any{
-				"channel":  req.ChannelKind,
-				"target":   req.Target,
-				"status":   "failed",
-				"error":    lastError,
-				"attempts": totalAttempts,
-			},
-		})
-		return err
+		return s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifyFailed, totalAttempts, "failed", detailError)
 	})
 	if updateErr != nil {
 		return fmt.Errorf("notify: 发送失败(%v)且回写状态失败: %w", sendErr, updateErr)
 	}
 	return sendErr
+}
+
+// appendResultTimeline 把一次发送的最终结果（sent/failed）追加到关联告警的时间线：
+// 单告警发送（req.AlertID 非空）落在该告警上；分组发送没有单一 AlertID，按
+// req.Msg.AlertIDs（组内全部告警，见 Message.AlertIDs 注释）逐条扇出——这也补上了
+// 旧版本"分组通知失败不落时间线"的缺口。两者皆空（ops 运营任务的合成 GroupKey
+// 消息，无关联告警）时不追加，符合预期。
+//
+// 幂等性：本函数与 UpdateStatus 同一个 WithTx 事务提交，调用方（Send）只在
+// placeholder 阶段判定"非 alreadySent"之后才会走到这里，重投的判重完全靠那个
+// alreadySent 短路兜底，这里不需要也不做额外去重——failed 后重投再 sent 会产生
+// 一条 failed + 一条 sent，是真实发送历史，予以保留。
+func (s *Sender) appendResultTimeline(ctx context.Context, tx pgx.Tx, req SendRequest, action domain.TimelineAction, attempts int, status, detailError string) error {
+	alertIDs := req.Msg.AlertIDs
+	if req.AlertID != "" {
+		alertIDs = []string{req.AlertID}
+	}
+	if len(alertIDs) == 0 {
+		return nil
+	}
+
+	var step any
+	if req.Step != nil {
+		step = *req.Step
+	}
+	detail := map[string]any{
+		"channel":  req.ChannelKind,
+		"target":   maskTarget(req.ChannelKind, req.Target),
+		"step":     step,
+		"attempts": attempts,
+		"status":   status,
+	}
+	if detailError != "" {
+		detail["error"] = detailError
+	}
+
+	now := time.Now()
+	for _, alertID := range alertIDs {
+		if _, err := s.timeline.Append(ctx, tx, domain.TimelineEntry{
+			AlertID: alertID,
+			Actor:   "notify-sender",
+			Action:  action,
+			At:      now,
+			Detail:  detail,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sendWithBackoff 反复调用 ch.Send，失败后按指数退避 + jitter 等待再重试，尊重 ctx 取消。

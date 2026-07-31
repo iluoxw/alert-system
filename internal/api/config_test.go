@@ -801,6 +801,153 @@ func TestCreateEscalationPolicy_Success(t *testing.T) {
 	}
 }
 
+// ---- escalation policies severity_config（任务 4：透传与校验）----
+
+func TestCreateEscalationPolicy_SeverityConfigUnknownOverrideSeverity_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}},
+		},
+		"severity_config": map[string]any{
+			"overrides": map[string]any{"bogus": []int{10}},
+		},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/escalation-policies", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.escalations.byID) != 0 {
+		t.Fatalf("校验失败不应落库，got %d 条", len(env.escalations.byID))
+	}
+}
+
+func TestCreateEscalationPolicy_SeverityConfigUnknownSkipSeverity_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}},
+		},
+		"severity_config": map[string]any{
+			"skip": []string{"bogus"},
+		},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/escalation-policies", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.escalations.byID) != 0 {
+		t.Fatalf("校验失败不应落库，got %d 条", len(env.escalations.byID))
+	}
+}
+
+func TestCreateEscalationPolicy_SeverityConfigNegativeWaitSeconds_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}},
+		},
+		"severity_config": map[string]any{
+			"overrides": map[string]any{"critical": []int{-1}},
+		},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/escalation-policies", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.escalations.byID) != 0 {
+		t.Fatalf("校验失败不应落库，got %d 条", len(env.escalations.byID))
+	}
+}
+
+func TestCreateEscalationPolicy_SeverityConfigOverridesExceedLevels_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}}, // 只有 1 级
+		},
+		"severity_config": map[string]any{
+			"overrides": map[string]any{"critical": []int{60, 120}}, // 长度 2 > levels 长度 1
+		},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/escalation-policies", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.escalations.byID) != 0 {
+		t.Fatalf("校验失败不应落库，got %d 条", len(env.escalations.byID))
+	}
+}
+
+func TestCreateEscalationPolicy_SeverityConfigFullRoundTrip_Returns201(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}},
+			{"wait_seconds": 300, "targets": []string{team.ID}},
+		},
+		"severity_config": map[string]any{
+			"overrides": map[string]any{"critical": []int{180, 600}},
+			"skip":      []string{"info"},
+		},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/escalation-policies", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var created struct {
+		ID             string               `json:"id"`
+		SeverityConfig store.SeverityConfig `json:"severity_config"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("解析响应体失败: %v; body=%s", err, w.Body.String())
+	}
+	if len(created.SeverityConfig.Overrides["critical"]) != 2 || created.SeverityConfig.Overrides["critical"][0] != 180 {
+		t.Fatalf("响应体 severity_config.overrides 未正确透传: %+v", created.SeverityConfig)
+	}
+	if len(created.SeverityConfig.Skip) != 1 || created.SeverityConfig.Skip[0] != "info" {
+		t.Fatalf("响应体 severity_config.skip 未正确透传: %+v", created.SeverityConfig)
+	}
+
+	// 更新端点同样要透传：换一套合法配置，PATCH 后 GET 验证生效（覆盖 update 代码路径）。
+	updateBody := map[string]any{
+		"team_id": team.ID,
+		"levels": []map[string]any{
+			{"wait_seconds": 60, "targets": []string{team.ID}},
+		},
+		"severity_config": map[string]any{
+			"overrides": map[string]any{"warning": []int{30}},
+		},
+	}
+	w = env.do(t, http.MethodPatch, "/api/v1/admin/escalation-policies/"+created.ID, updateBody)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("update status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+	w = env.do(t, http.MethodGet, "/api/v1/admin/escalation-policies/"+created.ID, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		SeverityConfig store.SeverityConfig `json:"severity_config"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析响应体失败: %v; body=%s", err, w.Body.String())
+	}
+	if len(got.SeverityConfig.Overrides["warning"]) != 1 || got.SeverityConfig.Overrides["warning"][0] != 30 {
+		t.Fatalf("更新后的 severity_config 未生效: %+v", got.SeverityConfig)
+	}
+}
+
 // ---- notification policies（R13.6：引用未注册渠道 → 422）----
 
 func TestCreateNotificationPolicy_UnregisteredChannel_Returns422(t *testing.T) {

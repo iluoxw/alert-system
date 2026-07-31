@@ -130,8 +130,12 @@ func (c *Chain) Start(ctx context.Context, tx pgx.Tx, alert domain.Alert) error 
 	if len(policies) == 0 || len(policies[0].Levels) == 0 {
 		return nil
 	}
+	wait, skip := effectiveWaitSeconds(policies[0], alert.Severity, 0)
+	if skip {
+		return nil // severity 命中 SeverityConfig.Skip：不参与即时升级，等同未配置升级策略
+	}
 
-	fireAt := c.clock.Now().Add(time.Duration(policies[0].Levels[0].WaitSeconds) * time.Second)
+	fireAt := c.clock.Now().Add(time.Duration(wait) * time.Second)
 	payload, err := json.Marshal(escalationPayload{Level: 0})
 	if err != nil {
 		return fmt.Errorf("oncall: 序列化升级链 payload 失败: %w", err)
@@ -165,7 +169,11 @@ func (c *Chain) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []b
 	return c.advance(ctx, tx, refID, p.Level)
 }
 
-// advance 是 Handle 的核心逻辑，在 Handle 传入的事务内执行。
+// advance 是 Handle 的核心逻辑，在 Handle 传入的事务内执行。每次触发都重新查询
+// alert（而非从 payload 里的快照取值），因此 severity 若在链路推进途中被修改，
+// 本级及之后的 effectiveWaitSeconds 求值天然采用当前值——这是刻意设计，不是缺陷：
+// 与 escalationPayload 只携带 level、不携带策略快照的理由一致（见类型注释），避免
+// 升级节奏与数据库当前状态脱节。
 func (c *Chain) advance(ctx context.Context, tx pgx.Tx, alertID string, level int) error {
 	alert, err := c.alerts.GetByID(ctx, tx, alertID)
 	if err != nil {
@@ -236,7 +244,11 @@ func (c *Chain) advance(ctx context.Context, tx pgx.Tx, alertID string, level in
 	if next >= len(policy.Levels) {
 		return nil // 已到链路末级，正常结束
 	}
-	fireAt := now.Add(time.Duration(policy.Levels[next].WaitSeconds) * time.Second)
+	wait, skip := effectiveWaitSeconds(policy, alert.Severity, next)
+	if skip {
+		return nil // severity 中途变为 skip 名单内：停止推进，不再注册下一级定时器
+	}
+	fireAt := now.Add(time.Duration(wait) * time.Second)
 	nextPayload, err := json.Marshal(escalationPayload{Level: next})
 	if err != nil {
 		return fmt.Errorf("oncall: 序列化升级链 payload 失败: %w", err)
@@ -268,6 +280,25 @@ func (c *Chain) recordWarning(ctx context.Context, tx pgx.Tx, alert domain.Alert
 		return fmt.Errorf("oncall: 写入无人可通知警告失败: %w", err)
 	}
 	return nil
+}
+
+// effectiveWaitSeconds 按 severity 求出第 level 级应等待的秒数（R1：severity 差异化
+// 升级节奏）。sev 命中 p.SeverityConfig.Skip 时 skip=true，调用方应视同"不升级"处理
+// （Start 不建定时器、advance 不再推进）；否则若该 severity 配置了覆写且覆写数组
+// 长度覆盖到 level，用覆写值，其余一切情况（零值 SeverityConfig、未知 severity、
+// 覆写数组短于 levels 缺位）一律回退 p.Levels[level].WaitSeconds——这保证了旧版
+// 升级策略（SeverityConfig 为零值）在本函数接入后行为完全不变。
+// 调用方需保证 level 在 p.Levels 范围内（沿用 advance/Start 现有的越界检查）。
+func effectiveWaitSeconds(p store.EscalationPolicy, sev domain.Severity, level int) (waitSeconds int, skip bool) {
+	for _, s := range p.SeverityConfig.Skip {
+		if domain.Severity(s) == sev {
+			return 0, true
+		}
+	}
+	if overrides, ok := p.SeverityConfig.Overrides[string(sev)]; ok && level < len(overrides) {
+		return overrides[level], false
+	}
+	return p.Levels[level].WaitSeconds, false
 }
 
 // shouldContinueEscalation 报告 alert 是否仍处于需要人员升级的状态：firing 且未被

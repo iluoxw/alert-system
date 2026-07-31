@@ -25,6 +25,7 @@ import { RoutesPage } from './pages/Settings/Routes'
 import { Schedules } from './pages/Settings/Schedules'
 import { EscalationPolicies } from './pages/Settings/EscalationPolicies'
 import { NotificationPolicies } from './pages/Settings/NotificationPolicies'
+import { TeamOpsSettings } from './pages/Settings/TeamOpsSettings'
 
 const { Header, Content } = Layout
 
@@ -157,6 +158,7 @@ function App() {
                 <Route path="schedules" element={<Schedules />} />
                 <Route path="escalation-policies" element={<EscalationPolicies />} />
                 <Route path="notification-policies" element={<NotificationPolicies />} />
+                <Route path="ops-settings" element={<TeamOpsSettings />} />
               </Route>
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

@@ -255,9 +255,11 @@ func (e *Engine) advance(ctx context.Context, tx pgx.Tx, alertID string, step in
 // escalationActor/escalationDetail* 是落时间线时 Detail 的固定键与 Action 复用约定：
 // 渠道升级复用 domain.TimelineActionNotify（而非 TimelineActionEscalate），因为后者
 // 已被 oncall 包用于人员升级——两条正交的升级维度若共用同一个 Action 常量，时间线
-// 视图上会把"换渠道"和"换责任人"混在一起，无法区分。TimelineActionNotify 本身已被
-// Sender.markFailed 用于失败发送记账，这里用 Detail[kind]="channel_escalation" 与
-// Sender 的失败记账条目（无此字段）区分开，读者可按 Detail 内容判断具体来源。
+// 视图上会把"换渠道"和"换责任人"混在一起，无法区分。domain.TimelineActionNotify
+// 本身已 deprecated（Sender 的发送结果记账已迁移到 TimelineActionNotifySent/
+// TimelineActionNotifyFailed，见 R3），这里继续复用它是历史选择、非新代码首选，
+// 用 Detail[kind]="channel_escalation" 与其他历史用途区分开，读者可按 Detail 内容
+// 判断具体来源。
 const (
 	escalationActor          = "notify-policy-engine"
 	escalationDetailKind     = "kind"

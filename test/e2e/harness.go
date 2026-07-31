@@ -44,6 +44,7 @@ type system struct {
 	Integrations         *store.IntegrationRepo
 	Silences             *store.SilenceRepo
 	Alerts               *store.AlertRepo
+	Ops                  *store.OpsRepo
 
 	scheduler *scheduler.Scheduler
 	pipeline  *pipeline.Pipeline
@@ -72,6 +73,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	notificationLogs := store.NewNotificationLogRepo()
 	sessions := store.NewSessionRepo()
 	memberships := store.NewMembershipRepo()
+	opsRepo := store.NewOpsRepo()
 
 	// pipeline/notify/oncall 全部依赖 + 六个 scheduler kind 的绑定，与
 	// cmd/server/main.go 共用同一份装配逻辑，见 internal/app.Build。
@@ -85,8 +87,17 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		NotificationPolicies: notificationPolicies,
 		Silences:             silences,
 		NotificationLogs:     notificationLogs,
+		Teams:                teams,
+		Users:                users,
+		Ops:                  opsRepo,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
+
+	// 启动对账（design.md R2），与生产 main.go 共用同一个 app.ReconcileOpsTimers；
+	// E2E 场景目前不预置 ops 设置，通常是空操作，保留是为了不让两处装配出现分叉。
+	if err := app.ReconcileOpsTimers(context.Background(), st, opsRepo, sched); err != nil {
+		return nil, fmt.Errorf("e2e: ops 定时器启动对账失败: %w", err)
+	}
 
 	// ingest：alertmanager 用于场景①/R13（真实 Alertmanager webhook 格式，
 	// ResolvePolicy 固定 source），generic 用于场景③（唯一能显式指定
@@ -112,6 +123,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		AlertSilences:        alerts,
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
+	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)
@@ -129,6 +141,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		Integrations:         integrations,
 		Silences:             silences,
 		Alerts:               alerts,
+		Ops:                  opsRepo,
 		scheduler:            sched,
 		pipeline:             pl,
 	}, nil

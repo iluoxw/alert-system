@@ -13,6 +13,7 @@ import (
 	"alert-system/internal/domain"
 	"alert-system/internal/notify"
 	"alert-system/internal/oncall"
+	"alert-system/internal/ops"
 	"alert-system/internal/scheduler"
 )
 
@@ -220,6 +221,31 @@ func (o *notifyOutbox) DispatchStep(ctx context.Context, tx pgx.Tx, alert domain
 		}
 	}
 	return nil
+}
+
+// ScheduleOpsSend 实现 ops.OpsNotifier：把 ops 周期任务（日报/悬置扫描/值班播报）
+// 的一次发送意图注册进既有 notify_send 定时器，完全复用 scheduleSend/
+// notifySendRefID——不新写一套调度逻辑。ops 消息没有 AlertID，只需按 design.md R2
+// 把 GroupKey 拼成 "ops:{teamID}:{kind}"：notifySendRefID 的 resourceKey 在
+// AlertID 为空时回退取 GroupKey，算出的 refID 天然是
+// "ops:{teamID}:{kind}\x1e-\x1e{channel}\x1e{target}"（step 恒为 "-"，因为 ops
+// 没有渠道升级的"级"概念）——不含 round，满足不变量 4"refID 不掺 round、round 只
+// 随 payload 持久化供 Sender 算幂等键"的要求。
+func (o *notifyOutbox) ScheduleOpsSend(ctx context.Context, tx pgx.Tx, teamID, kind string, round int64, ch ops.ChannelTarget, msg notify.Message) error {
+	req := notify.SendRequest{
+		GroupKey:    opsGroupKey(teamID, kind),
+		ChannelKind: ch.Kind,
+		Target:      ch.Target,
+		Msg:         msg,
+		Round:       round,
+	}
+	return o.scheduleSend(ctx, tx, req)
+}
+
+// opsGroupKey 拼出 ops 消息的 GroupKey，与 ops.OpsNotifier 接口注释里"由实现自己
+// 拼、调用方不重复维护这个格式常量"的约定一致。
+func opsGroupKey(teamID, kind string) string {
+	return "ops:" + teamID + ":" + kind
 }
 
 // buildAlertMessage 把单个告警组装成渠道无关的 Message（Sender/Channel 的载荷）。

@@ -165,7 +165,17 @@ function withQuery(params: Record<string, string | number | undefined>): string 
 // ============================================================
 
 // TimelineAction 对应 internal/domain/state.go 的 TimelineAction 枚举。
-export type TimelineAction = 'ack' | 'resolve' | 'handoff' | 'notify' | 'escalate' | 'silence'
+// notify 为历史动作（已废弃但历史数据仍存在，需兼容渲染）；
+// notify_sent/notify_failed 是其替代，区分发送成功/失败（R3）。
+export type TimelineAction =
+  | 'ack'
+  | 'resolve'
+  | 'handoff'
+  | 'notify'
+  | 'escalate'
+  | 'silence'
+  | 'notify_sent'
+  | 'notify_failed'
 
 // TimelineEntry 对应 timelineEntryResponse（省略了 alert_id，由所在详情响应的
 // alert.id 隐含）。
@@ -264,6 +274,39 @@ export function updateTeam(id: string, body: TeamRequest): Promise<void> {
 }
 export function deleteTeam(id: string): Promise<void> {
   return request(`/admin/teams/${id}`, { method: 'DELETE' })
+}
+
+// ---- team ops settings ----
+//
+// 对应 internal/api/ops_settings.go（任务 10，R2 配置入口）：日报/陈旧告警清扫/
+// 值班播报三个周期任务的开关、时刻/间隔与共用通知渠道，按团队维度存取。GET 未
+// 配置的团队也返回 200 + 默认值（不是 404），PUT 是全量替换语义——后端不补默认、
+// 不接受部分字段，前端必须先 GET 拿完整值再整体提交。
+
+export interface OpsChannelTarget {
+  kind: string
+  target: string
+}
+
+export interface OpsSettings {
+  team_id: string
+  timezone: string
+  daily_report_enabled: boolean
+  daily_report_time: string
+  stale_sweep_enabled: boolean
+  stale_sweep_interval_seconds: number
+  oncall_broadcast_enabled: boolean
+  oncall_broadcast_time: string
+  channels: OpsChannelTarget[]
+}
+
+export type OpsSettingsRequest = Omit<OpsSettings, 'team_id'>
+
+export function getOpsSettings(teamId: string): Promise<OpsSettings> {
+  return request(`/teams/${teamId}/ops-settings`)
+}
+export function updateOpsSettings(teamId: string, body: OpsSettingsRequest): Promise<OpsSettings> {
+  return request(`/admin/teams/${teamId}/ops-settings`, { method: 'PUT', body: JSON.stringify(body) })
 }
 
 // ---- users ----
@@ -399,10 +442,20 @@ export interface EscalationLevel {
   targets: string[]
 }
 
+// SeverityConfig 对应 store.SeverityConfig（ops-enhancements 任务 4/11，R1 覆写口径）：
+// overrides 按 severity 覆写升级链各级等待秒数（可短于 levels，缺位回退默认），
+// skip 里的 severity 不参与即时升级。后端 omitempty，未配置时序列化为 {}，两个
+// 子字段都可能是 undefined（零值兼容），不传 severity_config 字段 = 全默认。
+export interface SeverityConfig {
+  overrides?: Partial<Record<Severity, number[]>>
+  skip?: Severity[]
+}
+
 export interface EscalationPolicy {
   id: string
   team_id: string
   levels: EscalationLevel[]
+  severity_config: SeverityConfig
   created_at: string
   updated_at: string
 }
@@ -410,6 +463,7 @@ export interface EscalationPolicy {
 export interface EscalationPolicyRequest {
   team_id: string
   levels: EscalationLevel[]
+  severity_config?: SeverityConfig
 }
 
 export function listEscalationPolicies(params?: {

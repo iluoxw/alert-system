@@ -16,7 +16,7 @@ import {
   Typography,
   message,
 } from 'antd'
-import { ArrowLeftOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import type { Severity, Status, TimelineAction } from '../api/client'
 import { ApiError, ackAlert, getAlertDetail, handoffAlert, resolveAlert } from '../api/client'
 
@@ -36,6 +36,8 @@ const timelineActionLabel: Record<TimelineAction, string> = {
   notify: '通知',
   escalate: '升级',
   silence: '静默',
+  notify_sent: '通知成功',
+  notify_failed: '通知失败',
 }
 
 const timelineActionColor: Record<TimelineAction, string> = {
@@ -45,6 +47,48 @@ const timelineActionColor: Record<TimelineAction, string> = {
   notify: 'gray',
   escalate: 'orange',
   silence: 'gray',
+  notify_sent: 'green',
+  notify_failed: 'red',
+}
+
+// notify_sent/notify_failed 的 detail 形状（后端 internal/notify 记账写入，
+// target 已由后端脱敏，前端直接展示）；字段均可能缺失，渲染需优雅降级。
+interface NotifyDetail {
+  channel?: string
+  target?: string
+  attempts?: number
+  error?: string
+}
+
+// notify_sent/notify_failed 走定制文案而非通用 JSON.stringify（其余 action
+// 的 detail 形状不固定，仍走通用兜底渲染，保持兼容不回归）。
+function renderNotifyDetail(action: 'notify_sent' | 'notify_failed', detail: NotifyDetail) {
+  const channel = detail.channel ?? '未知渠道'
+  const target = detail.target ?? '未知对象'
+
+  if (action === 'notify_sent') {
+    return (
+      <Space size={4}>
+        <CheckCircleOutlined style={{ color: '#52c41a' }} />
+        <Text>
+          已通过 {channel} 通知 {target}
+        </Text>
+      </Space>
+    )
+  }
+
+  return (
+    <Space direction="vertical" size={0}>
+      <Space size={4}>
+        <CloseCircleOutlined style={{ color: '#ff4d4f' }} />
+        <Text>
+          通过 {channel} 通知 {target} 失败
+          {typeof detail.attempts === 'number' ? `（${detail.attempts} 次尝试）` : ''}
+        </Text>
+      </Space>
+      {detail.error && <Text type="secondary">{detail.error}</Text>}
+    </Space>
+  )
 }
 
 export function AlertDetail() {
@@ -215,8 +259,13 @@ export function AlertDetail() {
                     {entry.actor} · {timelineActionLabel[entry.action]}
                   </Text>
                   <Text type="secondary">{new Date(entry.at).toLocaleString()}</Text>
-                  {entry.detail && Object.keys(entry.detail).length > 0 && (
-                    <Text type="secondary">{JSON.stringify(entry.detail)}</Text>
+                  {entry.action === 'notify_sent' || entry.action === 'notify_failed' ? (
+                    renderNotifyDetail(entry.action, (entry.detail ?? {}) as NotifyDetail)
+                  ) : (
+                    entry.detail &&
+                    Object.keys(entry.detail).length > 0 && (
+                      <Text type="secondary">{JSON.stringify(entry.detail)}</Text>
+                    )
                   )}
                 </Space>
               ),

@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/ops-enhancements/design.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T00:39:28.441Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785458368438_af6hic0hj",
+      "approvalTitle": "ops-enhancements 设计文档评审"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T00:42:33.662Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785458368438_af6hic0hj",
+      "approvalTitle": "ops-enhancements 设计文档评审"
+    }
+  ]
+}

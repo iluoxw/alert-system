@@ -417,3 +417,233 @@ func TestChain_Stop_CancelsTimer(t *testing.T) {
 		t.Fatalf("Cancel 调用不正确: %+v", sched.cancelCalls)
 	}
 }
+
+// ===================== effectiveWaitSeconds：severity 差异化升级节奏（R1）=====================
+
+// TestEffectiveWaitSeconds 表驱动覆盖：零值 SeverityConfig 回退默认、覆写命中、
+// 覆写数组短于 levels 时缺位回退、skip 命中与不命中、未知 severity 回退默认。
+func TestEffectiveWaitSeconds(t *testing.T) {
+	basePolicy := store.EscalationPolicy{
+		Levels: []store.EscalationLevel{{WaitSeconds: 60}, {WaitSeconds: 300}},
+	}
+
+	cases := []struct {
+		name      string
+		sevConfig store.SeverityConfig
+		sev       domain.Severity
+		level     int
+		wantWait  int
+		wantSkip  bool
+	}{
+		{
+			name:     "零值SeverityConfig回退默认",
+			sev:      domain.SeverityCritical,
+			level:    1,
+			wantWait: 300,
+		},
+		{
+			name:      "severity覆写命中_level0",
+			sevConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {10, 20}}},
+			sev:       domain.SeverityCritical,
+			level:     0,
+			wantWait:  10,
+		},
+		{
+			name:      "severity覆写命中_level1",
+			sevConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {10, 20}}},
+			sev:       domain.SeverityCritical,
+			level:     1,
+			wantWait:  20,
+		},
+		{
+			name:      "覆写数组短于levels_缺位回退默认",
+			sevConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {10}}},
+			sev:       domain.SeverityCritical,
+			level:     1,
+			wantWait:  300,
+		},
+		{
+			name:      "skip命中",
+			sevConfig: store.SeverityConfig{Skip: []string{"info"}},
+			sev:       domain.SeverityInfo,
+			level:     0,
+			wantSkip:  true,
+		},
+		{
+			name:      "skip不命中其他severity仍按默认走",
+			sevConfig: store.SeverityConfig{Skip: []string{"info"}},
+			sev:       domain.SeverityCritical,
+			level:     0,
+			wantWait:  60,
+		},
+		{
+			name:      "未知severity回退默认",
+			sevConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {10}}},
+			sev:       domain.Severity("unknown"),
+			level:     0,
+			wantWait:  60,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := basePolicy
+			p.SeverityConfig = tc.sevConfig
+			gotWait, gotSkip := effectiveWaitSeconds(p, tc.sev, tc.level)
+			if gotSkip != tc.wantSkip {
+				t.Fatalf("skip = %v, want %v", gotSkip, tc.wantSkip)
+			}
+			if !gotSkip && gotWait != tc.wantWait {
+				t.Fatalf("wait = %d, want %d", gotWait, tc.wantWait)
+			}
+		})
+	}
+}
+
+// TestChain_Start_SeverityOverride_UsesOverrideWait 覆盖 Start：severity 命中
+// SeverityConfig.Overrides 时按覆写值注册第 0 级定时器，而非默认 WaitSeconds。
+func TestChain_Start_SeverityOverride_UsesOverrideWait(t *testing.T) {
+	const teamID = "team-7"
+	start := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	policies := &fakeEscalationPolicyRepo{byTeam: map[string][]store.EscalationPolicy{
+		teamID: {{ID: "p", TeamID: teamID,
+			Levels:         []store.EscalationLevel{{WaitSeconds: 300, Targets: []string{teamID}}},
+			SeverityConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {10}}},
+		}},
+	}}
+	sched := &fakeTimerScheduler{}
+	chain := newTestChain(&fakeAlertRepo{alerts: map[string]domain.Alert{}}, newFakeTimelineRepo(), policies,
+		NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}), sched, &fakeNotifier{}, start)
+
+	alert := domain.Alert{ID: "alert-7", TeamID: teamID, Status: domain.StatusFiring, Severity: domain.SeverityCritical}
+	if err := chain.Start(context.Background(), nil, alert); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	want := start.Add(10 * time.Second)
+	if len(sched.scheduleCalls) != 1 || !sched.scheduleCalls[0].fireAt.Equal(want) {
+		t.Fatalf("Start() 未按 severity 覆写注册定时器: %+v, want fireAt=%v", sched.scheduleCalls, want)
+	}
+}
+
+// TestChain_Start_SeveritySkip_NoOp 覆盖 Start：severity 命中 SeverityConfig.Skip 时
+// 不参与即时升级——不注册任何定时器，等同团队未配置升级策略。
+func TestChain_Start_SeveritySkip_NoOp(t *testing.T) {
+	const teamID = "team-8"
+	policies := &fakeEscalationPolicyRepo{byTeam: map[string][]store.EscalationPolicy{
+		teamID: {{ID: "p", TeamID: teamID,
+			Levels:         []store.EscalationLevel{{WaitSeconds: 0, Targets: []string{teamID}}},
+			SeverityConfig: store.SeverityConfig{Skip: []string{"info"}},
+		}},
+	}}
+	sched := &fakeTimerScheduler{}
+	chain := newTestChain(&fakeAlertRepo{alerts: map[string]domain.Alert{}}, newFakeTimelineRepo(), policies,
+		NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}), sched, &fakeNotifier{}, time.Now())
+
+	alert := domain.Alert{ID: "alert-8", TeamID: teamID, Status: domain.StatusFiring, Severity: domain.SeverityInfo}
+	if err := chain.Start(context.Background(), nil, alert); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(sched.scheduleCalls) != 0 {
+		t.Fatalf("severity 命中 skip 不应注册定时器, got %+v", sched.scheduleCalls)
+	}
+}
+
+// TestChain_Advance_SeverityOverride_UsesOverrideWaitForNextLevel 覆盖 advance：
+// 推进到下一级时按当前 severity 的覆写节奏计算 fireAt，而非默认 WaitSeconds。
+func TestChain_Advance_SeverityOverride_UsesOverrideWaitForNextLevel(t *testing.T) {
+	const alertID, teamID = "alert-9", "team-9"
+	start := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	policies := &fakeEscalationPolicyRepo{byTeam: map[string][]store.EscalationPolicy{
+		teamID: {{ID: "p", TeamID: teamID,
+			Levels: []store.EscalationLevel{
+				{WaitSeconds: 300, Targets: []string{teamID}},
+				{WaitSeconds: 600, Targets: []string{teamID}},
+			},
+			SeverityConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {0, 30}}},
+		}},
+	}}
+	alerts := &fakeAlertRepo{alerts: map[string]domain.Alert{
+		alertID: {ID: alertID, TeamID: teamID, Status: domain.StatusFiring, Severity: domain.SeverityCritical},
+	}}
+	timeline := newFakeTimelineRepo()
+	sched := &fakeTimerScheduler{}
+	chain := newTestChain(alerts, timeline, policies, NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}), sched, &fakeNotifier{}, start)
+
+	payload0, _ := json.Marshal(escalationPayload{Level: 0})
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
+		t.Fatalf("Handle(level0) error = %v", err)
+	}
+	want := start.Add(30 * time.Second) // critical 覆写的 level1 节奏（30s），非默认 600s
+	if len(sched.scheduleCalls) != 1 || !sched.scheduleCalls[0].fireAt.Equal(want) {
+		t.Fatalf("下一级未按 severity 覆写节奏调度: %+v, want fireAt=%v", sched.scheduleCalls, want)
+	}
+}
+
+// TestChain_Advance_SeverityChangeMidChain_UsesCurrentSeverity 覆盖设计意图：advance
+// 每次触发都重新查询告警而非用 payload 快照，severity 若在两级之间被改写，下一级
+// 的等待节奏按改写后的当前值计算——这是刻意行为（见 advance 函数注释），不是缺陷。
+func TestChain_Advance_SeverityChangeMidChain_UsesCurrentSeverity(t *testing.T) {
+	const alertID, teamID = "alert-10", "team-10"
+	start := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	policies := &fakeEscalationPolicyRepo{byTeam: map[string][]store.EscalationPolicy{
+		teamID: {{ID: "p", TeamID: teamID,
+			Levels: []store.EscalationLevel{
+				{WaitSeconds: 300, Targets: []string{teamID}},
+				{WaitSeconds: 600, Targets: []string{teamID}},
+			},
+			SeverityConfig: store.SeverityConfig{Overrides: map[string][]int{"critical": {0, 30}}},
+		}},
+	}}
+	alerts := &fakeAlertRepo{alerts: map[string]domain.Alert{
+		// 启动时是 warning（无覆写，走默认节奏）。
+		alertID: {ID: alertID, TeamID: teamID, Status: domain.StatusFiring, Severity: domain.SeverityWarning},
+	}}
+	timeline := newFakeTimelineRepo()
+	sched := &fakeTimerScheduler{}
+	chain := newTestChain(alerts, timeline, policies, NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}), sched, &fakeNotifier{}, start)
+
+	// 第 0 级触发前，告警被人工改判为 critical。
+	upgraded := alerts.alerts[alertID]
+	upgraded.Severity = domain.SeverityCritical
+	alerts.alerts[alertID] = upgraded
+
+	payload0, _ := json.Marshal(escalationPayload{Level: 0})
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
+		t.Fatalf("Handle(level0) error = %v", err)
+	}
+	want := start.Add(30 * time.Second) // 按当前 critical 的覆写节奏，而非启动时 warning 的默认 600s
+	if len(sched.scheduleCalls) != 1 || !sched.scheduleCalls[0].fireAt.Equal(want) {
+		t.Fatalf("severity 变更后未按当前值计算节奏: %+v, want fireAt=%v", sched.scheduleCalls, want)
+	}
+}
+
+// TestChain_Advance_SeveritySkipMidChain_StopsAdvancing 覆盖 advance 的 skip 分支：
+// severity 中途变为 SeverityConfig.Skip 命中项时，本级仍正常处理，但不再注册下一级
+// 定时器（等同该 severity 不参与升级）。
+func TestChain_Advance_SeveritySkipMidChain_StopsAdvancing(t *testing.T) {
+	const alertID, teamID = "alert-11", "team-11"
+	start := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	policies := &fakeEscalationPolicyRepo{byTeam: map[string][]store.EscalationPolicy{
+		teamID: {{ID: "p", TeamID: teamID,
+			Levels: []store.EscalationLevel{
+				{WaitSeconds: 0, Targets: []string{teamID}},
+				{WaitSeconds: 600, Targets: []string{teamID}},
+			},
+			SeverityConfig: store.SeverityConfig{Skip: []string{"info"}},
+		}},
+	}}
+	alerts := &fakeAlertRepo{alerts: map[string]domain.Alert{
+		alertID: {ID: alertID, TeamID: teamID, Status: domain.StatusFiring, Severity: domain.SeverityInfo},
+	}}
+	timeline := newFakeTimelineRepo()
+	sched := &fakeTimerScheduler{}
+	chain := newTestChain(alerts, timeline, policies, NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}), sched, &fakeNotifier{}, start)
+
+	payload0, _ := json.Marshal(escalationPayload{Level: 0})
+	if err := chain.Handle(context.Background(), nil, alertID, payload0); err != nil {
+		t.Fatalf("Handle(level0) error = %v", err)
+	}
+	if len(sched.scheduleCalls) != 0 {
+		t.Fatalf("severity 命中 skip 后不应注册下一级定时器, got %+v", sched.scheduleCalls)
+	}
+}

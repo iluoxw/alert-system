@@ -16,9 +16,16 @@ const (
 	TimelineActionResolve TimelineAction = "resolve"
 	TimelineActionHandoff TimelineAction = "handoff"
 
+	// TimelineActionNotify 已废弃：仅保留供历史数据渲染兼容，新代码改用
+	// TimelineActionNotifySent/TimelineActionNotifyFailed（R3，区分发送成功/失败）。
+	//
+	// Deprecated: 使用 TimelineActionNotifySent 或 TimelineActionNotifyFailed。
 	TimelineActionNotify   TimelineAction = "notify"
 	TimelineActionEscalate TimelineAction = "escalate"
 	TimelineActionSilence  TimelineAction = "silence"
+
+	TimelineActionNotifySent   TimelineAction = "notify_sent"
+	TimelineActionNotifyFailed TimelineAction = "notify_failed"
 )
 
 // ResolveReason 标识 Resolve 动作的来源（R4.3/R4.4/R12.5）。

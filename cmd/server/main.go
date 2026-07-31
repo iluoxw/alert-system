@@ -81,6 +81,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	notificationLogs := store.NewNotificationLogRepo()
 	sessions := store.NewSessionRepo()
 	memberships := store.NewMembershipRepo()
+	opsRepo := store.NewOpsRepo()
 
 	// ---- 生产通知渠道（E2E 用 mock_channel.go 顶替，notify.Register 对同 kind 是
 	// 覆盖语义，测试装配不会调用这个函数）----
@@ -98,8 +99,18 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 		NotificationPolicies: notificationPolicies,
 		Silences:             silences,
 		NotificationLogs:     notificationLogs,
+		Teams:                teams,
+		Users:                users,
+		Ops:                  opsRepo,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
+
+	// ---- 启动对账（design.md R2）：补建已启用但缺失 pending 定时器的 ops 周期
+	// 任务；失败不阻断启动——下一次进程重启或任务 10 的保存端点仍会重试，见
+	// app.ReconcileOpsTimers 文档。----
+	if err := app.ReconcileOpsTimers(ctx, st, opsRepo, sched); err != nil {
+		logger.Error("alert-system: ops 定时器启动对账失败", "err", err)
+	}
 
 	// ---- ingest：三个上游 adapter，兜底等级统一取 domain.SeverityWarning（与
 	// integrations.default_severity 列的 DEFAULT 对齐；每 integration 各自的
@@ -129,6 +140,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 		AlertSilences:        alerts,
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
+	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
 
 	httpServer := &http.Server{

@@ -1,7 +1,7 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { Tabs } from 'antd'
 
-// 设置页导航：七类配置资源共享同一套 Tabs + <Outlet/>，具体某个资源页面的路由
+// 设置页导航：八类配置资源共享同一套 Tabs + <Outlet/>，具体某个资源页面的路由
 // 在 App.tsx 里以 /settings/:resource 的形式挂在这个布局下面。
 
 const items = [
@@ -12,6 +12,7 @@ const items = [
   { key: 'schedules', label: '值班表' },
   { key: 'escalation-policies', label: '升级策略' },
   { key: 'notification-policies', label: '通知策略' },
+  { key: 'ops-settings', label: '运营任务' },
 ]
 
 export function SettingsLayout() {

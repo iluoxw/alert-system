@@ -4,6 +4,7 @@ import { Button, Card, Form, InputNumber, Select } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
 import { CrudTable } from '../../components/CrudTable'
+import { SeverityConfigEditor } from '../../components/SeverityConfigEditor'
 import type { EscalationPolicy, EscalationPolicyRequest } from '../../api/client'
 import {
   createEscalationPolicy,
@@ -60,7 +61,7 @@ export function EscalationPolicies() {
           onChange={setTeamFilter}
         />
       }
-      renderFields={() => (
+      renderFields={(editing) => (
         <>
           <Form.Item name="team_id" label="所属团队" rules={[{ required: true, message: '请选择所属团队' }]}>
             <Select options={teamOptions} showSearch optionFilterProp="label" />
@@ -113,6 +114,18 @@ export function EscalationPolicies() {
                 </>
               )}
             </Form.List>
+          </Form.Item>
+          <Form.Item label="Severity 覆写升级节奏（R1，不配置=全部使用默认节奏）">
+            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.levels !== cur.levels}>
+              {(formInstance) => (
+                <Form.Item name="severity_config" noStyle>
+                  <SeverityConfigEditor
+                    levelCount={(formInstance.getFieldValue('levels') as EscalationPolicyRequest['levels'] | undefined)?.length ?? 0}
+                    showSuggestedFill={editing === null}
+                  />
+                </Form.Item>
+              )}
+            </Form.Item>
           </Form.Item>
         </>
       )}

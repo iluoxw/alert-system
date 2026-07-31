@@ -1053,17 +1053,19 @@ func (h *configHandlers) deleteSchedule(c *gin.Context) {
 
 func escalationPolicyJSON(p store.EscalationPolicy) gin.H {
 	return gin.H{
-		"id":         p.ID,
-		"team_id":    p.TeamID,
-		"levels":     p.Levels,
-		"created_at": p.CreatedAt,
-		"updated_at": p.UpdatedAt,
+		"id":              p.ID,
+		"team_id":         p.TeamID,
+		"levels":          p.Levels,
+		"severity_config": p.SeverityConfig,
+		"created_at":      p.CreatedAt,
+		"updated_at":      p.UpdatedAt,
 	}
 }
 
 type escalationPolicyRequest struct {
-	TeamID string                  `json:"team_id"`
-	Levels []store.EscalationLevel `json:"levels"`
+	TeamID         string                  `json:"team_id"`
+	Levels         []store.EscalationLevel `json:"levels"`
+	SeverityConfig store.SeverityConfig    `json:"severity_config"`
 }
 
 func (h *configHandlers) validateEscalationPolicy(ctx context.Context, tx pgx.Tx, req escalationPolicyRequest) (string, bool, error) {
@@ -1097,7 +1099,37 @@ func (h *configHandlers) validateEscalationPolicy(ctx context.Context, tx pgx.Tx
 			}
 		}
 	}
+	if msg, ok := validateSeverityConfig(req.SeverityConfig, len(req.Levels)); !ok {
+		return msg, false, nil
+	}
 	return "", true, nil
+}
+
+// validateSeverityConfig 校验升级策略的 severity_config（R1 覆写口径）：
+// - overrides 的键与 skip 的元素都必须是已定义的 severity；
+// - overrides 的等待秒数不能为负；
+// - overrides 数组长度不能超过 levels 数组长度（缺位回退默认，超出则无级可对应）；
+// skip 与 overrides 同时命中同一 severity 不算冲突（skip 优先），无需互斥校验。
+func validateSeverityConfig(cfg store.SeverityConfig, levelCount int) (string, bool) {
+	for severity, waits := range cfg.Overrides {
+		if !domain.Severity(severity).IsValid() {
+			return fmt.Sprintf("severity_config.overrides 包含未知 severity: %s", severity), false
+		}
+		if len(waits) > levelCount {
+			return fmt.Sprintf("severity_config.overrides[%s] 长度不能超过 levels 数组长度", severity), false
+		}
+		for i, wait := range waits {
+			if wait < 0 {
+				return fmt.Sprintf("severity_config.overrides[%s][%d] 不能为负数", severity, i), false
+			}
+		}
+	}
+	for _, severity := range cfg.Skip {
+		if !domain.Severity(severity).IsValid() {
+			return fmt.Sprintf("severity_config.skip 包含未知 severity: %s", severity), false
+		}
+	}
+	return "", true
 }
 
 func (h *configHandlers) createEscalationPolicy(c *gin.Context) {
@@ -1116,7 +1148,7 @@ func (h *configHandlers) createEscalationPolicy(c *gin.Context) {
 			return &validationError{msg: msg}
 		}
 		var createErr error
-		out, createErr = h.deps.EscalationPolicies.Create(ctx, tx, store.EscalationPolicy{TeamID: req.TeamID, Levels: req.Levels})
+		out, createErr = h.deps.EscalationPolicies.Create(ctx, tx, store.EscalationPolicy{TeamID: req.TeamID, Levels: req.Levels, SeverityConfig: req.SeverityConfig})
 		return createErr
 	})
 	if h.writeValidationOr(c, err, "创建升级策略") {
@@ -1179,7 +1211,7 @@ func (h *configHandlers) updateEscalationPolicy(c *gin.Context) {
 		if !ok {
 			return &validationError{msg: msg}
 		}
-		return h.deps.EscalationPolicies.Update(ctx, tx, store.EscalationPolicy{ID: id, TeamID: req.TeamID, Levels: req.Levels})
+		return h.deps.EscalationPolicies.Update(ctx, tx, store.EscalationPolicy{ID: id, TeamID: req.TeamID, Levels: req.Levels, SeverityConfig: req.SeverityConfig})
 	})
 	if h.writeValidationOr(c, err, "更新升级策略") {
 		return

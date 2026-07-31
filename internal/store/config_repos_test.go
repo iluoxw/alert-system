@@ -17,7 +17,7 @@ import (
 // 版本（同包、同 build tag），无需重复实现。silences/change_events/notification_log
 // 的测试见 silences_test.go（拆分对应 config_repos*.go / silences.go 的生产代码分层）。
 // 实测运行：
-//   go test -tags=integration ./internal/store/... -run 'TestRoute|TestSilence|TestChangeEvent|TestNotificationPolicy|TestNotificationLog|TestShift' -v
+//   go test -tags=integration ./internal/store/... -run 'TestRoute|TestSilence|TestChangeEvent|TestNotificationPolicy|TestNotificationLog|TestShift|TestEscalationPolicy' -v
 
 // mustTeam 建一个团队，供依赖 team_id 外键的测试复用。
 func mustTeam(t *testing.T, ctx context.Context, st *Store, name string) *Team {
@@ -201,6 +201,138 @@ func TestNotificationPolicyRepo_ListByTeam(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].Name != "a-default" {
 		t.Fatalf("ListByTeam(teamA) = %+v, want 只含 a-default", list)
+	}
+}
+
+// TestEscalationPolicyRepo_SeverityConfig_DefaultZeroValue 验证默认 '{}' 反序列化
+// 后是零值（Overrides/Skip 均 nil），确保存量策略不会被误读出空 map/slice（R1）。
+func TestEscalationPolicyRepo_SeverityConfig_DefaultZeroValue(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "sre-core")
+	policies := NewEscalationPolicyRepo()
+
+	var created *EscalationPolicy
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		created, err = policies.Create(ctx, tx, EscalationPolicy{
+			TeamID: team.ID,
+			Levels: []EscalationLevel{{WaitSeconds: 300, Targets: []string{"user:alice"}}},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("创建升级策略失败: %v", err)
+	}
+	if created.SeverityConfig.Overrides != nil || created.SeverityConfig.Skip != nil {
+		t.Fatalf("默认 SeverityConfig = %+v, want 零值（Overrides/Skip 均 nil）", created.SeverityConfig)
+	}
+
+	var got *EscalationPolicy
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = policies.GetByID(ctx, tx, created.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("GetByID 失败: %v", err)
+	}
+	if got.SeverityConfig.Overrides != nil || got.SeverityConfig.Skip != nil {
+		t.Fatalf("GetByID 读回 SeverityConfig = %+v, want 零值", got.SeverityConfig)
+	}
+}
+
+// TestEscalationPolicyRepo_SeverityConfig_RoundTrip 验证带 Overrides + Skip 的完整
+// severity_config 经 Create -> GetByID 逐字段往返一致（R1）。
+func TestEscalationPolicyRepo_SeverityConfig_RoundTrip(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "sre-core")
+	policies := NewEscalationPolicyRepo()
+
+	cfg := SeverityConfig{
+		Overrides: map[string][]int{"critical": {60, 180}},
+		Skip:      []string{"info"},
+	}
+
+	var created *EscalationPolicy
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		created, err = policies.Create(ctx, tx, EscalationPolicy{
+			TeamID:         team.ID,
+			Levels:         []EscalationLevel{{WaitSeconds: 300, Targets: []string{"user:alice"}}},
+			SeverityConfig: cfg,
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("创建升级策略失败: %v", err)
+	}
+
+	var got *EscalationPolicy
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = policies.GetByID(ctx, tx, created.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("GetByID 失败: %v", err)
+	}
+	if len(got.SeverityConfig.Overrides["critical"]) != 2 || got.SeverityConfig.Overrides["critical"][0] != 60 || got.SeverityConfig.Overrides["critical"][1] != 180 {
+		t.Fatalf("got.SeverityConfig.Overrides = %+v, want critical: [60 180]", got.SeverityConfig.Overrides)
+	}
+	if len(got.SeverityConfig.Skip) != 1 || got.SeverityConfig.Skip[0] != "info" {
+		t.Fatalf("got.SeverityConfig.Skip = %+v, want [info]", got.SeverityConfig.Skip)
+	}
+}
+
+// TestEscalationPolicyRepo_Update_SeverityConfig 验证 Update 修改 severity_config
+// 后读回一致（覆盖 severity_config 列而非仅 levels/team_id）。
+func TestEscalationPolicyRepo_Update_SeverityConfig(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "sre-core")
+	policies := NewEscalationPolicyRepo()
+
+	var created *EscalationPolicy
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		created, err = policies.Create(ctx, tx, EscalationPolicy{
+			TeamID: team.ID,
+			Levels: []EscalationLevel{{WaitSeconds: 300, Targets: []string{"user:alice"}}},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("创建升级策略失败: %v", err)
+	}
+
+	updated := *created
+	updated.SeverityConfig = SeverityConfig{
+		Overrides: map[string][]int{"warning": {600}},
+		Skip:      []string{"info", "debug"},
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		return policies.Update(ctx, tx, updated)
+	})
+	if err != nil {
+		t.Fatalf("Update 失败: %v", err)
+	}
+
+	var got *EscalationPolicy
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = policies.GetByID(ctx, tx, created.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("GetByID 失败: %v", err)
+	}
+	if len(got.SeverityConfig.Overrides["warning"]) != 1 || got.SeverityConfig.Overrides["warning"][0] != 600 {
+		t.Fatalf("got.SeverityConfig.Overrides = %+v, want warning: [600]", got.SeverityConfig.Overrides)
+	}
+	if len(got.SeverityConfig.Skip) != 2 || got.SeverityConfig.Skip[0] != "info" || got.SeverityConfig.Skip[1] != "debug" {
+		t.Fatalf("got.SeverityConfig.Skip = %+v, want [info debug]", got.SeverityConfig.Skip)
 	}
 }
 

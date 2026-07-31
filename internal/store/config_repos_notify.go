@@ -18,25 +18,35 @@ type EscalationLevel struct {
 	Targets     []string `json:"targets"`
 }
 
-// EscalationPolicy 对应 escalation_policies 表：团队的人员升级链（R5.4）。
-type EscalationPolicy struct {
-	ID        string
-	TeamID    string
-	Levels    []EscalationLevel
-	CreatedAt time.Time
-	UpdatedAt time.Time
+// SeverityConfig 按 severity 覆写升级链节奏；零值（无覆写、无 skip）表示行为与旧版一致（R1）。
+type SeverityConfig struct {
+	Overrides map[string][]int `json:"overrides,omitempty"` // severity -> 各级等待秒数（可短于 levels，缺位回退默认）
+	Skip      []string         `json:"skip,omitempty"`      // 这些 severity 不参与即时升级
 }
 
-const escalationPolicyColumns = `id, team_id, levels, created_at, updated_at`
+// EscalationPolicy 对应 escalation_policies 表：团队的人员升级链（R5.4）。
+type EscalationPolicy struct {
+	ID             string
+	TeamID         string
+	Levels         []EscalationLevel
+	SeverityConfig SeverityConfig
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+const escalationPolicyColumns = `id, team_id, levels, severity_config, created_at, updated_at`
 
 func scanEscalationPolicy(row configRowScanner) (EscalationPolicy, error) {
 	var p EscalationPolicy
-	var levelsRaw []byte
-	if err := row.Scan(&p.ID, &p.TeamID, &levelsRaw, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var levelsRaw, severityConfigRaw []byte
+	if err := row.Scan(&p.ID, &p.TeamID, &levelsRaw, &severityConfigRaw, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return EscalationPolicy{}, err
 	}
 	if err := json.Unmarshal(levelsRaw, &p.Levels); err != nil {
 		return EscalationPolicy{}, fmt.Errorf("反序列化升级链 levels 失败: %w", err)
+	}
+	if err := json.Unmarshal(severityConfigRaw, &p.SeverityConfig); err != nil {
+		return EscalationPolicy{}, fmt.Errorf("反序列化升级链 severity_config 失败: %w", err)
 	}
 	return p, nil
 }
@@ -51,9 +61,13 @@ func (r *EscalationPolicyRepo) Create(ctx context.Context, tx pgx.Tx, p Escalati
 	if err != nil {
 		return nil, fmt.Errorf("store: 序列化升级链 levels 失败: %w", err)
 	}
+	severityConfigJSON, err := json.Marshal(p.SeverityConfig)
+	if err != nil {
+		return nil, fmt.Errorf("store: 序列化升级链 severity_config 失败: %w", err)
+	}
 	out, err := scanEscalationPolicy(tx.QueryRow(ctx, `
-		INSERT INTO escalation_policies (team_id, levels) VALUES ($1, $2)
-		RETURNING `+escalationPolicyColumns, p.TeamID, levelsJSON))
+		INSERT INTO escalation_policies (team_id, levels, severity_config) VALUES ($1, $2, $3)
+		RETURNING `+escalationPolicyColumns, p.TeamID, levelsJSON, severityConfigJSON))
 	if err != nil {
 		return nil, fmt.Errorf("store: 创建升级策略失败: %w", err)
 	}
@@ -100,7 +114,11 @@ func (r *EscalationPolicyRepo) Update(ctx context.Context, tx pgx.Tx, p Escalati
 	if err != nil {
 		return fmt.Errorf("store: 序列化升级链 levels 失败: %w", err)
 	}
-	tag, err := tx.Exec(ctx, `UPDATE escalation_policies SET team_id = $2, levels = $3 WHERE id = $1`, p.ID, p.TeamID, levelsJSON)
+	severityConfigJSON, err := json.Marshal(p.SeverityConfig)
+	if err != nil {
+		return fmt.Errorf("store: 序列化升级链 severity_config 失败: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `UPDATE escalation_policies SET team_id = $2, levels = $3, severity_config = $4 WHERE id = $1`, p.ID, p.TeamID, levelsJSON, severityConfigJSON)
 	if err != nil {
 		return fmt.Errorf("store: 更新升级策略失败: %w", err)
 	}

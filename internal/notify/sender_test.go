@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -299,5 +300,140 @@ func TestWebhookChannel_SuccessStatus_ReturnsNil(t *testing.T) {
 	ch := NewWebhookChannel(time.Second)
 	if err := ch.Send(context.Background(), srv.URL, Message{Title: "t"}); err != nil {
 		t.Fatalf("期望 2xx 状态码不返回错误，实际: %v", err)
+	}
+}
+
+// 场景⑥：发送成功后，单告警发送在 req.AlertID 上追加一条 notify_sent 时间线记录（R3）。
+func TestSender_Success_AppendsNotifySentTimeline(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+
+	req := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if got := tl.count(); got != 1 {
+		t.Fatalf("期望写入 1 条时间线记录，实际 %d 条", got)
+	}
+	entry := tl.entries[0]
+	if entry.Action != domain.TimelineActionNotifySent {
+		t.Fatalf("期望 Action=notify_sent，实际 %q", entry.Action)
+	}
+	if entry.AlertID != "alert-1" {
+		t.Fatalf("期望 AlertID=alert-1，实际 %q", entry.AlertID)
+	}
+	if entry.Detail["status"] != "sent" {
+		t.Fatalf("期望 detail.status=sent，实际 %v", entry.Detail["status"])
+	}
+}
+
+// 场景⑦：分组通知没有单一 AlertID，成功后应按 Msg.AlertIDs 逐条扇出（3 个 ID → 3 条）。
+func TestSender_GroupSuccess_FansOutTimelinePerAlert(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+
+	req := SendRequest{
+		GroupKey:    "group-1",
+		ChannelKind: "webhook",
+		Target:      "http://x",
+		Round:       1,
+		Msg:         Message{AlertIDs: []string{"a1", "a2", "a3"}},
+	}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if got := tl.count(); got != 3 {
+		t.Fatalf("期望分组扇出 3 条时间线记录，实际 %d 条", got)
+	}
+	seen := map[string]bool{}
+	for _, e := range tl.entries {
+		seen[e.AlertID] = true
+		if e.Action != domain.TimelineActionNotifySent {
+			t.Fatalf("期望 Action=notify_sent，实际 %q", e.Action)
+		}
+	}
+	for _, id := range req.Msg.AlertIDs {
+		if !seen[id] {
+			t.Fatalf("期望包含告警 %s 的时间线记录", id)
+		}
+	}
+}
+
+// 场景⑧：已 sent 记录被重投（崩溃重投同一条 notify_send 定时器）时，alreadySent
+// 短路直接返回，不应重复追加时间线（幂等口径见 Sender.Send 文档）。
+func TestSender_AlreadySent_Resend_DoesNotAppendTimelineAgain(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+
+	req := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("第一次 Send 失败: %v", err)
+	}
+	if got := tl.count(); got != 1 {
+		t.Fatalf("第一次发送后期望 1 条时间线记录，实际 %d 条", got)
+	}
+
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("第二次（重投）Send 失败: %v", err)
+	}
+	if got := tl.count(); got != 1 {
+		t.Fatalf("已 sent 重投不应重复追加时间线，期望仍为 1 条，实际 %d 条", got)
+	}
+}
+
+// 场景⑨：AlertID 与 Msg.AlertIDs 皆为空（ops 运营任务用合成 GroupKey 发送、无关联
+// 告警）时，不追加任何时间线记录。
+func TestSender_OpsGroupKeyWithoutAlertIDs_DoesNotAppendTimeline(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+
+	req := SendRequest{GroupKey: "ops:team-1:daily_report", ChannelKind: "webhook", Target: "http://x", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if got := tl.count(); got != 0 {
+		t.Fatalf("ops 合成消息无关联告警，期望不追加时间线，实际 %d 条", got)
+	}
+}
+
+// 场景⑩：分组发送失败也要按 Msg.AlertIDs 扇出（补上旧版本"分组失败不落时间线"的
+// 缺口），且 detail.error 截断到 200 字符。
+func TestSender_GroupFailure_FansOutTimelineAndTruncatesError(t *testing.T) {
+	longErr := strings.Repeat("x", 250)
+	ch := &fakeChannel{kind: "webhook", fn: func(int) error { return errors.New(longErr) }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.MaxAttempts = 1
+
+	req := SendRequest{
+		GroupKey:    "group-2",
+		ChannelKind: "webhook",
+		Target:      "http://x",
+		Round:       1,
+		Msg:         Message{AlertIDs: []string{"a1", "a2"}},
+	}
+	if err := s.Send(context.Background(), req); err == nil {
+		t.Fatal("期望 Send 返回错误")
+	}
+	if got := tl.count(); got != 2 {
+		t.Fatalf("期望失败分组扇出 2 条时间线记录，实际 %d 条", got)
+	}
+	for _, e := range tl.entries {
+		if e.Action != domain.TimelineActionNotifyFailed {
+			t.Fatalf("期望 Action=notify_failed，实际 %q", e.Action)
+		}
+		errText, _ := e.Detail["error"].(string)
+		if len(errText) != 200 {
+			t.Fatalf("期望 detail.error 截断为 200 字符，实际长度 %d", len(errText))
+		}
 	}
 }
