@@ -23,11 +23,13 @@ jobs:
         run: go vet ./...
 
       - name: go test
-        # go test ./... 会跑到 internal/store 的 testcontainers 用例与 test/e2e
-        # （其 TestMain 自行 docker compose up/down 一套真实 PG），ubuntu-latest
-        # runner 自带 docker 与 compose v2，无需额外安装。
+        # internal/store 的 testcontainers 用例带 //go:build integration 标签，
+        # 必须 -tags=integration 才会编译进来（裸跑 ./... 会静默跳过 store，
+        # 曾导致 CI「全绿」实际零覆盖 store）；test/e2e 无标签，其 TestMain
+        # 自行 docker compose up/down 一套真实 PG，ubuntu-latest runner 自带
+        # docker 与 compose v2，无需额外安装。
         timeout-minutes: 20
-        run: go test ./... -race -count=1
+        run: go test -tags=integration ./... -race -count=1
 
   frontend:
     runs-on: ubuntu-latest

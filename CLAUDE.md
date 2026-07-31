@@ -37,7 +37,7 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 
 ```bash
 go build ./... && go vet ./...          # 必须零错误（含 test/e2e 包）
-go test ./... -race -count=1           # 全量单测（store 用 testcontainers 需 Docker）
+go test -tags=integration ./... -race -count=1  # 全量单测（store 测试带 //go:build integration 标签，漏 tag 会静默跳过 store；testcontainers 需 Docker）
 cd web && npm run build && npx oxlint  # 前端验证（tsc -b 为准，编辑器诊断常 stale）
 cd test/e2e && docker compose up -d    # E2E 依赖的真实 PG（initdb 自动跑 migrations）
 ```
