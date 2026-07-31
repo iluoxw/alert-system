@@ -27,6 +27,19 @@ const (
 // （0x1e，ASCII record separator），避免相邻字段拼接产生歧义。
 const idempotencyKeySep = "\x1e"
 
+// ErrNoContact 表示用户在指定渠道下没有可用的联系方式（如 email 渠道但
+// users.email 为空）。这是永久性失败：换个时间点重试结果不会变，Resolve 的调用方
+// （Sender.Send）据此直接标记失败，不进 sendWithBackoff 重试队列。
+var ErrNoContact = errors.New("notify: 用户缺少该渠道的联系方式")
+
+// ContactResolver 把 SendRequest.TargetUserID 解析成某个渠道下的实际发送地址
+// （C3「通知送达到人」）：email 渠道解析到 users.email，lark 渠道解析到
+// users.lark_open_id，以此类推。实现放 internal/app（基于 UserRepo 的薄适配器，见任务 9），
+// 本包只依赖这个小接口——未来统一通知网关落地时只需换实现，Sender 的编排逻辑不必跟着改。
+type ContactResolver interface {
+	Resolve(ctx context.Context, tx pgx.Tx, userID, channelKind string) (string, error)
+}
+
 // logStore 抽象 store.NotificationLogRepo 用到的三个方法，让 Sender 的编排逻辑可以在
 // 单测里注入内存 fake，不需要真实 Postgres。*store.NotificationLogRepo 天然满足这个接口。
 type logStore interface {
@@ -58,6 +71,14 @@ type SendRequest struct {
 	Target      string
 	Msg         Message
 
+	// TargetUserID 非空时表示"到人"发送：Send 会在查找 Channel 之前，用注入的
+	// ContactResolver 按 ChannelKind 把它解析成实际地址并覆写 Target；解析失败
+	// （尤其 ErrNoContact）直接标记发送失败，不重试。为空时是团队渠道的现行为，
+	// Target 就是调用方给定的字面量地址，完全不受影响——这也是旧 payload（没有
+	// 这个字段）反序列化出的零值语义，升级期在途的 notify_send 定时器不会因为
+	// 加了新字段就断链。
+	TargetUserID string `json:"target_user_id,omitempty"`
+
 	// Round 区分"同一个 (AlertID/GroupKey, Step, Channel, Target) 元组下的第几次发送
 	// 意图"：调用方（internal/app 的 notifyOutbox）在构造 SendRequest 时用当时的
 	// o.now().UnixNano() 赋值一次，随请求整体序列化进 outbox 的 notify_send 定时器
@@ -79,6 +100,12 @@ type Sender struct {
 	// lookup 默认是包级 Get（生产环境走全局渠道注册表）；测试可替换成指向局部 map 的
 	// 闭包，避免各测试用例之间共享全局注册表状态。
 	lookup func(kind string) (Channel, error)
+
+	// Resolver 可选注入（nil 时到人发送一律按解析失败处理）：由 internal/app 装配
+	// 基于 UserRepo 的实现（任务 9）。不放进 NewSender 参数列表是为了不破坏既有
+	// 调用方（internal/app/app.go 已有一处 NewSender(...)），构造后按需赋值即可，
+	// 与 MaxAttempts 等三个可调字段同一约定。
+	Resolver ContactResolver
 
 	// 以下三项均有默认值（见 defaultMaxAttempts 等常量），构造后可直接覆盖用于调参/测试。
 	MaxAttempts    int
@@ -118,6 +145,8 @@ func idempotencyKey(req SendRequest) string {
 }
 
 // Send 执行一次可靠发送。流程：
+//  0. TargetUserID 非空时先解析成实际地址并覆写 Target（见 resolveTarget）；解析失败
+//     时跳过下面第 2 步的渠道查找与重试，直接按失败处理（不重试）。
 //  1. 占位写入 notification_log（status=pending）；撞幂等键冲突时查已有记录：
 //     已 sent → 直接返回成功，不重发；pending/failed → 继续走下面的发送流程（这正是
 //     崩溃恢复重投的意义：之前那次要么没真正发出去，要么发送后没能确认成功）。
@@ -133,6 +162,8 @@ func idempotencyKey(req SendRequest) string {
 // 无法参与数据库事务的固有代价，MVP 阶段已经过 team-lead 裁决接受，不指望唯一键堵住
 // 这个窗口。
 func (s *Sender) Send(ctx context.Context, req SendRequest) error {
+	resolveErr := s.resolveTarget(ctx, &req)
+
 	key := idempotencyKey(req)
 
 	logID, resumeAttempts, alreadySent, err := s.placeholder(ctx, req, key)
@@ -141,6 +172,10 @@ func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 	}
 	if alreadySent {
 		return nil
+	}
+
+	if resolveErr != nil {
+		return s.markFailed(ctx, req, logID, resumeAttempts, resolveErr)
 	}
 
 	channel, lookupErr := s.lookup(req.ChannelKind)
@@ -162,6 +197,45 @@ func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 		})
 	}
 	return s.markFailed(ctx, req, logID, totalAttempts, sendErr)
+}
+
+// resolveTarget 在 req.TargetUserID 非空时把它解析成本次发送的实际 Target（C3
+// 「通知送达到人」）。用独立的只读小事务调用 Resolver，而不是复用 outbox 侧那个
+// 持锁的编排事务——outbox 的四个通知意图接口本就在持锁事务内被调（见包顶注释的
+// 不变量 4：只准 Schedule 一条 notify_send 定时器，禁止同步外部 IO），把"查
+// users 表解析联系方式"这种可能变慢的操作放进那把锁里会拉长持锁时间；挪到 Sender
+// 这一步单开一个短事务，既不占 outbox 的锁，也让"用户查不到联系方式"这类必然失败
+// 提前在这里短路，不用等到后面真正尝试外部 IO。
+//
+// 返回值非 nil 时，调用方（Send）应跳过渠道查找与 sendWithBackoff，直接把返回的
+// error 当作发送失败处理——缺联系方式或解析出错都是"再试也没用"，重试没有意义。
+// 无论解析成功还是失败，req.Target 都会被覆写：成功覆写为解析出的真实地址（幂等键
+// 因此自然带上解析后地址）；失败覆写为 "user:"+TargetUserID 占位（真实地址未知，
+// 但 notification_log.target 和幂等键仍需要一个确定性的值）。
+func (s *Sender) resolveTarget(ctx context.Context, req *SendRequest) error {
+	if req.TargetUserID == "" {
+		return nil
+	}
+	if s.Resolver == nil {
+		req.Target = "user:" + req.TargetUserID
+		return fmt.Errorf("notify: 未配置 ContactResolver，无法把用户 %s 解析为 %s 渠道地址", req.TargetUserID, req.ChannelKind)
+	}
+
+	var addr string
+	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		var resolveErr error
+		addr, resolveErr = s.Resolver.Resolve(ctx, tx, req.TargetUserID, req.ChannelKind)
+		return resolveErr
+	})
+	if err != nil {
+		req.Target = "user:" + req.TargetUserID
+		if errors.Is(err, ErrNoContact) {
+			return fmt.Errorf("notify: 用户缺 %s 渠道联系方式: %w", req.ChannelKind, err)
+		}
+		return fmt.Errorf("notify: 解析用户 %s 的 %s 渠道地址失败: %w", req.TargetUserID, req.ChannelKind, err)
+	}
+	req.Target = addr
+	return nil
 }
 
 // placeholder 占位写入 notification_log。返回既有记录（撞幂等键时）或新建记录的 ID，

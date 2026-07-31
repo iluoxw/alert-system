@@ -22,16 +22,14 @@ import (
 // 领域逻辑。
 const notifySendTimerKind = "notify_send"
 
-// defaultNotifyChannel 是"组通知""重复提醒""人员升级"三类通知意图使用的固定渠道：
-// R6.2 约定飞书是主力渠道。只有渠道升级（notify.Dispatcher）按通知策略配置的
-// channels 逐级切换，不用这个默认值。
-//
-// 已知集成缝隙（已回报 team-lead，不在本任务范围内解决）：四个通知意图接口都不携带
-// "具体联系方式"（如飞书 open_id、邮箱地址）——users 表只有 email 字段，team 没有
-// 渠道联系方式表。装配层的临时口径：人员升级以 OnCallEntry.UserID 作 target；
-// 组通知/重复提醒/渠道升级以 alert.TeamID 作 target。真实接入飞书/邮件发送时需要
-// 补一张团队/用户的渠道联系方式表；E2E 用 mock 渠道断言时以这个临时口径为准。
-const defaultNotifyChannel = "lark"
+// teamNotifyChannel 是"组通知""重复提醒"两类团队维度通知意图使用的固定渠道字面量
+// （R6.2 约定飞书是主力渠道）。这两类意图的 target 是 alert.TeamID/组内共同 TeamID，
+// 不是具体的人，因此不走任务 9 新增的 ContactResolver 到人解析（team 还没有渠道
+// 联系方式表，是已知的后续缺口，不在本任务范围）；只有人员升级（NotifyEscalation）
+// 携带的是具体责任人的 UserID，才走 PersonnelChannel + TargetUserID 解析路径
+// （见 notifyOutbox.personnelChannel）。渠道升级（notify.Dispatcher）按通知策略
+// 配置的 channels 逐级切换，两者都不用这个字面量。
+const teamNotifyChannel = "lark"
 
 // notifyOutboxScheduler 是 notifyOutbox 依赖的定时器子集，由 *scheduler.Scheduler 实现。
 type notifyOutboxScheduler interface {
@@ -55,11 +53,12 @@ type notifyOutboxEngineStarter interface {
 // 或多个 scheduleSend 调用；NotifyGroup 额外承担"首次通知编排"职责（组首时间基准
 // 的渠道升级 + 首个 repeat 定时器 + 人员升级链启动），见该方法注释。
 type notifyOutbox struct {
-	scheduler      notifyOutboxScheduler
-	engine         notifyOutboxEngineStarter
-	chain          notifyOutboxChainStarter
-	repeatInterval time.Duration
-	now            func() time.Time
+	scheduler        notifyOutboxScheduler
+	engine           notifyOutboxEngineStarter
+	chain            notifyOutboxChainStarter
+	repeatInterval   time.Duration
+	personnelChannel string // 到人发送的渠道种类（config.PersonnelChannel，默认 "email"）
+	now              func() time.Time
 }
 
 // scheduleSend 把一个 SendRequest 序列化后注册进 "notify_send" 定时器，fireAt=now，
@@ -97,7 +96,11 @@ func notifySendRefID(req notify.SendRequest) string {
 }
 
 // NotifyEscalation 实现 oncall.Notifier：人员升级链推进到 level 级，给每个目标责任人
-// 各自注册一个发送意图（同一渠道、不同 target），target 用 OnCallEntry.UserID。
+// 各自注册一个发送意图（同一渠道、不同 target），到人发送——ChannelKind 用
+// personnelChannel（config.PersonnelChannel），TargetUserID 触发 Sender.Send 第 0 段
+// 解析出实际渠道地址（任务 9）。Target 仍填 t.UserID（而不是留空或填解析后地址）：
+// notifySendRefID 用它拼定时器 refID，必须是 UserID 这个稳定标识，解析后的地址会
+// 随联系方式变更而变，破坏"同一意图只有一个 in-flight 定时器"的收敛语义。
 func (o *notifyOutbox) NotifyEscalation(ctx context.Context, tx pgx.Tx, alert domain.Alert, level int, targets []oncall.OnCallEntry) error {
 	msg := buildAlertMessage(alert)
 	// round 在本次调用（本次人员升级推进）发生的时刻一次性捕获，随每个 SendRequest
@@ -107,12 +110,13 @@ func (o *notifyOutbox) NotifyEscalation(ctx context.Context, tx pgx.Tx, alert do
 	round := o.now().UnixNano()
 	for _, t := range targets {
 		req := notify.SendRequest{
-			AlertID:     alert.ID,
-			Step:        &level,
-			ChannelKind: defaultNotifyChannel,
-			Target:      t.UserID,
-			Msg:         msg,
-			Round:       round,
+			AlertID:      alert.ID,
+			Step:         &level,
+			ChannelKind:  o.personnelChannel,
+			Target:       t.UserID,
+			TargetUserID: t.UserID,
+			Msg:          msg,
+			Round:        round,
 		}
 		if err := o.scheduleSend(ctx, tx, req); err != nil {
 			return err
@@ -122,7 +126,7 @@ func (o *notifyOutbox) NotifyEscalation(ctx context.Context, tx pgx.Tx, alert do
 }
 
 // NotifyGroup 实现 pipeline.GroupNotifier：组 flush 时（1）发一条固定走
-// defaultNotifyChannel 的"组消息"发送意图，target 用组内告警共同的 TeamID（路由阶段
+// teamNotifyChannel 的"组消息"发送意图，target 用组内告警共同的 TeamID（路由阶段
 // 保证组内告警 TeamID 一致，取第一条即可）；（2）承担"首次通知编排"职责——对组内
 // 每条告警：以组首时间（组内最早 StartsAt）为基准启动渠道升级序列
 // （notify.Engine.Start 的 baseTime 参数正是为这个用途设计的）、用 ScheduleIfAbsent
@@ -145,7 +149,7 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 
 	req := notify.SendRequest{
 		GroupKey:    groupKey,
-		ChannelKind: defaultNotifyChannel,
+		ChannelKind: teamNotifyChannel,
 		Target:      active[0].TeamID,
 		Msg:         buildGroupMessage(groupKey, active),
 		// round 在本次组 flush 的时刻捕获（Bug C 修复）：静默过期后重复事件重新驱动
@@ -185,11 +189,17 @@ func activeAlerts(alerts []domain.Alert) []domain.Alert {
 }
 
 // NotifyRepeat 实现 notify.RepeatNotifier：repeat_interval 到期的重复提醒，固定走
-// defaultNotifyChannel，target 用 alert.TeamID。
+// teamNotifyChannel，target 用 alert.TeamID。
+//
+// 注：接口签名（notify.RepeatNotifier）只携带 domain.Alert，没有具体责任人信息，
+// 无法像 NotifyEscalation 那样解析到人——这与 design.md C3「升级链与 repeat 两处
+// Target: t.UserID 改 TargetUserID」的表述不完全一致，团队维度提醒本任务范围内维持
+// 现状，留待主对话确认是否需要引入"重复提醒也到人"的新语义（需要额外的当前责任人
+// 数据来源，属于设计层决策，不在本任务擅自展开）。
 func (o *notifyOutbox) NotifyRepeat(ctx context.Context, tx pgx.Tx, alert domain.Alert) error {
 	req := notify.SendRequest{
 		AlertID:     alert.ID,
-		ChannelKind: defaultNotifyChannel,
+		ChannelKind: teamNotifyChannel,
 		Target:      alert.TeamID,
 		Msg:         buildAlertMessage(alert),
 		// round 在本次 repeat 定时器触发的时刻捕获：下一轮 repeat 触发时 o.now() 已经

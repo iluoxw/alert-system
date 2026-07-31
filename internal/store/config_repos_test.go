@@ -386,3 +386,210 @@ func TestShiftRepo_ListInWindow(t *testing.T) {
 		t.Fatalf("覆盖 %v 的班次 = %+v, want 恰好 1 条属于 %s", at, covering, userID)
 	}
 }
+
+// TestShiftRepo_GetByID_Update_RoundTrip 验证 GetByID/Update 往返，以及不存在的 id
+// 走既有仓储 ErrNotFound 口径（供编辑班次前置校验复用）。
+func TestShiftRepo_GetByID_Update_RoundTrip(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "sre-core")
+
+	var scheduleID string
+	var alice, bob *User
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		schedules := NewScheduleRepo()
+		sched, err := schedules.Create(ctx, tx, Schedule{TeamID: team.ID, Name: "primary", Timezone: "UTC"})
+		if err != nil {
+			return err
+		}
+		scheduleID = sched.ID
+
+		users := NewUserRepo()
+		alice, err = users.Create(ctx, tx, User{Username: "alice", PasswordHash: "x", DisplayName: "Alice"})
+		if err != nil {
+			return err
+		}
+		bob, err = users.Create(ctx, tx, User{Username: "bob", PasswordHash: "x", DisplayName: "Bob"})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("准备值班数据失败: %v", err)
+	}
+
+	shifts := NewShiftRepo()
+	var created *Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		created, err = shifts.Create(ctx, tx, Shift{
+			ScheduleID: scheduleID,
+			UserID:     alice.ID,
+			StartsAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			EndsAt:     time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("创建班次失败: %v", err)
+	}
+
+	var got *Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = shifts.GetByID(ctx, tx, created.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("GetByID 失败: %v", err)
+	}
+	if got.UserID != alice.ID || !got.StartsAt.Equal(created.StartsAt) || !got.EndsAt.Equal(created.EndsAt) {
+		t.Fatalf("GetByID = %+v, want 与 created 一致", got)
+	}
+
+	updated := *created
+	updated.UserID = bob.ID
+	updated.StartsAt = time.Date(2026, 1, 1, 6, 0, 0, 0, time.UTC)
+	updated.EndsAt = time.Date(2026, 1, 1, 18, 0, 0, 0, time.UTC)
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		return shifts.Update(ctx, tx, updated)
+	})
+	if err != nil {
+		t.Fatalf("Update 失败: %v", err)
+	}
+
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = shifts.GetByID(ctx, tx, created.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Update 后 GetByID 失败: %v", err)
+	}
+	if got.UserID != bob.ID || !got.StartsAt.Equal(updated.StartsAt) || !got.EndsAt.Equal(updated.EndsAt) {
+		t.Fatalf("Update 后 GetByID = %+v, want 与 updated 一致", got)
+	}
+
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		_, err := shifts.GetByID(ctx, tx, "00000000-0000-0000-0000-000000000000")
+		return err
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetByID(不存在 id) err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestShiftRepo_ListOverlapping 验证 ListOverlapping 的半开区间重叠判定：严格相邻不
+// 命中、任意交叠（含完全包含/被包含）命中、excludeID 排除自身供编辑时跳过被编辑的班次。
+func TestShiftRepo_ListOverlapping(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "sre-core")
+
+	var scheduleID, userID string
+	var base *Shift // 基准班次：2026-01-02 00:00 ~ 2026-01-03 00:00
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		schedules := NewScheduleRepo()
+		sched, err := schedules.Create(ctx, tx, Schedule{TeamID: team.ID, Name: "primary", Timezone: "UTC"})
+		if err != nil {
+			return err
+		}
+		scheduleID = sched.ID
+
+		users := NewUserRepo()
+		u, err := users.Create(ctx, tx, User{Username: "alice", PasswordHash: "x", DisplayName: "Alice"})
+		if err != nil {
+			return err
+		}
+		userID = u.ID
+
+		shifts := NewShiftRepo()
+		base, err = shifts.Create(ctx, tx, Shift{
+			ScheduleID: scheduleID,
+			UserID:     userID,
+			StartsAt:   time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+			EndsAt:     time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC),
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("准备值班数据失败: %v", err)
+	}
+
+	shifts := NewShiftRepo()
+
+	// 严格相邻：待判定区间 [2026-01-01 00:00, 2026-01-02 00:00) 的 to 恰好等于
+	// base.StartsAt，不算重叠（允许无缝衔接排班）。
+	var adjacentBefore []Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		adjacentBefore, err = shifts.ListOverlapping(ctx, tx, scheduleID,
+			time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), base.StartsAt, "")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListOverlapping(严格相邻-前) 失败: %v", err)
+	}
+	if len(adjacentBefore) != 0 {
+		t.Fatalf("ListOverlapping(严格相邻-前) = %+v, want 空", adjacentBefore)
+	}
+
+	// 严格相邻：待判定区间 [2026-01-03 00:00, 2026-01-04 00:00) 的 from 恰好等于
+	// base.EndsAt，不算重叠。
+	var adjacentAfter []Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		adjacentAfter, err = shifts.ListOverlapping(ctx, tx, scheduleID,
+			base.EndsAt, time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC), "")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListOverlapping(严格相邻-后) 失败: %v", err)
+	}
+	if len(adjacentAfter) != 0 {
+		t.Fatalf("ListOverlapping(严格相邻-后) = %+v, want 空", adjacentAfter)
+	}
+
+	// 任意交叠：完全包含 base 的更大区间。
+	var containing []Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		containing, err = shifts.ListOverlapping(ctx, tx, scheduleID,
+			time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC), "")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListOverlapping(完全包含 base) 失败: %v", err)
+	}
+	if len(containing) != 1 || containing[0].ID != base.ID {
+		t.Fatalf("ListOverlapping(完全包含 base) = %+v, want 恰好命中 base", containing)
+	}
+
+	// 任意交叠：被 base 完全包含的更小区间。
+	var contained []Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		contained, err = shifts.ListOverlapping(ctx, tx, scheduleID,
+			time.Date(2026, 1, 2, 6, 0, 0, 0, time.UTC), time.Date(2026, 1, 2, 18, 0, 0, 0, time.UTC), "")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListOverlapping(被 base 包含) 失败: %v", err)
+	}
+	if len(contained) != 1 || contained[0].ID != base.ID {
+		t.Fatalf("ListOverlapping(被 base 包含) = %+v, want 恰好命中 base", contained)
+	}
+
+	// excludeID 排除自身：编辑 base 本身时传入其 id，即便区间与自己重叠也不应命中。
+	var excludingSelf []Shift
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		excludingSelf, err = shifts.ListOverlapping(ctx, tx, scheduleID,
+			time.Date(2026, 1, 2, 6, 0, 0, 0, time.UTC), time.Date(2026, 1, 2, 18, 0, 0, 0, time.UTC), base.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("ListOverlapping(excludeID) 失败: %v", err)
+	}
+	if len(excludingSelf) != 0 {
+		t.Fatalf("ListOverlapping(excludeID=base.ID) = %+v, want 空", excludingSelf)
+	}
+}

@@ -1,0 +1,109 @@
+# Requirements Document — serviceability
+
+## Introduction
+
+ops-enhancements 收官后的全局审视发现：引擎层（管道/调度/幂等/事务）已达可服务质量，但**配置运营闭环与通知送达的最后一公里是断的**——一个运营者从 UI 出发无法配置出「真的会通知到人」的告警系统，核心链路目前只能靠 seed 脚本直接写库跑通。本 spec 目标是把系统从「引擎正确的 demo」推进到「真实可提供服务、可用性较好」的状态。
+
+已核实的断点清单（证据为文件:行号）：
+
+- **P0-1 值班班次无法配置**：`shifts` 表存在（000002 迁移，FK 到 users），但 API 层只有 schedule 壳 CRUD（internal/api/config.go:174-178），无任何 shift 端点；前端 Schedules.tsx 仅 59 行无班次编辑。→ oncall 解析恒为空，人员升级链/值班播报生产上全部空转。
+- **P0-2 「通知到人」不存在**：人员升级通知 `Target` 直接填 UserID（internal/app/outbox.go:112），渠道固定 `lark`（outbox.go:34，真发送 HOLD 中）；users 表无「UUID→实际联系方式」映射（outbox.go:30 注释自认欠账）。当前唯一真实可用渠道是 webhook 且仅团队级可配。
+- **P0-3 团队成员管理不可运营**：`team_memberships` 表存在、RBAC middleware 依赖它判 admin，但 API 无成员 CRUD、UI 无成员管理。新用户永远进不了团队（除 seed-admin CLI / 手写 SQL），RBAC 模型形同虚设。
+- **P1-4 UI 裸 UUID**：告警列表团队列/认领人列显示裸 UUID，团队筛选是裸 UUID 输入框；`listTeams` admin-only，member 用户连解析团队名的数据源都没有。
+- **P1-5 值班无轮换规则**：shifts 是显式时段，真实运营需要轮换/批量生成，否则手工录无限班次不可持续。
+- **P2-6 系统自身不可运维**：无 /healthz（实测 404）；timers 已终态行与 notification_log 无保留策略，无限堆积。
+
+根因：MVP 按「引擎优先」切分，验收判据全是任务级正确性（测试绿/E2E 绿），E2E 的成员与班次靠 seed.go 直接写库，从未有过「运营者从零经 UI 配置到收到通知」的旅程判据。本 spec 以该旅程为最终验收。
+
+## Alignment with Product Vision
+
+告警系统的核心价值主张是「把该处理的告警送到该处理的人面前」。引擎已保证「该处理的告警」（归一、去重、路由、分组、静默、升级编排），本 spec 补齐「该处理的人」（成员→值班→联系方式→真实送达）与「运营者可自助配置」两块，是 MVP 变成可服务产品的必要条件，也是后续飞书直连/统一通知网关（HOLD 中）的承接基础——网关到位时只需替换渠道实现，人员解析与配置闭环不必重做。
+
+## Requirements
+
+### Requirement 1 团队成员管理（P0-3）
+
+**User Story:** 作为团队 admin，我要在 UI 上管理团队成员及其角色，使新用户能加入团队、RBAC 真实可运营，而不依赖 CLI 或手写 SQL。
+
+#### Acceptance Criteria
+
+1. WHEN admin 调用成员端点 THEN 系统 SHALL 提供成员的增删改查：列出团队成员（含 username/display_name/角色）、添加成员（指定 user + role ∈ {admin, member}）、变更角色、移除成员；路由归属 `/api/v1/admin/teams/:id/members`，admin only（403 口径与既有一致）。
+2. IF 添加的 user 已是该团队成员 THEN 系统 SHALL 返回 409（与既有唯一冲突口径一致）；user 或 team 不存在返回 404；role 非法返回 422（validationError 中文文案）。
+3. WHEN admin 在「团队」设置页选中团队 THEN UI SHALL 展示成员列表并支持添加（用户下拉选择器，非裸 UUID 输入）、改角色、移除。
+4. WHEN 移除某团队最后一名 admin 角色成员 THEN 系统 SHALL 拒绝（422），避免团队失管；用户被移除后其会话与既有告警数据不受影响（timeline 保留历史 actorName）。
+5. IF 移除/降级操作导致操作者自身失去 admin THEN 系统 SHALL 允许（自降级合法）但 UI SHALL 给出确认提示。
+
+### Requirement 2 值班班次管理（P0-1 + P1-5）
+
+**User Story:** 作为团队 admin，我要在 UI 上给值班表编排班次（含批量轮换生成），使 oncall 解析在生产上真的能找到人。
+
+#### Acceptance Criteria
+
+1. WHEN admin 调用班次端点 THEN 系统 SHALL 提供 schedule 下属班次的增删改查（`/api/v1/admin/schedules/:id/shifts`，admin only）：user + starts_at/ends_at，校验 ends_at > starts_at（422）、user 必须存在（404）。
+2. WHEN admin 使用批量轮换生成 THEN 系统 SHALL 按「成员顺序列表 + 单班时长（如 1 周/1 天）+ 起始时刻 + 生成周期数」一次性生成具体 shift 行（生成期展开，不引入查询期规则求值，oncall.Resolver 不改）；生成前预览、与既有班次时间重叠时明确报 422 并指出冲突区间。
+3. WHEN admin 打开「值班表」设置页某个 schedule THEN UI SHALL 展示未来班次列表（含值班人显示名），支持单班增删改与轮换批量生成表单；人员选择用下拉选择器（数据源为该团队成员，见 R1）。
+4. IF schedule 在某时刻无任何班次覆盖 THEN 既有语义保持不变（解析为空、播报「今日无值班安排」），本 spec 不引入强制全覆盖校验。
+5. WHEN 班次被增删改 THEN 已在途的人员升级定时器 SHALL 保持既有语义（触发时刻重新解析当班人，天然生效，无需额外失效逻辑）——此为现有 Resolver 行为的回归确认项。
+
+### Requirement 3 通知送达到人（P0-2）
+
+**User Story:** 作为值班人，我要真实收到升级/重复提醒通知（而不是系统把我的 UUID 当地址发出去），使告警闭环真正可用。
+
+#### Acceptance Criteria
+
+1. WHEN 系统解析人员通知目标 THEN 发送层 SHALL 把「user 引用」按渠道解析成实际联系方式：为 users 增加结构化联系方式（email 沿用现有列；预留渠道扩展位，如 lark_open_id），SendRequest 的 Target 语义由「裸 UserID」升级为「发送时按渠道解析」；解析失败（该用户缺该渠道联系方式）SHALL 记 notification_log failed 并写 notify_failed 时间线（复用 R3 已交付的时间线链路），不阻塞其他 target。
+2. WHEN 部署配置了 SMTP THEN 系统 SHALL 提供 email 渠道的真实发送（SMTP 配置走 config 与环境变量，凭据不落日志），作为第一个「到人」的真实渠道；未配置 SMTP 时 email 渠道注册但发送报错落 failed（与渠道不可用同口径）。
+3. WHEN 人员升级/重复提醒选择渠道 THEN 默认人员渠道 SHALL 可配置（config 项，默认 email），替换 outbox.go:34 写死的 `lark`；lark 渠道保留注册但真实发送仍 HOLD（等统一通知网关，不在本 spec 范围）。
+4. WHEN admin 创建/编辑用户 THEN UI SHALL 支持维护 email 等联系方式；WHEN 用户被编入班次且缺默认人员渠道的联系方式 THEN UI SHALL 在班次编辑处给出可见警告（不阻塞保存）。
+5. 幂等键口径 SHALL 保持 `资源|step|channel|target|round` 不变，其中 target 为解析后的实际地址；解析动作发生在 notify_send 定时器的发送时刻（outbox 持锁事务内仍只 Schedule、不做同步 IO 与解析查询之外的外部调用）。
+
+### Requirement 4 UI 去 UUID 化与 member 可用性（P1-4）
+
+**User Story:** 作为普通 member，我要在告警列表/详情里看到团队名与人名（而不是 UUID），并能按团队筛选，使日常值班操作可用。
+
+#### Acceptance Criteria
+
+1. WHEN 任何登录用户请求 THEN 系统 SHALL 提供轻量列表端点：`GET /api/v1/teams`（{id,name}）与 `GET /api/v1/users`（{id,display_name}），登录即可（与 ops-settings GET 同鉴权层级）；既有 `/admin/teams`、`/admin/users` 端点与语义不变。
+2. WHEN 告警列表/详情渲染 THEN UI SHALL 把 team_id、acked_by、值班/升级相关的用户引用解析为显示名（前端用轻量端点建 id→name 映射即可，不要求后端改列表响应结构）；团队筛选 SHALL 用下拉选择器替换裸 UUID 输入框。
+3. WHEN member 登录 THEN 告警列表、详情、处置（Ack/Resolve）、静默查看 SHALL 全部可用且不出现因 admin-only 数据源导致的空白或报错；设置区仍整体 admin-only 不变。
+4. 前端各设置页凡引用 user/team 的表单项 SHALL 一律使用下拉选择器（消灭裸 UUID 输入），数据源用轻量端点或既有 admin 端点（admin 页面语境）。
+
+### Requirement 5 系统自身可运维性（P2-6）
+
+**User Story:** 作为部署运维者，我要健康检查与数据保留策略，使系统能被编排平台探活、长期运行不被历史数据拖垮。
+
+#### Acceptance Criteria
+
+1. WHEN 请求 `GET /healthz` THEN 系统 SHALL 无鉴权返回 200（进程存活）；WHEN 请求 `GET /readyz` THEN 系统 SHALL 检查 DB 连通后返回 200/503。
+2. WHEN 系统运行 THEN 系统 SHALL 周期清理已终态数据：timers 中 fired/failed/canceled 且超过保留期（默认 7 天，config 可调）的行、notification_log 超过保留期（默认 90 天）的行；清理走既有 scheduler 定时器机制（新增 kind 须在 internal/app 注册，遵守 handler 不自开事务等全部既有不变量）。
+3. 清理任务 SHALL 分批删除（单批上限，避免长事务锁表），且清理行为写日志（数量级别，不落敏感内容）。
+
+### Requirement 6 旅程验收（最终判据）
+
+**User Story:** 作为产品负责人，我要一条「从零到通知到人」的端到端旅程作为验收判据，防止再次出现「模块各自全绿、全局一串就断」。
+
+#### Acceptance Criteria
+
+1. WHEN 执行新的 E2E 旅程场景 THEN 系统 SHALL 通过：仅经 API（不直接写库）完成——建团队→建用户（含 email）→加成员→建值班表→生成轮换班次→配路由/升级策略→灌 critical 告警→断言值班人的 email 渠道产生真实发送意图且 notification_log 为 sent（E2E 用 mock SMTP/mock 渠道捕获）、时间线出现 notify_sent。
+2. WHEN 全量回归 THEN 既有 452 单测与五场景 E2E SHALL 保持全绿（向后兼容判据）；既有 seed.go 允许改为走新 API 或保持写库，但新旅程场景本身禁止直接写库。
+3. WHEN 手动验收 THEN 真机上 SHALL 能完全通过 UI 完成上述旅程配置侧（不打开 psql、不用 curl 补口子）。
+
+## Non-Functional Requirements
+
+### Code Architecture and Modularity
+- 复用既有分层与模式：store 仓储带 `tx pgx.Tx`、API 层 WithTx、CrudTable/表单既有前端惯例；成员/班次端点沿用 config.go 的 handler 组织方式
+- 渠道联系方式解析设计为独立小接口，飞书/统一网关到位时只增实现不改调用方
+- 轮换生成是纯函数（成员列表+参数→shift 行集合），可单测
+
+### Performance
+- 轻量列表端点仅返回 id/name 字段；清理任务分批执行不产生长事务
+
+### Security
+- 成员/班次管理 admin only（403）；轻量列表端点登录即可但不泄露 email/username 之外的敏感字段（不含 password_hash 等）；SMTP 凭据走 config，不落日志；email 内容沿用既有脱敏约定
+- 保持既有安全约束全部不变（token 哈希存储、验签、bcrypt、会话机制）
+
+### Reliability
+- 通知解析失败不阻塞同轮其他 target；清理任务幂等可重投；所有新增 timer kind 遵守 scheduler 既有事务不变量（handler 不自开事务、markFired 前置、幂等）
+
+### Usability
+- 全站消灭裸 UUID 输入与展示；缺联系方式在班次编辑处前置可见警告；错误一律 422+中文文案口径

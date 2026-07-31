@@ -124,6 +124,22 @@ func (c *fakeChannel) callCount() int {
 	return c.calls
 }
 
+// fakeContactResolver 是 ContactResolver 的可控实现：按 userID 返回预设地址或
+// 预设错误（ErrNoContact 或其他任意错误），用于测试 Sender.resolveTarget 的分支。
+type fakeContactResolver struct {
+	addrByUser map[string]string
+	errByUser  map[string]error
+	calls      int
+}
+
+func (f *fakeContactResolver) Resolve(ctx context.Context, tx pgx.Tx, userID, channelKind string) (string, error) {
+	f.calls++
+	if err, ok := f.errByUser[userID]; ok {
+		return "", err
+	}
+	return f.addrByUser[userID], nil
+}
+
 func newSenderForTest(logs *fakeLogStore, tl *fakeTimeline, ch Channel) *Sender {
 	s := NewSender(fakeTx{}, logs, tl)
 	s.lookup = func(kind string) (Channel, error) {
@@ -435,5 +451,140 @@ func TestSender_GroupFailure_FansOutTimelineAndTruncatesError(t *testing.T) {
 		if len(errText) != 200 {
 			t.Fatalf("期望 detail.error 截断为 200 字符，实际长度 %d", len(errText))
 		}
+	}
+}
+
+// 场景⑪：TargetUserID 非空且 Resolver 解析成功 → 覆写 Target，且 notification_log
+// 的幂等键（进而 GetByIdempotencyKey 的查询键）含解析后地址，而不是原始 UserID（C3）。
+func TestSender_TargetUserID_ResolveSuccess_OverwritesTargetAndIdempotencyKey(t *testing.T) {
+	ch := &fakeChannel{kind: "email"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.Resolver = &fakeContactResolver{addrByUser: map[string]string{"user-1": "alice@example.com"}}
+
+	req := SendRequest{AlertID: "alert-1", ChannelKind: "email", TargetUserID: "user-1", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if got := ch.callCount(); got != 1 {
+		t.Fatalf("期望 Channel.Send 被调用 1 次，实际 %d 次", got)
+	}
+
+	resolvedReq := req
+	resolvedReq.Target = "alice@example.com"
+	entry, getErr := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(resolvedReq))
+	if getErr != nil {
+		t.Fatalf("按解析后地址查询通知记录失败（幂等键未含解析后地址）: %v", getErr)
+	}
+	if entry.Target != "alice@example.com" {
+		t.Fatalf("期望 notification_log.Target=alice@example.com，实际 %q", entry.Target)
+	}
+	if entry.Status != "sent" {
+		t.Fatalf("期望状态为 sent，实际 %q", entry.Status)
+	}
+}
+
+// 场景⑫：Resolver 返回 ErrNoContact → 不进 sendWithBackoff 重试（Channel.Send 不被
+// 调用），notification_log 直接标记 failed，并补一条 notify_failed 时间线。
+func TestSender_TargetUserID_ErrNoContact_MarksFailedWithoutRetry(t *testing.T) {
+	ch := &fakeChannel{kind: "email", fn: func(int) error { return errors.New("不应被调用") }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.MaxAttempts = 3
+	s.Resolver = &fakeContactResolver{errByUser: map[string]error{"user-2": ErrNoContact}}
+
+	req := SendRequest{AlertID: "alert-2", ChannelKind: "email", TargetUserID: "user-2", Round: 1}
+	err := s.Send(context.Background(), req)
+	if err == nil {
+		t.Fatal("期望 Send 返回错误（缺联系方式）")
+	}
+	if !errors.Is(err, ErrNoContact) {
+		t.Fatalf("期望错误链包含 ErrNoContact，实际 %v", err)
+	}
+	if got := ch.callCount(); got != 0 {
+		t.Fatalf("缺联系方式不应重试，期望 Channel.Send 调用 0 次，实际 %d 次", got)
+	}
+
+	placeholderReq := req
+	placeholderReq.Target = "user:user-2"
+	entry, getErr := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(placeholderReq))
+	if getErr != nil {
+		t.Fatalf("查询通知记录失败: %v", getErr)
+	}
+	if entry.Status != "failed" {
+		t.Fatalf("期望状态为 failed，实际 %q", entry.Status)
+	}
+	if got := tl.count(); got != 1 {
+		t.Fatalf("期望写入 1 条时间线记录，实际 %d 条", got)
+	}
+	if tl.entries[0].Action != domain.TimelineActionNotifyFailed {
+		t.Fatalf("期望 Action=notify_failed，实际 %q", tl.entries[0].Action)
+	}
+}
+
+// 场景⑬：TargetUserID 为空时，行为与不加这个字段之前完全一致（回归判据）——不调用
+// Resolver、不改写 Target、正常走原有发送流程。
+func TestSender_TargetUserID_Empty_BehaviorUnchanged(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	resolver := &fakeContactResolver{}
+	s.Resolver = resolver
+
+	req := SendRequest{AlertID: "alert-3", ChannelKind: "webhook", Target: "http://x", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("TargetUserID 为空时不应调用 Resolver，实际调用 %d 次", resolver.calls)
+	}
+	entry, getErr := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(req))
+	if getErr != nil {
+		t.Fatalf("查询通知记录失败: %v", getErr)
+	}
+	if entry.Target != "http://x" {
+		t.Fatalf("期望 Target 保持原样 http://x，实际 %q", entry.Target)
+	}
+	if entry.Status != "sent" {
+		t.Fatalf("期望状态为 sent，实际 %q", entry.Status)
+	}
+}
+
+// 场景⑭：Resolver 返回非 ErrNoContact 的其他错误 → 走既有失败路径（占位 + markFailed +
+// 时间线），同样不重试。
+func TestSender_TargetUserID_ResolverOtherError_FollowsExistingFailurePath(t *testing.T) {
+	dbErr := errors.New("查询用户联系方式超时")
+	ch := &fakeChannel{kind: "email", fn: func(int) error { return errors.New("不应被调用") }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.Resolver = &fakeContactResolver{errByUser: map[string]error{"user-4": dbErr}}
+
+	req := SendRequest{AlertID: "alert-4", ChannelKind: "email", TargetUserID: "user-4", Round: 1}
+	err := s.Send(context.Background(), req)
+	if err == nil {
+		t.Fatal("期望 Send 返回错误")
+	}
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("期望错误链包含原始 resolver 错误，实际 %v", err)
+	}
+	if got := ch.callCount(); got != 0 {
+		t.Fatalf("解析出错不应重试，期望 Channel.Send 调用 0 次，实际 %d 次", got)
+	}
+
+	placeholderReq := req
+	placeholderReq.Target = "user:user-4"
+	entry, getErr := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(placeholderReq))
+	if getErr != nil {
+		t.Fatalf("查询通知记录失败: %v", getErr)
+	}
+	if entry.Status != "failed" {
+		t.Fatalf("期望状态为 failed，实际 %q", entry.Status)
+	}
+	if got := tl.count(); got != 1 {
+		t.Fatalf("期望写入 1 条时间线记录，实际 %d 条", got)
 	}
 }

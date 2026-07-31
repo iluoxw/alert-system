@@ -148,6 +148,7 @@ type User struct {
 	PasswordHash string
 	DisplayName  string
 	Email        string // 可为空字符串（email 列可空）
+	LarkOpenID   string // 可为空字符串（lark_open_id 列可空，迁移 000007 加，渠道联系方式解析用）
 	Enabled      bool
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
@@ -160,16 +161,17 @@ func NewUserRepo() *UserRepo { return &UserRepo{} }
 
 func scanUser(row configRowScanner) (User, error) {
 	var u User
-	var email *string
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &email, &u.Enabled, &u.CreatedAt, &u.UpdatedAt)
+	var email, larkOpenID *string
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &email, &larkOpenID, &u.Enabled, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return User{}, err
 	}
 	u.Email = nullableString(email)
+	u.LarkOpenID = nullableString(larkOpenID)
 	return u, nil
 }
 
-const userColumns = `id, username, password_hash, display_name, email, enabled, created_at, updated_at`
+const userColumns = `id, username, password_hash, display_name, email, lark_open_id, enabled, created_at, updated_at`
 
 func (r *UserRepo) Create(ctx context.Context, tx pgx.Tx, u User) (*User, error) {
 	out, err := scanUser(tx.QueryRow(ctx, `

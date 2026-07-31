@@ -193,3 +193,101 @@ func TestLarkConfig_String_EmptySecretsNotMaskedAsPresent(t *testing.T) {
 		t.Errorf("String() = %q, 空凭据不应显示为已配置（****）", s)
 	}
 }
+
+func TestLoad_SMTPAndRetentionDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	wantSMTP := SMTPConfig{StartTLS: defaultSMTPStartTLS}
+	if cfg.SMTP != wantSMTP {
+		t.Errorf("SMTP = %+v, want %+v", cfg.SMTP, wantSMTP)
+	}
+	if cfg.PersonnelChannel != defaultPersonnelChannel {
+		t.Errorf("PersonnelChannel = %q, want %q", cfg.PersonnelChannel, defaultPersonnelChannel)
+	}
+	wantRetention := RetentionConfig{
+		TimersDays:          defaultRetentionTimersDays,
+		NotificationLogDays: defaultRetentionNotificationLogDays,
+		SweepInterval:       defaultRetentionSweepInterval,
+		BatchSize:           defaultRetentionBatchSize,
+	}
+	if cfg.Retention != wantRetention {
+		t.Errorf("Retention = %+v, want %+v", cfg.Retention, wantRetention)
+	}
+}
+
+func TestLoad_SMTPAndRetentionEnvOverrides(t *testing.T) {
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("SMTP_USERNAME", "alert-bot")
+	t.Setenv("SMTP_PASSWORD", "s3cr3t")
+	t.Setenv("SMTP_FROM", "alert-bot@example.com")
+	t.Setenv("SMTP_STARTTLS", "false")
+	t.Setenv("PERSONNEL_CHANNEL", "lark")
+	t.Setenv("RETENTION_TIMERS_DAYS", "3")
+	t.Setenv("RETENTION_NOTIFICATION_LOG_DAYS", "30")
+	t.Setenv("RETENTION_SWEEP_INTERVAL", "10m")
+	t.Setenv("RETENTION_BATCH_SIZE", "500")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	wantSMTP := SMTPConfig{
+		Host:     "smtp.example.com",
+		Port:     587,
+		Username: "alert-bot",
+		Password: "s3cr3t",
+		From:     "alert-bot@example.com",
+		StartTLS: false,
+	}
+	if cfg.SMTP != wantSMTP {
+		t.Errorf("SMTP = %+v, want %+v", cfg.SMTP, wantSMTP)
+	}
+	if cfg.PersonnelChannel != "lark" {
+		t.Errorf("PersonnelChannel = %q, want %q", cfg.PersonnelChannel, "lark")
+	}
+	wantRetention := RetentionConfig{
+		TimersDays:          3,
+		NotificationLogDays: 30,
+		SweepInterval:       10 * time.Minute,
+		BatchSize:           500,
+	}
+	if cfg.Retention != wantRetention {
+		t.Errorf("Retention = %+v, want %+v", cfg.Retention, wantRetention)
+	}
+}
+
+// SMTPConfig.String() 是硬约束的关键防线：Password 一旦被 %v/%s 打印整个结构体，
+// 绝不能把密码原文带出去（与 LarkConfig.String 同一防线）。
+func TestSMTPConfig_String_MasksPassword(t *testing.T) {
+	s := SMTPConfig{
+		Host:     "smtp.example.com",
+		Port:     587,
+		Username: "alert-bot",
+		Password: "super-secret-password",
+		From:     "alert-bot@example.com",
+		StartTLS: true,
+	}.String()
+
+	if strings.Contains(s, "super-secret-password") {
+		t.Errorf("String() = %q, 泄露了密码原文", s)
+	}
+	if !strings.Contains(s, "****") {
+		t.Errorf("String() = %q, 期望包含掩码占位符 ****", s)
+	}
+	for _, visible := range []string{"smtp.example.com", "alert-bot", "alert-bot@example.com"} {
+		if !strings.Contains(s, visible) {
+			t.Errorf("String() = %q, 应保留非敏感字段 %q", s, visible)
+		}
+	}
+}
+
+func TestSMTPConfig_String_EmptyPasswordNotMaskedAsPresent(t *testing.T) {
+	s := SMTPConfig{Host: "smtp.example.com"}.String()
+	if strings.Contains(s, "****") {
+		t.Errorf("String() = %q, 空密码不应显示为已配置（****）", s)
+	}
+}

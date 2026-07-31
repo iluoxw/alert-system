@@ -3,12 +3,16 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // alertDTO 是 GET /api/v1/alerts、/api/v1/alerts/:id 响应里 alert 部分用得到的字段
@@ -176,4 +180,69 @@ func mustJSON(v any) []byte {
 		panic(fmt.Sprintf("e2e: 序列化测试 payload 失败: %v", err))
 	}
 	return b
+}
+
+// adminCreate 是任务 16 旅程场景专用的 POST /api/v1/admin/... helper：状态码非
+// wantStatus 直接 t.Fatalf，成功时把响应体解到 map 供调用方取 id 等字段。既有五场景
+// 各自只调用一两次 admin 创建端点，直接内联 client.doJSON+状态检查即可；旅程场景要
+// 连续创建 team/user/member/schedule/shifts-generate/route/escalation-policy 七种
+// 资源，抽出这个 helper 避免七次几乎相同的样板代码。
+func adminCreate(t *testing.T, client *apiClient, path string, body map[string]any, wantStatus int) map[string]any {
+	t.Helper()
+	var resp map[string]any
+	status, raw, err := client.doJSON(http.MethodPost, path, body, &resp)
+	if err != nil {
+		t.Fatalf("e2e: POST %s 失败: %v", path, err)
+	}
+	if status != wantStatus {
+		t.Fatalf("e2e: POST %s 响应非 %d，status=%d body=%s", path, wantStatus, status, raw)
+	}
+	return resp
+}
+
+// notificationLogSent 直接查 notification_log 表（只读断言，不写库）：返回指定
+// alert_id + channel 下 status=sent 记录的 target 与 idempotency_key。这条记录由
+// notify.Sender.Send 在外部 IO 成功后回写，比"mock 渠道收到过调用"多验证一层
+// "发送状态确实落库为 sent"，是任务 16 断言链路里独立于 mockChannel 的第二重证据。
+func notificationLogSent(t *testing.T, alertID, channel string) (target, idempotencyKey string, found bool) {
+	t.Helper()
+	err := sys.Store.Pool.QueryRow(context.Background(),
+		`SELECT target, idempotency_key FROM notification_log WHERE alert_id = $1 AND channel = $2 AND status = 'sent' LIMIT 1`,
+		alertID, channel).Scan(&target, &idempotencyKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false
+	}
+	if err != nil {
+		t.Fatalf("e2e: 查询 notification_log 失败: %v", err)
+	}
+	return target, idempotencyKey, true
+}
+
+// timelineHasNotifySentToEmail 查 timeline_entries 表（只读断言）：是否存在给定
+// 告警的 notify_sent 条目，且 detail.target 呈邮箱形态（含 "@"）。时间线里的 target
+// 经 notify.maskTarget 脱敏（如 a***@example.com），这里只需确认"看得出是邮箱"，
+// 不要求逐字节匹配真实地址——脱敏正是 R6.4 要求的行为，不是缺陷。
+func timelineHasNotifySentToEmail(t *testing.T, alertID string) bool {
+	t.Helper()
+	rows, err := sys.Store.Pool.Query(context.Background(),
+		`SELECT detail->>'target' FROM timeline_entries WHERE alert_id = $1 AND action = 'notify_sent'`,
+		alertID)
+	if err != nil {
+		t.Fatalf("e2e: 查询 timeline_entries 失败: %v", err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			t.Fatalf("e2e: 扫描 timeline_entries 失败: %v", err)
+		}
+		if strings.Contains(target, "@") {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("e2e: 遍历 timeline_entries 失败: %v", err)
+	}
+	return found
 }

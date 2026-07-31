@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/serviceability/tasks.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T04:40:31.697Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785472831693_ybogtkmxn",
+      "approvalTitle": "serviceability 任务清单审批"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T05:19:28.739Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785472831693_ybogtkmxn",
+      "approvalTitle": "serviceability 任务清单审批"
+    }
+  ]
+}

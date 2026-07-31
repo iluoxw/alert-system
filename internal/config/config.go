@@ -27,6 +27,19 @@ const (
 	// defaultRepeatInterval 是 R6.5 重复提醒的默认周期（MVP 阶段尚未按路由配置化，
 	// 由 main 装配统一注入 notify.LifecycleHandlers，见该类型构造函数文档）。
 	defaultRepeatInterval = 30 * time.Minute
+
+	// defaultSMTPStartTLS 默认开启，与 SessionCookieSecure 同样的"默认从严、本地联调显式关闭"取舍。
+	defaultSMTPStartTLS = true
+
+	// defaultPersonnelChannel 是人员到人通知的默认渠道（R3：email 是首个真实到人渠道）。
+	defaultPersonnelChannel = "email"
+
+	// 保留策略默认值（R5）：timers 保留 7 天、notification_log 保留 90 天，
+	// 清理任务每小时对账一次，每批最多删 1000 行（防长事务锁表）。
+	defaultRetentionTimersDays          = 7
+	defaultRetentionNotificationLogDays = 90
+	defaultRetentionSweepInterval       = time.Hour
+	defaultRetentionBatchSize           = 1000
 )
 
 // Config 是服务启动所需的全部配置项。
@@ -41,6 +54,35 @@ type Config struct {
 	SessionCookieSecure bool          // session cookie 的 Secure 标志，本地 http 联调可关闭
 
 	RepeatInterval time.Duration // R6.5 重复提醒周期，main 装配注入 notify.LifecycleHandlers
+
+	SMTP             SMTPConfig      // R3 email 渠道凭据
+	PersonnelChannel string          // R3 人员到人通知的默认渠道，默认 "email"
+	Retention        RetentionConfig // R5 timers/notification_log 数据保留策略
+}
+
+// SMTPConfig 是 email 通知渠道（R3）所需的 SMTP 凭据配置。Host 为空表示未配置，
+// 渠道仍照常注册，发送时返回"SMTP 未配置"错误，走既有 markFailed 链路。
+type SMTPConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	From     string
+	StartTLS bool
+}
+
+// String 实现 fmt.Stringer：Password 是凭据，脱敏原则与 LarkConfig.String 一致。
+func (s SMTPConfig) String() string {
+	return fmt.Sprintf("SMTPConfig{Host:%q, Port:%d, Username:%q, Password:%s, From:%q, StartTLS:%t}",
+		s.Host, s.Port, s.Username, maskSecret(s.Password), s.From, s.StartTLS)
+}
+
+// RetentionConfig 是 R5 数据保留清理任务（retention_sweep timer）的策略配置。
+type RetentionConfig struct {
+	TimersDays          int           // timers 表：终态（fired/failed/canceled）且早于此天数的行会被清理
+	NotificationLogDays int           // notification_log 表：早于此天数的行会被清理
+	SweepInterval       time.Duration // 无积压时的对账周期
+	BatchSize           int           // 单批 DELETE 的最大行数
 }
 
 // LarkConfig 是飞书开放平台凭据配置（R6.2/R6.4 飞书渠道与回调验签）。
@@ -82,6 +124,26 @@ type fileConfig struct {
 	SessionCookieSecure bool   `yaml:"session_cookie_secure"`
 
 	RepeatInterval string `yaml:"repeat_interval"`
+
+	SMTP             fileSMTPConfig      `yaml:"smtp"`
+	PersonnelChannel string              `yaml:"personnel_channel"`
+	Retention        fileRetentionConfig `yaml:"retention"`
+}
+
+type fileSMTPConfig struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	From     string `yaml:"from"`
+	StartTLS bool   `yaml:"start_tls"`
+}
+
+type fileRetentionConfig struct {
+	TimersDays          int    `yaml:"timers_days"`
+	NotificationLogDays int    `yaml:"notification_log_days"`
+	SweepInterval       string `yaml:"sweep_interval"`
+	BatchSize           int    `yaml:"batch_size"`
 }
 
 type fileLarkConfig struct {
@@ -102,6 +164,16 @@ func Load(path string) (Config, error) {
 		SessionIdleTTL:        defaultSessionIdleTTL.String(),
 		SessionCookieSecure:   defaultSessionCookieSecure,
 		RepeatInterval:        defaultRepeatInterval.String(),
+		SMTP: fileSMTPConfig{
+			StartTLS: defaultSMTPStartTLS,
+		},
+		PersonnelChannel: defaultPersonnelChannel,
+		Retention: fileRetentionConfig{
+			TimersDays:          defaultRetentionTimersDays,
+			NotificationLogDays: defaultRetentionNotificationLogDays,
+			SweepInterval:       defaultRetentionSweepInterval.String(),
+			BatchSize:           defaultRetentionBatchSize,
+		},
 	}
 
 	if path != "" {
@@ -136,6 +208,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid repeat_interval %q: %w", fc.RepeatInterval, err)
 	}
+	retentionSweepInterval, err := time.ParseDuration(fc.Retention.SweepInterval)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid retention.sweep_interval %q: %w", fc.Retention.SweepInterval, err)
+	}
 
 	return Config{
 		HTTPPort:              fc.HTTPPort,
@@ -151,6 +227,21 @@ func Load(path string) (Config, error) {
 		SessionIdleTTL:      sessionIdleTTL,
 		SessionCookieSecure: fc.SessionCookieSecure,
 		RepeatInterval:      repeatInterval,
+		SMTP: SMTPConfig{
+			Host:     fc.SMTP.Host,
+			Port:     fc.SMTP.Port,
+			Username: fc.SMTP.Username,
+			Password: fc.SMTP.Password,
+			From:     fc.SMTP.From,
+			StartTLS: fc.SMTP.StartTLS,
+		},
+		PersonnelChannel: fc.PersonnelChannel,
+		Retention: RetentionConfig{
+			TimersDays:          fc.Retention.TimersDays,
+			NotificationLogDays: fc.Retention.NotificationLogDays,
+			SweepInterval:       retentionSweepInterval,
+			BatchSize:           fc.Retention.BatchSize,
+		},
 	}, nil
 }
 
@@ -192,5 +283,48 @@ func applyEnvOverrides(fc *fileConfig) {
 	}
 	if v := os.Getenv("REPEAT_INTERVAL"); v != "" {
 		fc.RepeatInterval = v
+	}
+	if v := os.Getenv("SMTP_HOST"); v != "" {
+		fc.SMTP.Host = v
+	}
+	if v := os.Getenv("SMTP_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			fc.SMTP.Port = p
+		}
+	}
+	if v := os.Getenv("SMTP_USERNAME"); v != "" {
+		fc.SMTP.Username = v
+	}
+	if v := os.Getenv("SMTP_PASSWORD"); v != "" {
+		fc.SMTP.Password = v
+	}
+	if v := os.Getenv("SMTP_FROM"); v != "" {
+		fc.SMTP.From = v
+	}
+	if v := os.Getenv("SMTP_STARTTLS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			fc.SMTP.StartTLS = b
+		}
+	}
+	if v := os.Getenv("PERSONNEL_CHANNEL"); v != "" {
+		fc.PersonnelChannel = v
+	}
+	if v := os.Getenv("RETENTION_TIMERS_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			fc.Retention.TimersDays = n
+		}
+	}
+	if v := os.Getenv("RETENTION_NOTIFICATION_LOG_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			fc.Retention.NotificationLogDays = n
+		}
+	}
+	if v := os.Getenv("RETENTION_SWEEP_INTERVAL"); v != "" {
+		fc.Retention.SweepInterval = v
+	}
+	if v := os.Getenv("RETENTION_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			fc.Retention.BatchSize = n
+		}
 	}
 }

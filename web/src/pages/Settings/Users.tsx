@@ -66,8 +66,8 @@ export function Users() {
           <Form.Item name="display_name" label="显示名" rules={[{ required: true, message: '请输入显示名' }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="email" label="邮箱">
-            <Input />
+          <Form.Item name="email" label="邮箱" rules={[{ type: 'email', message: '邮箱格式不正确' }]}>
+            <Input placeholder="留空表示暂无邮箱联系方式" />
           </Form.Item>
           <Form.Item name="enabled" label="启用" valuePropName="checked" initialValue={true}>
             <Switch />

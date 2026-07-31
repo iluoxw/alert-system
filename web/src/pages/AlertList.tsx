@@ -14,7 +14,8 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import { PlusOutlined, MinusCircleOutlined } from '@ant-design/icons'
 import type { Alert, Severity, Status } from '../api/client'
-import { listAlerts, logout } from '../api/client'
+import { listAlerts, listTeamsLite, logout } from '../api/client'
+import { teamsLiteQueryKey, useNameMaps } from '../hooks/useNameMaps'
 
 const { Title } = Typography
 
@@ -72,6 +73,13 @@ function labelsToRecord(rows: LabelFilterRow[]): Record<string, string> | undefi
 export function AlertList() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { teamName, userName } = useNameMaps()
+
+  // 团队筛选 Select 的数据源：queryKey 与 useNameMaps 内部一致，共享缓存不重复请求。
+  const { data: teamsData } = useQuery({
+    queryKey: teamsLiteQueryKey,
+    queryFn: async () => (await listTeamsLite()).teams,
+  })
 
   const [pending, setPending] = useState<FilterState>(emptyFilter)
   const [applied, setApplied] = useState<FilterState>(emptyFilter)
@@ -153,7 +161,7 @@ export function AlertList() {
       dataIndex: 'team_id',
       key: 'team_id',
       width: 140,
-      render: (teamId?: string) => teamId || '-',
+      render: (teamId?: string) => teamName(teamId),
     },
     { title: '来源', dataIndex: 'source', key: 'source', width: 120 },
     {
@@ -161,7 +169,7 @@ export function AlertList() {
       dataIndex: 'acked_by',
       key: 'acked_by',
       width: 100,
-      render: (v?: string) => v || '-',
+      render: (v?: string) => userName(v),
     },
     {
       title: '最近出现',
@@ -207,11 +215,15 @@ export function AlertList() {
               { value: 'resolved', label: '已恢复' },
             ]}
           />
-          <Input
-            placeholder="team_id（UUID）"
+          <Select
+            allowClear
+            showSearch
+            placeholder="团队"
             style={{ width: 220 }}
-            value={pending.teamId}
-            onChange={(e) => setPending((prev) => ({ ...prev, teamId: e.target.value }))}
+            value={pending.teamId || undefined}
+            onChange={(v) => setPending((prev) => ({ ...prev, teamId: v ?? '' }))}
+            options={(teamsData ?? []).map((t) => ({ value: t.id, label: t.name }))}
+            optionFilterProp="label"
           />
         </Space>
 

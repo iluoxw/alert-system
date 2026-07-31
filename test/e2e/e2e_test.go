@@ -55,6 +55,10 @@ func runTestMain(m *testing.M) (int, error) {
 		SessionIdleTTL:        time.Hour,
 		SessionCookieSecure:   false,
 		RepeatInterval:        4 * time.Second,
+		// PersonnelChannel 不走 config.Load()，struct 字面量必须显式给，否则零值 ""
+		// 会让 userContactResolver.Resolve 的 channelKind switch 落进 default 分支报错
+		// （任务 9：人员升级到人发送依赖这个字段，与生产 config.Load() 的默认值 "email" 对齐）。
+		PersonnelChannel: "email",
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))

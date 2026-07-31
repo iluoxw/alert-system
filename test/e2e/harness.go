@@ -124,6 +124,10 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterMemberRoutes(teams, users, memberships)
+	router.RegisterShiftRoutes(schedules, users, shifts)
+	router.RegisterDirectoryRoutes(teams, users)
+	router.RegisterHealthRoutes(st.Pool.Ping)
 	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)

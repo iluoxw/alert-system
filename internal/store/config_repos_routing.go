@@ -298,6 +298,66 @@ func (r *ShiftRepo) Create(ctx context.Context, tx pgx.Tx, s Shift) (*Shift, err
 	return &out, nil
 }
 
+func (r *ShiftRepo) GetByID(ctx context.Context, tx pgx.Tx, id string) (*Shift, error) {
+	out, err := scanShift(tx.QueryRow(ctx, `SELECT `+shiftColumns+` FROM shifts WHERE id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询班次失败: %w", err)
+	}
+	return &out, nil
+}
+
+func (r *ShiftRepo) Update(ctx context.Context, tx pgx.Tx, s Shift) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE shifts SET user_id = $2, starts_at = $3, ends_at = $4 WHERE id = $1
+	`, s.ID, s.UserID, s.StartsAt, s.EndsAt)
+	if err != nil {
+		return fmt.Errorf("store: 更新班次失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListOverlapping 返回同一 schedule 下与 [from, to) 有重叠的班次，供编辑/新建班次前
+// 校验值班表内班次互不重叠（半开区间语义：starts_at < to AND ends_at > from——
+// 严格相邻，即一条的 ends_at 恰好等于另一条的 starts_at，不算重叠，允许无缝衔接排班）。
+// excludeID 非空时排除该 id，供编辑现有班次时排除自身。
+func (r *ShiftRepo) ListOverlapping(ctx context.Context, tx pgx.Tx, scheduleID string, from, to time.Time, excludeID string) ([]Shift, error) {
+	// excludeID 传空串时以 NULL 绑定：id 列是 uuid，若直接绑定 ""，Postgres 会把
+	// $4 参数类型推断为 uuid（因 id != $4 那处比较），导致 "" 触发非法 uuid 报错。
+	var excludeArg any
+	if excludeID != "" {
+		excludeArg = excludeID
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT `+shiftColumns+`
+		FROM shifts
+		WHERE schedule_id = $1 AND starts_at < $3 AND ends_at > $2 AND ($4::uuid IS NULL OR id != $4)
+		ORDER BY starts_at
+	`, scheduleID, from, to, excludeArg)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询重叠班次失败: %w", err)
+	}
+	defer rows.Close()
+
+	var shifts []Shift
+	for rows.Next() {
+		s, err := scanShift(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: 扫描班次失败: %w", err)
+		}
+		shifts = append(shifts, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历重叠班次失败: %w", err)
+	}
+	return shifts, nil
+}
+
 // ListInWindow 返回与 [from, to) 有重叠的班次（起止区间求交），按开始时间升序，
 // 供值班求值（Resolver.OnCallAt）在应用层挑出覆盖具体时刻的那一条。
 func (r *ShiftRepo) ListInWindow(ctx context.Context, tx pgx.Tx, scheduleID string, from, to time.Time, limit int) ([]Shift, error) {

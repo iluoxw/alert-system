@@ -80,15 +80,19 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched := scheduler.New(st, cfg.SchedulerPollInterval)
 
 	sender := notify.NewSender(st, repos.NotificationLogs, repos.Timeline)
+	// 任务 9：到人发送在 Sender.Send 第 0 段解析 TargetUserID -> 实际渠道地址，
+	// 具体解析实现见下方 userContactResolver（基于 UserRepo 的薄适配器）。
+	sender.Resolver = userContactResolver{users: repos.Users}
 
 	// outbox 依赖 chain/engine，chain/engine 又依赖 outbox 作为通知意图的实现——
 	// 用零值字段构造 outbox 打破这个环：NotifyEscalation/NotifyRepeat/DispatchStep
 	// 不 touch o.engine/o.chain，真正用到它们的 NotifyGroup 要到 pipeline 起转后才会
 	// 被调用，那时 engine/chain 已经赋值完毕。
 	outbox := &notifyOutbox{
-		scheduler:      sched,
-		repeatInterval: cfg.RepeatInterval,
-		now:            time.Now,
+		scheduler:        sched,
+		repeatInterval:   cfg.RepeatInterval,
+		personnelChannel: cfg.PersonnelChannel,
+		now:              time.Now,
 	}
 
 	resolver := oncall.NewResolver(repos.Schedules, repos.Shifts)
@@ -133,8 +137,11 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 		dedupStage, routeStage, groupStage, silenceStage, inhibitStage,
 	})
 
-	// ---- 六个既有 scheduler kind + 三个 ops kind 全部在这里绑定；未注册的 kind
-	// 到期会被标 failed 不重试，新增 kind 务必在此登记全（CLAUDE.md 不变量 2）----
+	// ---- 全局单例的数据保留清理任务（C5，第十个 kind）----
+	retention := newRetentionHandler(sched, cfg.Retention)
+
+	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep 全部在这里绑定；
+	// 未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此登记全（CLAUDE.md 不变量 2）----
 	sched.RegisterHandler(notify.TimerKindAlertTTL, lifecycle.HandleTTL)
 	sched.RegisterHandler(notify.TimerKindAlertRepeat, lifecycle.HandleRepeat)
 	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
@@ -144,6 +151,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched.RegisterHandler(ops.TimerKindDailyReport, opsHandlers.HandleDailyReport)
 	sched.RegisterHandler(ops.TimerKindStaleSweep, opsHandlers.HandleStaleSweep)
 	sched.RegisterHandler(ops.TimerKindOncallBroadcast, opsHandlers.HandleOncallBroadcast)
+	sched.RegisterHandler(TimerKindRetentionSweep, retention.Handle)
 
 	return &App{
 		Scheduler: sched,
@@ -257,6 +265,38 @@ func (a opsOncallResolver) ResolveOnCallNames(ctx context.Context, tx pgx.Tx, te
 	return names, nil
 }
 
+// userContactResolver 把 *store.UserRepo 适配成 notify.ContactResolver（任务 9）：
+// email 渠道取 users.email，lark 渠道取 users.lark_open_id；对应字段为空、用户不存在
+// 或渠道种类未知都归 notify.ErrNoContact——对发送层而言三种情况同样是"解析不出地址"，
+// 不需要区分原因（用户不存在多半是脏引用/已删除账号，与"没填联系方式"处理口径一致）。
+type userContactResolver struct {
+	users *store.UserRepo
+}
+
+func (r userContactResolver) Resolve(ctx context.Context, tx pgx.Tx, userID, channelKind string) (string, error) {
+	u, err := r.users.GetByID(ctx, tx, userID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", notify.ErrNoContact
+	}
+	if err != nil {
+		return "", fmt.Errorf("app: 查询用户联系方式失败(user=%s): %w", userID, err)
+	}
+
+	var addr string
+	switch channelKind {
+	case "email":
+		addr = u.Email
+	case "lark":
+		addr = u.LarkOpenID
+	default:
+		return "", fmt.Errorf("app: 不支持解析渠道 %q 的用户联系方式", channelKind)
+	}
+	if addr == "" {
+		return "", notify.ErrNoContact
+	}
+	return addr, nil
+}
+
 // ReconcileOpsTimers 是启动对账的入口（design.md R2）：扫描 team_ops_settings 里
 // 任一周期任务开关为 true 的团队，对每个启用任务 ScheduleIfAbsent 补建 pending
 // 定时器。用 ScheduleIfAbsent 而非 Schedule 是关键——已有 pending 行的 (kind,
@@ -302,6 +342,21 @@ func ReconcileOpsTimers(ctx context.Context, st *store.Store, opsRepo *store.Ops
 					return fmt.Errorf("app: 对账 ops 定时器失败(team=%s kind=%s): %w", s.TeamID, task.kind, err)
 				}
 			}
+		}
+		return nil
+	})
+}
+
+// ReconcileRetentionTimer 是 retention_sweep 的启动对账入口（design.md C5），与
+// ReconcileOpsTimers 同一模式：用 ScheduleIfAbsent 而非 Schedule，已存在 pending
+// 记录时不打断正在倒计时的清理任务，只在从未注册过（首次上线、或运维误清过
+// timers 表）时补建一条。retention_sweep 是全局单例任务（固定 refID="global"），
+// 不像 ops 三个 kind 那样需要按团队枚举 settings，因此不需要查表，直接对账即可。
+func ReconcileRetentionTimer(ctx context.Context, st *store.Store, sched *scheduler.Scheduler, cfg config.RetentionConfig) error {
+	return st.WithTx(ctx, func(tx pgx.Tx) error {
+		fireAt := time.Now().Add(cfg.SweepInterval)
+		if _, err := sched.ScheduleIfAbsent(ctx, tx, TimerKindRetentionSweep, retentionSweepRefID, fireAt, nil); err != nil {
+			return fmt.Errorf("app: 对账 retention_sweep 定时器失败: %w", err)
 		}
 		return nil
 	})

@@ -141,6 +141,10 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterMemberRoutes(teams, users, memberships)
+	router.RegisterShiftRoutes(schedules, users, shifts)
+	router.RegisterDirectoryRoutes(teams, users)
+	router.RegisterHealthRoutes(st.Pool.Ping)
 	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
 
 	httpServer := &http.Server{
@@ -168,12 +172,15 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	return httpServer.Shutdown(shutdownCtx)
 }
 
-// registerNotifyChannels 注册生产环境的通知渠道（R6.2 飞书为主力渠道 + webhook）。
-// E2E 测试不调用这个函数，改用 test/e2e/mock_channel.go 的 mockChannel 顶替同名 kind
-// （notify.Register 对同 kind 是覆盖语义）。
+// registerNotifyChannels 注册生产环境的通知渠道（R6.2 飞书为主力渠道 + webhook + 任务 9
+// 新增的 email——第一个真正"到人"的渠道）。E2E 测试不调用这个函数，改用
+// test/e2e/mock_channel.go 的 mockChannel 顶替同名 kind（notify.Register 对同 kind 是
+// 覆盖语义）。cfg.SMTP.Host 为空时 EmailChannel 仍正常注册，Send 时返回
+// notify.ErrSMTPNotConfigured（走既有 markFailed 链路，不是启动期报错）。
 func registerNotifyChannels(cfg config.Config) {
 	notify.Register(notify.NewLarkChannel(cfg.Lark.AppID, cfg.Lark.AppSecret))
 	notify.Register(notify.NewWebhookChannel(notify.DefaultWebhookTimeout))
+	notify.Register(notify.NewEmailChannel(cfg.SMTP.Host, cfg.SMTP.Port, cfg.SMTP.Username, cfg.SMTP.Password, cfg.SMTP.From, cfg.SMTP.StartTLS))
 }
 
 // maskDSN 隐去 DSN 中的密码部分，避免敏感信息落日志（NFR-Security）。

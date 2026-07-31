@@ -69,12 +69,16 @@ export interface LoginResponse {
 }
 
 // ApiError 携带 HTTP 状态码与后端 {"error": "..."} 里的文案，供调用方展示。
+// details 对应少数端点（如 internal/api/shifts.go 的时段冲突）额外返回的
+// {"details": [...]} 数组，多数端点不带该字段，调用方按需断言其形状。
 export class ApiError extends Error {
   status: number
+  details?: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: unknown) {
     super(message)
     this.status = status
+    this.details = details
   }
 }
 
@@ -102,13 +106,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     let message = `请求失败（${res.status}）`
+    let details: unknown
     try {
-      const body = (await res.json()) as { error?: string }
+      const body = (await res.json()) as { error?: string; details?: unknown }
       if (body.error) message = body.error
+      details = body.details
     } catch {
       // 响应体不是 JSON（如 204 或网络层错误页）时保留默认文案
     }
-    throw new ApiError(res.status, message)
+    throw new ApiError(res.status, message, details)
   }
 
   if (res.status === 204) {
@@ -158,6 +164,33 @@ function withQuery(params: Record<string, string | number | undefined>): string 
   }
   const qs = usp.toString()
   return qs ? `?${qs}` : ''
+}
+
+// ============================================================
+// 目录（轻量，internal/api/directory.go，serviceability C4/R4）
+// ============================================================
+//
+// 对接 GET /api/v1/teams、/api/v1/users：登录即可访问（无需 admin），响应字段
+// 就 id + name/display_name 两个（后端硬字段白名单），供 useNameMaps 把告警
+// 列表/详情里裸露的 team_id/acked_by 等 UUID 解析成可读名字。与下方 /admin/teams、
+// /admin/users（TeamRequest/User 全量字段，仅 admin 可见）是两套不同用途的端点，
+// 不要混用。
+
+export interface TeamLite {
+  id: string
+  name: string
+}
+
+export interface UserLite {
+  id: string
+  display_name: string
+}
+
+export function listTeamsLite(limit?: number): Promise<{ teams: TeamLite[] }> {
+  return request(`/teams${withQuery({ limit })}`)
+}
+export function listUsersLite(limit?: number): Promise<{ users: UserLite[] }> {
+  return request(`/users${withQuery({ limit })}`)
 }
 
 // ============================================================
@@ -274,6 +307,41 @@ export function updateTeam(id: string, body: TeamRequest): Promise<void> {
 }
 export function deleteTeam(id: string): Promise<void> {
   return request(`/admin/teams/${id}`, { method: 'DELETE' })
+}
+
+// ---- team members ----
+//
+// 对接 internal/api/members.go（团队成员管理四端点，R1 最后 admin 护栏）：全部
+// admin only。移除/降级团队最后一名 admin 后端返回 422 中文提示；重复添加同一
+// 成员返回 409；role 非法返回 422——统一走 ApiError.message 展示，不在前端重复
+// 这些判断（自降级/自移除的二次确认是前端独有的 UX 职责，见 Teams.tsx）。
+
+export interface Member {
+  user_id: string
+  username: string
+  display_name: string
+  role: 'admin' | 'member'
+}
+
+export interface AddMemberRequest {
+  user_id: string
+  role: 'admin' | 'member'
+}
+
+export function listTeamMembers(teamId: string): Promise<{ members: Member[] }> {
+  return request(`/admin/teams/${teamId}/members`)
+}
+export function addTeamMember(teamId: string, body: AddMemberRequest): Promise<Member> {
+  return request(`/admin/teams/${teamId}/members`, { method: 'POST', body: JSON.stringify(body) })
+}
+export function updateTeamMemberRole(teamId: string, userId: string, role: 'admin' | 'member'): Promise<Member> {
+  return request(`/admin/teams/${teamId}/members/${userId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ role }),
+  })
+}
+export function removeTeamMember(teamId: string, userId: string): Promise<void> {
+  return request(`/admin/teams/${teamId}/members/${userId}`, { method: 'DELETE' })
 }
 
 // ---- team ops settings ----
@@ -430,6 +498,63 @@ export function updateSchedule(id: string, body: ScheduleRequest): Promise<void>
 }
 export function deleteSchedule(id: string): Promise<void> {
   return request(`/admin/schedules/${id}`, { method: 'DELETE' })
+}
+
+// ---- shifts ----
+//
+// 对应 internal/api/shifts.go（任务 6，R2 班次管理 + 轮换生成）：schedule 下属
+// 班次 CRUD + 基于 oncall.GenerateRotation 的批量生成。GET 不带 from/to 时后端
+// 默认返回 now~now+90d 窗口。时段冲突返回 422，冲突明细走 ApiError.details（形状
+// 即 ShiftConflictDetail[]），不是普通 error 文案，调用方需专门处理 status===422
+// 且 details 非空的情况（见 Schedules.tsx conflictLines）。
+//
+// id 设为可选：generate 端点 dry_run=true 时返回的预览条目没有 id（尚未落库），
+// 与落库后的响应共用同一个 Shift 类型，使预览表格与正式列表能复用同一套渲染
+// （硬约束：预览与落库复用同一渲染组件）。
+
+export interface Shift {
+  id?: string
+  user_id: string
+  user_display_name: string
+  starts_at: string
+  ends_at: string
+}
+
+export interface ShiftRequest {
+  user_id: string
+  starts_at: string
+  ends_at: string
+}
+
+export interface ShiftConflictDetail {
+  shift_id: string
+  user_display_name: string
+  starts_at: string
+  ends_at: string
+}
+
+export interface GenerateShiftsRequest {
+  user_ids: string[]
+  shift_duration_seconds: number
+  starts_at: string
+  rounds: number
+  dry_run: boolean
+}
+
+export function listShifts(scheduleId: string, params?: { from?: string; to?: string }): Promise<{ shifts: Shift[] }> {
+  return request(`/admin/schedules/${scheduleId}/shifts${withQuery({ from: params?.from, to: params?.to })}`)
+}
+export function createShift(scheduleId: string, body: ShiftRequest): Promise<Shift> {
+  return request(`/admin/schedules/${scheduleId}/shifts`, { method: 'POST', body: JSON.stringify(body) })
+}
+export function updateShift(scheduleId: string, shiftId: string, body: ShiftRequest): Promise<Shift> {
+  return request(`/admin/schedules/${scheduleId}/shifts/${shiftId}`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+export function deleteShift(scheduleId: string, shiftId: string): Promise<void> {
+  return request(`/admin/schedules/${scheduleId}/shifts/${shiftId}`, { method: 'DELETE' })
+}
+export function generateShifts(scheduleId: string, body: GenerateShiftsRequest): Promise<{ shifts: Shift[] }> {
+  return request(`/admin/schedules/${scheduleId}/shifts/generate`, { method: 'POST', body: JSON.stringify(body) })
 }
 
 // ---- escalation policies ----

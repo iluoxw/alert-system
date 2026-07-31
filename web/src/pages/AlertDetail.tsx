@@ -19,6 +19,7 @@ import {
 import { ArrowLeftOutlined, CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import type { Severity, Status, TimelineAction } from '../api/client'
 import { ApiError, ackAlert, getAlertDetail, handoffAlert, resolveAlert } from '../api/client'
+import { useNameMaps } from '../hooks/useNameMaps'
 
 const { Title, Text } = Typography
 
@@ -91,10 +92,25 @@ function renderNotifyDetail(action: 'notify_sent' | 'notify_failed', detail: Not
   )
 }
 
+// handoff 的 detail.from/to 与 acked_by 同源（见 domain.Handoff：target 写入
+// alerts.acked_by），走同一套 userName 映射；target 允许是团队标识等非 UUID
+// 自由文本时，userName 查不到会退回其前 8 位——与 acked_by 卡片的退化口径一致，
+// 不是本处新引入的缺口。
+function renderHandoffDetail(detail: { from?: string; to?: string } | undefined, userName: (id?: string | null) => string) {
+  const from = detail?.from ? userName(detail.from) : '无'
+  const to = detail?.to ? userName(detail.to) : '无'
+  return (
+    <Text type="secondary">
+      {from} → {to}
+    </Text>
+  )
+}
+
 export function AlertDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { teamName, userName } = useNameMaps()
   const [messageApi, contextHolder] = message.useMessage()
   const [handoffOpen, setHandoffOpen] = useState(false)
   const [handoffTarget, setHandoffTarget] = useState('')
@@ -187,9 +203,9 @@ export function AlertDetail() {
 
           <Descriptions size="small" column={2} bordered>
             <Descriptions.Item label="来源">{alert.source}</Descriptions.Item>
-            <Descriptions.Item label="团队">{alert.team_id || '-'}</Descriptions.Item>
+            <Descriptions.Item label="团队">{teamName(alert.team_id)}</Descriptions.Item>
             <Descriptions.Item label="去重计数">{alert.dedup_count}</Descriptions.Item>
-            <Descriptions.Item label="认领人">{alert.acked_by || '-'}</Descriptions.Item>
+            <Descriptions.Item label="认领人">{userName(alert.acked_by)}</Descriptions.Item>
             <Descriptions.Item label="首次出现">{new Date(alert.starts_at).toLocaleString()}</Descriptions.Item>
             <Descriptions.Item label="最近出现">{new Date(alert.last_seen_at).toLocaleString()}</Descriptions.Item>
             <Descriptions.Item label="资源" span={2}>
@@ -261,6 +277,8 @@ export function AlertDetail() {
                   <Text type="secondary">{new Date(entry.at).toLocaleString()}</Text>
                   {entry.action === 'notify_sent' || entry.action === 'notify_failed' ? (
                     renderNotifyDetail(entry.action, (entry.detail ?? {}) as NotifyDetail)
+                  ) : entry.action === 'handoff' ? (
+                    renderHandoffDetail(entry.detail as { from?: string; to?: string } | undefined, userName)
                   ) : (
                     entry.detail &&
                     Object.keys(entry.detail).length > 0 && (

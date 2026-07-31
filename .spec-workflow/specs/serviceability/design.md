@@ -1,0 +1,216 @@
+# Design Document
+
+## Overview
+
+本设计实现 serviceability 六项需求：R1 团队成员管理、R2 值班班次管理（含轮换批量生成）、R3 通知送达到人（email 首个真实到人渠道）、R4 UI 去 UUID 化与 member 可用性、R5 健康检查与数据保留、R6「从零到通知到人」旅程验收。
+
+核心思路仍是**零新基建**：R1/R2 是 store 仓储补方法 + 沿 config.go 模式加 admin 端点 + 既有设置页扩展；R3 不改 outbox 事务模型与幂等键口径，只把「Target 装 UserID」升级为「发送时按渠道解析」，解析点选在 `Sender.Send` 内部（它本就自管小事务、在 scheduler 持锁事务之外执行，见 outbox.go:296 的 notifySendPayloadHandler 注释）；R4 是两个只读轻量端点 + 前端 id→name 映射；R5 的清理任务是第十个 timer kind，完全复用 scheduler 既有机制。唯一的新外部交互是 SMTP（标准库 `net/smtp`，不加依赖）。
+
+关键取舍（requirements 已批准，此处落实为机制）：
+- **轮换生成期展开**：`GenerateRotation` 纯函数把「成员列表+单班时长+起始+周期数」展开成具体 shift 行落库，`oncall.Resolver` 零改动；不引入查询期规则求值。
+- **email 为默认人员渠道**：`defaultNotifyChannel = "lark"`（outbox.go:34）改为 config 注入，默认 `email`；lark 渠道保留注册、真实发送仍 HOLD。
+- **幂等键口径不变**：`资源|step|channel|target|round`，target 为解析后的实际地址；解析失败的 failed 记录用 `user:<uuid>` 占位形式入键。
+
+## Steering Document Alignment
+
+### Technical Standards（无 steering/tech.md，以项目 CLAUDE.md 核心不变量为准）
+
+- **不变量 2（timer kind 注册）**：新增 `retention_sweep` 一个 kind，在 `internal/app/app.go` 与既有九个 kind 同处注册 handler。
+- **不变量 3（scheduler 事务模型）**：retention handler 签名 `func(ctx, tx, refID, payload)`，绝不自开事务；分批 DELETE 幂等（重复删除天然无害）；自续期靠「markFired 前置后同事务 INSERT 新 pending 行」既有语义。
+- **不变量 4（outbox）**：四个通知意图接口的实现不动——本 spec 不新增意图接口；改动只在意图构造（Target→TargetUserID）与发送侧（Sender.Send 解析）。持锁事务内仍只 Schedule、不做同步外部 IO；联系方式解析发生在 Sender.Send 自己的小事务里（scheduler 事务之外），不违反该不变量。
+- **不变量 6/7（处置幂等、actor 双参数）**：不涉及，回归保持。
+- **安全约束**：SMTP 凭据走 config 且 `String()` 掩码（沿 LarkConfig/DSN 先例）；轻量端点不泄露 email/username/password_hash；成员/班次端点 admin only 403；email 内容复用既有 `mask.go` 脱敏约定。
+
+### Project Structure
+
+- store 新方法全部带 `tx pgx.Tx`；API 新文件 `members.go`/`shifts.go`/`directory.go` 沿 config.go 的 handler 组织（结构体方法 + WithTx + validationError 中文文案）；轮换生成纯函数放 `internal/oncall/rotation.go`（与 resolver 同包，无 IO 可单测）；email 渠道 `internal/notify/channel_email.go`（与 channel_webhook.go/channel_lark.go 平级）；迁移 `000007` 顺延。
+
+## Code Reuse Analysis
+
+### Existing Components to Leverage
+
+- **`store.MembershipRepo`**（memberships.go，现仅 `IsAdminAnyTeam`）：R1 在同文件补 `ListByTeam`/`Add`/`UpdateRole`/`Remove`/`CountAdmins`，表结构 `team_memberships` 已在（000002）。
+- **`store.ShiftRepo`**（config_repos_routing.go，现有 `Create`/`ListInWindow`/`Delete`）：R2 补 `GetByID`/`Update`/`ListOverlapping`；`shifts` 表已在（000002，FK users + CHECK ends_at > starts_at）。
+- **`oncall.Resolver.OnCallAt`**：零改动——生成期展开后班次就是普通 shift 行，解析、播报、升级链全部天然生效（R2.5 回归确认项）。
+- **`notify.Sender`**：解析点。Send 已是「placeholder 小事务 → 事务外 HTTP+退避 → 结果小事务」三段式，解析作为第 0 段插入（只读小查询），失败直接走既有 `markFailed` + `appendResultTimeline`（R3 时间线链路复用，notify_failed 已有）。
+- **`notify.Channel` 注册表**（channel.go:46 Register，同 kind 覆盖）：email 渠道注册进去即被 Sender/Validate/E2E mock 替换机制全部接住；E2E 用既有 `test/e2e/mock_channel.go` 的 `newMockChannel("email")` 顶替，零新机制。
+- **`internal/app/outbox.go`**：`defaultNotifyChannel` 改为 Options 注入；`Target: t.UserID` 改填新字段 `TargetUserID`；timers refID 业务元组继续用 UserID（稳定标识，pending 收敛不受地址变更影响）。
+- **`scheduler` + `ReconcileOpsTimers` 模式**（app.go:272）：retention_sweep 启动对账用同样的 ScheduleIfAbsent 思路（单条全局 timer，refID="global"）。
+- **`internal/config`**：加 `SMTPConfig` 与 `PersonnelChannel`/保留期字段，沿既有「文件 + 环境变量覆盖 + String() 掩码」模式。
+- **web 既有惯例**：Teams.tsx/Schedules.tsx 扩展沿 CrudTable+Modal 或 TeamOpsSettings 的表单页模式；AlertList/AlertDetail 的 React Query 数据流不变，只加 id→name 映射层。
+
+### Integration Points
+
+- **users 表**：迁移 000007 加 `lark_open_id TEXT NULL`（渠道扩展预留位）；email 沿用现有可空列。不加新表。
+- **team_memberships / shifts 表**：零 schema 改动，纯补 API/UI。
+- **timers / notification_log 表**：retention_sweep 按 status+时间条件分批 DELETE；notification_log 按 created_at。
+- **`/healthz` `/readyz`**：挂 gin engine 根（server.go mount()，不进 authed 分组），readyz 依赖注入一个 `ping func(ctx) error`（main 装配传 pool.Ping）。
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph 配置侧（admin UI → API → store）
+        UI1[Teams.tsx 成员抽屉] --> M[api/members.go]
+        UI2[Schedules.tsx 班次+轮换] --> S[api/shifts.go]
+        S --> ROT[oncall.GenerateRotation 纯函数]
+        M --> MR[store.MembershipRepo]
+        S --> SR[store.ShiftRepo]
+    end
+    subgraph 通知侧（意图 → 发送）
+        OB[outbox 意图: TargetUserID] -->|Schedule notify_send| T[(timers)]
+        T --> H[notifySendPayloadHandler]
+        H --> SND[Sender.Send]
+        SND -->|第0段: 解析| CR[ContactResolver: userID+kind→地址]
+        CR -->|成功: Target=地址| KEY[幂等键 含解析后地址]
+        CR -->|ErrNoContact| FAIL[markFailed + notify_failed 时间线]
+        KEY --> CH[Channel: email/webhook/lark]
+    end
+    UI3[AlertList/Detail] -->|GET /teams /users 轻量| DIR[api/directory.go]
+```
+
+人员数据流：R1 让成员进团队 → R2 让成员进班次 → oncall 解析出 UserID → outbox 以 TargetUserID 表达意图 → Sender 发送时经 ContactResolver 解析成 email 地址 → email 渠道真实送达。每一环都是既有机制的最小扩展。
+
+## Components and Interfaces
+
+### C1 成员管理端点与仓储（R1）
+
+- **Purpose:** 团队成员增删改查 + 最后 admin 护栏。
+- **Interfaces:**
+  - `GET /api/v1/admin/teams/:id/members` → `{members:[{user_id, username, display_name, role}]}`（join users）
+  - `POST /api/v1/admin/teams/:id/members` body `{user_id, role}` → 201；已存在 409；user/team 不存在 404；role ∉ {admin,member} 422
+  - `PATCH /api/v1/admin/teams/:id/members/:userID` body `{role}`；`DELETE .../members/:userID` → 204
+  - store：`ListByTeam(ctx, tx, teamID)`、`Add(ctx, tx, teamID, userID, role)`、`UpdateRole(...)`、`Remove(...)`、`CountAdmins(ctx, tx, teamID) (int, error)`
+- **护栏语义:** 移除成员或将 admin 降级为 member 前，同一事务内查 `CountAdmins`；若操作对象是该团队最后一名 admin → 422「不能移除/降级团队最后一名管理员」。自降级合法（服务端不特判操作者），确认提示由 UI 承担（Modal.confirm 文案「你将失去该团队的管理员权限」，判定条件：被操作 userID === 当前登录用户且从 admin 降级/移除）。
+- **Dependencies:** requireAdmin 中间件、TeamRepo.GetByID / UserRepo.GetByID（404 判定）。
+- **Reuses:** config.go 的 handler 组织、409/404/422 口径、team_memberships 唯一约束。
+
+### C2 班次管理与轮换生成（R2）
+
+- **Purpose:** schedule 下属班次 CRUD + 批量轮换生成（预览/落库两步）。
+- **Interfaces:**
+  - `GET /api/v1/admin/schedules/:id/shifts?from=&to=`（默认 from=now、to=now+90d，复用 ListInWindow）→ 含 user display_name（join）
+  - `POST .../shifts` body `{user_id, starts_at, ends_at}`；`PATCH .../shifts/:shiftID`；`DELETE .../shifts/:shiftID`
+  - `POST /api/v1/admin/schedules/:id/shifts/generate` body `{user_ids:[有序], shift_duration_seconds, starts_at, rounds, dry_run}`：dry_run=true 只返回预览行（不落库、不校验重叠之外的冲突）；dry_run=false 整体重叠校验通过后单事务批量 INSERT。
+  - 纯函数：`oncall.GenerateRotation(userIDs []string, start time.Time, shiftDur time.Duration, rounds int) []RotationShift`——按序循环分配，产出 `{UserID, StartsAt, EndsAt}` 连续时段列表；参数校验（空成员/时长≤0/rounds≤0 或超上限）返回错误。生成上限：`rounds×len(userIDs) ≤ 1000` 行（防误操作灌库）。
+  - store：`ShiftRepo.ListOverlapping(ctx, tx, scheduleID string, from, to time.Time, excludeID string) ([]Shift, error)`（`starts_at < to AND ends_at > from`）。
+- **重叠语义:** 单班创建/编辑与批量落库都做重叠校验，422 响应 details 列出每个冲突区间 `{shift_id, user_display_name, starts_at, ends_at}`（R2.2「指出冲突区间」）。同一 schedule 内不允许时段重叠（MVP 语义：一个时刻一个当班人；多人同时值班留给未来 layer 概念，不在本 spec）。
+- **Dependencies:** requireAdmin、UserRepo（user 存在性 404）、ScheduleRepo（schedule 存在性 404）。
+- **Reuses:** shifts 表 CHECK 约束、ListInWindow、config.go 端点模式。
+
+### C3 通知送达到人（R3）
+
+- **Purpose:** user 引用 → 渠道实际地址的发送时解析 + email 真实渠道 + 默认人员渠道 config 化。
+- **Interfaces:**
+  - `notify.SendRequest` 加字段 `TargetUserID string`（json `target_user_id,omitempty`）。约定：非空 ⇒ 到人发送，Send 时解析并覆写 `Target`；为空 ⇒ 现行为完全不变。旧 payload 反序列化零值天然兼容（升级期在途 timer 不断链——旧行为是把 UserID 当 Target 发给 lark 渠道，本就 HOLD 不真发）。
+  - `notify.ContactResolver` 接口（notify 包定义，app 装配注入 Sender）：
+    ```go
+    type ContactResolver interface {
+        // Resolve 把 userID 按渠道 kind 解析成实际地址（email→users.email，
+        // lark→users.lark_open_id）。缺联系方式返回 ErrNoContact（哨兵）。
+        Resolve(ctx context.Context, tx pgx.Tx, userID, channelKind string) (string, error)
+    }
+    ```
+    实现放 internal/app（基于 UserRepo 的薄适配器），未来统一通知网关到位时只换实现不改 Sender——满足「独立小接口」的 NFR。
+  - `Sender.Send` 第 0 段：`req.TargetUserID != ""` 时在一个只读小事务里 Resolve；成功则 `req.Target = 地址` 后流程照旧（幂等键此时含解析后地址）；`ErrNoContact` 则 `req.Target = "user:"+UserID` 占位，直接走 markFailed（status=failed，error「用户缺 `kind` 渠道联系方式」）+ notify_failed 时间线，**不重试**（永久失败，退避无意义），不影响同轮其他 target（本就逐 target 独立 timer）。
+  - email 渠道 `channel_email.go`：`Kind()="email"`，`net/smtp` + PLAIN auth + STARTTLS（可配关闭，供本地 mailhog 类调试）；主题 `[severity] 告警标题`，正文纯文本复用 Message 既有字段与 mask 脱敏。未配置 SMTP host 时渠道照常注册，Send 返回「SMTP 未配置」错误 → 既有 markFailed 链路（与渠道不可用同口径）。
+  - config：`SMTPConfig{Host, Port, Username, Password, From, StartTLS}`（env：SMTP_HOST/SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM/SMTP_STARTTLS），`String()` 掩码 Password；`PersonnelChannel string` 默认 `"email"`（env：PERSONNEL_CHANNEL）。
+  - outbox：`defaultNotifyChannel` 常量删除，改 Options 字段注入 PersonnelChannel；人员意图构造处 `Target: t.UserID` → `TargetUserID: t.UserID`（升级链与 repeat 两处）；timers refID 元组的 target 分量继续用 UserID。
+- **Dependencies:** users 表（000007 加 lark_open_id）、UserRepo.GetByID。
+- **Reuses:** Sender 三段式结构、markFailed/appendResultTimeline、Channel 注册表、mask.go。
+
+### C4 轻量目录端点与前端去 UUID（R4）
+
+- **Purpose:** 登录级 id→name 数据源 + 前端解析显示。
+- **Interfaces:**
+  - `internal/api/directory.go`：`GET /api/v1/teams` → `{teams:[{id,name}]}`；`GET /api/v1/users` → `{users:[{id,display_name}]}`。挂 authed 分组（sessionAuth，无 requireAdmin），复用 TeamRepo.List/UserRepo.List 但只序列化两个字段（不含 email/username/enabled）。
+  - 前端 `client.ts`：`listTeamsLite()`/`listUsersLite()`；新 hook `useNameMaps()`（React Query，staleTime 5min，返回 `teamName(id)`/`userName(id)` 查不到回退显示 UUID 前 8 位）。
+  - AlertList：团队列/认领人列经映射渲染；团队筛选改 Select（数据源 listTeamsLite，allowClear）。AlertDetail：acked_by、时间线中 user 引用同样映射。
+  - 设置页扫尾：凡 user/team 引用的表单项一律 Select（admin 语境用既有 /admin 端点）；已知点：TeamOpsSettings 渠道 target 保持 Input（团队级渠道地址本就是字面量，不是 user 引用）。
+- **Reuses:** 既有 listTeams/listUsers admin 端点不动；sessionAuth 中间件。
+
+### C5 健康检查与数据保留（R5）
+
+- **Purpose:** 探活/就绪端点 + timers/notification_log 保留清理。
+- **Interfaces:**
+  - server.go mount()：`engine.GET("/healthz", ...)` 恒 200 `{"status":"ok"}`；`engine.GET("/readyz", ...)` 调注入的 `ready func(ctx) error`（main 传 `pool.Ping`），nil→200、err→503（错误文案不含 DSN）。挂 engine 根（与 /callbacks/lark/card 同层，豁免鉴权）。
+  - retention timer kind `retention_sweep`，refID `"global"`，单条自续期。handler（internal/app 新文件 retention.go）：
+    - 同事务内两条分批 DELETE：`DELETE FROM timers WHERE id IN (SELECT id FROM timers WHERE status IN ('fired','failed','canceled') AND fire_at < now()-保留期 LIMIT 批量)`；notification_log 按 `created_at < now()-保留期` 同法。
+    - 续期：任一表删满一批 ⇒ 1 分钟后再 fire（积压快速消化）；否则按 SweepInterval（默认 1h）。
+    - 日志记两表删除行数（数量级别，无内容）。
+  - config：`RetentionConfig{TimersDays=7, NotificationLogDays=90, SweepInterval=1h, BatchSize=1000}`（env 可覆盖）。
+  - 启动对账：app 装配后 `ScheduleIfAbsent`（沿 ReconcileOpsTimers 模式，同一入口或并列函数）。
+- **不变量遵守:** handler 不自开事务；DELETE 幂等；批量上限防长事务锁表（NFR）；`retention_sweep` 的续期 INSERT 依赖 markFired 前置语义（与 ops 三 kind 完全同构）。
+
+### C6 旅程 E2E（R6）
+
+- **Purpose:** 「从零到通知到人」端到端判据。
+- **设计:** test/e2e 新场景（journey）：`newMockChannel("email")` 顶替 email 渠道 → 仅经 API：登录 admin → 建团队 → 建用户（含 email）→ 加成员 → 建 schedule → `shifts/generate` 轮换生成 → 配路由 + 升级策略 → ingest 灌 critical 告警 → 断言 mock email 渠道收到发送（target=该用户 email 地址而非 UUID）、notification_log status=sent 且幂等键含解析后地址、时间线出现 notify_sent。种子 admin 沿用既有 harness 初始化方式（旅程场景断言链路上禁止直接写库；admin 自举属 harness 前置，与 R6.2 一致）。
+- **Reuses:** 既有 e2e harness（internal/app 共享装配）、mock_channel.go、秒级配置压缩时钟。
+
+## Data Models
+
+### 迁移 000007_contacts.up.sql
+
+```sql
+-- 渠道扩展预留位：统一通知网关/飞书直连到位时 ContactResolver 直接可用，无需再迁移
+ALTER TABLE users ADD COLUMN lark_open_id TEXT;
+```
+
+（email 沿用 000002 既有可空列；down 迁移 DROP COLUMN。）
+
+### API 模型（新增/变更）
+
+```
+Member        { user_id: uuid, username: string, display_name: string, role: "admin"|"member" }
+ShiftView     { id: uuid, user_id: uuid, user_display_name: string, starts_at: RFC3339, ends_at: RFC3339 }
+GenerateReq   { user_ids: uuid[有序], shift_duration_seconds: int>0, starts_at: RFC3339, rounds: int>0, dry_run: bool }
+GenerateResp  { shifts: ShiftView[](dry_run 预览或落库结果), conflicts?: 冲突区间[]（仅 422 details） }
+TeamLite      { id: uuid, name: string }          // GET /api/v1/teams
+UserLite      { id: uuid, display_name: string }  // GET /api/v1/users
+```
+
+### Go 结构（新增/变更要点）
+
+```
+notify.SendRequest        + TargetUserID string `json:"target_user_id,omitempty"`
+notify.ContactResolver    interface { Resolve(ctx, tx, userID, kind) (string, error) }；var ErrNoContact
+oncall.RotationShift      { UserID string; StartsAt, EndsAt time.Time }
+config.SMTPConfig         { Host, Port, Username, Password, From string; StartTLS bool }
+config.Config             + SMTP SMTPConfig; PersonnelChannel string; Retention RetentionConfig
+config.RetentionConfig    { TimersDays, NotificationLogDays int; SweepInterval time.Duration; BatchSize int }
+```
+
+## Error Handling
+
+### Error Scenarios
+
+1. **添加已存在成员 / 重复班次生成落库时序竞争:** 唯一约束冲突 → 409（既有口径）；generate 落库事务内重叠校验 + 约束兜底。用户看到「该用户已是团队成员」/ 冲突区间列表。
+2. **移除/降级最后一名 admin:** 同事务 CountAdmins 判定 → 422「不能移除（降级）团队最后一名管理员」。UI 弹错误消息，操作不生效。
+3. **班次时段重叠:** 422，details 携带冲突区间数组；前端在生成预览/编辑表单处逐条展示冲突班次与时段。
+4. **发送时用户缺联系方式:** `ErrNoContact` → notification_log failed（target=`user:<uuid>` 占位，error 中文说明）+ notify_failed 时间线，不重试、不阻塞同轮其他 target。运营者在告警时间线可见失败原因；班次编辑处已有前置警告（R3.4，admin 端点 email 为空判定）。
+5. **SMTP 未配置/发送失败:** 渠道 Send 返回错误 → 既有退避重试 → 最终 markFailed + notify_failed 时间线。凭据不出现在任何错误文案与日志。
+6. **DB 不可达:** `/readyz` 503（编排平台摘流量）；`/healthz` 仍 200（进程活着，不触发无谓重启）。
+7. **retention 单批超时/失败:** per-timer 事务回滚 → 标 failed；下一轮对账/手动恢复不丢语义（删除幂等）。批量上限保证单事务体量可控。
+
+## Testing Strategy
+
+### Unit Testing
+
+- `oncall.GenerateRotation`：常规轮换、单成员、rounds 上限、跨 DST/时区（time.Time 直接运算，无本地时区依赖）、参数非法。
+- 成员护栏：CountAdmins 判定逻辑（含「降级即最后 admin」「移除非 admin 不触发」分支）。
+- `ContactResolver` app 适配器 + `Sender.Send` 解析段：解析成功覆写 Target 且幂等键含地址、ErrNoContact 走 failed 不重试、TargetUserID 为空零行为变化（回归）。
+- `channel_email.go`：报文构造（主题/收件人/脱敏）单测；SMTP 交互用本地 net.Listener 假 SMTP 或接口抽象，不出网。
+- config：SMTP env 覆盖、String() 掩码、PersonnelChannel/Retention 默认值。
+
+### Integration Testing（testcontainers，//go:build integration）
+
+- MembershipRepo 新方法：CRUD、唯一冲突、CountAdmins、join 字段。
+- ShiftRepo：Update/GetByID/ListOverlapping 边界（相邻不算重叠：`ends_at = 下一班 starts_at` 合法）。
+- retention handler：造过期/未过期 timers 与 notification_log 行，验证只删终态+过期、续期行存在、批满快速续期。
+
+### End-to-End Testing
+
+- **新旅程场景（R6）**：见 C6，纯 API、mock email 渠道断言真实地址送达。
+- **既有五场景 + 452 单测回归全绿**（R6.2 向后兼容判据）。
+- **真机手动验收（R6.3）**：纯 UI 完成配置侧旅程（成员→班次→路由→策略），团队/人员处处显示名、无裸 UUID 输入。

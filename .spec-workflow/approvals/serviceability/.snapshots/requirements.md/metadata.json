@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/serviceability/requirements.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T04:17:05.946Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785471425943_56ys89r8f",
+      "approvalTitle": "serviceability 需求文档：配置闭环+通知到人+可运维性"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T04:17:45.552Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785471425943_56ys89r8f",
+      "approvalTitle": "serviceability 需求文档：配置闭环+通知到人+可运维性"
+    }
+  ]
+}

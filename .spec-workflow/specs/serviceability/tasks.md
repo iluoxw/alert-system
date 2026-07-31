@@ -1,0 +1,167 @@
+# Tasks Document — serviceability
+
+任务全局约束（每个任务的 Restrictions 默认包含，不再重复）：禁改 `.spec-workflow/`、禁 git 操作、禁改 go.mod/package.json 依赖（除非主对话明确授权）；中文注释解释「为什么」；`go build ./... && go vet ./...` 零错误；遵守 CLAUDE.md 全部核心不变量与安全约束。
+
+- [x] 1. 迁移 000007 与 config 扩展（SMTP/人员渠道/保留策略）
+  - File: migrations/000007_contacts.up.sql、migrations/000007_contacts.down.sql、internal/config/config.go、internal/config/config_test.go
+  - users 表加 `lark_open_id TEXT NULL`（渠道扩展预留位，down 迁移 DROP COLUMN）
+  - Config 加 `SMTP SMTPConfig{Host,Port,Username,Password,From string; StartTLS bool}`、`PersonnelChannel string`（默认 "email"）、`Retention RetentionConfig{TimersDays=7, NotificationLogDays=90, SweepInterval=1h, BatchSize=1000}`；env 覆盖：SMTP_HOST/SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM/SMTP_STARTTLS/PERSONNEL_CHANNEL/RETENTION_TIMERS_DAYS/RETENTION_NOTIFICATION_LOG_DAYS/RETENTION_SWEEP_INTERVAL/RETENTION_BATCH_SIZE
+  - SMTPConfig 实现 `String()` 掩码 Password（沿 LarkConfig 先例）
+  - Purpose: 为 R3/R5 提供 schema 与配置基座
+  - _Leverage: migrations/000006_ops.up.sql（编号与风格）、internal/config/config.go 的 LarkConfig 掩码与 env 覆盖模式_
+  - _Requirements: 3.1, 3.2, 3.3, 5.2_
+  - _Prompt: Role: Go 后端工程师（配置与数据库迁移） | Task: 按 design.md「Data Models」与 C3/C5 落实迁移 000007 与 config 扩展——users 加 lark_open_id 列；Config 新增 SMTPConfig/PersonnelChannel/RetentionConfig 三块，含默认值、env 覆盖与 Password 掩码，补 config_test 覆盖默认值/覆盖/掩码 | Restrictions: 迁移只加列不动既有数据；掩码不得泄露任何凭据片段；不改既有配置字段语义 | Success: 迁移可 up/down 往返；config 单测覆盖新字段默认值、env 覆盖、String() 掩码；go build/vet 零错误_
+
+- [x] 2. store：MembershipRepo 成员管理方法
+  - File: internal/store/memberships.go、internal/store/memberships_test.go
+  - 补 `ListByTeam(ctx, tx, teamID) ([]Member, error)`（join users 取 username/display_name）、`Add(ctx, tx, teamID, userID, role) error`、`UpdateRole(...) error`、`Remove(...) error`、`CountAdmins(ctx, tx, teamID) (int, error)`
+  - 集成测试（//go:build integration）：CRUD、唯一冲突（重复 Add）、CountAdmins、join 字段正确性
+  - Purpose: R1 成员管理的数据层
+  - _Leverage: internal/store/memberships.go 既有 IsAdminAnyTeam、config_repos.go 的 scanner/错误口径、config_repos_test.go 的 testcontainers 模式_
+  - _Requirements: 1.1, 1.2, 1.4_
+  - _Prompt: Role: Go 后端工程师（pgx 仓储层） | Task: 按 design.md C1 在 MembershipRepo 上补五个方法（全部带 tx pgx.Tx 参数，事务由调用方开），Member 视图 join users 返回 username/display_name/role，配 integration 集成测试 | Restrictions: 不自开事务；唯一冲突返回可被 API 层识别为 409 的错误（沿既有 store 错误口径）；不改 team_memberships schema | Success: 五方法与测试全过（-tags=integration -race）；join 字段正确；重复 Add 冲突可识别_
+
+- [x] 3. store：ShiftRepo 补班次方法
+  - File: internal/store/config_repos_routing.go、internal/store/config_repos_test.go
+  - 补 `GetByID(ctx, tx, id) (*Shift, error)`、`Update(ctx, tx, s Shift) error`、`ListOverlapping(ctx, tx, scheduleID string, from, to time.Time, excludeID string) ([]Shift, error)`（条件 `starts_at < to AND ends_at > from`，excludeID 供编辑时排除自身）
+  - 集成测试：Update/GetByID、ListOverlapping 边界——相邻不算重叠（ends_at == 下一班 starts_at 合法）
+  - Purpose: R2 班次管理的数据层
+  - _Leverage: internal/store/config_repos_routing.go 既有 Create/ListInWindow/Delete 与 scanShift_
+  - _Requirements: 2.1, 2.2_
+  - _Prompt: Role: Go 后端工程师（pgx 仓储层） | Task: 按 design.md C2 补 ShiftRepo 三方法与集成测试，重点验证 ListOverlapping 的开闭区间语义（严格相邻合法、任意交叠命中、excludeID 排除自身） | Restrictions: 不自开事务；不改 shifts schema（CHECK 约束已在）；查询走 schedule_id 条件避免全表 | Success: 三方法与边界测试全过（-tags=integration -race）_
+
+- [x] 4. oncall：GenerateRotation 轮换生成纯函数
+  - File: internal/oncall/rotation.go、internal/oncall/rotation_test.go
+  - `GenerateRotation(userIDs []string, start time.Time, shiftDur time.Duration, rounds int) ([]RotationShift, error)`：按序循环分配连续时段；`RotationShift{UserID string; StartsAt, EndsAt time.Time}`
+  - 参数校验返回错误:空成员、`shiftDur <= 0`、`rounds <= 0`、`rounds*len(userIDs) > 1000`（防误操作灌库）
+  - 单测：常规轮换（3 人×2 轮=6 班连续无缝）、单成员、上限触发、参数非法各分支
+  - Purpose: R2 轮换生成的领域核心（生成期展开，Resolver 零改动）
+  - _Leverage: internal/oncall/resolver.go（包内风格）；纯函数无 IO_
+  - _Requirements: 2.2_
+  - _Prompt: Role: Go 工程师（领域纯函数） | Task: 按 design.md C2 实现 GenerateRotation 纯函数与全分支单测——产出的班次必须时间连续（前班 EndsAt == 后班 StartsAt）、按成员列表顺序循环 | Restrictions: 纯函数，禁止任何 IO/时钟读取（start 由调用方传入）；时间运算用 time.Time 直接加 Duration，不做本地时区换算 | Success: 单测覆盖全部分支且 -race 通过；连续性与顺序性有显式断言_
+
+- [x] 5. API：成员管理端点 members.go
+  - File: internal/api/members.go、internal/api/members_test.go、internal/api/server.go（挂路由）
+  - `GET/POST /api/v1/admin/teams/:id/members`、`PATCH/DELETE /api/v1/admin/teams/:id/members/:userID`，admin only
+  - 语义：重复添加 409；user/team 不存在 404；role ∉ {admin,member} 422 中文文案；移除或降级该团队最后一名 admin → 同事务 CountAdmins 判定 422「不能移除/降级团队最后一名管理员」；自降级合法（服务端不特判操作者）
+  - Purpose: R1 成员管理的 API 层
+  - _Leverage: internal/api/config.go 的 handler 组织/WithTx/validationError 口径、任务 2 的 MembershipRepo、TeamRepo.GetByID/UserRepo.GetByID_
+  - _Requirements: 1.1, 1.2, 1.4, 1.5_
+  - _Prompt: Role: Go 后端工程师（gin API 层） | Task: 按 design.md C1 实现成员管理四端点并挂进 admin 分组，护栏判定与写操作同一事务，httptest 单测覆盖 200/201/204/403/404/409/422 与最后 admin 护栏（含「降级即最后 admin」分支） | Restrictions: 不绕过 requireAdmin；错误口径与 config.go 完全一致；护栏判定必须在同一事务内（防并发窗口） | Success: 全部状态码路径有测试；护栏在移除与降级两条路径都生效；go vet 零错误_
+
+- [x] 6. API：班次端点 shifts.go（含轮换生成）
+  - File: internal/api/shifts.go、internal/api/shifts_test.go、internal/api/server.go（挂路由）
+  - `GET /api/v1/admin/schedules/:id/shifts?from=&to=`（默认 now~now+90d，join user display_name）、`POST/PATCH/DELETE` 单班；`POST /api/v1/admin/schedules/:id/shifts/generate` body `{user_ids, shift_duration_seconds, starts_at, rounds, dry_run}`
+  - 语义：`ends_at <= starts_at` 422；user/schedule 不存在 404；单班与批量落库都做重叠校验，422 details 列冲突区间 `{shift_id, user_display_name, starts_at, ends_at}`；dry_run=true 只返回预览不落库；dry_run=false 单事务批量 INSERT
+  - Purpose: R2 班次管理的 API 层
+  - _Leverage: 任务 3 的 ShiftRepo、任务 4 的 GenerateRotation、config.go 端点模式_
+  - _Requirements: 2.1, 2.2, 2.3_
+  - _Prompt: Role: Go 后端工程师（gin API 层） | Task: 按 design.md C2 实现班次五端点，generate 走「纯函数展开 → 重叠校验 → dry_run 分流」，httptest 单测覆盖 CRUD、预览/落库两步、冲突 422 details 结构 | Restrictions: 重叠校验与 INSERT 同一事务；预览响应与落库响应结构一致（前端复用渲染）；不重新实现轮换逻辑（必须调纯函数） | Success: dry_run 两态、冲突区间结构、默认时间窗均有测试；同一 schedule 任意交叠被拒_
+
+- [x] 7. notify：ContactResolver 接口与 Sender 发送时解析
+  - File: internal/notify/sender.go、internal/notify/sender_test.go、internal/notify/channel.go（如需放 ErrNoContact 可放 sender.go）
+  - `SendRequest` 加 `TargetUserID string`（json `target_user_id,omitempty`）；notify 包定义 `ContactResolver interface { Resolve(ctx, tx, userID, channelKind) (string, error) }` 与哨兵 `ErrNoContact`；Sender 增加 resolver 依赖（可选注入，nil 时到人请求直接失败）
+  - Send 第 0 段：TargetUserID 非空时在只读小事务里 Resolve——成功则覆写 req.Target 后流程照旧（幂等键含解析后地址）；ErrNoContact 则 req.Target=`"user:"+TargetUserID` 占位，直接 markFailed + notify_failed 时间线，**不进退避重试**；TargetUserID 为空零行为变化
+  - 单测：解析成功覆写与幂等键、ErrNoContact 不重试且时间线正确、空 TargetUserID 回归、resolver 返回其他错误走既有失败路径
+  - Purpose: R3 到人解析的发送侧核心
+  - _Leverage: sender.go 既有三段式（placeholder/HTTP/结果回写）、markFailed/appendResultTimeline、idempotencyKey_
+  - _Requirements: 3.1, 3.5_
+  - _Prompt: Role: Go 后端工程师（通知发送链路） | Task: 按 design.md C3 给 SendRequest 加 TargetUserID、定义 ContactResolver/ErrNoContact、在 Sender.Send 插入第 0 段解析，配齐单测（fake resolver） | Restrictions: 幂等键口径 `资源|step|channel|target|round` 与连接符不变；解析在 Sender 自己的小事务里（不动 scheduler 事务模型）；旧 payload（无 target_user_id）反序列化后行为必须与现状完全一致；ErrNoContact 属永久失败禁止重试 | Success: 四类单测全过 -race；TargetUserID 为空时既有 sender_test 全部不改仍绿（向后兼容判据）_
+
+- [x] 8. notify：email 渠道 channel_email.go
+  - File: internal/notify/channel_email.go、internal/notify/channel_email_test.go
+  - `EmailChannel`：`Kind()="email"`，`net/smtp` + PLAIN auth + STARTTLS（config 可关，供本地调试）；主题 `[severity] 标题`，正文纯文本复用 Message 字段与 mask.go 脱敏；From/凭据来自 SMTPConfig
+  - SMTP Host 未配置时 Send 返回「SMTP 未配置」错误（渠道照常注册，走既有 markFailed 口径）
+  - 单测：报文构造（收件人/主题/脱敏/UTF-8 主题编码）；SMTP 交互用本地 net.Listener 假服务器或最小接口抽象，不出网
+  - Purpose: R3 第一个「到人」真实渠道
+  - _Leverage: internal/notify/channel_webhook.go（渠道实现形状）、mask.go、任务 1 的 SMTPConfig_
+  - _Requirements: 3.2_
+  - _Prompt: Role: Go 后端工程师（SMTP/通知渠道） | Task: 按 design.md C3 用标准库 net/smtp 实现 EmailChannel 与单测，主题含中文需 RFC2047 编码，正文脱敏复用 mask.go | Restrictions: 不引入第三方 SMTP 库；凭据与收件人不落日志；错误文案不含密码；测试不做真实网络外呼 | Success: 报文构造与未配置降级有单测；渠道满足 notify.Channel 接口；go vet 零错误_
+
+- [x] 9. app：装配改造（resolver 实现/outbox 到人意图/email 注册）
+  - File: internal/app/app.go、internal/app/outbox.go、internal/app/outbox_test.go（如有）、cmd/server 相关装配（如需传 config）
+  - internal/app 实现 ContactResolver（基于 UserRepo：email→users.email，lark→users.lark_open_id，空值→ErrNoContact）并注入 Sender
+  - outbox：删除 `defaultNotifyChannel` 常量，Options 注入 PersonnelChannel（来自 config，默认 email）；人员升级与 repeat 两处 `Target: t.UserID` 改 `TargetUserID: t.UserID`；timers refID 业务元组的 target 分量继续用 UserID（保持 pending 收敛稳定）
+  - 装配注册 EmailChannel（SMTPConfig 注入）
+  - Purpose: R3 端到端接线
+  - _Leverage: app.go 既有渠道注册与 Options 模式、outbox.go 意图构造两处、任务 1/7/8 产物_
+  - _Requirements: 3.1, 3.2, 3.3_
+  - _Prompt: Role: Go 后端工程师（应用装配层） | Task: 按 design.md C3 完成 app 侧接线——UserRepo 版 ContactResolver、outbox 两处意图改 TargetUserID、PersonnelChannel config 注入、EmailChannel 注册；补/改相应测试 | Restrictions: outbox 持锁事务内只 Schedule 的不变量不动；refID 元组分量不得改成解析后地址；不改四个意图接口签名 | Success: 全量 `go test -tags=integration ./... -race` 绿（既有 outbox/E2E 语义回归）；grep 确认 defaultNotifyChannel 常量已消失_
+
+- [x] 10. API：轻量目录端点 + 健康检查
+  - File: internal/api/directory.go、internal/api/directory_test.go、internal/api/server.go、cmd/server/main.go（readyz ping 注入）
+  - `GET /api/v1/teams` → `{teams:[{id,name}]}`、`GET /api/v1/users` → `{users:[{id,display_name}]}`：挂 authed 分组（登录即可，无 requireAdmin），只序列化两字段（不含 email/username/enabled/password_hash）
+  - `GET /healthz` 恒 200 `{"status":"ok"}`；`GET /readyz` 调注入的 `ready func(ctx) error`（main 传 pool.Ping），nil→200、err→503（文案不含 DSN）；两者挂 engine 根豁免鉴权
+  - 单测：轻量端点 member 会话可访问、字段白名单断言（响应 JSON 不含敏感字段）、healthz 无鉴权、readyz 两态
+  - Purpose: R4 数据源 + R5 探活
+  - _Leverage: server.go mount() 分组结构（/callbacks/lark/card 的根挂载先例）、TeamRepo.List/UserRepo.List_
+  - _Requirements: 4.1, 5.1_
+  - _Prompt: Role: Go 后端工程师（gin API 层） | Task: 按 design.md C4/C5 实现两个轻量目录端点与 healthz/readyz，readyz 依赖注入 ping 函数，单测覆盖鉴权层级与字段白名单 | Restrictions: 轻量端点严禁泄露 id/name（display_name）之外字段；healthz/readyz 不进 authed 分组；readyz 错误响应不含连接串 | Success: member 会话访问轻量端点 200、未登录 401；healthz 未登录 200；readyz 两态有测试_
+
+- [x] 11. app：retention_sweep 数据保留清理
+  - File: internal/app/retention.go、internal/app/retention_test.go、internal/app/app.go（注册 kind + 启动对账）
+  - 新 timer kind `retention_sweep`（refID `"global"`，单条自续期）：handler 同事务内两条分批 DELETE——timers（status IN fired/failed/canceled 且 fire_at < now()-TimersDays）、notification_log（created_at < now()-NotificationLogDays），单批上限 BatchSize
+  - 续期：任一表删满一批 → 1 分钟后再 fire（积压快速消化）；否则按 SweepInterval；日志记两表删除行数（数量级别，无内容）
+  - 启动对账 ScheduleIfAbsent（沿 ReconcileOpsTimers 模式，app.go:272 附近并列或合入同一入口）
+  - 集成测试：只删终态+过期行、未过期/pending 不动、续期行存在、批满快速续期
+  - Purpose: R5 长期运行不被历史数据拖垮
+  - _Leverage: internal/app/app.go 的 kind 注册与 ReconcileOpsTimers、scheduler markFired 前置续期语义、任务 1 的 RetentionConfig_
+  - _Requirements: 5.2, 5.3_
+  - _Prompt: Role: Go 后端工程师（scheduler 定时任务） | Task: 按 design.md C5 实现 retention_sweep handler、kind 注册与启动对账，集成测试造过期/未过期数据验证删除边界与续期节奏 | Restrictions: handler 签名带 tx 绝不自开事务；DELETE 必须走 `id IN (SELECT ... LIMIT n)` 分批形态防长事务；删除幂等（at-least-once 安全）；日志不落任何通知内容 | Success: 集成测试全过（-tags=integration -race）；未注册 kind 告警不出现（已注册）；重启后对账补建 pending_
+
+- [x] 12. web：useNameMaps 与告警页去 UUID
+  - File: web/src/api/client.ts、web/src/hooks/useNameMaps.ts（新）、web/src/pages/AlertList.tsx、web/src/pages/AlertDetail.tsx
+  - client.ts 加 `listTeamsLite()`/`listUsersLite()`（GET /api/v1/teams、/api/v1/users）；`useNameMaps()` hook（React Query，staleTime 5min，返回 `teamName(id)`/`userName(id)`，查不到回退 UUID 前 8 位）
+  - AlertList：团队列/认领人列经映射渲染；团队筛选由裸 UUID Input 改 Select（listTeamsLite 数据源，allowClear，showSearch）
+  - AlertDetail：acked_by 与时间线中 user 引用映射为显示名
+  - Purpose: R4 member 日常可用
+  - _Leverage: client.ts 既有 fetch 封装与 ApiError、React Query 既有用法、AntD Select showSearch 惯例（TeamOpsSettings.tsx）_
+  - _Requirements: 4.1, 4.2, 4.3_
+  - _Prompt: Role: 前端工程师（React 19 + AntD 5 + React Query 5） | Task: 按 design.md C4 实现轻量端点客户端、useNameMaps hook 与告警列表/详情去 UUID 化，团队筛选改 Select | Restrictions: 不改后端列表响应结构（映射纯前端）；AntD 锁 5 不升 6；hook 查询失败不阻塞页面渲染（回退 UUID 前 8 位） | Success: `cd web && npm run build && npx oxlint` 全过；member 会话下列表/详情无裸 UUID、筛选可用_
+
+- [x] 13. web：Teams.tsx 团队成员管理
+  - File: web/src/pages/Settings/Teams.tsx、web/src/api/client.ts（成员端点客户端）
+  - 团队行加「成员」操作 → Drawer/Modal：成员列表（username/display_name/role）、添加（用户 Select 数据源 /admin/users，role 选择）、改角色、移除
+  - 自降级/自移除（被操作者 === 当前登录用户且失去 admin）Modal.confirm 确认文案「你将失去该团队的管理员权限」；后端 409/422/404 错误文案透传展示
+  - Purpose: R1 成员管理 UI
+  - _Leverage: Teams.tsx 既有 CrudTable 模式、client.ts 的 listUsers、/me 当前用户信息、任务 5 端点_
+  - _Requirements: 1.3, 1.5_
+  - _Prompt: Role: 前端工程师（React 19 + AntD 5） | Task: 按 design.md C1 在团队设置页实现成员管理面板（列表/添加/改角色/移除 + 自降级确认），client.ts 补成员端点函数 | Restrictions: 用户选择一律 Select 禁止裸 UUID 输入；变更后失效相关 React Query 缓存；AntD 锁 5 | Success: npm run build + oxlint 全过；添加/改角色/移除/最后 admin 报错/自降级确认全链路可操作_
+
+- [x] 14. web：Schedules.tsx 班次管理与轮换生成
+  - File: web/src/pages/Settings/Schedules.tsx、web/src/api/client.ts（班次端点客户端）
+  - 选中 schedule → 未来班次表格（值班人显示名、起止时间），单班增删改 Modal（人员 Select 数据源为该 schedule 所属团队成员——任务 5 的成员端点；时间 DatePicker showTime，提交边界转 RFC3339）
+  - 轮换生成表单：成员多选有序（Select mode=multiple 保持选择顺序）+ 单班时长 + 起始时刻 + 周期数 → 先 dry_run 预览表格 → 确认落库；冲突 422 details 逐条展示冲突区间
+  - 缺联系方式警告（R3.4）：编入班次的用户若 email 为空（/admin/users 数据判定），在选择器与班次行显示 warning 提示（不阻塞保存）
+  - Purpose: R2 班次管理 UI + R3.4 前置警告
+  - _Leverage: Schedules.tsx 既有壳、TeamOpsSettings.tsx 的 dayjs 边界转换模式、任务 6/13 端点与客户端_
+  - _Requirements: 2.3, 3.4_
+  - _Prompt: Role: 前端工程师（React 19 + AntD 5） | Task: 按 design.md C2 实现班次列表/单班编辑/轮换生成（预览→确认两步）与缺 email 警告，client.ts 补班次端点函数 | Restrictions: dayjs 转换只在提交/回显边界（对齐 TeamOpsSettings 惯例）；预览与落库复用同一渲染组件；人员选择数据源必须是该团队成员而非全量用户 | Success: npm run build + oxlint 全过；生成预览/冲突提示/警告图标全链路可操作_
+
+- [x] 15. web：Users.tsx 联系方式维护与设置页裸 UUID 扫尾
+  - File: web/src/pages/Settings/Users.tsx、web/src/pages/Settings/ 下其余引用 user/team 的表单项
+  - 确认/补齐 Users.tsx 的 email 维护（创建与编辑都可填，格式校验，允许留空）；lark_open_id 本期不进 UI（渠道 HOLD）
+  - 扫尾：设置页凡 user/team 引用的表单项一律 Select（admin 语境用 /admin 端点数据源）；TeamOpsSettings 渠道 target 保持 Input（团队级地址是字面量，非 user 引用）
+  - Purpose: R3.4 联系方式入口 + R4.4 收尾
+  - _Leverage: Users.tsx 既有表单、各设置页现状、任务 12 的轻量端点（如适用）_
+  - _Requirements: 3.4, 4.4_
+  - _Prompt: Role: 前端工程师（React 19 + AntD 5） | Task: 按 design.md C4 确认并补齐用户 email 维护，逐页扫描 Settings 下裸 UUID 输入并替换为 Select，逐项列出改动清单 | Restrictions: 不改 TeamOpsSettings 渠道 target 的 Input；email 允许空（警告在班次处，不在此阻塞）；AntD 锁 5 | Success: npm run build + oxlint 全过；交付物含「扫尾清单」（每处：文件/表单项/改动或确认无需改）_
+
+- [x] 16. E2E：「从零到通知到人」旅程场景
+  - File: test/e2e/journey_test.go（新）、test/e2e/helpers_test.go（如需扩 API helper）
+  - `newMockChannel("email")` 顶替 email 渠道 → 仅经 API：登录 admin → 建团队 → 建用户（含 email）→ 加成员 → 建 schedule → shifts/generate 轮换生成 → 配路由 + 升级策略 → ingest 灌 critical 告警 → 断言：mock email 渠道收到发送且 target 为该用户 email 地址（非 UUID）、notification_log status=sent 且幂等键含解析后地址、时间线出现 notify_sent
+  - admin 自举沿既有 harness 前置；旅程断言链路上禁止直接写库
+  - Purpose: R6 最终判据
+  - _Leverage: test/e2e/mock_channel.go、helpers_test.go 既有 API helper 与秒级配置、e2e_test.go 场景组织_
+  - _Requirements: 6.1, 6.2_
+  - _Prompt: Role: Go 测试工程师（E2E） | Task: 按 design.md C6 实现旅程场景——配置侧全部走 HTTP API（可扩 helper），断言送达 target 是 email 地址、日志 sent、时间线 notify_sent | Restrictions: 场景主链路禁止直接 SQL 写库（断言可只读查库）；不改既有五场景；秒级配置压缩等待不 sleep 硬编码长时 | Success: 新场景与既有五场景在 docker compose PG 下全绿；断言明确覆盖「地址非 UUID」_
+
+- [x] 17. 全量回归与收口验证
+  - File: 无新文件（验证任务，修复性小改允许）
+  - `go build ./... && go vet ./...`、`go test -tags=integration ./... -race -count=1`（含新旅程 E2E）、`cd web && npm run build && npx oxlint` 全绿
+  - grep 复核：defaultNotifyChannel 常量已消失、SendRequest 旧字段语义未破坏、轻量端点无敏感字段
+  - 输出回归报告：测试计数对比（基线 452+）、发现并修复的问题清单
+  - Purpose: R6.2 向后兼容判据收口
+  - _Leverage: CLAUDE.md 常用命令、CI 工作流_
+  - _Requirements: All_
+  - _Prompt: Role: 资深 Go 工程师（质量收口） | Task: 跑全量验证命令并修复发现的集成期问题（仅限本 spec 引入的破坏），输出回归报告与 grep 复核结果 | Restrictions: 只修不改设计（设计层问题上报主对话裁决）；不动既有五场景与 452 基线单测的语义 | Success: 四条验证命令零错误全绿；回归报告含测试计数与修复清单_
