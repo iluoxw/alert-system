@@ -22,6 +22,7 @@ import (
 	"alert-system/internal/app"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
+	"alert-system/internal/events"
 	"alert-system/internal/ingest"
 	"alert-system/internal/notify"
 	"alert-system/internal/store"
@@ -126,6 +127,12 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	// stopper/lifecycle，保证两条处置路径的"停止升级链/生命周期定时器"不变量一致。----
 	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
 
+	// ---- 告警变更实时推送：PG 触发器 pg_notify（migrations/000011）→ 专用连接
+	// LISTEN → 进程内 Bus → SSE。RunListener 是常驻 goroutine，独立于 st 的连接池，
+	// 不占用业务查询的连接配额。----
+	bus := events.NewBus()
+	go events.RunListener(ctx, cfg.DBDSN, bus, logger)
+
 	auth := api.NewPasswordAuthenticator(users)
 	router := api.NewRouter(cfg, users, sessions, memberships, st, auth, larkServer.Handler(), logger)
 	router.RegisterConfigRoutes(api.ConfigDeps{
@@ -144,6 +151,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
+	router.RegisterEventRoutes(bus)
 	router.RegisterHealthRoutes(st.Pool.Ping)
 	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
 

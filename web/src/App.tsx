@@ -13,6 +13,7 @@ import {
 import { Button, ConfigProvider, Layout, Menu, Spin } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import { logout, me, setUnauthorizedHandler } from './api/client'
+import { useAlertEvents } from './hooks/useAlertEvents'
 import { Login } from './pages/Login'
 import { AlertList } from './pages/AlertList'
 import { AlertDetail } from './pages/AlertDetail'
@@ -75,6 +76,8 @@ function AppLayout() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { data } = useQuery({ queryKey: ['me'], queryFn: me })
+  // 全站只订阅一条 SSE 连接：AppLayout 是所有已登录页面的公共父组件。
+  useAlertEvents()
 
   const handleLogout = async () => {
     await logout()
