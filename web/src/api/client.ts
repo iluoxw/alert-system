@@ -33,6 +33,7 @@ export interface Alert {
   silenced_by?: string[]
   acked_by?: string
   acked_at: string | null
+  flapping: boolean
   starts_at: string
   last_seen_at: string
   ends_at: string | null
@@ -199,7 +200,8 @@ export function listUsersLite(limit?: number): Promise<{ users: UserLite[] }> {
 
 // TimelineAction 对应 internal/domain/state.go 的 TimelineAction 枚举。
 // notify 为历史动作（已废弃但历史数据仍存在，需兼容渲染）；
-// notify_sent/notify_failed 是其替代，区分发送成功/失败（R3）。
+// notify_sent/notify_failed 是其替代，区分发送成功/失败（R3）；
+// note 是独立备注（ui-enrichment R3），不代表任何状态转移。
 export type TimelineAction =
   | 'ack'
   | 'resolve'
@@ -209,6 +211,7 @@ export type TimelineAction =
   | 'silence'
   | 'notify_sent'
   | 'notify_failed'
+  | 'note'
 
 // TimelineEntry 对应 timelineEntryResponse（省略了 alert_id，由所在详情响应的
 // alert.id 隐含）。
@@ -251,8 +254,13 @@ export function ackAlert(id: string): Promise<AlertActionResponse> {
   return request<AlertActionResponse>(`/alerts/${id}/ack`, { method: 'POST' })
 }
 
-export function resolveAlert(id: string): Promise<AlertActionResponse> {
-  return request<AlertActionResponse>(`/alerts/${id}/resolve`, { method: 'POST' })
+// note 是可选的处置说明（R5，"怎么修的"），落入 resolve timeline entry 的
+// detail.note；超过 1000 字符后端返回 422。
+export function resolveAlert(id: string, note?: string): Promise<AlertActionResponse> {
+  return request<AlertActionResponse>(`/alerts/${id}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ note: note ?? '' }),
+  })
 }
 
 // handoffAlert 不是幂等操作：对已 resolved 的告警会返回 409（ApiError.status
@@ -261,6 +269,46 @@ export function handoffAlert(id: string, target: string): Promise<AlertActionRes
   return request<AlertActionResponse>(`/alerts/${id}/handoff`, {
     method: 'POST',
     body: JSON.stringify({ target }),
+  })
+}
+
+// ============================================================
+// 噪声画像 / 独立备注（ui-enrichment 任务4，internal/api/alerts.go 的 stats/addNote）
+// ============================================================
+
+// ResolvedRefItem 对应 stats 端点 recent_resolved 数组元素（resolvedRefResponse）。
+// note 可能是空串（人工恢复未填处置说明），此时前端按 reason 展示中文兜底标签。
+export interface ResolvedRefItem {
+  alert_id: string
+  starts_at: string
+  ends_at: string
+  duration_seconds: number
+  note: string
+  reason: string
+}
+
+// AlertStats 对应 GET /alerts/:id/stats 响应体：同 fingerprint 近 window_days 天的
+// 历史统计。avg_duration_seconds 无已解决样本时为 null（区分"无数据"与"耗时为 0"，
+// 前端不能用 0 顶替）。
+export interface AlertStats {
+  window_days: number
+  count: number
+  first_seen: boolean
+  avg_duration_seconds: number | null
+  recent_resolved: ResolvedRefItem[]
+}
+
+export function fetchAlertStats(id: string): Promise<AlertStats> {
+  return request<AlertStats>(`/alerts/${id}/stats`)
+}
+
+// addAlertNote 追加一条独立备注（不改变告警状态，任何登录用户可用，resolved 后
+// 仍可补记）。成功响应体带新 entry 但其 id 可能为空（尚未落库前的临时值），调用方
+// 不应消费返回值，成功后应直接 invalidate 详情/统计 query 重拉。
+export function addAlertNote(id: string, note: string): Promise<void> {
+  return request<void>(`/alerts/${id}/notes`, {
+    method: 'POST',
+    body: JSON.stringify({ note }),
   })
 }
 
@@ -437,6 +485,8 @@ export interface RouteConfig {
   group_wait_seconds: number
   group_interval_seconds: number
   repeat_interval_seconds: number
+  group_mode: string
+  storm_threshold_per_min: number
   created_at: string
   updated_at: string
 }
@@ -449,6 +499,8 @@ export interface RouteRequest {
   group_wait_seconds: number
   group_interval_seconds: number
   repeat_interval_seconds: number
+  group_mode: string
+  storm_threshold_per_min: number
 }
 
 export function listRoutes(limit?: number): Promise<{ routes: RouteConfig[] }> {

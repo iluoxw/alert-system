@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/aiops-foundation/tasks.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T07:24:42.428Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785482682421_oj50hu47f",
+      "approvalTitle": "aiops-foundation 任务拆分：14 个实施任务"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T07:27:38.997Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785482682421_oj50hu47f",
+      "approvalTitle": "aiops-foundation 任务拆分：14 个实施任务"
+    }
+  ]
+}

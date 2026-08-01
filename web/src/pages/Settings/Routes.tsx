@@ -29,9 +29,17 @@ export function RoutesPage() {
       key: 'target_team_id',
       render: (id: string) => teamOptions.find((o) => o.value === id)?.label ?? id,
     },
+    {
+      title: '分组模式',
+      dataIndex: 'group_mode',
+      key: 'group_mode',
+      width: 100,
+      render: (mode: string) => (mode === 'window' ? '窗口全归并' : '按标签分组'),
+    },
     { title: '分组等待(s)', dataIndex: 'group_wait_seconds', key: 'group_wait_seconds', width: 110 },
     { title: '分组间隔(s)', dataIndex: 'group_interval_seconds', key: 'group_interval_seconds', width: 110 },
     { title: '重复间隔(s)', dataIndex: 'repeat_interval_seconds', key: 'repeat_interval_seconds', width: 110 },
+    { title: '风暴阈值(条/分)', dataIndex: 'storm_threshold_per_min', key: 'storm_threshold_per_min', width: 130 },
   ]
 
   return (
@@ -58,8 +66,37 @@ export function RoutesPage() {
           <Form.Item name="target_team_id" label="目标团队" rules={[{ required: true, message: '请选择目标团队' }]}>
             <Select options={teamOptions} showSearch optionFilterProp="label" />
           </Form.Item>
-          <Form.Item name="group_by" label="分组键（group_by，按标签名分组）">
-            <Select mode="tags" tokenSeparators={[',']} open={false} />
+          {/* group_mode='window' 与 group_by 互斥（后端 422 兜底，见 internal/api/config.go
+              validateRoute）：这里用 shouldUpdate 拿到 formInstance，选中 window 时清空
+              并禁用 group_by，避免用户提交一个必然被拒绝的组合。 */}
+          <Form.Item noStyle shouldUpdate={(prev, cur) => prev.group_mode !== cur.group_mode}>
+            {(formInstance) => {
+              const isWindow = formInstance.getFieldValue('group_mode') === 'window'
+              return (
+                <>
+                  <Form.Item name="group_mode" label="分组模式" initialValue="label">
+                    <Select
+                      options={[
+                        { value: 'label', label: '按标签分组' },
+                        { value: 'window', label: '窗口全归并' },
+                      ]}
+                      onChange={(value) => {
+                        if (value === 'window') {
+                          formInstance.setFieldValue('group_by', [])
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="group_by"
+                    label="分组键（group_by，按标签名分组）"
+                    help={isWindow ? '窗口全归并模式下不使用分组键' : undefined}
+                  >
+                    <Select mode="tags" tokenSeparators={[',']} open={false} disabled={isWindow} />
+                  </Form.Item>
+                </>
+              )
+            }}
           </Form.Item>
           <Form.Item name="group_wait_seconds" label="分组等待秒数" initialValue={0}>
             <InputNumber style={{ width: '100%' }} min={0} />
@@ -68,6 +105,14 @@ export function RoutesPage() {
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
           <Form.Item name="repeat_interval_seconds" label="重复通知间隔秒数" initialValue={0}>
+            <InputNumber style={{ width: '100%' }} min={0} />
+          </Form.Item>
+          <Form.Item
+            name="storm_threshold_per_min"
+            label="风暴熔断阈值（条/分钟）"
+            initialValue={0}
+            help="0 表示关闭熔断"
+          >
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
         </>

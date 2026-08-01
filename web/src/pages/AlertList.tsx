@@ -60,9 +60,11 @@ interface FilterState {
 
 const emptyFilter: FilterState = { teamId: '', labels: [] }
 
-// 轮询刷新间隔：告警列表是运维值班的高时效场景，10s 内感知新告警/状态变化，
-// 与后端未提供 WebSocket/SSE 推送时的折中方案。
-const refetchIntervalMs = 10_000
+// 轮询刷新间隔：告警列表是运维值班的高时效场景。SSE（useAlertEvents）负责
+// 秒级推送 invalidate，这里的轮询降级为断线兜底——SSE 断线到浏览器重连之间
+// 仍需一个上限，二者叠加不冲突。refetchIntervalInBackground: false 避免后台
+// 标签页无意义地耗电/耗流量。
+const refetchIntervalMs = 15_000
 
 function labelsToRecord(rows: LabelFilterRow[]): Record<string, string> | undefined {
   const entries = rows.filter((r) => r.key.trim() !== '' && r.value.trim() !== '')
@@ -98,6 +100,7 @@ export function AlertList() {
         offset: (page - 1) * pageSize,
       }),
     refetchInterval: refetchIntervalMs,
+    refetchIntervalInBackground: false,
     placeholderData: (previous) => previous,
   })
 
@@ -152,6 +155,7 @@ export function AlertList() {
         <Space size={4}>
           <Tag color={statusColor[status]}>{statusLabel[status]}</Tag>
           {record.silenced_by && record.silenced_by.length > 0 && <Tag>已静默</Tag>}
+          {record.flapping && <Tag color="gold">抖动中</Tag>}
         </Space>
       ),
     },

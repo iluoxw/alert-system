@@ -40,6 +40,9 @@ type Stage interface {
 //   - GroupBy/GroupWait/GroupInterval/RepeatInterval 只在命中某条路由时有意义；
 //     默认团队兜底路径没有路由记录可取这些参数，均为零值——分组 stage 需要自行
 //     定义零值语义（如零值 GroupWait 视为不等待、立即分组）。
+//   - GroupMode 透传 store.Route.GroupMode（aiops-foundation R1/C1 窗口全归并分组
+//     模式的数据通路），供分组 stage 判断走哪条 group_key 计算分支；默认团队兜底
+//     路径无路由记录可取，留空串——分组 stage 对空串按现状（非 window）处理。
 type RouteResult struct {
 	RouteID        string
 	TeamID         string
@@ -47,6 +50,7 @@ type RouteResult struct {
 	GroupWait      time.Duration
 	GroupInterval  time.Duration
 	RepeatInterval time.Duration
+	GroupMode      string
 }
 
 // PipelineContext 携带一个事件在管道各 stage 间流转的可变状态。
@@ -61,17 +65,21 @@ type RouteResult struct {
 //   - Created 标识本轮去重是新建告警（true）还是合并进已有告警（false），供分组/
 //     通知等后续 stage 判断是否需要发起新通知（R3.4：合并不重复通知）。
 //   - Route 是路由 stage 的产出。
+//   - FlappingStarted 标识本轮去重把 Alert.Flapping 从 false 置为了 true（R4 置位
+//     当次事件）：分组 stage 对 flapping 告警跳过定时器注册，但置位当次要照常注册，
+//     让「进入抖动」的提示能送出去——这个"当次"只有去重 stage 知道，靠此标记传递。
 //   - Tx 是本轮 pollOnce 所在的数据库事务：去重 stage 需要在同一事务内完成
 //     UpsertByFingerprint/UpdateStatus 与 Schedule/Cancel TTL 定时器，才能与
 //     pollOnce 最终的 MarkProcessed/MarkFailed 一并原子提交或回滚（store/scheduler
 //     全套仓储方法都以 pgx.Tx 为入参，正是为了让调用方在编译期无法绕开这个约束）。
 type PipelineContext struct {
-	Event         domain.AlertEvent
-	IntegrationID string
-	Alert         domain.Alert
-	Created       bool
-	Route         RouteResult
-	Tx            pgx.Tx
+	Event           domain.AlertEvent
+	IntegrationID   string
+	Alert           domain.Alert
+	Created         bool
+	Route           RouteResult
+	FlappingStarted bool
+	Tx              pgx.Tx
 }
 
 // Pipeline 是管道编排器：从 EventQueue 消费事件，依序驱动 stages，每个 stage

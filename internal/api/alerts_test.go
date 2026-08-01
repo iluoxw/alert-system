@@ -23,6 +23,10 @@ import (
 
 type alertsFakeStore struct {
 	alerts map[string]domain.Alert
+	// resolvedHistory 是同 fingerprint 的历史已解决记录，供 stats 端点测试装配；
+	// 与 alerts map 分开维护是因为真实 store 里"历史"包含已被覆盖/早已不在
+	// alerts 表当前查询范围内的行，fake 没必要照抄整张表的时间窗过滤逻辑。
+	resolvedHistory []store.ResolvedRef
 }
 
 func (f *alertsFakeStore) GetByID(ctx context.Context, tx pgx.Tx, id string) (domain.Alert, error) {
@@ -85,6 +89,46 @@ func (f *alertsFakeStore) List(ctx context.Context, tx pgx.Tx, filter store.Aler
 		end = len(matched)
 	}
 	return store.AlertPage{Alerts: matched[offset:end], Total: total}, nil
+}
+
+// FingerprintStats 纯内存实现：按 fingerprint + since 过滤 f.alerts（测试用多个不同
+// ID、相同 fingerprint 的条目模拟同一 fingerprint 的历史发生记录），已解决样本的
+// 平均耗时用 EndsAt-StartsAt 计算，无样本时返回 nil（与真实 store 同一口径）。
+func (f *alertsFakeStore) FingerprintStats(ctx context.Context, tx pgx.Tx, fingerprint string, since time.Time) (int, *float64, error) {
+	var count, samples int
+	var sum float64
+	for _, a := range f.alerts {
+		if a.Fingerprint != fingerprint || a.StartsAt.Before(since) {
+			continue
+		}
+		count++
+		if a.Status == domain.StatusResolved && !a.EndsAt.IsZero() {
+			sum += a.EndsAt.Sub(a.StartsAt).Seconds()
+			samples++
+		}
+	}
+	if samples == 0 {
+		return count, nil, nil
+	}
+	avg := sum / float64(samples)
+	return count, &avg, nil
+}
+
+// ListRecentResolvedByFingerprint 简化实现：fake 不建模 fingerprint 关联查询，直接
+// 返回测试预先装配的 resolvedHistory（排除 excludeID 自身、按 limit 截断）——测试
+// 装配数据时保证只放入与被查询告警同 fingerprint 的记录即可。
+func (f *alertsFakeStore) ListRecentResolvedByFingerprint(ctx context.Context, tx pgx.Tx, fingerprint, excludeID string, limit int) ([]store.ResolvedRef, error) {
+	var out []store.ResolvedRef
+	for _, r := range f.resolvedHistory {
+		if r.AlertID == excludeID {
+			continue
+		}
+		out = append(out, r)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 type alertsFakeTimeline struct {
@@ -175,9 +219,11 @@ func TestAlertsRoutes_Unauthenticated_Returns401(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/alerts"},
 		{http.MethodGet, "/api/v1/alerts/a1"},
+		{http.MethodGet, "/api/v1/alerts/a1/stats"},
 		{http.MethodPost, "/api/v1/alerts/a1/ack"},
 		{http.MethodPost, "/api/v1/alerts/a1/resolve"},
 		{http.MethodPost, "/api/v1/alerts/a1/handoff"},
+		{http.MethodPost, "/api/v1/alerts/a1/notes"},
 	}
 	for _, tc := range cases {
 		w := doAlertsRequest(router, tc.method, tc.path, nil, nil)
@@ -278,6 +324,33 @@ func TestAlertsDetail_IncludesTimelineAndRecentChanges(t *testing.T) {
 	}
 	if resp.RecentChanges == nil || len(resp.RecentChanges) != 0 {
 		t.Errorf("recent_changes = %+v, want 空列表（changeEvents 未装配）", resp.RecentChanges)
+	}
+}
+
+// flapping 是任务 8（R4 抖动防抖）写入的只读状态，响应层（任务 13）只负责透出，
+// 这里验证 newAlertResponse 没有漏掉这个字段。
+func TestAlertsDetail_ExposesFlappingField(t *testing.T) {
+	router, alerts, _, _, _, cookie := newAlertsTestRouter(t)
+
+	alerts.alerts["a1"] = domain.Alert{
+		ID: "a1", Status: domain.StatusFiring, Severity: domain.SeverityWarning,
+		Flapping: true,
+		StartsAt: time.Now(), LastSeenAt: time.Now(),
+	}
+
+	w := doAlertsRequest(router, http.MethodGet, "/api/v1/alerts/a1", cookie, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Alert alertResponse `json:"alert"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.Alert.Flapping {
+		t.Errorf("alert.flapping = false, want true")
 	}
 }
 
@@ -427,8 +500,9 @@ func TestAlertsResolve_TransitionsAndCancelsLifecycleTimers(t *testing.T) {
 	}
 }
 
-// 重复 Resolve 幂等成功：已经 resolved 的告警再次 Resolve 返回 200 当前状态，不报
-// 409，不追加第二条时间线。
+// 重复 Resolve 幂等成功：已经 resolved 的告警再次 Resolve（即便这次带了 note）返回
+// 200 当前状态，不报 409，不追加第二条时间线——note 随幂等短路一起丢弃（design.md
+// C5：不变量 6 一字不改）。
 func TestAlertsResolve_AlreadyResolved_IdempotentSuccess(t *testing.T) {
 	router, alerts, timeline, _, lifecycle, cookie := newAlertsTestRouter(t)
 	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
@@ -437,15 +511,70 @@ func TestAlertsResolve_AlreadyResolved_IdempotentSuccess(t *testing.T) {
 	if w1.Code != http.StatusOK {
 		t.Fatalf("第一次 resolve status = %d, want 200", w1.Code)
 	}
-	w2 := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/resolve", cookie, nil)
+	w2 := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/resolve", cookie, map[string]string{"note": "第二次带的 note"})
 	if w2.Code != http.StatusOK {
 		t.Fatalf("第二次 resolve status = %d, want 200（幂等成功，不报 409）", w2.Code)
 	}
 	if len(timeline.entries["a1"]) != 1 {
 		t.Errorf("重复 resolve 不应追加新时间线，实际 %d 条", len(timeline.entries["a1"]))
 	}
+	if _, hasNote := timeline.entries["a1"][0].Detail["note"]; hasNote {
+		t.Errorf("幂等短路应丢弃第二次的 note，不应重写时间线，实际 Detail = %v", timeline.entries["a1"][0].Detail)
+	}
 	if len(lifecycle.canceled) != 2 {
 		t.Errorf("CancelLifecycleTimers 应该每次 resolve 调用都执行（幂等），实际调用 %d 次", len(lifecycle.canceled))
+	}
+}
+
+// 带 note 的 Resolve：note 写入 resolve timeline entry 的 detail（R5）。
+func TestAlertsResolve_WithNote_WrittenToTimeline(t *testing.T) {
+	router, alerts, timeline, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/resolve", cookie, map[string]string{"note": "重启服务后恢复"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(timeline.entries["a1"]) != 1 {
+		t.Fatalf("timeline = %+v, want 1 条 resolve", timeline.entries["a1"])
+	}
+	if timeline.entries["a1"][0].Detail["note"] != "重启服务后恢复" {
+		t.Errorf("Detail[note] = %v, want 重启服务后恢复", timeline.entries["a1"][0].Detail["note"])
+	}
+}
+
+// 不带 note（body 整体省略）的 Resolve：既有行为不变，timeline detail 不出现 note 键。
+func TestAlertsResolve_WithoutNote_NoNoteInDetail(t *testing.T) {
+	router, alerts, timeline, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/resolve", cookie, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if _, hasNote := timeline.entries["a1"][0].Detail["note"]; hasNote {
+		t.Errorf("空 note 不应出现在 Detail 中，实际 = %v", timeline.entries["a1"][0].Detail["note"])
+	}
+}
+
+// note 超出长度上限（1000 字符）-> 422，不落库、不追加时间线。
+func TestAlertsResolve_NoteTooLong_Returns422(t *testing.T) {
+	router, alerts, timeline, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	tooLong := make([]byte, maxResolveNoteLength+1)
+	for i := range tooLong {
+		tooLong[i] = 'a'
+	}
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/resolve", cookie, map[string]string{"note": string(tooLong)})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if alerts.alerts["a1"].Status != domain.StatusFiring {
+		t.Errorf("status = %s, want firing（超长 note 校验失败不应落库）", alerts.alerts["a1"].Status)
+	}
+	if len(timeline.entries["a1"]) != 0 {
+		t.Errorf("超长 note 校验失败不应追加时间线，实际 %d 条", len(timeline.entries["a1"]))
 	}
 }
 
@@ -492,5 +621,197 @@ func TestAlertsHandoff_OnResolvedAlert_Returns409(t *testing.T) {
 	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/handoff", cookie, map[string]string{"target": "someone"})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", w.Code)
+	}
+}
+
+// ---- stats（ui-enrichment 任务4，"噪声画像"）----
+
+type alertStatsResponse struct {
+	WindowDays         int                   `json:"window_days"`
+	Count              int                   `json:"count"`
+	FirstSeen          bool                  `json:"first_seen"`
+	AvgDurationSeconds *int64                `json:"avg_duration_seconds"`
+	RecentResolved     []resolvedRefResponse `json:"recent_resolved"`
+}
+
+// 同 fingerprint 出现过 3 次（含当前这条），其中 2 条已解决——count=3、
+// first_seen=false、avg 按 2 条已解决样本计算、recent_resolved 排除当前告警自身。
+func TestAlertsStats_MultipleOccurrences_ReturnsCountAndAvg(t *testing.T) {
+	router, alerts, _, _, _, cookie := newAlertsTestRouter(t)
+	now := time.Now()
+	const fp = "fp-1"
+
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Fingerprint: fp, Status: domain.StatusFiring, StartsAt: now}
+	alerts.alerts["a2"] = domain.Alert{
+		ID: "a2", Fingerprint: fp, Status: domain.StatusResolved,
+		StartsAt: now.Add(-2 * time.Hour), EndsAt: now.Add(-2*time.Hour + 10*time.Minute),
+	}
+	alerts.alerts["a3"] = domain.Alert{
+		ID: "a3", Fingerprint: fp, Status: domain.StatusResolved,
+		StartsAt: now.Add(-4 * time.Hour), EndsAt: now.Add(-4*time.Hour + 20*time.Minute),
+	}
+	alerts.resolvedHistory = []store.ResolvedRef{
+		{AlertID: "a3", StartsAt: now.Add(-4 * time.Hour), EndsAt: now.Add(-4*time.Hour + 20*time.Minute), Note: "重启恢复", Reason: "manual"},
+		{AlertID: "a2", StartsAt: now.Add(-2 * time.Hour), EndsAt: now.Add(-2*time.Hour + 10*time.Minute), Reason: "manual"},
+		{AlertID: "a1", StartsAt: now, EndsAt: now}, // 应被 excludeID 过滤掉
+	}
+
+	w := doAlertsRequest(router, http.MethodGet, "/api/v1/alerts/a1/stats", cookie, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp alertStatsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.WindowDays != 30 {
+		t.Errorf("window_days = %d, want 30", resp.WindowDays)
+	}
+	if resp.Count != 3 {
+		t.Errorf("count = %d, want 3", resp.Count)
+	}
+	if resp.FirstSeen {
+		t.Errorf("first_seen = true, want false（count>1）")
+	}
+	if resp.AvgDurationSeconds == nil || *resp.AvgDurationSeconds != 900 {
+		t.Fatalf("avg_duration_seconds = %v, want 900（(600+1200)/2）", resp.AvgDurationSeconds)
+	}
+	if len(resp.RecentResolved) != 2 || resp.RecentResolved[0].AlertID != "a3" {
+		t.Fatalf("recent_resolved = %+v, want [a3, a2]（排除自身 a1）", resp.RecentResolved)
+	}
+	if resp.RecentResolved[0].Note != "重启恢复" {
+		t.Errorf("recent_resolved[0].note = %q, want 重启恢复", resp.RecentResolved[0].Note)
+	}
+	if resp.RecentResolved[0].DurationSeconds != 1200 {
+		t.Errorf("recent_resolved[0].duration_seconds = %d, want 1200", resp.RecentResolved[0].DurationSeconds)
+	}
+}
+
+// 该 fingerprint 只出现过当前这一条（count=1）时 first_seen=true，且没有已解决样本
+// 时 avg_duration_seconds 序列化为 JSON null（不是 0）。
+func TestAlertsStats_FirstOccurrence_FirstSeenTrueAndAvgNull(t *testing.T) {
+	router, alerts, _, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Fingerprint: "fp-only-once", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	w := doAlertsRequest(router, http.MethodGet, "/api/v1/alerts/a1/stats", cookie, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// 直接检查原始 JSON，确认字段是字面量 null 而不是被 omitempty 整体省略。
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if v, ok := raw["avg_duration_seconds"]; !ok || string(v) != "null" {
+		t.Errorf("avg_duration_seconds = %v, want 字面量 null", raw["avg_duration_seconds"])
+	}
+
+	var resp alertStatsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.FirstSeen {
+		t.Errorf("first_seen = false, want true（count<=1）")
+	}
+	if resp.Count != 1 {
+		t.Errorf("count = %d, want 1", resp.Count)
+	}
+	if len(resp.RecentResolved) != 0 {
+		t.Errorf("recent_resolved = %+v, want 空列表", resp.RecentResolved)
+	}
+}
+
+// stats 端点：告警不存在 → 404（与 detail 端点同一错误口径，见 respondActionError）。
+func TestAlertsStats_NotFound_Returns404(t *testing.T) {
+	router, _, _, _, _, cookie := newAlertsTestRouter(t)
+	w := doAlertsRequest(router, http.MethodGet, "/api/v1/alerts/no-such-id/stats", cookie, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+// ---- notes（ui-enrichment 任务2，独立备注）----
+
+// 201 创建成功后，detail 端点的时间线里能看到这条新备注（actor 取会话用户名，
+// action=note，不改变告警状态）。
+func TestAlertsAddNote_Success_VisibleInDetailTimeline(t *testing.T) {
+	router, alerts, _, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/notes", cookie, map[string]string{"note": "已联系业务方等回复"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Entry timelineEntryResponse `json:"entry"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if created.Entry.Action != domain.TimelineActionNote {
+		t.Errorf("action = %q, want note", created.Entry.Action)
+	}
+	if created.Entry.Actor != "member1" {
+		t.Errorf("actor = %q, want member1（会话用户名）", created.Entry.Actor)
+	}
+	if created.Entry.Detail["note"] != "已联系业务方等回复" {
+		t.Errorf("detail.note = %v, want 已联系业务方等回复", created.Entry.Detail["note"])
+	}
+
+	detailResp := doAlertsRequest(router, http.MethodGet, "/api/v1/alerts/a1", cookie, nil)
+	var detail struct {
+		Timeline []timelineEntryResponse `json:"timeline"`
+		Alert    alertResponse           `json:"alert"`
+	}
+	if err := json.Unmarshal(detailResp.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("解析 detail 响应失败: %v", err)
+	}
+	if len(detail.Timeline) != 1 || detail.Timeline[0].Action != domain.TimelineActionNote {
+		t.Fatalf("detail timeline = %+v, want 1 条 note", detail.Timeline)
+	}
+	if detail.Alert.Status != domain.StatusFiring {
+		t.Errorf("status = %s, want firing（AddNote 不改变状态）", detail.Alert.Status)
+	}
+}
+
+// 空 note（去空白后为空）→ 422，不追加时间线。
+func TestAlertsAddNote_Empty_Returns422(t *testing.T) {
+	router, alerts, timeline, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/notes", cookie, map[string]string{"note": "   "})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(timeline.entries["a1"]) != 0 {
+		t.Errorf("空 note 不应追加时间线，实际 %d 条", len(timeline.entries["a1"]))
+	}
+}
+
+// note 超过 1000 字符 → 422。
+func TestAlertsAddNote_TooLong_Returns422(t *testing.T) {
+	router, alerts, timeline, _, _, cookie := newAlertsTestRouter(t)
+	alerts.alerts["a1"] = domain.Alert{ID: "a1", Status: domain.StatusFiring, StartsAt: time.Now()}
+
+	tooLong := make([]byte, 1001)
+	for i := range tooLong {
+		tooLong[i] = 'a'
+	}
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/a1/notes", cookie, map[string]string{"note": string(tooLong)})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	if len(timeline.entries["a1"]) != 0 {
+		t.Errorf("超长 note 不应追加时间线，实际 %d 条", len(timeline.entries["a1"]))
+	}
+}
+
+// notes 端点：告警不存在 → 404。
+func TestAlertsAddNote_NotFound_Returns404(t *testing.T) {
+	router, _, _, _, _, cookie := newAlertsTestRouter(t)
+	w := doAlertsRequest(router, http.MethodPost, "/api/v1/alerts/no-such-id/notes", cookie, map[string]string{"note": "some note"})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }

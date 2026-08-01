@@ -25,6 +25,21 @@ type fakeAlertRepo struct {
 
 	updateStatusErr   error
 	updateStatusCalls []domain.Alert
+
+	getLatestResolvedAlert domain.Alert
+	getLatestResolvedErr   error
+	getLatestResolvedCalls []string
+
+	updateFlapErr   error
+	updateFlapCalls []flapUpdateCall
+}
+
+// flapUpdateCall 记录一次 UpdateFlapState 调用的入参，供测试断言。
+type flapUpdateCall struct {
+	id          string
+	count       int
+	windowStart time.Time
+	flapping    bool
 }
 
 func (f *fakeAlertRepo) UpsertByFingerprint(ctx context.Context, tx pgx.Tx, event domain.AlertEvent, integrationID string) (domain.Alert, bool, error) {
@@ -46,6 +61,19 @@ func (f *fakeAlertRepo) GetByFingerprint(ctx context.Context, tx pgx.Tx, fingerp
 func (f *fakeAlertRepo) UpdateStatus(ctx context.Context, tx pgx.Tx, alert domain.Alert) error {
 	f.updateStatusCalls = append(f.updateStatusCalls, alert)
 	return f.updateStatusErr
+}
+
+func (f *fakeAlertRepo) GetLatestResolvedByFingerprint(ctx context.Context, tx pgx.Tx, fingerprint string) (domain.Alert, error) {
+	f.getLatestResolvedCalls = append(f.getLatestResolvedCalls, fingerprint)
+	if f.getLatestResolvedErr != nil {
+		return domain.Alert{}, f.getLatestResolvedErr
+	}
+	return f.getLatestResolvedAlert, nil
+}
+
+func (f *fakeAlertRepo) UpdateFlapState(ctx context.Context, tx pgx.Tx, id string, flapCount int, flapWindowStart time.Time, flapping bool) error {
+	f.updateFlapCalls = append(f.updateFlapCalls, flapUpdateCall{id: id, count: flapCount, windowStart: flapWindowStart, flapping: flapping})
+	return f.updateFlapErr
 }
 
 // fakeTimelineRepo 是 TimelineRepo 的可编程测试替身。
@@ -96,13 +124,21 @@ type fixedClock struct{ t time.Time }
 func (c fixedClock) Now() time.Time { return c.t }
 
 func newDedupStageForTest(alerts AlertRepo, timeline TimelineRepo, sched TimerScheduler, fallback SeverityFallback, now time.Time) *DedupStage {
-	s := NewDedupStage(alerts, timeline, sched, fallback)
+	s := NewDedupStage(alerts, timeline, sched, fallback, 0, 0)
+	s.clock = fixedClock{t: now}
+	return s
+}
+
+// newDedupStageForFlapTest 额外接受 flap 窗口秒数与阈值，供 flapping 相关用例使用；
+// 其余场景沿用 newDedupStageForTest（windowSeconds=0，flapping 逻辑整体关闭）。
+func newDedupStageForFlapTest(alerts AlertRepo, timeline TimelineRepo, sched TimerScheduler, now time.Time, windowSeconds, threshold int) *DedupStage {
+	s := NewDedupStage(alerts, timeline, sched, nil, windowSeconds, threshold)
 	s.clock = fixedClock{t: now}
 	return s
 }
 
 func TestDedupStage_Name(t *testing.T) {
-	s := NewDedupStage(&fakeAlertRepo{}, &fakeTimelineRepo{}, &fakeScheduler{}, nil)
+	s := NewDedupStage(&fakeAlertRepo{}, &fakeTimelineRepo{}, &fakeScheduler{}, nil, 0, 0)
 	if got := s.Name(); got != "dedup" {
 		t.Fatalf("Name() = %q, want %q", got, "dedup")
 	}
@@ -417,5 +453,369 @@ func TestDedupStage_Process_SeverityFallback_FuncError_Propagates(t *testing.T) 
 	}
 	if len(alertRepo.upsertEvents) != 0 {
 		t.Fatal("severity 兜底失败后不应继续调用 UpsertByFingerprint")
+	}
+}
+
+// ---- Flapping 防抖（aiops-foundation R4/C4）----
+
+// ⑥ 窗口内累计：resolved 转移点，既有 flap_window_start 未滑出，count 累加，
+// 未达阈值不置位，不写任何 flapping_* 时间线。
+func TestDedupStage_Process_Flap_WindowAccumulation(t *testing.T) {
+	now := time.Date(2026, 7, 31, 10, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		getByFPAlert: domain.Alert{
+			ID:              "alert-flap-1",
+			Fingerprint:     "fp-flap-1",
+			Status:          domain.StatusFiring,
+			StartsAt:        now.Add(-time.Minute),
+			FlapCount:       1,
+			FlapWindowStart: now.Add(-100 * time.Second), // 窗口 300s，未滑出
+			Flapping:        false,
+		},
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-1",
+		Status:      domain.StatusResolved,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(alertRepo.updateFlapCalls) != 1 {
+		t.Fatalf("UpdateFlapState 被调用 %d 次, want 1", len(alertRepo.updateFlapCalls))
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.count != 2 || call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=2 flapping=false", call)
+	}
+	if !call.windowStart.Equal(now.Add(-100 * time.Second)) {
+		t.Fatalf("windowStart = %v, want 保持不变", call.windowStart)
+	}
+	// 只有 resolve 自身的时间线，没有 flapping_* 条目。
+	if len(timeline.appendCalls) != 1 || timeline.appendCalls[0].Action != domain.TimelineActionResolve {
+		t.Fatalf("timeline calls = %+v, want 仅 1 条 resolve", timeline.appendCalls)
+	}
+	if pctx.FlappingStarted {
+		t.Fatal("未达阈值不应置 FlappingStarted")
+	}
+}
+
+// ⑦ 窗口滑出重置：既有 flap_window_start 已超窗口，count 重置为 1、window_start=now，
+// 此前未 flapping 时不触发任何时间线。
+func TestDedupStage_Process_Flap_WindowSlideResets(t *testing.T) {
+	now := time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		getByFPAlert: domain.Alert{
+			ID:              "alert-flap-2",
+			Fingerprint:     "fp-flap-2",
+			Status:          domain.StatusFiring,
+			StartsAt:        now.Add(-time.Minute),
+			FlapCount:       5,
+			FlapWindowStart: now.Add(-400 * time.Second), // 窗口 300s，已滑出
+			Flapping:        false,
+		},
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-2",
+		Status:      domain.StatusResolved,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.count != 1 || call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=1 flapping=false", call)
+	}
+	if !call.windowStart.Equal(now) {
+		t.Fatalf("windowStart = %v, want 重置为 now(%v)", call.windowStart, now)
+	}
+	if len(timeline.appendCalls) != 1 {
+		t.Fatalf("timeline calls = %+v, want 仅 1 条 resolve（窗口滑出且此前未 flapping 不产生 flapping_* 条目）", timeline.appendCalls)
+	}
+}
+
+// ⑧ 置位：count 达到阈值且此前未 flapping → flapping=true，写 flapping_start，
+// 置 pctx.FlappingStarted=true（供 group stage 判断"抖动提示当次仍要发出"）。
+func TestDedupStage_Process_Flap_SetsFlappingAtThreshold(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		getByFPAlert: domain.Alert{
+			ID:              "alert-flap-3",
+			Fingerprint:     "fp-flap-3",
+			Status:          domain.StatusFiring,
+			StartsAt:        now.Add(-time.Minute),
+			FlapCount:       2,
+			FlapWindowStart: now.Add(-100 * time.Second),
+			Flapping:        false,
+		},
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-3",
+		Status:      domain.StatusResolved,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.count != 3 || !call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=3 flapping=true", call)
+	}
+	if len(timeline.appendCalls) != 2 {
+		t.Fatalf("timeline calls = %+v, want 2 条（resolve + flapping_start）", timeline.appendCalls)
+	}
+	if timeline.appendCalls[1].Action != domain.TimelineActionFlappingStart {
+		t.Fatalf("第二条时间线 Action = %q, want flapping_start", timeline.appendCalls[1].Action)
+	}
+	if !pctx.FlappingStarted {
+		t.Fatal("置位当次应设 pctx.FlappingStarted = true")
+	}
+	if pctx.Alert.Flapping != true || pctx.Alert.FlapCount != 3 {
+		t.Fatalf("pctx.Alert flap 字段 = {Flapping:%v FlapCount:%d}, want {true 3}", pctx.Alert.Flapping, pctx.Alert.FlapCount)
+	}
+}
+
+// ⑨ 惰性解除：已 flapping 的告警在窗口滑出后的下一次转移判定时解除，写 flapping_end，
+// 不置 pctx.FlappingStarted（解除不是置位）。
+func TestDedupStage_Process_Flap_LazyClearOnWindowSlide(t *testing.T) {
+	now := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		getByFPAlert: domain.Alert{
+			ID:              "alert-flap-4",
+			Fingerprint:     "fp-flap-4",
+			Status:          domain.StatusFiring,
+			StartsAt:        now.Add(-time.Minute),
+			FlapCount:       5,
+			FlapWindowStart: now.Add(-400 * time.Second), // 已滑出
+			Flapping:        true,
+		},
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-4",
+		Status:      domain.StatusResolved,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.count != 1 || call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=1 flapping=false（惰性解除）", call)
+	}
+	if len(timeline.appendCalls) != 2 || timeline.appendCalls[1].Action != domain.TimelineActionFlappingEnd {
+		t.Fatalf("timeline calls = %+v, want 2 条且第二条为 flapping_end", timeline.appendCalls)
+	}
+	if pctx.FlappingStarted {
+		t.Fatal("解除不是置位，不应设 pctx.FlappingStarted")
+	}
+}
+
+// ⑩ 未配置短路：FLAP_WINDOW_SECONDS<=0 时 firing/resolved 两条路径都不应产生任何
+// 额外 UPDATE/时间线写入——与现状逐字节一致（硬性约束）。
+func TestDedupStage_Process_Flap_DisabledWhenWindowZero(t *testing.T) {
+	now := time.Date(2026, 7, 31, 14, 0, 0, 0, time.UTC)
+
+	// resolved 路径：即便历史 flap 状态已经达到阈值，窗口=0 时也不应触碰 flap 字段。
+	resolvedRepo := &fakeAlertRepo{
+		getByFPAlert: domain.Alert{
+			ID:              "alert-flap-5",
+			Fingerprint:     "fp-flap-5",
+			Status:          domain.StatusFiring,
+			StartsAt:        now.Add(-time.Minute),
+			FlapCount:       10,
+			FlapWindowStart: now.Add(-10 * time.Second),
+			Flapping:        false,
+		},
+	}
+	resolvedTimeline := &fakeTimelineRepo{}
+	resolvedStage := newDedupStageForFlapTest(resolvedRepo, resolvedTimeline, &fakeScheduler{}, now, 0, 3)
+	resolvedPctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-5",
+		Status:      domain.StatusResolved,
+		Severity:    domain.SeverityCritical,
+	}}
+	if err := resolvedStage.Process(context.Background(), resolvedPctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(resolvedRepo.updateFlapCalls) != 0 {
+		t.Fatalf("窗口关闭时不应调用 UpdateFlapState，实际调用 %d 次", len(resolvedRepo.updateFlapCalls))
+	}
+	if len(resolvedTimeline.appendCalls) != 1 {
+		t.Fatalf("窗口关闭时应只有 resolve 自身的 1 条时间线，实际 %d 条", len(resolvedTimeline.appendCalls))
+	}
+
+	// firing/refire 路径：created=true 时也不应查询历史行或更新 flap 字段。
+	firingRepo := &fakeAlertRepo{
+		upsertAlert:   domain.Alert{ID: "alert-flap-6", Fingerprint: "fp-flap-6"},
+		upsertCreated: true,
+	}
+	firingStage := newDedupStageForFlapTest(firingRepo, &fakeTimelineRepo{}, &fakeScheduler{}, now, 0, 3)
+	firingPctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-6",
+		Status:      domain.StatusFiring,
+		Severity:    domain.SeverityCritical,
+	}}
+	if err := firingStage.Process(context.Background(), firingPctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(firingRepo.getLatestResolvedCalls) != 0 {
+		t.Fatalf("窗口关闭时不应查询历史 resolved 行，实际调用 %d 次", len(firingRepo.getLatestResolvedCalls))
+	}
+	if len(firingRepo.updateFlapCalls) != 0 {
+		t.Fatalf("窗口关闭时不应调用 UpdateFlapState，实际调用 %d 次", len(firingRepo.updateFlapCalls))
+	}
+	if firingPctx.FlappingStarted {
+		t.Fatal("窗口关闭时不应设 pctx.FlappingStarted")
+	}
+}
+
+// ⑪ refire 跨行延续：resolved 后同 fingerprint 再次 firing（created=true），从历史
+// resolved 行继承 flap_count/flap_window_start 基线并继续翻转判定（本次 refire 本身
+// 就是一次 resolved→firing 翻转），验证 GetLatestResolvedByFingerprint 被正确调用。
+func TestDedupStage_Process_Flap_RefireCarriesForwardFromResolvedHistory(t *testing.T) {
+	now := time.Date(2026, 7, 31, 15, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		upsertAlert:   domain.Alert{ID: "alert-flap-new", Fingerprint: "fp-flap-7"},
+		upsertCreated: true,
+		getLatestResolvedAlert: domain.Alert{
+			ID:              "alert-flap-old",
+			Fingerprint:     "fp-flap-7",
+			Status:          domain.StatusResolved,
+			FlapCount:       2,
+			FlapWindowStart: now.Add(-100 * time.Second), // 窗口 300s，未滑出
+			Flapping:        false,
+		},
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-7",
+		Status:      domain.StatusFiring,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(alertRepo.getLatestResolvedCalls) != 1 || alertRepo.getLatestResolvedCalls[0] != "fp-flap-7" {
+		t.Fatalf("GetLatestResolvedByFingerprint 调用 = %v, want [fp-flap-7]", alertRepo.getLatestResolvedCalls)
+	}
+	if len(alertRepo.updateFlapCalls) != 1 {
+		t.Fatalf("UpdateFlapState 被调用 %d 次, want 1", len(alertRepo.updateFlapCalls))
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.id != "alert-flap-new" {
+		t.Fatalf("UpdateFlapState 的 id = %q, want 新行 ID alert-flap-new", call.id)
+	}
+	if call.count != 3 || !call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=3（2+1 继承延续）flapping=true（达阈值）", call)
+	}
+	if len(timeline.appendCalls) != 1 || timeline.appendCalls[0].Action != domain.TimelineActionFlappingStart {
+		t.Fatalf("timeline calls = %+v, want 仅 1 条 flapping_start", timeline.appendCalls)
+	}
+	if !pctx.FlappingStarted {
+		t.Fatal("跨行延续达到阈值应置位 pctx.FlappingStarted = true")
+	}
+}
+
+// ⑫ refire 且该 fingerprint 首次出现（无历史 resolved 行）：ErrAlertNotFound 应被
+// 当作"从零值起算"处理，不向上传播为错误。
+func TestDedupStage_Process_Flap_RefireNoHistoryStartsFromZero(t *testing.T) {
+	now := time.Date(2026, 7, 31, 16, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		upsertAlert:          domain.Alert{ID: "alert-flap-first", Fingerprint: "fp-flap-8"},
+		upsertCreated:        true,
+		getLatestResolvedErr: store.ErrAlertNotFound,
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(alertRepo, timeline, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-8",
+		Status:      domain.StatusFiring,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	call := alertRepo.updateFlapCalls[0]
+	if call.count != 1 || call.flapping {
+		t.Fatalf("flap 更新 = %+v, want count=1 flapping=false（首次出现，零值起算）", call)
+	}
+	if len(timeline.appendCalls) != 0 {
+		t.Fatalf("首次出现不应产生任何 flapping_* 时间线，实际 %d 条", len(timeline.appendCalls))
+	}
+}
+
+// ⑬ 合并事件（created=false）不受 flapping 逻辑影响：不查历史行、不更新 flap 字段
+// （AC4.3：dedup 合并语义不受 flapping 影响）。
+func TestDedupStage_Process_Flap_MergedFiringUnaffected(t *testing.T) {
+	now := time.Date(2026, 7, 31, 17, 0, 0, 0, time.UTC)
+	alertRepo := &fakeAlertRepo{
+		upsertAlert:   domain.Alert{ID: "alert-flap-merged", Fingerprint: "fp-flap-9", FlapCount: 7},
+		upsertCreated: false,
+	}
+	stage := newDedupStageForFlapTest(alertRepo, &fakeTimelineRepo{}, &fakeScheduler{}, now, 300, 3)
+
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-9",
+		Status:      domain.StatusFiring,
+		Severity:    domain.SeverityCritical,
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(alertRepo.getLatestResolvedCalls) != 0 {
+		t.Fatalf("合并事件不应查询历史 resolved 行，实际调用 %d 次", len(alertRepo.getLatestResolvedCalls))
+	}
+	if len(alertRepo.updateFlapCalls) != 0 {
+		t.Fatalf("合并事件不应更新 flap 字段，实际调用 %d 次", len(alertRepo.updateFlapCalls))
+	}
+}
+
+// ⑪ 阈值=0 视同关闭：窗口>0 但 FLAP_THRESHOLD 显式配 0 时，若放行判定则
+// count>=threshold 恒真、首个事件即置位——与「零值=关闭」约定相悖，flapEnabled
+// 总闸门必须把这种组合整体关闭（零额外查询/写入）。
+func TestDedupStage_Process_Flap_DisabledWhenThresholdZero(t *testing.T) {
+	now := time.Date(2026, 7, 31, 14, 0, 0, 0, time.UTC)
+	firingRepo := &fakeAlertRepo{
+		upsertAlert:   domain.Alert{ID: "alert-flap-7", Fingerprint: "fp-flap-7"},
+		upsertCreated: true,
+	}
+	timeline := &fakeTimelineRepo{}
+	stage := newDedupStageForFlapTest(firingRepo, timeline, &fakeScheduler{}, now, 600, 0)
+	pctx := &PipelineContext{Event: domain.AlertEvent{
+		Fingerprint: "fp-flap-7",
+		Status:      domain.StatusFiring,
+		Severity:    domain.SeverityCritical,
+	}}
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if len(firingRepo.updateFlapCalls) != 0 {
+		t.Fatalf("阈值=0 应整体关闭 flap 判定，不应调用 UpdateFlapState，实际 %d 次", len(firingRepo.updateFlapCalls))
+	}
+	if pctx.FlappingStarted {
+		t.Fatal("阈值=0 时不应置位 FlappingStarted")
 	}
 }

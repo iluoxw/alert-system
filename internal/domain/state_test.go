@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,7 +114,7 @@ func TestResolve_LegalTransitions(t *testing.T) {
 	now := time.Date(2026, 7, 30, 11, 0, 0, 0, time.UTC)
 	for _, from := range []Status{StatusFiring, StatusAcknowledged} {
 		alert := Alert{ID: "a1", Status: from}
-		updated, entry, err := Resolve(alert, "bob", ResolveReasonManual, now)
+		updated, entry, err := Resolve(alert, "bob", ResolveReasonManual, "", now)
 		if err != nil {
 			t.Fatalf("Resolve() from %s: error = %v", from, err)
 		}
@@ -135,9 +136,38 @@ func TestResolve_LegalTransitions(t *testing.T) {
 	}
 }
 
+// TestResolve_NoteWrittenToDetail 覆盖 R5：note 非空时写入 entry.Detail["note"]，
+// 与 reason 自身的 label（如 TTL/自愈）互不干扰。
+func TestResolve_NoteWrittenToDetail(t *testing.T) {
+	alert := Alert{ID: "a1", Status: StatusFiring}
+	_, entry, err := Resolve(alert, "bob", ResolveReasonManual, "重启服务后恢复", time.Now())
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if entry.Detail["note"] != "重启服务后恢复" {
+		t.Errorf("Detail[note] = %v, want 重启服务后恢复", entry.Detail["note"])
+	}
+}
+
+// TestResolve_EmptyNoteMatchesPriorBehavior 断言 note 引入前后，空串 note 产出的
+// entry.Detail 形态完全一致（不出现空字符串的 "note" 键），R5 acceptance criteria 2。
+func TestResolve_EmptyNoteMatchesPriorBehavior(t *testing.T) {
+	alert := Alert{ID: "a1", Status: StatusFiring}
+	_, entry, err := Resolve(alert, "bob", ResolveReasonManual, "", time.Now())
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if _, hasNote := entry.Detail["note"]; hasNote {
+		t.Errorf("空 note 不应出现在 Detail 中，实际 = %v", entry.Detail["note"])
+	}
+	if len(entry.Detail) != 1 {
+		t.Errorf("Detail = %v, want 只含 reason 一个键", entry.Detail)
+	}
+}
+
 func TestResolve_AlreadyResolved(t *testing.T) {
 	alert := Alert{ID: "a1", Status: StatusResolved}
-	_, _, err := Resolve(alert, "bob", ResolveReasonManual, time.Now())
+	_, _, err := Resolve(alert, "bob", ResolveReasonManual, "", time.Now())
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Errorf("error = %v, want ErrInvalidTransition", err)
 	}
@@ -153,7 +183,7 @@ func TestResolve_ReasonLabels(t *testing.T) {
 	}
 	for _, tt := range tests {
 		alert := Alert{ID: "a1", Status: StatusFiring}
-		_, entry, err := Resolve(alert, "system", tt.reason, time.Now())
+		_, entry, err := Resolve(alert, "system", tt.reason, "", time.Now())
 		if err != nil {
 			t.Fatalf("Resolve() reason=%s: error = %v", tt.reason, err)
 		}
@@ -165,7 +195,7 @@ func TestResolve_ReasonLabels(t *testing.T) {
 
 func TestResolve_SourceReasonHasNoLabel(t *testing.T) {
 	alert := Alert{ID: "a1", Status: StatusFiring}
-	_, entry, err := Resolve(alert, "alertmanager", ResolveReasonSource, time.Now())
+	_, entry, err := Resolve(alert, "alertmanager", ResolveReasonSource, "", time.Now())
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -176,14 +206,14 @@ func TestResolve_SourceReasonHasNoLabel(t *testing.T) {
 
 func TestResolve_InvalidReason(t *testing.T) {
 	alert := Alert{ID: "a1", Status: StatusFiring}
-	if _, _, err := Resolve(alert, "bob", ResolveReason("bogus"), time.Now()); err == nil {
+	if _, _, err := Resolve(alert, "bob", ResolveReason("bogus"), "", time.Now()); err == nil {
 		t.Error("Resolve() with invalid reason: error = nil, want error")
 	}
 }
 
 func TestResolve_EmptyActor(t *testing.T) {
 	alert := Alert{ID: "a1", Status: StatusFiring}
-	if _, _, err := Resolve(alert, "", ResolveReasonManual, time.Now()); err == nil {
+	if _, _, err := Resolve(alert, "", ResolveReasonManual, "", time.Now()); err == nil {
 		t.Error("Resolve() with empty actor: error = nil, want error")
 	}
 }
@@ -228,5 +258,59 @@ func TestHandoff_EmptyActorOrTarget(t *testing.T) {
 	}
 	if _, _, err := Handoff(alert, "alice", "", time.Now()); err == nil {
 		t.Error("Handoff() with empty target: error = nil, want error")
+	}
+}
+
+// TestAddNote_ValidationBoundaries 覆盖 R5（ui-enrichment）：空串/纯空白/长度边界
+// 的拒绝与通过，口径与 Resolve.note 一致地按 rune 计数（maxNoteLength=1000）。
+func TestAddNote_ValidationBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		note    string
+		wantErr bool
+	}{
+		{name: "空串", note: "", wantErr: true},
+		{name: "纯空白", note: "   \t\n  ", wantErr: true},
+		{name: "1000字符边界通过", note: strings.Repeat("a", 1000), wantErr: false},
+		{name: "1001字符拒绝", note: strings.Repeat("a", 1001), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := AddNote("a1", "alice", tt.note, time.Now())
+			if tt.wantErr {
+				if !errors.Is(err, ErrInvalidNote) {
+					t.Errorf("AddNote() error = %v, want ErrInvalidNote", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("AddNote() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestAddNote_EntryShape 断言正常形态下 entry 各字段：action/actor/detail.note 均
+// 正确，且不返回 Alert（AddNote 不是状态转移，签名上也没有 Alert 返回值）。
+func TestAddNote_EntryShape(t *testing.T) {
+	now := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	entry, err := AddNote("a1", "alice", "  已联系业务方等回复  ", now)
+	if err != nil {
+		t.Fatalf("AddNote() error = %v", err)
+	}
+	if entry.AlertID != "a1" {
+		t.Errorf("AlertID = %q, want a1", entry.AlertID)
+	}
+	if entry.Actor != "alice" {
+		t.Errorf("Actor = %q, want alice", entry.Actor)
+	}
+	if entry.Action != TimelineActionNote {
+		t.Errorf("Action = %q, want %q", entry.Action, TimelineActionNote)
+	}
+	if !entry.At.Equal(now) {
+		t.Errorf("At = %v, want %v", entry.At, now)
+	}
+	if entry.Detail["note"] != "已联系业务方等回复" {
+		t.Errorf("Detail[note] = %v, want 去空白后的备注内容", entry.Detail["note"])
 	}
 }

@@ -743,6 +743,8 @@ func routeJSON(r store.Route) gin.H {
 		"group_wait_seconds":      r.GroupWaitSeconds,
 		"group_interval_seconds":  r.GroupIntervalSeconds,
 		"repeat_interval_seconds": r.RepeatIntervalSeconds,
+		"group_mode":              r.GroupMode,
+		"storm_threshold_per_min": r.StormThresholdPerMin,
 		"created_at":              r.CreatedAt,
 		"updated_at":              r.UpdatedAt,
 	}
@@ -756,12 +758,31 @@ type routeRequest struct {
 	GroupWaitSeconds      int               `json:"group_wait_seconds"`
 	GroupIntervalSeconds  int               `json:"group_interval_seconds"`
 	RepeatIntervalSeconds int               `json:"repeat_interval_seconds"`
+	GroupMode             string            `json:"group_mode"`
+	StormThresholdPerMin  int               `json:"storm_threshold_per_min"`
+}
+
+// normalizedGroupMode 把请求里缺省的 group_mode（""）落成 "label"，与 store 层
+// （config_repos_routing.go 的 Create/Update 对空 GroupMode 的兜底）双保险对齐——
+// 保证不带该字段的既有路由请求落库结果与引入 group_mode 之前逐字节一致（design.md
+// C1：缺省值语义=关闭/现状）。
+func normalizedGroupMode(m string) string {
+	if m == "" {
+		return "label"
+	}
+	return m
 }
 
 // validateRoute 校验 matcher 语法（正则合法性等，见 domain.Matcher.Validate）与
 // target_team_id 是否存在；不要求 matchers 非空——留白 matchers 在当前领域模型下
 // 恒不匹配（domain.MatcherSet.Matches），是否应该在 API 层拒绝这种"实质上的死配置"
 // 不在本任务裁决范围内，按 brief 要求只做了列出的三类校验，这里不新增。
+// 另外校验 group_mode（R1/C1）与 storm_threshold_per_min（R3/C3）：group_mode 提供
+// 时只能是 label/window；group_mode=window 与 group_by 语义互斥（window 是固定组键，
+// 不使用 group_by 计算分组），二者同时非空即 422；storm_threshold_per_min 不能为负。
+// group_by 本身（含保留键 __template__，R2/C2）在这里不做格式校验——现有实现从未
+// 校验过 group_by 的元素格式（只有 matchers/target_team_id 两类语义校验），因此
+// __template__ 无需任何放行改动即可直接使用。
 // 返回值第三项非 nil 表示查团队存在性时发生了基础设施故障（而非校验不通过），
 // 调用方应把它当普通 store 错误处理（500），不能当成校验失败（422）。
 func (h *configHandlers) validateRoute(ctx context.Context, tx pgx.Tx, req routeRequest) (string, bool, error) {
@@ -777,6 +798,15 @@ func (h *configHandlers) validateRoute(ctx context.Context, tx pgx.Tx, req route
 	}
 	if !exists {
 		return "target_team_id 不存在", false, nil
+	}
+	if req.GroupMode != "" && req.GroupMode != "label" && req.GroupMode != "window" {
+		return "group_mode 只能是 label 或 window", false, nil
+	}
+	if req.GroupMode == "window" && len(req.GroupBy) > 0 {
+		return "group_mode=window 与 group_by 互斥：窗口全归并模式不使用 group_by 分组键", false, nil
+	}
+	if req.StormThresholdPerMin < 0 {
+		return "storm_threshold_per_min 不能为负数", false, nil
 	}
 	return "", true, nil
 }
@@ -806,6 +836,8 @@ func (h *configHandlers) createRoute(c *gin.Context) {
 			GroupWaitSeconds:      req.GroupWaitSeconds,
 			GroupIntervalSeconds:  req.GroupIntervalSeconds,
 			RepeatIntervalSeconds: req.RepeatIntervalSeconds,
+			GroupMode:             normalizedGroupMode(req.GroupMode),
+			StormThresholdPerMin:  req.StormThresholdPerMin,
 		})
 		return createErr
 	})
@@ -873,6 +905,8 @@ func (h *configHandlers) updateRoute(c *gin.Context) {
 			GroupWaitSeconds:      req.GroupWaitSeconds,
 			GroupIntervalSeconds:  req.GroupIntervalSeconds,
 			RepeatIntervalSeconds: req.RepeatIntervalSeconds,
+			GroupMode:             normalizedGroupMode(req.GroupMode),
+			StormThresholdPerMin:  req.StormThresholdPerMin,
 		})
 	})
 	if h.writeValidationOr(c, err, "更新路由") {

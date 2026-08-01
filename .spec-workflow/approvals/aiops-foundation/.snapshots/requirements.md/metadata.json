@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/aiops-foundation/requirements.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T07:06:16.809Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785481576804_9qim6ov8p",
+      "approvalTitle": "aiops-foundation 需求文档：确定性降噪 + AI 框架预留（6 项需求）"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T07:07:50.210Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785481576804_9qim6ov8p",
+      "approvalTitle": "aiops-foundation 需求文档：确定性降噪 + AI 框架预留（6 项需求）"
+    }
+  ]
+}

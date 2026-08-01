@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -24,6 +27,11 @@ type AlertsStore interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id string) (domain.Alert, error)
 	UpdateStatus(ctx context.Context, tx pgx.Tx, alert domain.Alert) error
 	List(ctx context.Context, tx pgx.Tx, filter store.AlertFilter) (store.AlertPage, error)
+	// FingerprintStats/ListRecentResolvedByFingerprint 供告警详情页"噪声画像"
+	// （ui-enrichment 任务4）读取同 fingerprint 的历史发生次数/平均耗时/最近已解决
+	// 记录。*store.AlertRepo 天然满足。
+	FingerprintStats(ctx context.Context, tx pgx.Tx, fingerprint string, since time.Time) (int, *float64, error)
+	ListRecentResolvedByFingerprint(ctx context.Context, tx pgx.Tx, fingerprint, excludeID string, limit int) ([]store.ResolvedRef, error)
 }
 
 // AlertTimelineStore 抽象 store.TimelineRepo 用到的方法。与已有的 TimelineStore
@@ -65,6 +73,18 @@ const (
 	defaultRecentChangesLimit  = 20
 )
 
+// maxResolveNoteLength 是 Resolve 处置说明（R5，"怎么修的"）的字符数上限，design.md
+// C5 定的 1000 字符；超限 422（复用 unprocessable，与 config.go 的语义校验同一口径）。
+const maxResolveNoteLength = 1000
+
+// statsWindow/statsRecentResolvedLimit 是详情页"噪声画像"（ui-enrichment 任务4）
+// 的固定回看窗口与最近已解决记录条数，MVP 阶段服务端固定、不接受查询参数——理由
+// 同 defaultRecentChangesWindow：按需细分不是本任务范围。
+const (
+	statsWindow              = 30 * 24 * time.Hour
+	statsRecentResolvedLimit = 5
+)
+
 // uuidPattern 用于在查询/校验阶段提前拒绝格式非法的 team_id，避免把非法输入一路
 // 带到 SQL 的 ::uuid 转换上产生数据库层 500（而不是更合适的 400）。
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -104,9 +124,11 @@ func (r *Router) RegisterAlertRoutes(alerts AlertsStore, timeline AlertTimelineS
 	authed.Use(r.sessionAuth())
 	authed.GET("/alerts", h.list)
 	authed.GET("/alerts/:id", h.detail)
+	authed.GET("/alerts/:id/stats", h.stats)
 	authed.POST("/alerts/:id/ack", h.ack)
 	authed.POST("/alerts/:id/resolve", h.resolve)
 	authed.POST("/alerts/:id/handoff", h.handoff)
+	authed.POST("/alerts/:id/notes", h.addNote)
 	return r
 }
 
@@ -251,6 +273,110 @@ func (h *alertsHandler) detail(c *gin.Context) {
 	})
 }
 
+// stats 处理 GET /api/v1/alerts/:id/stats（ui-enrichment 任务4）：详情页"噪声画像"，
+// 统计同 fingerprint 近 statsWindow 内的历史发生次数/已解决样本平均耗时，并列出最近
+// 若干条已解决记录（各自带上处置说明/原因）供排查参考"上次是怎么处理的"。
+// first_seen=true 表示这是该 fingerprint 迄今唯一一次出现（count<=1），提示前端不必
+// 展示"历史"相关 UI。avg_duration_seconds 无已解决样本时序列化为 JSON null（而不是
+// 0），区分"没有数据"与"平均耗时为 0"。
+func (h *alertsHandler) stats(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	since := h.router.clock.Now().Add(-statsWindow)
+
+	var (
+		count      int
+		avgSeconds *float64
+		recent     []store.ResolvedRef
+	)
+	err := h.router.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		alert, getErr := h.alerts.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return getErr
+		}
+
+		cnt, avg, statsErr := h.alerts.FingerprintStats(ctx, tx, alert.Fingerprint, since)
+		if statsErr != nil {
+			return statsErr
+		}
+		count = cnt
+		avgSeconds = avg
+
+		refs, listErr := h.alerts.ListRecentResolvedByFingerprint(ctx, tx, alert.Fingerprint, alert.ID, statsRecentResolvedLimit)
+		if listErr != nil {
+			return listErr
+		}
+		recent = refs
+		return nil
+	})
+	if err != nil {
+		h.respondActionError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"window_days":          int(statsWindow / (24 * time.Hour)),
+		"count":                count,
+		"first_seen":           count <= 1,
+		"avg_duration_seconds": roundSecondsPtr(avgSeconds),
+		"recent_resolved":      newResolvedRefResponses(recent),
+	})
+}
+
+// addNote 处理 POST /api/v1/alerts/:id/notes（ui-enrichment 任务2）：详情页追加一条
+// 独立备注（不代表任何状态转移，见 domain.AddNote）。空备注或超过 1000 字符
+// （domain.ErrInvalidNote）-> 422，与 resolve 端点对超长 note 的映射口径一致。
+func (h *alertsHandler) addNote(c *gin.Context) {
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+		return
+	}
+
+	id := c.Param("id")
+	rbac, _ := UserFromContext(c)
+	ctx := c.Request.Context()
+	now := h.router.clock.Now()
+
+	var entry domain.TimelineEntry
+	err := h.router.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		alert, getErr := h.alerts.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return getErr
+		}
+		e, noteErr := domain.AddNote(alert.ID, rbac.Username, req.Note, now)
+		if noteErr != nil {
+			return noteErr
+		}
+		if _, appendErr := h.timeline.Append(ctx, tx, e); appendErr != nil {
+			return appendErr
+		}
+		entry = e
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidNote) {
+			unprocessable(c, "note 不能为空，且不超过 1000 字符")
+			return
+		}
+		h.respondActionError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"entry": newTimelineResponses([]domain.TimelineEntry{entry})[0]})
+}
+
+// roundSecondsPtr 把 avg(EXTRACT(EPOCH FROM ...)) 算出的浮点秒数四舍五入为整数秒，
+// 供 JSON 响应展示；nil 原样透传（"无样本"与"耗时为 0"是两码事，不能用 0 顶替）。
+func roundSecondsPtr(v *float64) *int64 {
+	if v == nil {
+		return nil
+	}
+	r := int64(math.Round(*v))
+	return &r
+}
+
 // ack 处理 POST /api/v1/alerts/:id/ack（R4.1/R4.2）。幂等口径（team-lead 裁决）：
 // 告警已经是 acknowledged 或 resolved 时视为"重复同一动作"，不调用 domain.Ack、不
 // 追加新的时间线条目，直接 200 返回当前状态，不报 409。无论本次是否真的发生了
@@ -299,12 +425,28 @@ func (h *alertsHandler) ack(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"alert": newAlertResponse(result)})
 }
 
-// resolve 处理 POST /api/v1/alerts/:id/resolve（R4.1，reason=manual）。幂等口径同
-// ack：已经 resolved 视为重复同一动作，直接 200 返回当前状态，不报 409、不追加
-// 新时间线。无论本次是否真的发生了状态转移，都无条件尝试停止升级链定时器与
-// TTL/repeat 等生命周期定时器（两者均幂等）——保证"Resolve 之后一定没有残留定时器"
-// 这个不变量。
+// resolve 处理 POST /api/v1/alerts/:id/resolve（R4.1，reason=manual；R5 可选 note）。
+// note 为可选处置说明，body 可以整体省略（走既有的无 body 调用方式）；提供时超过
+// maxResolveNoteLength 字符 -> 422（复用 config.go 的 unprocessable 语义校验口径）。
+// 幂等口径同 ack：已经 resolved 视为重复同一动作，直接 200 返回当前状态，不报 409、
+// 不追加新时间线——本次传入的 note 也随之丢弃（不重写时间线，不变量 6 一字不改）。
+// 无论本次是否真的发生了状态转移，都无条件尝试停止升级链定时器与 TTL/repeat 等
+// 生命周期定时器（两者均幂等）——保证"Resolve 之后一定没有残留定时器"这个不变量。
 func (h *alertsHandler) resolve(c *gin.Context) {
+	var req struct {
+		Note string `json:"note"`
+	}
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+			return
+		}
+	}
+	if utf8.RuneCountInString(req.Note) > maxResolveNoteLength {
+		unprocessable(c, fmt.Sprintf("note 超出长度上限（%d 字符）", maxResolveNoteLength))
+		return
+	}
+
 	id := c.Param("id")
 	rbac, _ := UserFromContext(c)
 	ctx := c.Request.Context()
@@ -318,7 +460,7 @@ func (h *alertsHandler) resolve(c *gin.Context) {
 		}
 
 		if alert.Status != domain.StatusResolved {
-			updated, entry, resolveErr := domain.Resolve(alert, rbac.Username, domain.ResolveReasonManual, now)
+			updated, entry, resolveErr := domain.Resolve(alert, rbac.Username, domain.ResolveReasonManual, req.Note, now)
 			if resolveErr != nil {
 				return resolveErr
 			}
@@ -436,6 +578,7 @@ type alertResponse struct {
 	SilencedBy          []string             `json:"silenced_by,omitempty"`
 	AckedBy             string               `json:"acked_by,omitempty"`
 	AckedAt             *time.Time           `json:"acked_at,omitempty"`
+	Flapping            bool                 `json:"flapping"`
 	StartsAt            time.Time            `json:"starts_at"`
 	LastSeenAt          time.Time            `json:"last_seen_at"`
 	EndsAt              *time.Time           `json:"ends_at,omitempty"`
@@ -463,6 +606,7 @@ func newAlertResponse(a domain.Alert) alertResponse {
 		TeamID:              a.TeamID,
 		SilencedBy:          a.SilencedBy,
 		AckedBy:             a.AckedBy,
+		Flapping:            a.Flapping,
 		StartsAt:            a.StartsAt,
 		LastSeenAt:          a.LastSeenAt,
 		CreatedAt:           a.CreatedAt,
@@ -492,6 +636,32 @@ func newTimelineResponses(entries []domain.TimelineEntry) []timelineEntryRespons
 	resp := make([]timelineEntryResponse, len(entries))
 	for i, e := range entries {
 		resp[i] = timelineEntryResponse{Actor: e.Actor, Action: e.Action, Detail: e.Detail, At: e.At}
+	}
+	return resp
+}
+
+// resolvedRefResponse 是 stats 端点"最近已解决"卡片的对外 JSON 表示，对应
+// store.ResolvedRef 投影。duration_seconds 由 EndsAt-StartsAt 取整秒计算。
+type resolvedRefResponse struct {
+	AlertID         string    `json:"alert_id"`
+	StartsAt        time.Time `json:"starts_at"`
+	EndsAt          time.Time `json:"ends_at"`
+	DurationSeconds int64     `json:"duration_seconds"`
+	Note            string    `json:"note"`
+	Reason          string    `json:"reason"`
+}
+
+func newResolvedRefResponses(refs []store.ResolvedRef) []resolvedRefResponse {
+	resp := make([]resolvedRefResponse, len(refs))
+	for i, r := range refs {
+		resp[i] = resolvedRefResponse{
+			AlertID:         r.AlertID,
+			StartsAt:        r.StartsAt,
+			EndsAt:          r.EndsAt,
+			DurationSeconds: int64(math.Round(r.EndsAt.Sub(r.StartsAt).Seconds())),
+			Note:            r.Note,
+			Reason:          r.Reason,
+		}
 	}
 	return resp
 }

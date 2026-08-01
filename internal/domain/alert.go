@@ -141,8 +141,16 @@ type Alert struct {
 	DedupCount int    // 同 fingerprint 合并计数（R3.3）
 	GroupKey   string // 分组通知用（R9），未分组时为空
 	TeamID     string // 路由到的团队，未路由时为空
+	RouteID    string // 路由到的规则 ID（aiops-foundation R3，供风暴熔断按路由计数），未路由时为空
 
 	SilencedBy []string // 命中的 silence 规则 ID 列表（R10）
+
+	// FlapCount/FlapWindowStart/Flapping 是 flapping 防抖状态（aiops-foundation R4）：
+	// 窗口内状态翻转计数、窗口起点、是否已判定为抖动中；均只影响通知层，不影响
+	// 状态机/入库/dedup/时间线（AC4.3）。未开启防抖或从未翻转过时保持零值。
+	FlapCount       int
+	FlapWindowStart time.Time
+	Flapping        bool
 
 	AckedBy string    // 响应人，未 Ack 时为空
 	AckedAt time.Time // 未 Ack 时为零值

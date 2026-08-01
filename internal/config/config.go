@@ -40,6 +40,12 @@ const (
 	defaultRetentionNotificationLogDays = 90
 	defaultRetentionSweepInterval       = time.Hour
 	defaultRetentionBatchSize           = 1000
+
+	// defaultFlapWindowSeconds 默认 0（关闭）：flapping 防抖是 opt-in 能力
+	// （aiops-foundation R4/C4），未显式配置窗口时行为与现状逐字节一致。
+	defaultFlapWindowSeconds = 0
+	// defaultFlapThreshold 是窗口内状态翻转次数阈值，仅在窗口>0 时生效。
+	defaultFlapThreshold = 3
 )
 
 // Config 是服务启动所需的全部配置项。
@@ -58,6 +64,11 @@ type Config struct {
 	SMTP             SMTPConfig      // R3 email 渠道凭据
 	PersonnelChannel string          // R3 人员到人通知的默认渠道，默认 "email"
 	Retention        RetentionConfig // R5 timers/notification_log 数据保留策略
+
+	// FlapWindowSeconds/FlapThreshold 是 flapping 防抖（aiops-foundation R4）的判定窗口
+	// 与翻转次数阈值；FlapWindowSeconds<=0 表示关闭（opt-in，默认关闭）。
+	FlapWindowSeconds int
+	FlapThreshold     int
 }
 
 // SMTPConfig 是 email 通知渠道（R3）所需的 SMTP 凭据配置。Host 为空表示未配置，
@@ -128,6 +139,9 @@ type fileConfig struct {
 	SMTP             fileSMTPConfig      `yaml:"smtp"`
 	PersonnelChannel string              `yaml:"personnel_channel"`
 	Retention        fileRetentionConfig `yaml:"retention"`
+
+	FlapWindowSeconds int `yaml:"flap_window_seconds"`
+	FlapThreshold     int `yaml:"flap_threshold"`
 }
 
 type fileSMTPConfig struct {
@@ -174,6 +188,8 @@ func Load(path string) (Config, error) {
 			SweepInterval:       defaultRetentionSweepInterval.String(),
 			BatchSize:           defaultRetentionBatchSize,
 		},
+		FlapWindowSeconds: defaultFlapWindowSeconds,
+		FlapThreshold:     defaultFlapThreshold,
 	}
 
 	if path != "" {
@@ -242,6 +258,8 @@ func Load(path string) (Config, error) {
 			SweepInterval:       retentionSweepInterval,
 			BatchSize:           fc.Retention.BatchSize,
 		},
+		FlapWindowSeconds: fc.FlapWindowSeconds,
+		FlapThreshold:     fc.FlapThreshold,
 	}, nil
 }
 
@@ -325,6 +343,16 @@ func applyEnvOverrides(fc *fileConfig) {
 	if v := os.Getenv("RETENTION_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			fc.Retention.BatchSize = n
+		}
+	}
+	if v := os.Getenv("FLAP_WINDOW_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			fc.FlapWindowSeconds = n
+		}
+	}
+	if v := os.Getenv("FLAP_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			fc.FlapThreshold = n
 		}
 	}
 }

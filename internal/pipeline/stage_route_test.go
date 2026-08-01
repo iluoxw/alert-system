@@ -30,7 +30,7 @@ func (f *fakeRouteRepo) ListOrdered(ctx context.Context, tx pgx.Tx, limit int) (
 
 // routingUpdateCall 记录 fakeRouteAlertRepo.UpdateRouting 收到的参数。
 type routingUpdateCall struct {
-	id, teamID, groupKey string
+	id, teamID, groupKey, routeID string
 }
 
 // fakeRouteAlertRepo 是 RouteAlertRepo 的可编程测试替身。
@@ -39,8 +39,8 @@ type fakeRouteAlertRepo struct {
 	err   error
 }
 
-func (f *fakeRouteAlertRepo) UpdateRouting(ctx context.Context, tx pgx.Tx, id, teamID, groupKey string) error {
-	f.calls = append(f.calls, routingUpdateCall{id: id, teamID: teamID, groupKey: groupKey})
+func (f *fakeRouteAlertRepo) UpdateRouting(ctx context.Context, tx pgx.Tx, id, teamID, groupKey, routeID string) error {
+	f.calls = append(f.calls, routingUpdateCall{id: id, teamID: teamID, groupKey: groupKey, routeID: routeID})
 	return f.err
 }
 
@@ -104,11 +104,14 @@ func TestRouteStage_Process_PriorityOrder_FirstMatchWins(t *testing.T) {
 	if pctx.Route.TeamID != "team-mid" || pctx.Alert.TeamID != "team-mid" {
 		t.Fatalf("TeamID = %q/%q, want team-mid", pctx.Route.TeamID, pctx.Alert.TeamID)
 	}
+	if pctx.Alert.RouteID != "r-mid" {
+		t.Fatalf("Alert.RouteID = %q, want r-mid（命中路由后应同步写回 Alert，供分组 stage 透传）", pctx.Alert.RouteID)
+	}
 	if pctx.Route.GroupWait != 30*time.Second || pctx.Route.GroupInterval != 300*time.Second || pctx.Route.RepeatInterval != 14400*time.Second {
 		t.Fatalf("分组参数转换错误: %+v", pctx.Route)
 	}
-	if len(alerts.calls) != 1 || alerts.calls[0] != (routingUpdateCall{id: "alert-1", teamID: "team-mid", groupKey: ""}) {
-		t.Fatalf("UpdateRouting 调用 = %+v, want [{alert-1 team-mid }]", alerts.calls)
+	if len(alerts.calls) != 1 || alerts.calls[0] != (routingUpdateCall{id: "alert-1", teamID: "team-mid", groupKey: "", routeID: "r-mid"}) {
+		t.Fatalf("UpdateRouting 调用 = %+v, want [{alert-1 team-mid  r-mid}]", alerts.calls)
 	}
 }
 
@@ -131,8 +134,11 @@ func TestRouteStage_Process_NoMatch_FallsBackToDefaultTeam(t *testing.T) {
 	if pctx.Route.TeamID != "team-default" || pctx.Alert.TeamID != "team-default" {
 		t.Fatalf("TeamID = %q/%q, want team-default", pctx.Route.TeamID, pctx.Alert.TeamID)
 	}
-	if len(alerts.calls) != 1 || alerts.calls[0].teamID != "team-default" {
-		t.Fatalf("UpdateRouting 调用 = %+v, want teamID=team-default", alerts.calls)
+	if pctx.Alert.RouteID != "" {
+		t.Fatalf("Alert.RouteID = %q, want 空（未命中任何规则，落到默认团队兜底）", pctx.Alert.RouteID)
+	}
+	if len(alerts.calls) != 1 || alerts.calls[0].teamID != "team-default" || alerts.calls[0].routeID != "" {
+		t.Fatalf("UpdateRouting 调用 = %+v, want teamID=team-default, routeID=空", alerts.calls)
 	}
 }
 
@@ -257,6 +263,33 @@ func TestRouteStage_Process_UpdateRoutingError_Propagates(t *testing.T) {
 	err := stage.Process(context.Background(), pctx)
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("Process() 错误 = %v, 期望包裹 %v", err, wantErr)
+	}
+}
+
+// ⑨ 路由重配从"命中 r1"变为"命中 r2"：pctx.Alert.RouteID 应改写为新命中的路由 ID，
+// 而不是保留上一轮遗留的旧值——route_id 是路由 stage 自己负责的字段，理应无条件
+// 覆盖为本轮求出的最新结果。
+func TestRouteStage_Process_RouteIDUpdatesOnReroute(t *testing.T) {
+	routes := &fakeRouteRepo{routes: []store.Route{
+		{ID: "r2", Priority: 1, Matchers: domain.MatcherSet{{Name: "env", Op: domain.MatchEqual, Value: "prod"}}, TargetTeamID: "team-b"},
+	}}
+	alerts := &fakeRouteAlertRepo{}
+	stage := newRouteStageForTest(routes, alerts, "team-default", &mutableClock{t: time.Now()})
+
+	pctx := &PipelineContext{Alert: domain.Alert{
+		ID:      "alert-10",
+		Labels:  map[string]string{"env": "prod"},
+		RouteID: "r1", // 上一轮命中的旧路由 ID
+	}}
+
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatalf("Process() 返回意外错误: %v", err)
+	}
+	if pctx.Alert.RouteID != "r2" {
+		t.Fatalf("Alert.RouteID = %q, want 改写为本轮命中的 r2", pctx.Alert.RouteID)
+	}
+	if len(alerts.calls) != 1 || alerts.calls[0].routeID != "r2" {
+		t.Fatalf("UpdateRouting 收到的 routeID = %+v, want r2", alerts.calls)
 	}
 }
 

@@ -769,6 +769,111 @@ func TestCreateRoute_TargetTeamNotFound_Returns422(t *testing.T) {
 	}
 }
 
+// ---- routes：group_mode/storm_threshold_per_min（R1/R3，C1/C3）----
+
+// 不带 group_mode/storm_threshold_per_min 字段的既有请求：落库结果与引入这两个
+// 字段之前逐字节一致——group_mode 缺省 "label"，storm_threshold_per_min 缺省 0。
+func TestCreateRoute_DefaultGroupModeAndStormThreshold_BackwardCompatible(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 1, "target_team_id": team.ID,
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp["group_mode"] != "label" {
+		t.Errorf("group_mode = %v, want label", resp["group_mode"])
+	}
+	if resp["storm_threshold_per_min"] != float64(0) {
+		t.Errorf("storm_threshold_per_min = %v, want 0", resp["storm_threshold_per_min"])
+	}
+}
+
+// group_mode=window 且 group_by 为空 → 合法，响应回显 group_mode。
+func TestCreateRoute_GroupModeWindow_Success(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 2, "target_team_id": team.ID, "group_mode": "window",
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["group_mode"] != "window" {
+		t.Errorf("group_mode = %v, want window", resp["group_mode"])
+	}
+}
+
+// group_mode 非法枚举值 → 422。
+func TestCreateRoute_GroupModeInvalid_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 3, "target_team_id": team.ID, "group_mode": "bogus",
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// group_mode=window 与 group_by 非空互斥 → 422。
+func TestCreateRoute_GroupModeWindowWithGroupBy_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 4, "target_team_id": team.ID, "group_mode": "window",
+		"group_by": []string{"env"},
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422（group_mode=window 与 group_by 互斥）; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// storm_threshold_per_min 为负数 → 422。
+func TestCreateRoute_StormThresholdNegative_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 6, "target_team_id": team.ID, "storm_threshold_per_min": -1,
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// group_by 保留键 __template__（R2/C2）：API 层不做 group_by 元素格式校验，
+// 与普通 label 键混用同样应当放行（201）。
+func TestCreateRoute_GroupByTemplateReservedKey_Success(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 7, "target_team_id": team.ID,
+		"group_by": []string{"__template__", "cluster"},
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+}
+
 // ---- escalation policies（Targets 引用的团队必须存在）----
 
 func TestCreateEscalationPolicy_TargetTeamNotFound_Returns422(t *testing.T) {

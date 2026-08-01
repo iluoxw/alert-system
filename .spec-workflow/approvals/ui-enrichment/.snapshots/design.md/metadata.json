@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/ui-enrichment/design.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T15:42:20.582Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785512540576_w8ehsgu9p",
+      "approvalTitle": "ui-enrichment 设计文档审批（统计端点/linkify 组件/备注端点）"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T15:49:06.388Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785512540576_w8ehsgu9p",
+      "approvalTitle": "ui-enrichment 设计文档审批（统计端点/linkify 组件/备注端点）"
+    }
+  ]
+}

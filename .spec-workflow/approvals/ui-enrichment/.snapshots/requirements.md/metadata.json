@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/ui-enrichment/requirements.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T15:30:59.025Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785511859018_q5w2y7iz9",
+      "approvalTitle": "ui-enrichment 需求文档审批（噪声画像/链接化/独立备注）"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T15:39:31.236Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785511859018_q5w2y7iz9",
+      "approvalTitle": "ui-enrichment 需求文档审批（噪声画像/链接化/独立备注）"
+    }
+  ]
+}

@@ -291,3 +291,32 @@ func TestSMTPConfig_String_EmptyPasswordNotMaskedAsPresent(t *testing.T) {
 		t.Errorf("String() = %q, 空密码不应显示为已配置（****）", s)
 	}
 }
+
+func TestLoad_FlapDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FlapWindowSeconds != defaultFlapWindowSeconds {
+		t.Errorf("FlapWindowSeconds = %d, want %d（默认关闭）", cfg.FlapWindowSeconds, defaultFlapWindowSeconds)
+	}
+	if cfg.FlapThreshold != defaultFlapThreshold {
+		t.Errorf("FlapThreshold = %d, want %d", cfg.FlapThreshold, defaultFlapThreshold)
+	}
+}
+
+func TestLoad_FlapEnvOverrides(t *testing.T) {
+	t.Setenv("FLAP_WINDOW_SECONDS", "600")
+	t.Setenv("FLAP_THRESHOLD", "5")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FlapWindowSeconds != 600 {
+		t.Errorf("FlapWindowSeconds = %d, want 600", cfg.FlapWindowSeconds)
+	}
+	if cfg.FlapThreshold != 5 {
+		t.Errorf("FlapThreshold = %d, want 5", cfg.FlapThreshold)
+	}
+}

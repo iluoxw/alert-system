@@ -179,7 +179,7 @@ func (s *Server) handleCardAction(ctx context.Context, action *larkcard.CardActi
 			// actorID 的处理约定）；actor（OpenID/UserID）仍完整写入 timeline 展示。
 			updated, entry, err = domain.Ack(alert, "", actor, now)
 		case "resolve":
-			updated, entry, err = domain.Resolve(alert, actor, domain.ResolveReasonManual, now)
+			updated, entry, err = domain.Resolve(alert, actor, domain.ResolveReasonManual, "", now)
 		default:
 			return fmt.Errorf("lark_callback: 未知 action %q", actionName)
 		}

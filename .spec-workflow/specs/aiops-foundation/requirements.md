@@ -1,0 +1,91 @@
+# Requirements Document — aiops-foundation
+
+## Introduction
+
+serviceability 收官后，系统已具备「配置闭环 + 通知到人」的可服务基线。对照 PagerDuty AI/LLM 能力图的评估结论（用户已裁决）：**降噪能力只做确定性实现，embedding/语义相似度路径目前与后续都不考虑；AI 相关能力只做框架规划与扩展点预留，不做任何模型调用的实装。** 本 spec 据此落地两块：确定性降噪补齐 + AI enrichment 框架的纸面设计。
+
+已核实的能力缺口清单（证据为文件:行号）：
+
+- **G1 时间窗口全归并分组不存在**：分组仅支持按 label 分组（内容/统一分组，`internal/pipeline/stage_group.go:120`）；`group_by` 为空走单例组（stage_group.go:113-118，键 `{routeID}-single-{fingerprint}`），语义与「窗口内全部归并」恰好相反。高频瞬时告警场景（PagerDuty 分组表第一行）无解。
+- **G2 变量污染型告警轰炸无解**：fingerprint 按 D5 基于 labels 计算（`internal/domain/fingerprint.go:15-21`）。上游把 IP/实例号等变量塞进 label 值或 summary 时（如 "Ping timeout from 10.0.0.X"），每个变量值一个 fingerprint，dedup 与 group_by 全部失效，20 台机器 = 20 条独立告警轰炸。
+- **G3 无告警风暴/抖动防护**：全库 grep `flap|storm|ratelimit` 零命中。上游误配或大面积故障时，管道会忠实地把每条告警都编排到通知，响应人被「轰炸」且真正的根因告警被淹没。
+- **G4 处置知识无沉淀载体**：`domain.Resolve(alert, username, reason, now)`（`internal/api/alerts.go:321`）的 reason 是枚举（manual/ttl 等）非自由文本；告警解决时「怎么修的」无处记录，时间线只有动作没有知识。这是后续一切 AI 知识推荐/相似告警参考的种子数据，现在不埋后面无米下锅。
+- **G5 AI 扩展点无约定**：未来引入 AI 能力（建议合并、事件总结等）时，往哪挂、数据模型长什么样、与管道事务的边界在哪，目前零约定。不提前定框架，后续实装容易踩「LLM 调用进持锁事务」的红线（与 outbox 不变量同源的事故模式）。
+
+范围外（用户已裁决，不做也不再评估）：embedding/语义分组、异常检测与预测（监控系统职责）、Customer Service Ops（产品域外）、任何 LLM 调用实装。
+
+## Alignment with Product Vision
+
+核心价值主张「把该处理的告警送到该处理的人面前」在 serviceability 后补上了「送到人」，本 spec 补「该处理的」的另一半——**噪音不该处理**。确定性降噪（模板归并、窗口归并、风暴熔断、抖动防抖）直接降低告警疲劳；处置记录与 AI 框架预留则是为「后续再考虑引入实现」的 AI 能力铺路：数据地基现在开始积累，架构边界现在写死，届时实装只是填充扩展点。
+
+## Requirements
+
+### Requirement 1 时间窗口全归并分组模式（G1）
+
+**User Story:** 作为运营者，我要为某条路由配置「窗口内全部归并」的分组模式，使高频瞬时告警（如批量 ping timeout）在 group_wait 窗口内合并为一条聚合通知，而不是逐条轰炸。
+
+#### Acceptance Criteria
+
+1. WHEN 路由配置为窗口全归并模式 THEN 系统 SHALL 把该路由在窗口内的所有告警（不论 fingerprint/labels）归入同一聚合组，复用既有 group_wait/group_interval 定时器编排；配置表意必须显式（新模式字段或等价机制，设计阶段定），不得改变既有「group_by 空 = 单例组」的默认语义（向后兼容）。
+2. WHEN 窗口全归并组触发通知 THEN 通知 SHALL 呈现聚合摘要（告警条数、代表性标题），不逐条展开轰炸。
+3. WHEN 该模式与既有内容/统一分组路由并存 THEN 各路由 SHALL 互不影响；不得重新引入 directDispatch 直发路径（不变量 5）。
+
+### Requirement 2 模板化内容归并（G2）
+
+**User Story:** 作为响应人，我希望 "Ping timeout from 10.0.0.1/2/3" 这类只差变量的告警被识别为同一模板并归并，而不是每个 IP 一条。
+
+#### Acceptance Criteria
+
+1. WHEN 系统计算告警的模板指纹 THEN 归一化 SHALL 为纯确定性函数：将 IPv4/IPv6、UUID、十六进制串、连续数字等变量 token 替换为占位符后哈希；同一输入永远同一输出，不含变量的文本原样哈希；纯函数、全覆盖单测。
+2. WHEN 路由的分组配置引用模板维度 THEN 分组 SHALL 可按模板指纹归并（作为可选分组键接入既有 group_by 机制，具体接入方式设计阶段定）。
+3. WHEN 归一化规则不命中 THEN 行为 SHALL 与现状完全一致（模板归并是 opt-in，默认不启用，既有 fingerprint/dedup 语义不变）。
+
+### Requirement 3 告警风暴熔断（G3）
+
+**User Story:** 作为响应人，当某路由短时间涌入大量告警（上游误配或大面积故障）时，我要收到一条风暴摘要通知而不是几百条独立通知，且原始告警数据一条不丢。
+
+#### Acceptance Criteria
+
+1. WHEN 路由单位时间窗口内新告警数超过可配置阈值 THEN 系统 SHALL 进入风暴熔断态：新告警照常入库、走管道、写时间线，但该路由的通知编排折叠为周期性风暴摘要通知（含累计条数、时间范围、代表样本）。
+2. WHEN 窗口内告警速率回落到阈值以下 THEN 系统 SHALL 解除熔断并恢复正常通知编排；进入与解除均写入可查询的记录（时间线或等价可观测载体）。
+3. WHEN 熔断期间发生崩溃重投 THEN 风暴摘要通知 SHALL 保持幂等（复用既有 notify_send outbox 幂等键口径，不变量 4 不动）。
+4. IF 阈值未配置 THEN 熔断 SHALL 不生效（opt-in，默认关闭，存量行为零变化）。
+
+### Requirement 4 Flapping 通知防抖（G3）
+
+**User Story:** 作为响应人，同一告警短时间内反复 firing↔resolved 时，我要收到一次「该告警正在抖动」的提示而不是每次翻转都被通知。
+
+#### Acceptance Criteria
+
+1. WHEN 同 fingerprint 在可配置窗口内状态翻转次数超过可配置阈值 THEN 系统 SHALL 标记其 flapping 并抑制常规通知，改发一次 flapping 提示；窗口内不再重复提示。
+2. WHEN 翻转停止且窗口滑出 THEN flapping 标记 SHALL 自动解除，恢复正常通知；进入/解除均写时间线。
+3. 防抖 SHALL 只作用于通知层：告警状态机、入库、dedup、时间线均不受影响（数据永远忠实）。
+4. IF 未配置阈值 THEN 防抖不生效（opt-in，默认关闭）。
+
+### Requirement 5 处置记录 resolution note（G4）
+
+**User Story:** 作为响应人，Resolve 告警时我要能附一句「怎么修的」，让处置知识沉淀在时间线里，供后来者与未来的 AI 知识层参考。
+
+#### Acceptance Criteria
+
+1. WHEN REST Resolve 请求携带可选 note 字段 THEN 系统 SHALL 将其写入该告警时间线（长度上限设计阶段定，超限 422）；详情页时间线可见。
+2. IF note 为空或缺省 THEN 行为 SHALL 与现状完全一致——处置幂等口径（不变量 6：重复 Resolve 短路 200、无条件清定时器）一个字不改。
+3. WHEN note 内容落库与展示 THEN SHALL 延续既有安全口径：不落日志、通知渠道展示时同现有时间线内容同等对待。
+
+### Requirement 6 AI enrichment 框架规划（G5，只设计不实装）
+
+**User Story:** 作为架构负责人，我要在引入任何 AI 能力之前把架构边界、数据模型与扩展点定稿成文，使后续实装是填空而非返工，且不可能踩「外部 IO 进持锁事务」的红线。
+
+#### Acceptance Criteria
+
+1. 本 spec 的 design.md SHALL 包含独立的「AI enrichment 框架」章节，定稿：异步 enrichment 层的执行位置（管道外、事务外，消费已提交数据）、Advisor 能力接口的抽象形态、建议元数据模型（类型/来源/置信度/状态 pending→accepted/rejected 及人工反馈落库口径）、与 timers/notify 既有机制的关系。
+2. 该章节 SHALL 明确红线条款并同步进 CLAUDE.md 核心不变量：任何 AI/LLM 调用都是外部 IO，只准在异步 enrichment 层发生，禁止进入管道 stage 与任何持锁事务；LLM 不可用时系统功能 100% 不受影响。
+3. 代码层面 SHALL 零实装：不建表、不留空接口死代码、不引入任何模型调用或新依赖——框架交付物就是设计文档与 CLAUDE.md 条款本身。
+
+## Non-Functional Requirements
+
+- **纯确定性**：R1-R5 的全部逻辑不得引入网络调用、模型依赖或随机性；归一化/熔断判定/防抖判定均为可单测的纯函数或纯 SQL。
+- **零默认行为变化**：R1-R4 全部 opt-in，未配置时存量路由行为与现状逐字节一致；升级零迁移风险。
+- **管道不变量不动**：管道顺序（dedup→route→group→silence→inhibit）、scheduler 事务模型、outbox 幂等口径、六+四个既有 timer kind 语义全部保持；新增 timer kind（如风暴摘要周期通知需要）必须在 internal/app 注册。
+- **性能**：归一化为 O(len) 单遍处理；风暴计数不得在热路径引入全表扫描（计数机制设计阶段定，倾向窗口计数表或内存滑窗+落库对账）。
+- **安全**：风暴摘要与 flapping 提示的通知内容延续脱敏口径；note 不落日志；一切新配置项遵守既有 config 掩码约定。

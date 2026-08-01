@@ -125,11 +125,16 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// ---- 管道 stage：顺序 dedup -> route -> group -> silence -> inhibit（route 必须
 	// 先于 group——group stage 读取 pctx.Route.GroupBy/GroupWait/GroupInterval，这三个
 	// 字段由 route stage 填充）----
+	// stormState 是 route_storm_state 的唯一仓储实例，GroupStage（风暴判定/Activate，
+	// 任务 9）与 stormHandler（摘要发送/Deactivate，任务 10）共用同一份——两者都是
+	// 无状态包装（同 AlertRepo），共用实例只是避免重复构造，不涉及并发状态。
+	stormState := store.NewStormStateRepo()
+
 	eventQueue := store.NewEventQueue()
 	hooks := hook.New()
-	dedupStage := pipeline.NewDedupStage(repos.Alerts, repos.Timeline, sched, nil)
+	dedupStage := pipeline.NewDedupStage(repos.Alerts, repos.Timeline, sched, nil, cfg.FlapWindowSeconds, cfg.FlapThreshold)
 	routeStage := pipeline.NewRouteStage(repos.Routes, repos.Alerts, defaultTeamID)
-	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox)
+	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox, repos.Routes, stormState)
 	silenceStage := pipeline.NewSilenceStage(repos.Silences, repos.Alerts)
 	inhibitStage := pipeline.NewInhibitStage()
 
@@ -140,8 +145,15 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// ---- 全局单例的数据保留清理任务（C5，第十个 kind）----
 	retention := newRetentionHandler(sched, cfg.Retention)
 
-	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep 全部在这里绑定；
-	// 未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此登记全（CLAUDE.md 不变量 2）----
+	// ---- 风暴摘要 handler（design.md C3，第十一个 kind）：依赖任务 4/5 落地的
+	// StormStateRepo/CountByRouteSince，路由信息复用 repos.Routes；GroupStage 的
+	// storm 判定（任务 9）到期时会 ScheduleIfAbsent(storm_summary, routeID, ...)
+	// 触发这里注册的 handler ----
+	storm := newStormHandler(stormState, repos.Routes, repos.Alerts, sched)
+
+	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep + storm_summary
+	// 全部在这里绑定；未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此
+	// 登记全（CLAUDE.md 不变量 2）----
 	sched.RegisterHandler(notify.TimerKindAlertTTL, lifecycle.HandleTTL)
 	sched.RegisterHandler(notify.TimerKindAlertRepeat, lifecycle.HandleRepeat)
 	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
@@ -152,6 +164,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched.RegisterHandler(ops.TimerKindStaleSweep, opsHandlers.HandleStaleSweep)
 	sched.RegisterHandler(ops.TimerKindOncallBroadcast, opsHandlers.HandleOncallBroadcast)
 	sched.RegisterHandler(TimerKindRetentionSweep, retention.Handle)
+	sched.RegisterHandler(TimerKindStormSummary, storm.Handle)
 
 	return &App{
 		Scheduler: sched,

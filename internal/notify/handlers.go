@@ -128,7 +128,7 @@ func (h *LifecycleHandlers) HandleTTL(ctx context.Context, tx pgx.Tx, refID stri
 	}
 
 	now := h.clock.Now()
-	resolved, entry, err := domain.Resolve(alert, lifecycleActorTTL, domain.ResolveReasonTTL, now)
+	resolved, entry, err := domain.Resolve(alert, lifecycleActorTTL, domain.ResolveReasonTTL, "", now)
 	if err != nil {
 		return fmt.Errorf("notify: TTL 自动恢复状态转移失败: %w", err)
 	}

@@ -24,6 +24,8 @@ type Route struct {
 	GroupWaitSeconds      int
 	GroupIntervalSeconds  int
 	RepeatIntervalSeconds int
+	GroupMode             string // 分组模式（R1/C1）："label"（现状）或 "window"（窗口全归并）
+	StormThresholdPerMin  int    // 风暴熔断阈值（R3/C3），0 表示关闭
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 }
@@ -32,13 +34,14 @@ type Route struct {
 // 调用方（管理 API）据此给出「优先级已被占用」而非笼统的 500。
 var ErrRoutePriorityConflict = errors.New("store: 路由 priority 已被占用")
 
-const routeColumns = `id, priority, matchers, target_team_id, group_by, group_wait_seconds, group_interval_seconds, repeat_interval_seconds, created_at, updated_at`
+const routeColumns = `id, priority, matchers, target_team_id, group_by, group_wait_seconds, group_interval_seconds, repeat_interval_seconds, group_mode, storm_threshold_per_min, created_at, updated_at`
 
 func scanRoute(row configRowScanner) (Route, error) {
 	var out Route
 	var matchersRaw, groupByRaw []byte
 	err := row.Scan(&out.ID, &out.Priority, &matchersRaw, &out.TargetTeamID, &groupByRaw,
-		&out.GroupWaitSeconds, &out.GroupIntervalSeconds, &out.RepeatIntervalSeconds, &out.CreatedAt, &out.UpdatedAt)
+		&out.GroupWaitSeconds, &out.GroupIntervalSeconds, &out.RepeatIntervalSeconds,
+		&out.GroupMode, &out.StormThresholdPerMin, &out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
 		return Route{}, err
 	}
@@ -79,13 +82,19 @@ func (r *RouteRepo) Create(ctx context.Context, tx pgx.Tx, route Route) (*Route,
 	if err != nil {
 		return nil, fmt.Errorf("store: 序列化路由 group_by 失败: %w", err)
 	}
+	if route.GroupMode == "" {
+		// 零值等价于列的 DEFAULT 'label'——由于 INSERT 显式列出该列，DB 侧的
+		// DEFAULT 不会生效，这里补上以保持「未设置 = 现状 label 分组」的语义。
+		route.GroupMode = "label"
+	}
 
 	out, err := scanRoute(tx.QueryRow(ctx, `
-		INSERT INTO routes (priority, matchers, target_team_id, group_by, group_wait_seconds, group_interval_seconds, repeat_interval_seconds)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO routes (priority, matchers, target_team_id, group_by, group_wait_seconds, group_interval_seconds, repeat_interval_seconds, group_mode, storm_threshold_per_min)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING `+routeColumns,
 		route.Priority, matchersJSON, route.TargetTeamID, groupByJSON,
-		route.GroupWaitSeconds, route.GroupIntervalSeconds, route.RepeatIntervalSeconds))
+		route.GroupWaitSeconds, route.GroupIntervalSeconds, route.RepeatIntervalSeconds,
+		route.GroupMode, route.StormThresholdPerMin))
 	if isPriorityConflict(err) {
 		return nil, ErrRoutePriorityConflict
 	}
@@ -143,13 +152,18 @@ func (r *RouteRepo) Update(ctx context.Context, tx pgx.Tx, route Route) error {
 	if err != nil {
 		return fmt.Errorf("store: 序列化路由 group_by 失败: %w", err)
 	}
+	if route.GroupMode == "" {
+		route.GroupMode = "label"
+	}
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE routes SET priority = $2, matchers = $3, target_team_id = $4, group_by = $5,
-			group_wait_seconds = $6, group_interval_seconds = $7, repeat_interval_seconds = $8
+			group_wait_seconds = $6, group_interval_seconds = $7, repeat_interval_seconds = $8,
+			group_mode = $9, storm_threshold_per_min = $10
 		WHERE id = $1
 	`, route.ID, route.Priority, matchersJSON, route.TargetTeamID, groupByJSON,
-		route.GroupWaitSeconds, route.GroupIntervalSeconds, route.RepeatIntervalSeconds)
+		route.GroupWaitSeconds, route.GroupIntervalSeconds, route.RepeatIntervalSeconds,
+		route.GroupMode, route.StormThresholdPerMin)
 	if isPriorityConflict(err) {
 		return ErrRoutePriorityConflict
 	}

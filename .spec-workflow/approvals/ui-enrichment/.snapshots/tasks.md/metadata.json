@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/ui-enrichment/tasks.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2026-07-31T15:51:15.879Z",
+      "trigger": "initial",
+      "approvalId": "approval_1785513075876_bzig39aav",
+      "approvalTitle": "ui-enrichment 任务拆分审批（6 任务，1/2/3 并行 → 4 → 5 → 收口）"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2026-07-31T15:55:37.276Z",
+      "trigger": "approved",
+      "approvalId": "approval_1785513075876_bzig39aav",
+      "approvalTitle": "ui-enrichment 任务拆分审批（6 任务，1/2/3 并行 → 4 → 5 → 收口）"
+    }
+  ]
+}

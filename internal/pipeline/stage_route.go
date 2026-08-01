@@ -25,7 +25,7 @@ type RouteRepo interface {
 
 // RouteAlertRepo 是 RouteStage 依赖的告警仓储子集，用于把路由结果持久化回 alerts 表。
 type RouteAlertRepo interface {
-	UpdateRouting(ctx context.Context, tx pgx.Tx, id, teamID, groupKey string) error
+	UpdateRouting(ctx context.Context, tx pgx.Tx, id, teamID, groupKey, routeID string) error
 }
 
 // routeClock 抽象「当前时间」，供测试注入 fake clock 精确控制缓存过期，无需真的
@@ -102,17 +102,19 @@ func (s *RouteStage) Process(ctx context.Context, pctx *PipelineContext) error {
 			GroupWait:      time.Duration(route.GroupWaitSeconds) * time.Second,
 			GroupInterval:  time.Duration(route.GroupIntervalSeconds) * time.Second,
 			RepeatInterval: time.Duration(route.RepeatIntervalSeconds) * time.Second,
+			GroupMode:      route.GroupMode,
 		}
 		break
 	}
 
 	pctx.Route = result
 	pctx.Alert.TeamID = teamID
+	pctx.Alert.RouteID = result.RouteID
 
 	// group_key 原样传回：本 stage 不计算分组（那是分组 stage 的职责），传入
 	// pctx.Alert.GroupKey 当前值只是为了在同一次 UPDATE 里一并写回，避免覆盖掉
 	// dedup/GetByFingerprint 已经读出的既有 group_key（合并场景下可能非空）。
-	if err := s.alerts.UpdateRouting(ctx, pctx.Tx, pctx.Alert.ID, teamID, pctx.Alert.GroupKey); err != nil {
+	if err := s.alerts.UpdateRouting(ctx, pctx.Tx, pctx.Alert.ID, teamID, pctx.Alert.GroupKey, result.RouteID); err != nil {
 		return fmt.Errorf("route: 持久化路由结果失败: %w", err)
 	}
 	return nil

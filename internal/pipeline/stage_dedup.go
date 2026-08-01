@@ -26,6 +26,10 @@ type AlertRepo interface {
 	UpsertByFingerprint(ctx context.Context, tx pgx.Tx, event domain.AlertEvent, integrationID string) (domain.Alert, bool, error)
 	GetByFingerprint(ctx context.Context, tx pgx.Tx, fingerprint string) (domain.Alert, error)
 	UpdateStatus(ctx context.Context, tx pgx.Tx, alert domain.Alert) error
+	// GetLatestResolvedByFingerprint 与 UpdateFlapState 供 flapping 防抖（R4/C4）使用，
+	// 见本文件 applyFlapOnRefire/persistFlapTransition 的调用点与注释。
+	GetLatestResolvedByFingerprint(ctx context.Context, tx pgx.Tx, fingerprint string) (domain.Alert, error)
+	UpdateFlapState(ctx context.Context, tx pgx.Tx, id string, flapCount int, flapWindowStart time.Time, flapping bool) error
 }
 
 // TimelineRepo 是 DedupStage 依赖的时间线仓储子集，由 store.TimelineRepo 实现。
@@ -63,24 +67,33 @@ func (realDedupClock) Now() time.Time { return time.Now() }
 //     TTL 定时器，新建即注册、合并即续期，都是同一次 Schedule 调用（scheduler
 //     内部按 (kind, refID) 的替换语义天然处理了"续期"）；
 //   - resolved 事件按 fingerprint 查找现存未 resolved 告警并 Resolve，找不到则
-//     视为迟到事件忽略。
+//     视为迟到事件忽略；
+//   - flapWindowSeconds<=0 时 flapping 防抖（R4/C4）整体关闭，行为与现状逐字节
+//     一致（不产生任何额外 UPDATE/时间线写入），flapWindowSeconds>0 时在 firing/
+//     resolved 两个转移点计翻转、判定置位/惰性解除（见 evaluateFlap）。
 type DedupStage struct {
 	alerts           AlertRepo
 	timeline         TimelineRepo
 	scheduler        TimerScheduler
 	severityFallback SeverityFallback
 	clock            dedupClock
+
+	flapWindowSeconds int
+	flapThreshold     int
 }
 
 // NewDedupStage 构造 DedupStage。severityFallback 可为 nil（此时缺失/非法 severity
-// 一律兜底为 domain.SeverityWarning）。
-func NewDedupStage(alerts AlertRepo, timeline TimelineRepo, sched TimerScheduler, severityFallback SeverityFallback) *DedupStage {
+// 一律兜底为 domain.SeverityWarning）。flapWindowSeconds<=0 关闭 flapping 防抖（opt-in，
+// 与 config.Config.FlapWindowSeconds 默认值 0 对齐）。
+func NewDedupStage(alerts AlertRepo, timeline TimelineRepo, sched TimerScheduler, severityFallback SeverityFallback, flapWindowSeconds, flapThreshold int) *DedupStage {
 	return &DedupStage{
-		alerts:           alerts,
-		timeline:         timeline,
-		scheduler:        sched,
-		severityFallback: severityFallback,
-		clock:            realDedupClock{},
+		alerts:            alerts,
+		timeline:          timeline,
+		scheduler:         sched,
+		severityFallback:  severityFallback,
+		clock:             realDedupClock{},
+		flapWindowSeconds: flapWindowSeconds,
+		flapThreshold:     flapThreshold,
 	}
 }
 
@@ -126,7 +139,9 @@ func (s *DedupStage) applySeverityFallback(ctx context.Context, tx pgx.Tx, event
 }
 
 // processFiring 处理 firing 事件：upsert 告警，若 resolve_policy=ttl 则
-// 注册/续期一次 TTL 定时器。
+// 注册/续期一次 TTL 定时器；flap 防抖开启（见 flapEnabled）且本次是新建行
+// （created=true）时额外做一次 flap 基线延续判定（见 applyFlapOnRefire）——合并进
+// 已有行（created=false）时状态仍是 firing→firing，不构成转移，不碰 flap 三字段。
 func (s *DedupStage) processFiring(ctx context.Context, pctx *PipelineContext, event domain.AlertEvent) error {
 	alert, created, err := s.alerts.UpsertByFingerprint(ctx, pctx.Tx, event, pctx.IntegrationID)
 	if err != nil {
@@ -140,6 +155,130 @@ func (s *DedupStage) processFiring(ctx context.Context, pctx *PipelineContext, e
 		if err := s.scheduler.Schedule(ctx, pctx.Tx, timerKindTTL, alert.ID, fireAt, nil); err != nil {
 			return fmt.Errorf("dedup: 注册/续期 TTL 定时器失败: %w", err)
 		}
+	}
+
+	if s.flapEnabled() && created {
+		if err := s.applyFlapOnRefire(ctx, pctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// flapEnabled 是 flap 防抖的总闸门：窗口与阈值都必须为正。阈值<=0 时若放行，
+// evaluateFlap 的 count>=threshold 恒真、首个事件就会置位——与本 spec「零值=关闭」
+// 的约定相悖，因此显式配 FLAP_THRESHOLD=0 与不配窗口同义（整体关闭）。
+func (s *DedupStage) flapEnabled() bool {
+	return s.flapWindowSeconds > 0 && s.flapThreshold > 0
+}
+
+// applyFlapOnRefire 处理 processFiring 里 created==true 的 flap 延续：R3.4 下
+// resolved 是终态，同 fingerprint 再次 firing 必然落在一条全新的行上（flap 三字段
+// 回到列默认值），但这次 refire 本身就是一次 resolved→firing 翻转。若不继承上一条
+// 历史行的 flap_count/flap_window_start 作为基线，翻转计数每次都会从 1 重新起算，
+// 阈值检测对"同一 fingerprint 反复 firing/resolved"这个 R4 本该覆盖的核心场景形同
+// 虚设。查询走 alerts_fingerprint_resolved_idx（迁移 000009，与排除 resolved 行的
+// alerts_fingerprint_unresolved_uidx 互不冲突）。flapping 布尔值不继承——新行的
+// flapping 从 false 起算，由阈值判定在 evaluateFlap 里自然重新推导，让 flapping_start
+// 时间线落在这条新行自己身上（有实际存在的行可挂载）。
+func (s *DedupStage) applyFlapOnRefire(ctx context.Context, pctx *PipelineContext) error {
+	baseline, err := s.alerts.GetLatestResolvedByFingerprint(ctx, pctx.Tx, pctx.Alert.Fingerprint)
+	if err != nil {
+		if errors.Is(err, store.ErrAlertNotFound) {
+			baseline = domain.Alert{} // 该 fingerprint 首次出现，从零值起算
+		} else {
+			return fmt.Errorf("dedup: 查询历史 flap 基线失败: %w", err)
+		}
+	}
+	baseline.Flapping = false // 不继承 flapping bool，见函数注释
+
+	return s.persistFlapTransition(ctx, pctx, baseline, s.clock.Now())
+}
+
+// flapTransition 是 evaluateFlap 的计算结果：count/windowStart/flapping 是待持久化
+// 的三个 flap 字段目标值；started/ended 标记本次转移是否触发了 flapping 置位/惰性
+// 解除，供调用方决定要不要写时间线、要不要置 pctx.FlappingStarted。
+type flapTransition struct {
+	count       int
+	windowStart time.Time
+	flapping    bool
+	started     bool
+	ended       bool
+}
+
+// evaluateFlap 按 design.md C4 计算一次 firing↔resolved 转移对 flap 三字段的影响。
+// baseline 是转移前的 flap 状态（同一行的既有值，或 refire 时从历史行延续来的基线，
+// 来源由调用方决定，本函数不关心）：
+//   - 窗口滑出（baseline.FlapWindowStart 为零值，或 now 距其超过 windowSeconds）：
+//     count 重置为 1、windowStart=now；若 baseline 此前处于 flapping，本次判定为
+//     惰性解除（ended=true，flapping 置回 false）。
+//   - 未滑出：count = baseline.FlapCount + 1，windowStart 不变；count >= threshold
+//     且 baseline 此前未 flapping 时判定为置位（started=true，flapping 置 true）；
+//     否则 flapping 维持 baseline 原值不变（已在 flapping 中的后续翻转不重复触发）。
+//
+// 调用方负责保证 windowSeconds>0（总闸门在 processFiring/processResolved 判断）。
+func evaluateFlap(baseline domain.Alert, now time.Time, windowSeconds, threshold int) flapTransition {
+	window := time.Duration(windowSeconds) * time.Second
+	slidOut := baseline.FlapWindowStart.IsZero() || now.Sub(baseline.FlapWindowStart) > window
+
+	if slidOut {
+		return flapTransition{
+			count:       1,
+			windowStart: now,
+			flapping:    false,
+			ended:       baseline.Flapping,
+		}
+	}
+
+	count := baseline.FlapCount + 1
+	flapping := baseline.Flapping
+	started := false
+	if count >= threshold && !baseline.Flapping {
+		flapping = true
+		started = true
+	}
+	return flapTransition{
+		count:       count,
+		windowStart: baseline.FlapWindowStart,
+		flapping:    flapping,
+		started:     started,
+	}
+}
+
+// persistFlapTransition 依据 baseline 算出新的 flap 三字段并落到 pctx.Alert 这一行：
+// 置位/解除时补写时间线（flapping_start/flapping_end）并在置位当次设置
+// pctx.FlappingStarted（供 group stage 判断"抖动提示当次仍要发出"，见
+// PipelineContext 注释）。同步更新 pctx.Alert 的内存态，保持与落库结果一致，
+// 供后续 stage（route/group/silence/inhibit）读取到最新 flap 状态。
+func (s *DedupStage) persistFlapTransition(ctx context.Context, pctx *PipelineContext, baseline domain.Alert, now time.Time) error {
+	t := evaluateFlap(baseline, now, s.flapWindowSeconds, s.flapThreshold)
+
+	if err := s.alerts.UpdateFlapState(ctx, pctx.Tx, pctx.Alert.ID, t.count, t.windowStart, t.flapping); err != nil {
+		return fmt.Errorf("dedup: 更新 flap 状态失败: %w", err)
+	}
+	pctx.Alert.FlapCount = t.count
+	pctx.Alert.FlapWindowStart = t.windowStart
+	pctx.Alert.Flapping = t.flapping
+
+	var action domain.TimelineAction
+	switch {
+	case t.started:
+		pctx.FlappingStarted = true
+		action = domain.TimelineActionFlappingStart
+	case t.ended:
+		action = domain.TimelineActionFlappingEnd
+	default:
+		return nil
+	}
+
+	entry := domain.TimelineEntry{
+		AlertID: pctx.Alert.ID,
+		Actor:   resolveActorSource,
+		Action:  action,
+		At:      now,
+	}
+	if _, err := s.timeline.Append(ctx, pctx.Tx, entry); err != nil {
+		return fmt.Errorf("dedup: 写入 %s 时间线失败: %w", action, err)
 	}
 	return nil
 }
@@ -156,7 +295,7 @@ func (s *DedupStage) processResolved(ctx context.Context, pctx *PipelineContext,
 	}
 
 	now := s.clock.Now()
-	resolved, entry, err := domain.Resolve(existing, resolveActorSource, domain.ResolveReasonSource, now)
+	resolved, entry, err := domain.Resolve(existing, resolveActorSource, domain.ResolveReasonSource, "", now)
 	if err != nil {
 		return fmt.Errorf("dedup: resolve 状态转移失败: %w", err)
 	}
@@ -172,5 +311,13 @@ func (s *DedupStage) processResolved(ctx context.Context, pctx *PipelineContext,
 
 	pctx.Alert = resolved
 	pctx.Created = false
+
+	// firing→resolved 本身就是一次翻转，基线就是这一行自己转移前的 flap 状态
+	// （existing，尚未被上面的 resolve 覆盖）。
+	if s.flapEnabled() {
+		if err := s.persistFlapTransition(ctx, pctx, existing, now); err != nil {
+			return err
+		}
+	}
 	return nil
 }
