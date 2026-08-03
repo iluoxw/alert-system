@@ -134,6 +134,29 @@ func (s *Scheduler) Cancel(ctx context.Context, tx pgx.Tx, kind string, refID st
 	return nil
 }
 
+// TryLockRefShared 与 LockRefExclusive 为“handler 可能续挂下一层 timer”和
+// “处置动作取消整条 timer 链”提供事务级读写屏障。handler 已持有 timer 行锁，
+// 因此只能 try shared，拿不到时直接结束，不能等待写锁形成锁顺序反转；Stop 使用
+// exclusive 等待所有已经开始的 handler 提交后，再取消它们刚续挂的 pending timer。
+func (s *Scheduler) TryLockRefShared(ctx context.Context, tx pgx.Tx, refID string) (bool, error) {
+	var locked bool
+	if err := tx.QueryRow(ctx, `
+		SELECT pg_try_advisory_xact_lock_shared(hashtextextended('timer-chain:' || $1, 0))
+	`, refID).Scan(&locked); err != nil {
+		return false, fmt.Errorf("scheduler: 获取 timer 链共享屏障失败: %w", err)
+	}
+	return locked, nil
+}
+
+func (s *Scheduler) LockRefExclusive(ctx context.Context, tx pgx.Tx, refID string) error {
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended('timer-chain:' || $1, 0))
+	`, refID); err != nil {
+		return fmt.Errorf("scheduler: 获取 timer 链独占屏障失败: %w", err)
+	}
+	return nil
+}
+
 // ScheduleIfAbsent 仅当 kind+refID 当前不存在 pending 定时器时才插入一条新记录，
 // 与 Schedule 的"替换"语义相反：已存在 pending 记录时 DO NOTHING，不修改其
 // fire_at/payload。用于"组首告警注册定时器、后续加入者不得重置已注册的基准时间"

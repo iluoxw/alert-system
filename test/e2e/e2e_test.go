@@ -115,15 +115,27 @@ func newLoggedInClient(t *testing.T) *apiClient {
 	return client
 }
 
+func newLoggedInApproverClient(t *testing.T) *apiClient {
+	t.Helper()
+	client, err := newAPIClient(sys.Server.URL)
+	if err != nil {
+		t.Fatalf("e2e: 创建审批人 HTTP 客户端失败: %v", err)
+	}
+	if err := client.login(seedApproverUsername, seedApproverPassword); err != nil {
+		t.Fatalf("e2e: 审批人登录失败: %v", err)
+	}
+	return client
+}
+
 // ---- 场景①：Alertmanager webhook -> 去重 -> 路由 -> 分组 -> mock 飞书收到组通知 ->
 // Ack -> 人员/渠道升级定时器被取消 ----
 func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {
 	client := newLoggedInClient(t)
 
 	alertname := "e2e-s1-" + uniqueSuffix()
-	payload := alertmanagerPayload(alertname, "critical", "firing", time.Now(), nil)
+	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postIngest(seedResult.AlertmanagerIntegrationID, seedResult.AlertmanagerToken, payload)
+	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -173,7 +185,7 @@ func TestScenario3_TTLAutoResolve(t *testing.T) {
 	labels := map[string]string{"alertname": ruleID}
 	payload := genericAlertPayload(ruleID, "warning", "firing", "ttl", 3, time.Now(), labels)
 
-	status, body, err := client.postIngest(seedResult.GenericIntegrationID, seedResult.GenericToken, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -221,8 +233,8 @@ func TestScenario2_SilenceSuppressesThenResumesRepeat(t *testing.T) {
 	alertname := "e2e-s2-" + uniqueSuffix()
 	startsAt := time.Now()
 	post := func() {
-		if _, _, err := client.postIngest(seedResult.AlertmanagerIntegrationID, seedResult.AlertmanagerToken,
-			alertmanagerPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
+		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+			compatibleWebhookPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}
 	}
@@ -307,9 +319,9 @@ func TestScenarioR13_ChannelEscalationEmailThenLark(t *testing.T) {
 	client := newLoggedInClient(t)
 
 	alertname := "e2e-r13-" + uniqueSuffix()
-	payload := alertmanagerPayload(alertname, "warning", "firing", time.Now(), nil)
+	payload := compatibleWebhookPayload(alertname, "warning", "firing", time.Now(), nil)
 
-	status, body, err := client.postIngest(seedResult.AlertmanagerIntegrationID, seedResult.AlertmanagerToken, payload)
+	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -357,9 +369,9 @@ func TestScenario5_UngroupedRouteStillNotifies(t *testing.T) {
 	client := newLoggedInClient(t)
 
 	alertname := "e2e-s5-" + uniqueSuffix()
-	payload := alertmanagerPayload(alertname, "critical", "firing", time.Now(), nil)
+	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postIngest(seedResult.AlertmanagerIntegrationID, seedResult.AlertmanagerToken, payload)
+	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}

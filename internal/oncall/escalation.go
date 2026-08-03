@@ -78,6 +78,8 @@ type EscalationPolicyRepo interface {
 type TimerScheduler interface {
 	Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error
 	Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error
+	TryLockRefShared(ctx context.Context, tx pgx.Tx, refID string) (bool, error)
+	LockRefExclusive(ctx context.Context, tx pgx.Tx, refID string) error
 }
 
 // Clock 抽象"当前时间"，与 scheduler.Clock/dedup 同一模式，供测试注入 fake clock。
@@ -151,6 +153,9 @@ func (c *Chain) Start(ctx context.Context, tx pgx.Tx, alert domain.Alert) error 
 // pipeline.DedupStage.processResolved 里 Resolve 时 Cancel 掉 TTL 定时器一致。
 // 幂等：不存在待触发定时器时不报错（见 scheduler.Cancel 的文档）。
 func (c *Chain) Stop(ctx context.Context, tx pgx.Tx, alertID string) error {
+	if err := c.scheduler.LockRefExclusive(ctx, tx, alertID); err != nil {
+		return fmt.Errorf("oncall: 等待升级链处理完成失败: %w", err)
+	}
 	if err := c.scheduler.Cancel(ctx, tx, TimerKindPersonnelEscalation, alertID); err != nil {
 		return fmt.Errorf("oncall: 取消升级链定时器失败: %w", err)
 	}
@@ -165,6 +170,13 @@ func (c *Chain) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []b
 	var p escalationPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("oncall: 反序列化升级链 payload 失败: %w", err)
+	}
+	locked, err := c.scheduler.TryLockRefShared(ctx, tx, refID)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return nil
 	}
 	return c.advance(ctx, tx, refID, p.Level)
 }

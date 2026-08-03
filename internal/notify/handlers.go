@@ -183,16 +183,18 @@ func (h *LifecycleHandlers) HandleRepeat(ctx context.Context, tx pgx.Tx, refID s
 // 一遍 Cancel 序列。scheduler.Cancel 本身是幂等的（定时器不存在时不报错），本方法
 // 同样幂等。
 func (h *LifecycleHandlers) CancelLifecycleTimers(ctx context.Context, tx pgx.Tx, alertID string) error {
+	// escalation.Stop（生产装配为 CompositeStopper）先取得 timer 链独占屏障，
+	// 等待已经开始的人员/渠道 handler 完成续挂，再统一执行下面的取消。
+	if h.escalation != nil {
+		if err := h.escalation.Stop(ctx, tx, alertID); err != nil {
+			return fmt.Errorf("notify: 停止升级链失败: %w", err)
+		}
+	}
 	if err := h.scheduler.Cancel(ctx, tx, TimerKindAlertRepeat, alertID); err != nil {
 		return fmt.Errorf("notify: 取消 repeat 定时器失败: %w", err)
 	}
 	if err := h.scheduler.Cancel(ctx, tx, TimerKindChannelEscalation, alertID); err != nil {
 		return fmt.Errorf("notify: 取消渠道升级定时器失败: %w", err)
-	}
-	if h.escalation != nil {
-		if err := h.escalation.Stop(ctx, tx, alertID); err != nil {
-			return fmt.Errorf("notify: 停止人员升级链失败: %w", err)
-		}
 	}
 	return nil
 }

@@ -116,9 +116,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // MountUnauthenticated 在 engine 根上挂载一个豁免 session 中间件的路由，供 main 装配
-// 时接入 /ingest 端点用（internal/ingest/server.go，任务 17，stdlib net/http.Handler，
-// 有自己的 token 校验）。本任务不知道 main 最终选择的路径/方法，所以只留出这个挂载点，
-// 不在这里预先注册 /ingest 本身。
+// 时接入 /ingest 端点用（internal/ingest/server.go，stdlib net/http.Handler，有自己的
+// managed hook 校验）。本任务不知道 main 最终选择的路径/方法，所以只
+// 留出这个挂载点，不在这里预先注册 /ingest 本身。
 func (r *Router) MountUnauthenticated(method, path string, h http.Handler) {
 	r.engine.Handle(method, path, gin.WrapH(h))
 }

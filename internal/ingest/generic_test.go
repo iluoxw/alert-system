@@ -15,29 +15,32 @@ import (
 // fakeStore 是 Store 的测试替身：整合集成信息与已入队事件的记录，均在内存中，
 // 无需 Docker/testcontainers 即可覆盖 handleIngest 的完整流程。
 type fakeStore struct {
-	integrations map[string]Integration
-	enqueued     [][]domain.AlertEvent // 每次 EnqueueBatch 调用记录一批
-	enqueueErr   error
+	integrations          map[string]Integration
+	enqueued              [][]domain.AlertEvent // 每次 EnqueueBatch 调用记录一批
+	enqueuedIntegrationID []string
+	enqueueErr            error
 }
 
-func (f *fakeStore) GetIntegration(_ context.Context, id string) (Integration, error) {
-	integ, ok := f.integrations[id]
-	if !ok {
-		return Integration{}, ErrIntegrationNotFound
+func (f *fakeStore) GetIntegrationByHookIDHash(_ context.Context, hookIDHash string) (Integration, error) {
+	for _, integ := range f.integrations {
+		if integ.HookIDHash == hookIDHash {
+			return integ, nil
+		}
 	}
-	return integ, nil
+	return Integration{}, ErrIntegrationNotFound
 }
 
-func (f *fakeStore) EnqueueBatch(_ context.Context, _ string, events []domain.AlertEvent) error {
+func (f *fakeStore) EnqueueBatch(_ context.Context, integrationID string, events []domain.AlertEvent) error {
 	if f.enqueueErr != nil {
 		return f.enqueueErr
 	}
 	f.enqueued = append(f.enqueued, events)
+	f.enqueuedIntegrationID = append(f.enqueuedIntegrationID, integrationID)
 	return nil
 }
 
 const testIntegrationID = "11111111-1111-1111-1111-111111111111"
-const testToken = "correct-token"
+const testHookID = "11111111-1111-4111-8111-111111111111"
 
 // newTestServer 构造一个已注册 generic adapter、并预置一个启用中 integration 的 Server，
 // 供各测试用例复用；integrations 参数为 nil 时使用默认的单个启用 integration。
@@ -53,20 +56,17 @@ func defaultFakeStore() *fakeStore {
 	return &fakeStore{
 		integrations: map[string]Integration{
 			testIntegrationID: {
-				ID:        testIntegrationID,
-				Kind:      genericKind,
-				Enabled:   true,
-				TokenHash: hashToken(testToken),
+				ID:         testIntegrationID,
+				Kind:       genericKind,
+				Enabled:    true,
+				HookIDHash: hashHookID(testHookID),
 			},
 		},
 	}
 }
 
-func doIngest(srv *Server, integrationID, authHeader, body string) *http.Response {
-	req := httptest.NewRequest(http.MethodPost, "/ingest/"+integrationID, strings.NewReader(body))
-	if authHeader != "" {
-		req.Header.Set("Authorization", authHeader)
-	}
+func doManagedHook(srv *Server, hookID, body string) *http.Response {
+	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/hook/"+hookID, strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	return rec.Result()
@@ -88,56 +88,58 @@ const validBatchBody = `[
 	{"rule_id":"b","severity":"warning","status":"firing","title":"t2","resolve_policy":"manual","starts_at":"2026-07-30T00:00:00Z"}
 ]`
 
-func TestHandleIngest_AuthFailures(t *testing.T) {
-	cases := []struct {
-		name           string
-		integrationID  string
-		authHeader     string
-		integrationsFn func(*fakeStore)
-	}{
-		{name: "缺少 token", integrationID: testIntegrationID, authHeader: ""},
-		{name: "token 错误", integrationID: testIntegrationID, authHeader: "Bearer wrong-token"},
-		{name: "integration 不存在", integrationID: "22222222-2222-2222-2222-222222222222", authHeader: "Bearer " + testToken},
-		{
-			name: "integration 已禁用", integrationID: testIntegrationID, authHeader: "Bearer " + testToken,
-			integrationsFn: func(fs *fakeStore) {
-				integ := fs.integrations[testIntegrationID]
-				integ.Enabled = false
-				fs.integrations[testIntegrationID] = integ
-			},
-		},
-	}
+func TestManagedHook_IdentifiesSourceWithoutAdditionalHeader(t *testing.T) {
+	fs := defaultFakeStore()
+	srv := newTestServer(t, fs)
 
-	for _, tc := range cases {
+	resp := doManagedHook(srv, testHookID, validSingleBody)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("状态码=%d，期望 managed hook 无额外 Header 返回 202", resp.StatusCode)
+	}
+	if len(fs.enqueuedIntegrationID) != 1 || fs.enqueuedIntegrationID[0] != testIntegrationID {
+		t.Fatalf("hook 未映射到预期 source: %+v", fs.enqueuedIntegrationID)
+	}
+}
+
+func TestManagedHook_UnknownInvalidAndDisabledAreIndistinguishable(t *testing.T) {
+	tests := []struct {
+		name   string
+		hookID string
+		mutate func(*fakeStore)
+	}{
+		{name: "非法格式", hookID: "not-a-uuid"},
+		{name: "未知 UUID", hookID: "22222222-2222-4222-8222-222222222222"},
+		{name: "已禁用", hookID: testHookID, mutate: func(fs *fakeStore) {
+			in := fs.integrations[testIntegrationID]
+			in.Enabled = false
+			fs.integrations[testIntegrationID] = in
+		}},
+	}
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := defaultFakeStore()
-			if tc.integrationsFn != nil {
-				tc.integrationsFn(fs)
+			if tc.mutate != nil {
+				tc.mutate(fs)
 			}
-			srv := newTestServer(t, fs)
-
-			resp := doIngest(srv, tc.integrationID, tc.authHeader, validSingleBody)
+			resp := doManagedHook(newTestServer(t, fs), tc.hookID, validSingleBody)
 			if resp.StatusCode != http.StatusUnauthorized {
-				t.Fatalf("状态码 = %d，期望 401", resp.StatusCode)
+				t.Fatalf("status=%d, want 401", resp.StatusCode)
 			}
 			if len(fs.enqueued) != 0 {
-				t.Fatalf("鉴权失败时不应有事件入队，实际 %d 批", len(fs.enqueued))
+				t.Fatal("拒绝的 hook 不应入队")
 			}
 		})
 	}
 }
 
-func TestHandleIngest_XIngestTokenHeader(t *testing.T) {
+func TestLegacyIngestRouteDoesNotExist(t *testing.T) {
 	fs := defaultFakeStore()
-	srv := newTestServer(t, fs)
-
 	req := httptest.NewRequest(http.MethodPost, "/ingest/"+testIntegrationID, strings.NewReader(validSingleBody))
-	req.Header.Set("X-Ingest-Token", testToken)
+	req.Header.Set("Authorization", "Bearer "+testHookID)
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("状态码 = %d，期望 202（X-Ingest-Token 应被接受）", rec.Code)
+	newTestServer(t, fs).Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("旧 ingest 路由 status=%d，期望 404", rec.Code)
 	}
 }
 
@@ -159,7 +161,7 @@ func TestHandleIngest_BadPayload(t *testing.T) {
 			fs := defaultFakeStore()
 			srv := newTestServer(t, fs)
 
-			resp := doIngest(srv, testIntegrationID, "Bearer "+testToken, tc.body)
+			resp := doManagedHook(srv, testHookID, tc.body)
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("状态码 = %d，期望 400", resp.StatusCode)
 			}
@@ -175,7 +177,7 @@ func TestHandleIngest_ValidSingleAndBatch(t *testing.T) {
 		fs := defaultFakeStore()
 		srv := newTestServer(t, fs)
 
-		resp := doIngest(srv, testIntegrationID, "Bearer "+testToken, validSingleBody)
+		resp := doManagedHook(srv, testHookID, validSingleBody)
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("状态码 = %d，期望 202", resp.StatusCode)
 		}
@@ -198,7 +200,7 @@ func TestHandleIngest_ValidSingleAndBatch(t *testing.T) {
 		fs := defaultFakeStore()
 		srv := newTestServer(t, fs)
 
-		resp := doIngest(srv, testIntegrationID, "Bearer "+testToken, validBatchBody)
+		resp := doManagedHook(srv, testHookID, validBatchBody)
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("状态码 = %d，期望 202", resp.StatusCode)
 		}
@@ -213,7 +215,7 @@ func TestHandleIngest_EnqueueFailureReturns500(t *testing.T) {
 	fs.enqueueErr = context.DeadlineExceeded
 	srv := newTestServer(t, fs)
 
-	resp := doIngest(srv, testIntegrationID, "Bearer "+testToken, validSingleBody)
+	resp := doManagedHook(srv, testHookID, validSingleBody)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("状态码 = %d，期望 500", resp.StatusCode)
 	}
@@ -224,7 +226,7 @@ func TestHandleIngest_OversizedBody(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	bigBody := `{"rule_id":"` + strings.Repeat("a", 2*1024*1024) + `"}`
-	resp := doIngest(srv, testIntegrationID, "Bearer "+testToken, bigBody)
+	resp := doManagedHook(srv, testHookID, bigBody)
 	if resp.StatusCode < 400 || resp.StatusCode >= 500 {
 		t.Fatalf("状态码 = %d，期望 4xx", resp.StatusCode)
 	}

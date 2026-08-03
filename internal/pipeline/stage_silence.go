@@ -75,6 +75,13 @@ func NewSilenceStage(silences SilenceListRepo, alerts SilenceAlertRepo) *Silence
 // Name 返回 "silence"。
 func (s *SilenceStage) Name() string { return "silence" }
 
+// InvalidateCache 让新建、更新或删除的静默在下一条事件上立即重新求值。
+func (s *SilenceStage) InvalidateCache() {
+	s.mu.Lock()
+	s.cache = nil
+	s.mu.Unlock()
+}
+
 // Process 实现 Stage 接口。
 func (s *SilenceStage) Process(ctx context.Context, pctx *PipelineContext) error {
 	// 迟到的 resolved 事件在 dedup stage 里找不到现存告警时，pctx.Alert 仍是零值

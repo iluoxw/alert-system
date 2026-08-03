@@ -20,6 +20,13 @@ type fakeStage struct {
 	fn   func(pctx *PipelineContext)
 }
 
+type authoritativeFakeStage struct {
+	*fakeStage
+	allowed bool
+}
+
+func (s *authoritativeFakeStage) RunForAuthoritativeSource() bool { return s.allowed }
+
 func (s *fakeStage) Name() string { return s.name }
 
 func (s *fakeStage) Process(ctx context.Context, pctx *PipelineContext) error {
@@ -62,6 +69,30 @@ func TestPipeline_Process_StagesRunInOrder(t *testing.T) {
 		if order[i] != want[i] {
 			t.Fatalf("stage 执行顺序 = %v, 期望 %v", order, want)
 		}
+	}
+}
+
+func TestPipeline_Process_AuthoritativeSourceSkipsLocalControlStages(t *testing.T) {
+	var order []string
+	p := &Pipeline{
+		hooks: hook.New(),
+		stages: []Stage{
+			&authoritativeFakeStage{fakeStage: &fakeStage{name: "dedup", fn: func(pctx *PipelineContext) {
+				order = append(order, "dedup")
+				pctx.AuthoritativeSource = true
+			}}, allowed: true},
+			&fakeStage{name: "route", fn: func(*PipelineContext) { order = append(order, "route") }},
+			&authoritativeFakeStage{fakeStage: &fakeStage{name: "fault-mapping", fn: func(*PipelineContext) {
+				order = append(order, "fault-mapping")
+			}}, allowed: true},
+			&fakeStage{name: "group", fn: func(*PipelineContext) { order = append(order, "group") }},
+		},
+	}
+	if err := p.process(context.Background(), &PipelineContext{}); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(order) != 2 || order[0] != "dedup" || order[1] != "fault-mapping" {
+		t.Fatalf("权威来源执行顺序=%v, want [dedup fault-mapping]", order)
 	}
 }
 

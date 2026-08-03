@@ -155,6 +155,37 @@ func (h *alertsHandler) list(c *gin.Context) {
 		}
 		filter.Status = st
 	}
+	if v := c.Query("source_state"); v != "" {
+		state := domain.SourceState(v)
+		if !state.IsValid() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source_state"})
+			return
+		}
+		filter.SourceState = state
+	}
+	if v := c.Query("response_state"); v != "" {
+		state := domain.ResponseState(v)
+		if !state.IsValid() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid response_state"})
+			return
+		}
+		filter.ResponseState = state
+	}
+	if v := c.Query("suppression_state"); v != "" {
+		state := domain.SuppressionState(v)
+		if !state.IsValid() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid suppression_state"})
+			return
+		}
+		filter.SuppressionState = state
+	}
+	if v := c.Query("source_id"); v != "" {
+		if !uuidPattern.MatchString(v) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source_id"})
+			return
+		}
+		filter.SourceID = v
+	}
 	if v := c.Query("team_id"); v != "" {
 		if !uuidPattern.MatchString(v) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid team_id"})
@@ -548,6 +579,8 @@ func (h *alertsHandler) respondActionError(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "告警不存在"})
 	case errors.Is(err, domain.ErrAlertResolved), errors.Is(err, domain.ErrInvalidTransition):
 		c.JSON(http.StatusConflict, gin.H{"error": "告警当前状态不允许该操作"})
+	case errors.Is(err, domain.ErrAuthoritativeSourceManualResolve):
+		c.JSON(http.StatusConflict, gin.H{"error": "Alertmanager 是该 Alert 的生命周期权威，请在上游恢复规则条件；本地仅支持认领、移交和备注"})
 	default:
 		h.router.logger.Error("api: 告警处置操作失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -559,58 +592,76 @@ func (h *alertsHandler) respondActionError(c *gin.Context, err error) {
 // alertResponse 是告警对外的 JSON 表示。AckedAt/EndsAt 用指针，未设置时序列化为
 // null 而不是 "0001-01-01T00:00:00Z"（domain 层用零值 time.Time 表示"未设置"）。
 type alertResponse struct {
-	ID                  string               `json:"id"`
-	Fingerprint         string               `json:"fingerprint"`
-	Status              domain.Status        `json:"status"`
-	Severity            domain.Severity      `json:"severity"`
-	SeverityFallback    bool                 `json:"severity_fallback"`
-	Title               string               `json:"title"`
-	Source              string               `json:"source"`
-	Labels              map[string]string    `json:"labels"`
-	ResourceRef         map[string]string    `json:"resource_ref"`
-	SignalContext       json.RawMessage      `json:"signal_context,omitempty"`
-	ResolvePolicy       domain.ResolvePolicy `json:"resolve_policy"`
-	TTLSeconds          int                  `json:"ttl_seconds,omitempty"`
-	SourceIntegrationID string               `json:"source_integration_id,omitempty"`
-	DedupCount          int                  `json:"dedup_count"`
-	GroupKey            string               `json:"group_key,omitempty"`
-	TeamID              string               `json:"team_id,omitempty"`
-	SilencedBy          []string             `json:"silenced_by,omitempty"`
-	AckedBy             string               `json:"acked_by,omitempty"`
-	AckedAt             *time.Time           `json:"acked_at,omitempty"`
-	Flapping            bool                 `json:"flapping"`
-	StartsAt            time.Time            `json:"starts_at"`
-	LastSeenAt          time.Time            `json:"last_seen_at"`
-	EndsAt              *time.Time           `json:"ends_at,omitempty"`
-	CreatedAt           time.Time            `json:"created_at"`
-	UpdatedAt           time.Time            `json:"updated_at"`
+	ID                     string                  `json:"id"`
+	Fingerprint            string                  `json:"fingerprint"`
+	UpstreamFingerprint    string                  `json:"upstream_fingerprint,omitempty"`
+	Status                 domain.Status           `json:"status"`
+	SourceState            domain.SourceState      `json:"source_state"`
+	ResponseState          domain.ResponseState    `json:"response_state"`
+	SuppressionState       domain.SuppressionState `json:"suppression_state"`
+	SuppressionDetails     map[string][]string     `json:"suppression_details,omitempty"`
+	Authoritative          bool                    `json:"authoritative"`
+	Severity               domain.Severity         `json:"severity"`
+	SeverityFallback       bool                    `json:"severity_fallback"`
+	Title                  string                  `json:"title"`
+	Source                 string                  `json:"source"`
+	Labels                 map[string]string       `json:"labels"`
+	ResourceRef            map[string]string       `json:"resource_ref"`
+	SignalContext          json.RawMessage         `json:"signal_context,omitempty"`
+	ResolvePolicy          domain.ResolvePolicy    `json:"resolve_policy"`
+	TTLSeconds             int                     `json:"ttl_seconds,omitempty"`
+	SourceIntegrationID    string                  `json:"source_integration_id,omitempty"`
+	SourceUpdatedAt        *time.Time              `json:"source_updated_at,omitempty"`
+	LastReconciledAt       *time.Time              `json:"last_reconciled_at,omitempty"`
+	ReconcileMissCount     int                     `json:"reconcile_miss_count"`
+	SourceResolutionReason string                  `json:"source_resolution_reason,omitempty"`
+	DedupCount             int                     `json:"dedup_count"`
+	GroupKey               string                  `json:"group_key,omitempty"`
+	TeamID                 string                  `json:"team_id,omitempty"`
+	SilencedBy             []string                `json:"silenced_by,omitempty"`
+	AckedBy                string                  `json:"acked_by,omitempty"`
+	AckedAt                *time.Time              `json:"acked_at,omitempty"`
+	Flapping               bool                    `json:"flapping"`
+	StartsAt               time.Time               `json:"starts_at"`
+	LastSeenAt             time.Time               `json:"last_seen_at"`
+	EndsAt                 *time.Time              `json:"ends_at,omitempty"`
+	CreatedAt              time.Time               `json:"created_at"`
+	UpdatedAt              time.Time               `json:"updated_at"`
 }
 
 func newAlertResponse(a domain.Alert) alertResponse {
 	resp := alertResponse{
-		ID:                  a.ID,
-		Fingerprint:         a.Fingerprint,
-		Status:              a.Status,
-		Severity:            a.Severity,
-		SeverityFallback:    a.SeverityFallback,
-		Title:               a.Title,
-		Source:              a.Source,
-		Labels:              a.Labels,
-		ResourceRef:         a.ResourceRef,
-		SignalContext:       a.SignalContext,
-		ResolvePolicy:       a.ResolvePolicy,
-		TTLSeconds:          a.TTLSeconds,
-		SourceIntegrationID: a.SourceIntegrationID,
-		DedupCount:          a.DedupCount,
-		GroupKey:            a.GroupKey,
-		TeamID:              a.TeamID,
-		SilencedBy:          a.SilencedBy,
-		AckedBy:             a.AckedBy,
-		Flapping:            a.Flapping,
-		StartsAt:            a.StartsAt,
-		LastSeenAt:          a.LastSeenAt,
-		CreatedAt:           a.CreatedAt,
-		UpdatedAt:           a.UpdatedAt,
+		ID:                     a.ID,
+		Fingerprint:            a.Fingerprint,
+		UpstreamFingerprint:    a.UpstreamFingerprint,
+		Status:                 a.Status,
+		SourceState:            a.SourceState,
+		ResponseState:          a.ResponseState,
+		SuppressionState:       a.SuppressionState,
+		SuppressionDetails:     a.SuppressionDetails,
+		Authoritative:          a.IsAuthoritativeSource(),
+		Severity:               a.Severity,
+		SeverityFallback:       a.SeverityFallback,
+		Title:                  a.Title,
+		Source:                 a.Source,
+		Labels:                 a.Labels,
+		ResourceRef:            a.ResourceRef,
+		SignalContext:          a.SignalContext,
+		ResolvePolicy:          a.ResolvePolicy,
+		TTLSeconds:             a.TTLSeconds,
+		SourceIntegrationID:    a.SourceIntegrationID,
+		ReconcileMissCount:     a.ReconcileMissCount,
+		SourceResolutionReason: a.SourceResolutionReason,
+		DedupCount:             a.DedupCount,
+		GroupKey:               a.GroupKey,
+		TeamID:                 a.TeamID,
+		SilencedBy:             a.SilencedBy,
+		AckedBy:                a.AckedBy,
+		Flapping:               a.Flapping,
+		StartsAt:               a.StartsAt,
+		LastSeenAt:             a.LastSeenAt,
+		CreatedAt:              a.CreatedAt,
+		UpdatedAt:              a.UpdatedAt,
 	}
 	if !a.AckedAt.IsZero() {
 		t := a.AckedAt
@@ -619,6 +670,14 @@ func newAlertResponse(a domain.Alert) alertResponse {
 	if !a.EndsAt.IsZero() {
 		t := a.EndsAt
 		resp.EndsAt = &t
+	}
+	if !a.SourceUpdatedAt.IsZero() {
+		t := a.SourceUpdatedAt
+		resp.SourceUpdatedAt = &t
+	}
+	if !a.LastReconciledAt.IsZero() {
+		t := a.LastReconciledAt
+		resp.LastReconciledAt = &t
 	}
 	return resp
 }

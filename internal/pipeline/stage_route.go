@@ -72,6 +72,14 @@ func NewRouteStage(routes RouteRepo, alerts RouteAlertRepo, defaultTeamID string
 // Name 返回 "route"。
 func (s *RouteStage) Name() string { return "route" }
 
+// InvalidateCache 让已成功提交的配置变更对下一条事件立即可见。它只清空进程内
+// 快照，不做数据库 I/O；下一次 Process 会在自己的事务中重新加载规则。
+func (s *RouteStage) InvalidateCache() {
+	s.mu.Lock()
+	s.cache = nil
+	s.mu.Unlock()
+}
+
 // Process 实现 Stage 接口。
 func (s *RouteStage) Process(ctx context.Context, pctx *PipelineContext) error {
 	// 迟到的 resolved 事件在 dedup stage 里因找不到现存告警而被忽略时，pctx.Alert

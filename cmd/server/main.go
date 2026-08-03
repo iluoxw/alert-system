@@ -18,13 +18,16 @@ import (
 	"syscall"
 	"time"
 
+	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	"alert-system/internal/events"
+	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
 	"alert-system/internal/notify"
+	"alert-system/internal/runbook"
 	"alert-system/internal/store"
 )
 
@@ -34,6 +37,8 @@ var version = "dev"
 func main() {
 	configPath := flag.String("config", "", "YAML 配置文件路径（可选）")
 	defaultTeamID := flag.String("default-team-id", "", "路由未命中任何规则时的兜底团队 ID（可选，留空表示不路由）")
+	fakeRunbookExecutor := flag.Bool("e2e-fake-runbooks", false, "仅用于隔离的本地 E2E：启用不修改外部状态的 Runbook 假执行器")
+	enableE2BUATRunbooks := flag.Bool("enable-e2b-uat-runbooks", false, "显式启用隔离 E2B UAT 生命周期 Runbook（需要专用 UAT 配置）")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -50,7 +55,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, cfg, *defaultTeamID, logger); err != nil {
+	if *fakeRunbookExecutor && *enableE2BUATRunbooks {
+		fmt.Println("启动失败: -e2e-fake-runbooks 与 -enable-e2b-uat-runbooks 不能同时启用")
+		os.Exit(1)
+	}
+	uatRuntime, err := buildE2BUATRuntime(*enableE2BUATRunbooks)
+	if err != nil {
+		fmt.Printf("加载 E2B UAT Runbook 配置失败: %v\n", err)
+		os.Exit(1)
+	}
+	var runbookExecutor runbook.Executor = uatRuntime.Executor
+	if *fakeRunbookExecutor {
+		runbookExecutor = runbook.NewFakeExecutor()
+		logger.Warn("alert-system: 已启用本地 E2E Runbook 假执行器", "external_mutation", false)
+	}
+	if *enableE2BUATRunbooks {
+		logger.Warn("alert-system: 已启用隔离 E2B UAT 生命周期执行器",
+			"host", uatRuntime.Host, "allowed_template_count", uatRuntime.AllowedTemplateCount,
+			"authorization_expires_at", uatRuntime.AuthorizationExpires)
+	}
+	if err := run(ctx, cfg, *defaultTeamID, runbookExecutor, uatRuntime.Policy, logger); err != nil {
 		logger.Error("alert-system: 退出", "err", err)
 		os.Exit(1)
 	}
@@ -58,7 +82,7 @@ func main() {
 
 // run 组装全部依赖，启动 HTTP 服务与后台 worker，阻塞直到 ctx 被取消（收到中断信号）
 // 或 HTTP 服务异常退出。
-func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, uatPolicy runbook.UATPolicy, logger *slog.Logger) error {
 	st, err := store.New(ctx, cfg.DBDSN)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
@@ -77,12 +101,19 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	escalationPolicies := store.NewEscalationPolicyRepo()
 	notificationPolicies := store.NewNotificationPolicyRepo()
 	integrations := store.NewIntegrationRepo()
+	alertSources := store.NewAlertSourceRepo()
 	silences := store.NewSilenceRepo()
 	changeEvents := store.NewChangeEventRepo()
 	notificationLogs := store.NewNotificationLogRepo()
 	sessions := store.NewSessionRepo()
 	memberships := store.NewMembershipRepo()
 	opsRepo := store.NewOpsRepo()
+	faults := store.NewFaultRepo()
+	topology := store.NewTopologyRepo()
+	incidents := store.NewIncidentRepo()
+	runbooks := store.NewRunbookRepo()
+	serviceCatalog := store.NewServiceCatalogRepo()
+	alertMappings := store.NewAlertMappingRepo()
 
 	// ---- 生产通知渠道（E2E 用 mock_channel.go 顶替，notify.Register 对同 kind 是
 	// 覆盖语义，测试装配不会调用这个函数）----
@@ -100,9 +131,14 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 		NotificationPolicies: notificationPolicies,
 		Silences:             silences,
 		NotificationLogs:     notificationLogs,
+		Incidents:            incidents,
 		Teams:                teams,
 		Users:                users,
 		Ops:                  opsRepo,
+		ServiceCatalog:       serviceCatalog,
+		AlertMappings:        alertMappings,
+		Topology:             topology,
+		Faults:               faults,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
 
@@ -121,6 +157,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
+	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
 
 	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发，与下面 REST API
 	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes）共用同一套
@@ -145,15 +182,23 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 		Integrations:         integrations,
 		Silences:             silences,
 		AlertSilences:        alerts,
+		CacheInvalidator:     a.CacheInvalidator,
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
+	router.RegisterAlertSourceRoutes(alertSources, alertSourceReconciler)
+	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	router.RegisterIncidentRoutes(incidentService)
+	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor, runbook.WithUATPolicy(uatPolicy))
+	router.RegisterRunbookRoutes(runbookService)
+	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
 	router.RegisterHealthRoutes(st.Pool.Ping)
-	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
+	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
@@ -168,6 +213,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 	}()
 	go sched.Run(ctx)
 	go pl.Run(ctx)
+	go alertSourceReconciler.Run(ctx)
 
 	select {
 	case <-ctx.Done():
@@ -187,6 +233,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, logger *s
 // notify.ErrSMTPNotConfigured（走既有 markFailed 链路，不是启动期报错）。
 func registerNotifyChannels(cfg config.Config) {
 	notify.Register(notify.NewLarkChannel(cfg.Lark.AppID, cfg.Lark.AppSecret))
+	notify.Register(notify.NewLarkWebhookChannel(notify.DefaultWebhookTimeout))
 	notify.Register(notify.NewWebhookChannel(notify.DefaultWebhookTimeout))
 	notify.Register(notify.NewEmailChannel(cfg.SMTP.Host, cfg.SMTP.Port, cfg.SMTP.Username, cfg.SMTP.Password, cfg.SMTP.From, cfg.SMTP.StartTLS))
 }

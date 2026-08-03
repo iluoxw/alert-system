@@ -43,7 +43,7 @@ type DequeuedEvent struct {
 // 返回生成的事件 ID。integrationID 为空字符串时落 NULL（如未来支持匿名/测试来源）。
 //
 // domain.AlertEvent 本身不携带 integration ID（只有面向展示的 Source 字符串），
-// 该 ID 由 ingest 端点从请求路径 `/ingest/{integration_id}` 解析后传入，
+// 该 ID 由 managed hook 凭据反查后传入，
 // 因此签名比任务描述里的 (ctx, tx, event) 多了 integrationID 一个参数。
 func (q *EventQueue) Enqueue(ctx context.Context, tx pgx.Tx, integrationID string, event domain.AlertEvent) (string, error) {
 	payload, err := json.Marshal(event)

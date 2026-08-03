@@ -45,6 +45,57 @@ func (s Status) IsValid() bool {
 	}
 }
 
+// SourceState 是上游 Alertmanager 对 occurrence 生命周期的权威判断。它与本地响应
+// 动作完全正交：值班人 Ack 不能把 firing 改成 acknowledged，来源暂时不可判定时也
+// 不能伪造 resolved。
+type SourceState string
+
+const (
+	SourceStateFiring   SourceState = "firing"
+	SourceStateResolved SourceState = "resolved"
+	SourceStateUnknown  SourceState = "unknown"
+)
+
+func (s SourceState) IsValid() bool {
+	switch s {
+	case SourceStateFiring, SourceStateResolved, SourceStateUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// ResponseState 是 SRE Control 自己拥有的响应状态，只能由用户/API 写入。
+type ResponseState string
+
+const (
+	ResponseStateUnacknowledged ResponseState = "unacknowledged"
+	ResponseStateAcknowledged   ResponseState = "acknowledged"
+)
+
+func (s ResponseState) IsValid() bool {
+	return s == ResponseStateUnacknowledged || s == ResponseStateAcknowledged
+}
+
+// SuppressionState 镜像 Alertmanager 的通知抑制事实。一个 Alert 同时命中 silence
+// 与 inhibition 时，主状态选择 silenced，并在 SuppressionDetails 中保留两组 ID。
+type SuppressionState string
+
+const (
+	SuppressionStateNone      SuppressionState = "none"
+	SuppressionStateSilenced  SuppressionState = "silenced"
+	SuppressionStateInhibited SuppressionState = "inhibited"
+)
+
+func (s SuppressionState) IsValid() bool {
+	switch s {
+	case SuppressionStateNone, SuppressionStateSilenced, SuppressionStateInhibited:
+		return true
+	default:
+		return false
+	}
+}
+
 // ResolvePolicy 表示告警的恢复策略（D4，信封级必备字段）。
 type ResolvePolicy string
 
@@ -90,6 +141,9 @@ func (k SignalKind) IsValid() bool {
 // 核心管道（去重/路由/通知/状态机）的逻辑只依赖信封字段，不读取 SignalContext（R2.3）。
 type AlertEvent struct {
 	Fingerprint string // 由 Fingerprint() 计算得出（D5），不由上游提供
+	// UpstreamFingerprint 是 Alertmanager API/webhook 给出的稳定 alert 指纹。
+	// Alertmanager occurrence 的幂等键是 integration + 此字段 + StartsAt。
+	UpstreamFingerprint string
 
 	RuleID     string     // 规则/告警名标识，参与 fingerprint 计算（D5）
 	SignalKind SignalKind // 决定 fingerprint 计算策略（D5）
@@ -114,6 +168,12 @@ type AlertEvent struct {
 
 	StartsAt time.Time
 	EndsAt   time.Time // 上游 resolved 事件携带的结束时间；未恢复时为零值
+
+	// SourceUpdatedAt 用于拒绝乱序上游事件。webhook 没有 updatedAt 时，firing 用
+	// StartsAt、resolved 用 EndsAt；API 对账使用 gettableAlert.updatedAt。
+	SourceUpdatedAt    time.Time
+	SuppressionState   SuppressionState
+	SuppressionDetails map[string][]string
 }
 
 // Alert 是去重后持久化的告警实体，对应 alerts 表，一条记录代表一轮 firing 周期（R3）。
@@ -121,10 +181,15 @@ type AlertEvent struct {
 type Alert struct {
 	ID string
 
-	Fingerprint      string
-	Status           Status
-	Severity         Severity
-	SeverityFallback bool
+	Fingerprint         string
+	UpstreamFingerprint string
+	Status              Status
+	SourceState         SourceState
+	ResponseState       ResponseState
+	SuppressionState    SuppressionState
+	SuppressionDetails  map[string][]string
+	Severity            Severity
+	SeverityFallback    bool
 
 	Title  string
 	Source string
@@ -136,7 +201,12 @@ type Alert struct {
 	ResolvePolicy ResolvePolicy
 	TTLSeconds    int // 仅 ResolvePolicy == ResolvePolicyTTL 时有意义
 
-	SourceIntegrationID string // 对应 source_integration_id，可为空字符串（无来源集成）
+	SourceIntegrationID    string // 对应 source_integration_id，可为空字符串（无来源集成）
+	SourceUpdatedAt        time.Time
+	LastReconciledAt       time.Time
+	ReconcileGeneration    int64
+	ReconcileMissCount     int
+	SourceResolutionReason string
 
 	DedupCount int    // 同 fingerprint 合并计数（R3.3）
 	GroupKey   string // 分组通知用（R9），未分组时为空
@@ -161,4 +231,22 @@ type Alert struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// IsAuthoritativeSource 表示该行是 Alertmanager occurrence 镜像，而不是兼容来源的
+// 本地生命周期 Alert。判断依赖持久化身份字段，不只看可展示的 Source 字符串。
+func (a Alert) IsAuthoritativeSource() bool {
+	return a.SourceIntegrationID != "" && a.UpstreamFingerprint != ""
+}
+
+// ProjectLegacyStatus 在兼容期把三轴投影回旧 status，供尚未迁移的查询/页面使用。
+// resolved 优先；其余情况下 Ack 只影响响应投影，不篡改 SourceState。
+func ProjectLegacyStatus(source SourceState, response ResponseState) Status {
+	if source == SourceStateResolved {
+		return StatusResolved
+	}
+	if response == ResponseStateAcknowledged {
+		return StatusAcknowledged
+	}
+	return StatusFiring
 }

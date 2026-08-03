@@ -70,9 +70,7 @@ func generateSessionToken() (string, error) {
 }
 
 // hashSessionToken 计算 token 的 hex(sha256(token))，与 sessions.token_hash 列的存储
-// 编码约定一致——同 internal/ingest/server.go 的 hashToken，二者故意重复而不是共享
-// 一个跨包函数：ingest 的 token 是 integration 凭据，session 的 token 是登录凭据，
-// 语义上并非同一概念，共享实现只会造成两个不相关的包相互耦合。
+// 编码约定一致。
 func hashSessionToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])

@@ -92,8 +92,10 @@ type scheduleCall struct {
 type cancelCall struct{ kind, refID string }
 
 type fakeTimerScheduler struct {
-	scheduleCalls []scheduleCall
-	cancelCalls   []cancelCall
+	scheduleCalls   []scheduleCall
+	cancelCalls     []cancelCall
+	lockUnavailable bool
+	exclusiveLocks  []string
 }
 
 func (f *fakeTimerScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error {
@@ -103,6 +105,15 @@ func (f *fakeTimerScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refI
 
 func (f *fakeTimerScheduler) Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error {
 	f.cancelCalls = append(f.cancelCalls, cancelCall{kind: kind, refID: refID})
+	return nil
+}
+
+func (f *fakeTimerScheduler) TryLockRefShared(ctx context.Context, tx pgx.Tx, refID string) (bool, error) {
+	return !f.lockUnavailable, nil
+}
+
+func (f *fakeTimerScheduler) LockRefExclusive(ctx context.Context, tx pgx.Tx, refID string) error {
+	f.exclusiveLocks = append(f.exclusiveLocks, refID)
 	return nil
 }
 
@@ -415,6 +426,36 @@ func TestChain_Stop_CancelsTimer(t *testing.T) {
 	}
 	if len(sched.cancelCalls) != 1 || sched.cancelCalls[0].kind != TimerKindPersonnelEscalation || sched.cancelCalls[0].refID != "alert-5" {
 		t.Fatalf("Cancel 调用不正确: %+v", sched.cancelCalls)
+	}
+	if !reflect.DeepEqual(sched.exclusiveLocks, []string{"alert-5"}) {
+		t.Fatalf("Stop 应先取得 timer 链独占屏障，实际 %+v", sched.exclusiveLocks)
+	}
+}
+
+// TestChain_Handle_StopBarrierHeld 覆盖 Ack/Resolve 已取得独占屏障时，正在被
+// scheduler 投递的 handler 必须直接结束，不能发送通知或续挂下一层 timer。
+func TestChain_Handle_StopBarrierHeld(t *testing.T) {
+	const alertID = "alert-barrier"
+	sched := &fakeTimerScheduler{lockUnavailable: true}
+	notifier := &fakeNotifier{}
+	timeline := newFakeTimelineRepo()
+	chain := newTestChain(
+		&fakeAlertRepo{alerts: map[string]domain.Alert{alertID: {ID: alertID, TeamID: "team-1", Status: domain.StatusFiring}}},
+		timeline,
+		&fakeEscalationPolicyRepo{},
+		NewResolver(&fakeScheduleRepo{}, &fakeShiftRepo{}),
+		sched,
+		notifier,
+		time.Now(),
+	)
+
+	payload, _ := json.Marshal(escalationPayload{Level: 0})
+	if err := chain.Handle(context.Background(), nil, alertID, payload); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(notifier.calls) != 0 || len(sched.scheduleCalls) != 0 || len(timeline.entries[alertID]) != 0 {
+		t.Fatalf("独占屏障期间 handler 应无副作用: notifier=%d schedule=%d timeline=%d",
+			len(notifier.calls), len(sched.scheduleCalls), len(timeline.entries[alertID]))
 	}
 }
 

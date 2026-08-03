@@ -17,7 +17,8 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
 
+	"alert-system/internal/alertsource"
 	"alert-system/internal/domain"
 	"alert-system/internal/notify"
 	"alert-system/internal/store"
@@ -99,6 +101,7 @@ type ConfigIntegrationStore interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id string) (*store.Integration, error)
 	List(ctx context.Context, tx pgx.Tx, limit int) ([]store.Integration, error)
 	Update(ctx context.Context, tx pgx.Tx, in store.Integration) error
+	RotateHookIDHash(ctx context.Context, tx pgx.Tx, id, hookIDHash string) error
 	Delete(ctx context.Context, tx pgx.Tx, id string) error
 }
 
@@ -119,6 +122,13 @@ type ConfigAlertSilenceStore interface {
 	DetachSilence(ctx context.Context, tx pgx.Tx, silenceID string) error
 }
 
+// ConfigCacheInvalidator 由 pipeline 的失效器实现。调用必须发生在配置事务成功提交
+// 之后，避免数据库回滚时却提前丢弃仍然有效的缓存。
+type ConfigCacheInvalidator interface {
+	InvalidateRoutes()
+	InvalidateSilences()
+}
+
 // ConfigDeps 是 RegisterConfigRoutes 所需的全部仓储依赖。main 装配时传入对应的
 // *store.XxxRepo 即可（均天然满足上面的精简接口）；测试注入内存 fake。
 type ConfigDeps struct {
@@ -131,6 +141,7 @@ type ConfigDeps struct {
 	Integrations         ConfigIntegrationStore
 	Silences             ConfigSilenceStore
 	AlertSilences        ConfigAlertSilenceStore
+	CacheInvalidator     ConfigCacheInvalidator
 }
 
 // configHandlers 持有配置管理 API 的全部依赖，方法接收者集中在这里（而不是直接挂在
@@ -151,7 +162,9 @@ func (r *Router) RegisterConfigRoutes(deps ConfigDeps) {
 	admin.GET("/integrations", h.listIntegrations)
 	admin.GET("/integrations/:id", h.getIntegration)
 	admin.PATCH("/integrations/:id", h.updateIntegration)
+	admin.POST("/integrations/:id/rotate-hook", h.rotateIntegrationHook)
 	admin.DELETE("/integrations/:id", h.deleteIntegration)
+	admin.POST("/alert-sources/:id/rotate-hook", h.rotateAlertSourceHook)
 
 	admin.POST("/teams", h.createTeam)
 	admin.GET("/teams", h.listTeams)
@@ -277,20 +290,32 @@ func isUniqueViolation(err error) bool {
 
 // ---- integrations ----
 //
-// R1.3 安全约束：明文 token 只在 Create 的响应里出现一次；GetByID/List/Update 的
-// 响应体不含 token 字段（即便是 hash 也不返回，避免不必要的信息面）；token 不落日志
-// （handleStoreErr 的日志只记 err，err 内容不包含 token/hash，见各 handler 实现）。
+// R1.3 安全约束：明文 hook UUID 只在 Create/Rotate 的响应里出现一次；GetByID/List/
+// Update 的响应体不含凭据（即便是 hash 也不返回）。UUID 是接入 URL 的 opaque bearer
+// credential，不是 integration 主键；轮换它不会改变来源身份和历史关联。
 
-const integrationTokenBytes = 32
-
-// generateIntegrationToken 生成 integrationTokenBytes 字节的随机明文 token，
-// base64 URL 安全编码——与 generateSessionToken 同一模式，独立生成互不影响。
-func generateIntegrationToken() (string, error) {
-	buf := make([]byte, integrationTokenBytes)
+// generateIntegrationHookID 使用 crypto/rand 生成 RFC 4122 UUID v4。122 位随机熵足以
+// 作为 webhook URL 的 bearer credential；数据库只保存其 SHA-256。
+func generateIntegrationHookID() (string, error) {
+	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
+}
+
+func hashIntegrationHookID(hookID string) string {
+	sum := sha256.Sum256([]byte(hookID))
+	return hex.EncodeToString(sum[:])
+}
+
+func hookCredentialJSON(in store.Integration, hookID string) gin.H {
+	return gin.H{
+		"id": in.ID, "name": in.Name,
+		"hook_id": hookID, "webhook_path": "/ingest/v1/hook/" + hookID,
+	}
 }
 
 type createIntegrationRequest struct {
@@ -338,14 +363,27 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
+	if req.Kind == "alertmanager" {
+		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
+		if err != nil {
+			unprocessable(c, err.Error())
+			return
+		}
+		if cfg.APIURL != "" {
+			if err := alertsource.ValidateConfig(cfg); err != nil {
+				unprocessable(c, err.Error())
+				return
+			}
+		}
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
 
-	token, err := generateIntegrationToken()
+	hookID, err := generateIntegrationHookID()
 	if err != nil {
-		h.logger.Error("api: 生成 integration token 失败", "err", err)
+		h.logger.Error("api: 生成 integration hook UUID 失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
@@ -357,7 +395,7 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 		out, createErr = h.deps.Integrations.Create(ctx, tx, store.Integration{
 			Kind:            req.Kind,
 			Name:            req.Name,
-			TokenHash:       hashSessionToken(token), // hex(sha256(token))，与 ingest hashToken 同编码
+			HookIDHash:      hashIntegrationHookID(hookID),
 			DefaultSeverity: req.DefaultSeverity,
 			Enabled:         enabled,
 			Config:          req.Config,
@@ -370,7 +408,9 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 	}
 
 	resp := integrationJSON(*out)
-	resp["token"] = token // 明文只在这一次响应里出现
+	for key, value := range hookCredentialJSON(*out, hookID) {
+		resp[key] = value
+	}
 	c.JSON(http.StatusCreated, resp)
 }
 
@@ -433,6 +473,19 @@ func (h *configHandlers) updateIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
+	if req.Kind == "alertmanager" {
+		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
+		if err != nil {
+			unprocessable(c, err.Error())
+			return
+		}
+		if cfg.APIURL != "" {
+			if err := alertsource.ValidateConfig(cfg); err != nil {
+				unprocessable(c, err.Error())
+				return
+			}
+		}
+	}
 
 	ctx := c.Request.Context()
 	id := c.Param("id")
@@ -451,6 +504,44 @@ func (h *configHandlers) updateIntegration(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func (h *configHandlers) rotateIntegrationHook(c *gin.Context) {
+	h.rotateHook(c, false)
+}
+
+func (h *configHandlers) rotateAlertSourceHook(c *gin.Context) {
+	h.rotateHook(c, true)
+}
+
+// rotateHook 先生成新 hook，再在同一事务内确认来源类型并替换哈希。事务提交后旧 URL
+// 立即失效；失败时不返回新凭据，也不会影响原 URL。
+func (h *configHandlers) rotateHook(c *gin.Context, alertmanagerOnly bool) {
+	hookID, err := generateIntegrationHookID()
+	if err != nil {
+		h.logger.Error("api: 生成 integration hook UUID 失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	id := c.Param("id")
+	var in *store.Integration
+	err = h.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		var getErr error
+		in, getErr = h.deps.Integrations.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return getErr
+		}
+		if alertmanagerOnly && in.Kind != "alertmanager" {
+			return &validationError{msg: "该 integration 不是 Alertmanager 数据源"}
+		}
+		return h.deps.Integrations.RotateHookIDHash(ctx, tx, id, hashIntegrationHookID(hookID))
+	})
+	if h.writeValidationOr(c, err, "轮换 integration hook") {
+		return
+	}
+	c.JSON(http.StatusOK, hookCredentialJSON(*in, hookID))
 }
 
 func (h *configHandlers) deleteIntegration(c *gin.Context) {
@@ -844,6 +935,7 @@ func (h *configHandlers) createRoute(c *gin.Context) {
 	if h.writeValidationOr(c, err, "创建路由") {
 		return
 	}
+	h.invalidateRoutes()
 	c.JSON(http.StatusCreated, routeJSON(*out))
 }
 
@@ -912,6 +1004,7 @@ func (h *configHandlers) updateRoute(c *gin.Context) {
 	if h.writeValidationOr(c, err, "更新路由") {
 		return
 	}
+	h.invalidateRoutes()
 	c.Status(http.StatusNoContent)
 }
 
@@ -924,7 +1017,20 @@ func (h *configHandlers) deleteRoute(c *gin.Context) {
 		h.handleStoreErr(c, err, "删除路由")
 		return
 	}
+	h.invalidateRoutes()
 	c.Status(http.StatusNoContent)
+}
+
+func (h *configHandlers) invalidateRoutes() {
+	if h.deps.CacheInvalidator != nil {
+		h.deps.CacheInvalidator.InvalidateRoutes()
+	}
+}
+
+func (h *configHandlers) invalidateSilences() {
+	if h.deps.CacheInvalidator != nil {
+		h.deps.CacheInvalidator.InvalidateSilences()
+	}
 }
 
 // ---- schedules ----

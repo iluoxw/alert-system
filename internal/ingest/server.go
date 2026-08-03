@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"alert-system/internal/domain"
 	"alert-system/internal/store"
@@ -30,17 +28,17 @@ var ErrIntegrationNotFound = errors.New("ingest: integration 不存在")
 
 // Integration 是鉴权与路由所需的 integration 元信息，字段对应 integrations 表的子集列。
 type Integration struct {
-	ID        string
-	Kind      string
-	Enabled   bool
-	TokenHash string // hex(sha256(明文 token))，与 GetIntegration 实现约定的编码一致
+	ID         string
+	Kind       string
+	Enabled    bool
+	HookIDHash string // hex(sha256(hook_id))，数据库不保存 URL 中的明文凭据
 }
 
-// Store 是 Server 依赖的持久化接口，只暴露用到的两个操作，方便测试用 fake 实现替换
+// Store 是 Server 依赖的持久化接口，只暴露用到的操作，方便测试用 fake 实现替换
 // （无需 Docker/testcontainers）。生产实现见 PGStore。
 type Store interface {
-	// GetIntegration 按 ID 查询 integration；不存在（含 ID 格式非法）返回 ErrIntegrationNotFound。
-	GetIntegration(ctx context.Context, id string) (Integration, error)
+	// GetIntegrationByHookIDHash 通过 URL 中 opaque hook UUID 的 SHA-256 反查来源。
+	GetIntegrationByHookIDHash(ctx context.Context, hookIDHash string) (Integration, error)
 	// EnqueueBatch 在单个事务内把 events 全部写入事件队列：一次 webhook 的多条事件
 	// 同一事务，要么全部提交要么全部回滚（R1.6：落库成功才能返回 202）。
 	EnqueueBatch(ctx context.Context, integrationID string, events []domain.AlertEvent) error
@@ -57,25 +55,18 @@ func NewPGStore(st *store.Store) *PGStore {
 	return &PGStore{st: st, events: store.NewEventQueue()}
 }
 
-func (p *PGStore) GetIntegration(ctx context.Context, id string) (Integration, error) {
+func (p *PGStore) GetIntegrationByHookIDHash(ctx context.Context, hookIDHash string) (Integration, error) {
 	var integ Integration
 	err := p.st.Pool.QueryRow(ctx, `
-		SELECT id, kind, enabled, token_hash FROM integrations WHERE id = $1::uuid
-	`, id).Scan(&integ.ID, &integ.Kind, &integ.Enabled, &integ.TokenHash)
+		SELECT id, kind, enabled, hook_id_hash FROM integrations WHERE hook_id_hash = $1
+	`, hookIDHash).Scan(&integ.ID, &integ.Kind, &integ.Enabled, &integ.HookIDHash)
 	if err == nil {
 		return integ, nil
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Integration{}, ErrIntegrationNotFound
 	}
-	// 22P02 = invalid_text_representation：id 不是合法 UUID 时 Postgres 会报这个错误码，
-	// 语义上等同于「不存在」，一并折叠成 ErrIntegrationNotFound；其余错误（连接失败等）
-	// 视为真正的基础设施故障，原样返回，交由调用方按 500 处理，不冒充鉴权失败。
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
-		return Integration{}, ErrIntegrationNotFound
-	}
-	return Integration{}, fmt.Errorf("ingest: 查询 integration 失败: %w", err)
+	return Integration{}, fmt.Errorf("ingest: 按 hook 查询 integration 失败: %w", err)
 }
 
 func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events []domain.AlertEvent) error {
@@ -85,11 +76,20 @@ func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events
 				return err
 			}
 		}
+		if len(events) > 0 && events[0].Source == alertmanagerKind {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO alert_source_status (integration_id, last_webhook_at)
+				VALUES ($1::uuid, now())
+				ON CONFLICT (integration_id) DO UPDATE SET last_webhook_at = EXCLUDED.last_webhook_at
+			`, integrationID); err != nil {
+				return fmt.Errorf("ingest: 更新 Alertmanager webhook 水位失败: %w", err)
+			}
+		}
 		return nil
 	})
 }
 
-// Server 是 /ingest/{integration_id} 的 HTTP 处理器集合。
+// Server 只提供 managed hook：URL 内 UUID 同时完成来源识别与鉴权。
 type Server struct {
 	registry *Registry
 	store    Store
@@ -109,39 +109,39 @@ func NewServer(registry *Registry, st Store, logger *slog.Logger) *Server {
 // http.ListenAndServe(addr, srv.Handler())。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /ingest/{integration_id}", s.handleIngest)
+	mux.HandleFunc("POST /ingest/v1/hook/{hook_id}", s.handleManagedHook)
 	return mux
 }
 
-func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleManagedHook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	integrationID := r.PathValue("integration_id")
-
-	token := extractToken(r)
-	if token == "" {
-		s.reject(w, integrationID, "缺少 token", http.StatusUnauthorized)
+	hookID := r.PathValue("hook_id")
+	if !validManagedHookID(hookID) {
+		// hook UUID 是 bearer credential，非法与不存在必须保持同一响应，且日志不能记录它。
+		s.reject(w, "", "hook 不存在", http.StatusUnauthorized)
 		return
 	}
 
-	integ, err := s.store.GetIntegration(ctx, integrationID)
+	integ, err := s.store.GetIntegrationByHookIDHash(ctx, hashHookID(hookID))
 	if err != nil {
 		if errors.Is(err, ErrIntegrationNotFound) {
-			s.reject(w, integrationID, "integration 不存在", http.StatusUnauthorized)
+			s.reject(w, "", "hook 不存在", http.StatusUnauthorized)
 			return
 		}
-		s.logger.Error("ingest: 查询 integration 失败", "integration_id", integrationID, "err", err)
+		s.logger.Error("ingest: 按 managed hook 查询 integration 失败", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if !integ.Enabled {
-		s.reject(w, integrationID, "integration 已禁用", http.StatusUnauthorized)
+		s.reject(w, integ.ID, "integration 已禁用", http.StatusUnauthorized)
 		return
 	}
-	if !validToken(token, integ.TokenHash) {
-		s.reject(w, integrationID, "token 不匹配", http.StatusUnauthorized)
-		return
-	}
+	s.handleIntegration(w, r, integ)
+}
 
+func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request, integ Integration) {
+	ctx := r.Context()
+	integrationID := integ.ID
 	adapter, ok := s.registry.Get(integ.Kind)
 	if !ok {
 		s.logger.Error("ingest: 未注册 adapter", "integration_id", integrationID, "kind", integ.Kind)
@@ -184,28 +184,31 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// extractToken 从请求头取鉴权 token：优先 Authorization: Bearer，其次 X-Ingest-Token
-// （任务 17 允许自行决定支持哪个/是否都支持，这里选择都支持以兼容不同调用方习惯）。
-func extractToken(r *http.Request) string {
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		if tok, ok := strings.CutPrefix(auth, "Bearer "); ok {
-			return strings.TrimSpace(tok)
+// validManagedHookID 只接受 SRE Control 分发的规范小写 UUID v4。source 主键即使也是
+// UUID，也无法通过 hook_id_hash 反查，不能被误当成接入凭据。
+func validManagedHookID(id string) bool {
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' || id[14] != '4' {
+		return false
+	}
+	if !strings.ContainsRune("89ab", rune(id[19])) {
+		return false
+	}
+	for i, ch := range id {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdef", ch) {
+			return false
 		}
 	}
-	return strings.TrimSpace(r.Header.Get("X-Ingest-Token"))
+	return true
 }
 
-// hashToken 计算 token 的 hex(sha256(token))，与 integrations.token_hash 列的存储编码
-// 约定一致——写入该列的调用方（如任务 25 的管理 API）必须使用相同编码。
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
+// hashHookID 计算 hook_id 的 hex(sha256(hook_id))，与 integrations.hook_id_hash
+// 的存储编码一致。
+func hashHookID(hookID string) string {
+	sum := sha256.Sum256([]byte(hookID))
 	return hex.EncodeToString(sum[:])
-}
-
-// validToken 用 crypto/subtle.ConstantTimeCompare 做常量时间比较，避免 token 校验
-// 存在时序侧信道。
-func validToken(token, storedHash string) bool {
-	return subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(storedHash)) == 1
 }
 
 // reject 写入统一的错误响应，并按 R1.4 记录结构化拒绝日志：只记 integration_id 与
@@ -262,6 +265,20 @@ func normalizeAndValidate(e *domain.AlertEvent, integrationKind string) error {
 
 	if e.Source == "" {
 		e.Source = integrationKind
+	}
+	if e.Source == alertmanagerKind && e.UpstreamFingerprint == "" {
+		return errors.New("Alertmanager fingerprint 不能为空")
+	}
+	if e.Source == alertmanagerKind {
+		if e.SuppressionState == "" {
+			e.SuppressionState = domain.SuppressionStateNone
+		}
+		if !e.SuppressionState.IsValid() {
+			return fmt.Errorf("非法 suppression_state: %q", e.SuppressionState)
+		}
+		if e.SourceUpdatedAt.IsZero() {
+			e.SourceUpdatedAt = e.StartsAt
+		}
 	}
 	if e.Fingerprint == "" {
 		e.Fingerprint = domain.Fingerprint(*e)

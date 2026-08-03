@@ -18,13 +18,20 @@ import (
 // alertDTO 是 GET /api/v1/alerts、/api/v1/alerts/:id 响应里 alert 部分用得到的字段
 // 子集（internal/api/alerts.go 的 alertResponse），测试代码只关心场景断言需要的这几个。
 type alertDTO struct {
-	ID         string   `json:"id"`
-	Status     string   `json:"status"`
-	Severity   string   `json:"severity"`
-	GroupKey   string   `json:"group_key"`
-	TeamID     string   `json:"team_id"`
-	SilencedBy []string `json:"silenced_by"`
-	DedupCount int      `json:"dedup_count"`
+	ID                  string   `json:"id"`
+	Status              string   `json:"status"`
+	SourceState         string   `json:"source_state"`
+	ResponseState       string   `json:"response_state"`
+	SuppressionState    string   `json:"suppression_state"`
+	Authoritative       bool     `json:"authoritative"`
+	UpstreamFingerprint string   `json:"upstream_fingerprint"`
+	SourceIntegrationID string   `json:"source_integration_id"`
+	ReconcileMissCount  int      `json:"reconcile_miss_count"`
+	Severity            string   `json:"severity"`
+	GroupKey            string   `json:"group_key"`
+	TeamID              string   `json:"team_id"`
+	SilencedBy          []string `json:"silenced_by"`
+	DedupCount          int      `json:"dedup_count"`
 }
 
 type alertListResponse struct {
@@ -116,9 +123,9 @@ func uniqueSuffix() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&suffixCounter, 1))
 }
 
-// alertmanagerPayload 构造一条 kind=alertmanager 的 webhook 请求体：单条告警，
-// labels 固定带 alertname（路由/静默/分组的 group_by 均按 alertname 匹配）。
-func alertmanagerPayload(alertname, severity, status string, startsAt time.Time, extraLabels map[string]string) []byte {
+// compatibleWebhookPayload 构造 Alertmanager template.Data 兼容格式的单条 webhook；
+// 既有本地编排场景通过 kind=grafana 接入，避免越过 Alertmanager 权威边界。
+func compatibleWebhookPayload(alertname, severity, status string, startsAt time.Time, extraLabels map[string]string) []byte {
 	labels := map[string]string{"alertname": alertname, "severity": severity}
 	for k, v := range extraLabels {
 		labels[k] = v

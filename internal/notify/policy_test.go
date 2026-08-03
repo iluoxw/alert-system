@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -108,10 +109,12 @@ type policyScheduleCall struct {
 // pending 唯一性替换语义（本文件的测试都是手工按 payload 直接调 Handle 模拟"到期"，
 // 不依赖 Schedule 的替换/去重行为）。
 type fakePolicyScheduler struct {
-	scheduled   []policyScheduleCall
-	canceled    []string
-	scheduleErr error
-	cancelErr   error
+	scheduled       []policyScheduleCall
+	canceled        []string
+	scheduleErr     error
+	cancelErr       error
+	lockUnavailable bool
+	exclusiveLocks  []string
 }
 
 func (f *fakePolicyScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error {
@@ -127,6 +130,15 @@ func (f *fakePolicyScheduler) Cancel(ctx context.Context, tx pgx.Tx, kind, refID
 		return f.cancelErr
 	}
 	f.canceled = append(f.canceled, refID)
+	return nil
+}
+
+func (f *fakePolicyScheduler) TryLockRefShared(ctx context.Context, tx pgx.Tx, refID string) (bool, error) {
+	return !f.lockUnavailable, nil
+}
+
+func (f *fakePolicyScheduler) LockRefExclusive(ctx context.Context, tx pgx.Tx, refID string) error {
+	f.exclusiveLocks = append(f.exclusiveLocks, refID)
 	return nil
 }
 
@@ -512,6 +524,38 @@ func TestEngine_Stop_CancelsTimer(t *testing.T) {
 	}
 	if len(sched.canceled) != 1 || sched.canceled[0] != "alert-1" {
 		t.Fatalf("Cancel 调用 = %+v, want [alert-1]", sched.canceled)
+	}
+	if !reflect.DeepEqual(sched.exclusiveLocks, []string{"alert-1"}) {
+		t.Fatalf("Stop 应先取得 timer 链独占屏障，实际 %+v", sched.exclusiveLocks)
+	}
+}
+
+// ⑮b Stop 已取得独占屏障时，handler 必须直接结束，不能发送或续挂下一层。
+func TestEngine_Handle_StopBarrierHeld(t *testing.T) {
+	registerPolicyTestChannels()
+	alert := domain.Alert{ID: "alert-barrier", Severity: domain.SeverityWarning, Status: domain.StatusFiring}
+	policy := store.NotificationPolicy{ID: "p-barrier", Steps: store.NotificationSteps{
+		domain.SeverityWarning: {{Channels: []string{"email"}}, {WaitSeconds: 60, Channels: []string{"im"}}},
+	}}
+	sched := &fakePolicyScheduler{lockUnavailable: true}
+	dispatcher := &fakeDispatcher{}
+	timeline := &fakePolicyTimeline{}
+	e := newTestEngine(
+		&fakePolicyAlertRepo{alerts: map[string]domain.Alert{alert.ID: alert}},
+		timeline,
+		&fakePolicyRepo{global: &policy},
+		sched,
+		dispatcher,
+		&fakeClock{t: time.Now()},
+	)
+
+	payload, _ := json.Marshal(stepPayload{Step: 0})
+	if err := e.Handle(context.Background(), nil, alert.ID, payload); err != nil {
+		t.Fatalf("Handle() 返回意外错误: %v", err)
+	}
+	if len(dispatcher.calls) != 0 || len(sched.scheduled) != 0 || len(timeline.entries) != 0 {
+		t.Fatalf("独占屏障期间 handler 应无副作用: dispatch=%d schedule=%d timeline=%d",
+			len(dispatcher.calls), len(sched.scheduled), len(timeline.entries))
 	}
 }
 

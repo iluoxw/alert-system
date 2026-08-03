@@ -79,23 +79,22 @@ func (c *apiClient) doJSON(method, path string, body, out any) (int, []byte, err
 	return resp.StatusCode, raw, nil
 }
 
-// postIngest 发一个不带会话 cookie 的 ingest 请求，token 走 Authorization: Bearer
-// header——与真实 webhook 调用方式一致（internal/ingest/server.go 的 extractToken）。
-func (c *apiClient) postIngest(integrationID, token string, body []byte) (int, []byte, error) {
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/ingest/"+integrationID, bytes.NewReader(body))
+// postManagedHook 只携带 SRE Control 分发的 managed webhook path；hook UUID 本身完成
+// 来源识别与鉴权，符合 Alertmanager receiver 的实际配置方式。
+func (c *apiClient) postManagedHook(webhookPath string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+webhookPath, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, fmt.Errorf("e2e: 构造 ingest 请求失败: %w", err)
+		return 0, nil, fmt.Errorf("e2e: 构造 hook 请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("e2e: ingest 请求失败: %w", err)
+		return 0, nil, fmt.Errorf("e2e: hook 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, fmt.Errorf("e2e: 读取 ingest 响应体失败: %w", err)
+		return 0, nil, fmt.Errorf("e2e: 读取 hook 响应体失败: %w", err)
 	}
 	return resp.StatusCode, raw, nil
 }

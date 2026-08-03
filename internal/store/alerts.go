@@ -30,7 +30,10 @@ const alertColumns = `
 	COALESCE(group_key, ''), COALESCE(team_id::text, ''), COALESCE(route_id::text, ''), silenced_by,
 	COALESCE(acked_by::text, ''), acked_at, starts_at, last_seen_at, ends_at,
 	flap_count, flap_window_start, flapping,
-	created_at, updated_at
+	created_at, updated_at,
+	upstream_fingerprint, source_state, response_state, suppression_state,
+	suppression_details, source_updated_at, last_reconciled_at,
+	reconcile_generation, reconcile_miss_count, COALESCE(source_resolution_reason, '')
 `
 
 // alertRowScanner 是 pgx.Row 与 pgx.Rows 共有的最小接口，让 scanAlertRow 同时服务于
@@ -49,10 +52,10 @@ type alertRowScanner interface {
 // 避免依赖 pgx 对 map/RawMessage 的隐式编解码行为（与 events.go 的 payload 处理方式一致）。
 func scanAlertRow(rs alertRowScanner, extra ...any) (domain.Alert, error) {
 	var (
-		a                                           domain.Alert
-		labelsRaw, resourceRefRaw, signalContextRaw []byte
-		ttlSeconds                                  *int
-		ackedAt, endsAt, flapWindowStart             *time.Time
+		a                                                                   domain.Alert
+		labelsRaw, resourceRefRaw, signalContextRaw, suppressionDetailsRaw  []byte
+		ttlSeconds                                                          *int
+		ackedAt, endsAt, flapWindowStart, sourceUpdatedAt, lastReconciledAt *time.Time
 	)
 
 	dest := []any{
@@ -63,6 +66,9 @@ func scanAlertRow(rs alertRowScanner, extra ...any) (domain.Alert, error) {
 		&a.AckedBy, &ackedAt, &a.StartsAt, &a.LastSeenAt, &endsAt,
 		&a.FlapCount, &flapWindowStart, &a.Flapping,
 		&a.CreatedAt, &a.UpdatedAt,
+		&a.UpstreamFingerprint, &a.SourceState, &a.ResponseState, &a.SuppressionState,
+		&suppressionDetailsRaw, &sourceUpdatedAt, &lastReconciledAt,
+		&a.ReconcileGeneration, &a.ReconcileMissCount, &a.SourceResolutionReason,
 	}
 	dest = append(dest, extra...)
 
@@ -82,6 +88,12 @@ func scanAlertRow(rs alertRowScanner, extra ...any) (domain.Alert, error) {
 	if flapWindowStart != nil {
 		a.FlapWindowStart = *flapWindowStart
 	}
+	if sourceUpdatedAt != nil {
+		a.SourceUpdatedAt = *sourceUpdatedAt
+	}
+	if lastReconciledAt != nil {
+		a.LastReconciledAt = *lastReconciledAt
+	}
 	if err := json.Unmarshal(labelsRaw, &a.Labels); err != nil {
 		return domain.Alert{}, fmt.Errorf("store: 反序列化 labels 失败: %w", err)
 	}
@@ -89,6 +101,9 @@ func scanAlertRow(rs alertRowScanner, extra ...any) (domain.Alert, error) {
 		return domain.Alert{}, fmt.Errorf("store: 反序列化 resource_ref 失败: %w", err)
 	}
 	a.SignalContext = json.RawMessage(signalContextRaw)
+	if err := json.Unmarshal(suppressionDetailsRaw, &a.SuppressionDetails); err != nil {
+		return domain.Alert{}, fmt.Errorf("store: 反序列化 suppression_details 失败: %w", err)
+	}
 
 	return a, nil
 }
@@ -137,7 +152,7 @@ func (r *AlertRepo) UpsertByFingerprint(ctx context.Context, tx pgx.Tx, event do
 			$6, $7, $8, $9, $10,
 			NULLIF($11, '')::uuid, 1, $12, $12
 		)
-		ON CONFLICT (fingerprint) WHERE status != 'resolved' DO UPDATE SET
+		ON CONFLICT (fingerprint) WHERE status != 'resolved' AND upstream_fingerprint = '' DO UPDATE SET
 			dedup_count = alerts.dedup_count + 1,
 			last_seen_at = EXCLUDED.last_seen_at,
 			severity = EXCLUDED.severity,
@@ -229,14 +244,35 @@ func (r *AlertRepo) GetLatestResolvedByFingerprint(ctx context.Context, tx pgx.T
 // Alert，本方法只做一次整体列更新，不重复做转移合法性校验（该校验属于 domain
 // 层职责）。domain 层以零值 time.Time 表示「未设置」，这里转换为 SQL NULL。
 func (r *AlertRepo) UpdateStatus(ctx context.Context, tx pgx.Tx, alert domain.Alert) error {
+	responseState := alert.ResponseState
+	if !responseState.IsValid() {
+		if alert.Status == domain.StatusAcknowledged {
+			responseState = domain.ResponseStateAcknowledged
+		} else {
+			responseState = domain.ResponseStateUnacknowledged
+		}
+	}
+	sourceState := alert.SourceState
+	if !sourceState.IsValid() {
+		if alert.Status == domain.StatusResolved {
+			sourceState = domain.SourceStateResolved
+		} else {
+			sourceState = domain.SourceStateFiring
+		}
+	}
+	if !alert.IsAuthoritativeSource() && alert.Status == domain.StatusResolved {
+		sourceState = domain.SourceStateResolved
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE alerts SET
 			status = $2,
 			acked_by = NULLIF($3, '')::uuid,
 			acked_at = $4,
-			ends_at = $5
+			ends_at = $5,
+			response_state = $6,
+			source_state = $7
 		WHERE id = $1
-	`, alert.ID, alert.Status, alert.AckedBy, nullableTime(alert.AckedAt), nullableTime(alert.EndsAt))
+	`, alert.ID, alert.Status, alert.AckedBy, nullableTime(alert.AckedAt), nullableTime(alert.EndsAt), responseState, sourceState)
 	if err != nil {
 		return fmt.Errorf("store: 更新告警状态失败: %w", err)
 	}
@@ -360,9 +396,13 @@ func (r *AlertRepo) ListActiveByRoute(ctx context.Context, tx pgx.Tx, routeID st
 
 // AlertFilter 是 List 支持的组合过滤条件；字段为零值（""/nil/0）表示不按该维度过滤。
 type AlertFilter struct {
-	Severity domain.Severity
-	Status   domain.Status
-	TeamID   string
+	Severity         domain.Severity
+	Status           domain.Status
+	SourceState      domain.SourceState
+	ResponseState    domain.ResponseState
+	SuppressionState domain.SuppressionState
+	SourceID         string
+	TeamID           string
 	// Labels 为空 map 或 nil 表示不按标签过滤；非空时用 JSONB `@>` 包含匹配，
 	// 即要求 alerts.labels 包含这里给出的全部 key/value（AND 语义）。
 	Labels map[string]string
@@ -400,6 +440,18 @@ func (r *AlertRepo) List(ctx context.Context, tx pgx.Tx, filter AlertFilter) (Al
 	}
 	if filter.Status != "" {
 		clauses = append(clauses, "status = "+arg(filter.Status))
+	}
+	if filter.SourceState != "" {
+		clauses = append(clauses, "source_state = "+arg(filter.SourceState))
+	}
+	if filter.ResponseState != "" {
+		clauses = append(clauses, "response_state = "+arg(filter.ResponseState))
+	}
+	if filter.SuppressionState != "" {
+		clauses = append(clauses, "suppression_state = "+arg(filter.SuppressionState))
+	}
+	if filter.SourceID != "" {
+		clauses = append(clauses, "source_integration_id = "+arg(filter.SourceID)+"::uuid")
 	}
 	if filter.TeamID != "" {
 		clauses = append(clauses, "team_id = "+arg(filter.TeamID)+"::uuid")

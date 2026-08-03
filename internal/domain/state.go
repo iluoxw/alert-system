@@ -37,23 +37,26 @@ const (
 	// TimelineActionNote 标记独立备注（ui-enrichment，AddNote 产出）：不改变告警
 	// 状态，仅在排查过程中沉淀中间信息（如"已联系业务方等回复"），与 Ack/Resolve/
 	// Handoff 等状态转移动作在语义上分离。
-	TimelineActionNote TimelineAction = "note"
+	TimelineActionNote            TimelineAction = "note"
+	TimelineActionSourceUnknown   TimelineAction = "source_unknown"
+	TimelineActionSourceRecovered TimelineAction = "source_recovered"
 )
 
 // ResolveReason 标识 Resolve 动作的来源（R4.3/R4.4/R12.5）。
 type ResolveReason string
 
 const (
-	ResolveReasonManual          ResolveReason = "manual"
-	ResolveReasonSource          ResolveReason = "source"
-	ResolveReasonTTL             ResolveReason = "ttl"
-	ResolveReasonAutoRemediation ResolveReason = "auto-remediation"
+	ResolveReasonManual           ResolveReason = "manual"
+	ResolveReasonSource           ResolveReason = "source"
+	ResolveReasonTTL              ResolveReason = "ttl"
+	ResolveReasonAutoRemediation  ResolveReason = "auto-remediation"
+	ResolveReasonSourceReconciled ResolveReason = "source-reconciled"
 )
 
 // IsValid 报告 r 是否为已定义的 resolve 来源取值。
 func (r ResolveReason) IsValid() bool {
 	switch r {
-	case ResolveReasonManual, ResolveReasonSource, ResolveReasonTTL, ResolveReasonAutoRemediation:
+	case ResolveReasonManual, ResolveReasonSource, ResolveReasonTTL, ResolveReasonAutoRemediation, ResolveReasonSourceReconciled:
 		return true
 	default:
 		return false
@@ -90,6 +93,10 @@ func (e *TransitionError) Is(target error) bool {
 
 // ErrAlertResolved 表示对已 resolved 的告警执行了不允许的动作（如 Handoff）。
 var ErrAlertResolved = errors.New("state: 告警已 resolved")
+
+// ErrAuthoritativeSourceManualResolve 表示用户试图在 SRE Control 内关闭一个由
+// Alertmanager 掌握生命周期的 occurrence。调用方应返回 409 并引导用户去上游处理。
+var ErrAuthoritativeSourceManualResolve = errors.New("state: Alertmanager 权威来源不允许手工 Resolve")
 
 // ErrInvalidNote 表示 AddNote 收到的备注去首尾空白后为空串，或超出长度上限。
 var ErrInvalidNote = errors.New("state: 备注内容为空或超出长度上限")
@@ -133,7 +140,11 @@ func Ack(alert Alert, actorID, actorName string, now time.Time) (Alert, Timeline
 	}
 
 	updated := alert
-	updated.Status = StatusAcknowledged
+	updated.ResponseState = ResponseStateAcknowledged
+	if !updated.SourceState.IsValid() {
+		updated.SourceState = SourceStateFiring
+	}
+	updated.Status = ProjectLegacyStatus(updated.SourceState, updated.ResponseState)
 	updated.AckedBy = actorID
 	updated.AckedAt = now
 	updated.UpdatedAt = now
@@ -167,12 +178,18 @@ func Resolve(alert Alert, actor string, reason ResolveReason, note string, now t
 	if !reason.IsValid() {
 		return alert, TimelineEntry{}, fmt.Errorf("state: 非法 resolve reason %q", reason)
 	}
+	if reason == ResolveReasonManual && alert.IsAuthoritativeSource() {
+		return alert, TimelineEntry{}, ErrAuthoritativeSourceManualResolve
+	}
 	if err := Transition(alert.Status, StatusResolved); err != nil {
 		return alert, TimelineEntry{}, err
 	}
 
 	updated := alert
 	updated.Status = StatusResolved
+	if !updated.IsAuthoritativeSource() {
+		updated.SourceState = SourceStateResolved
+	}
 	updated.EndsAt = now
 	updated.UpdatedAt = now
 
@@ -182,6 +199,8 @@ func Resolve(alert Alert, actor string, reason ResolveReason, note string, now t
 		detail["label"] = "TTL 自动恢复"
 	case ResolveReasonAutoRemediation:
 		detail["label"] = "自愈恢复"
+	case ResolveReasonSourceReconciled:
+		detail["label"] = "Alertmanager 对账确认恢复"
 	}
 	if note != "" {
 		detail["note"] = note
@@ -207,7 +226,7 @@ func Handoff(alert Alert, actor, target string, now time.Time) (Alert, TimelineE
 	if target == "" {
 		return alert, TimelineEntry{}, fmt.Errorf("state: handoff 的 target 不能为空")
 	}
-	if alert.Status == StatusResolved {
+	if alert.Status == StatusResolved || alert.SourceState == SourceStateResolved {
 		return alert, TimelineEntry{}, ErrAlertResolved
 	}
 

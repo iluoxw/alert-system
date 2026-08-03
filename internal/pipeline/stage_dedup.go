@@ -32,6 +32,17 @@ type AlertRepo interface {
 	UpdateFlapState(ctx context.Context, tx pgx.Tx, id string, flapCount int, flapWindowStart time.Time, flapping bool) error
 }
 
+type authoritativeAlertRepo interface {
+	UpsertAuthoritativeOccurrence(
+		ctx context.Context,
+		tx pgx.Tx,
+		event domain.AlertEvent,
+		sourceID string,
+		observedAt time.Time,
+		generation int64,
+	) (domain.Alert, bool, domain.SourceState, error)
+}
+
 // TimelineRepo 是 DedupStage 依赖的时间线仓储子集，由 store.TimelineRepo 实现。
 type TimelineRepo interface {
 	Append(ctx context.Context, tx pgx.Tx, entry domain.TimelineEntry) (string, error)
@@ -100,6 +111,8 @@ func NewDedupStage(alerts AlertRepo, timeline TimelineRepo, sched TimerScheduler
 // Name 返回 "dedup"。
 func (s *DedupStage) Name() string { return "dedup" }
 
+func (s *DedupStage) RunForAuthoritativeSource() bool { return true }
+
 // Process 实现 Stage 接口。
 func (s *DedupStage) Process(ctx context.Context, pctx *PipelineContext) error {
 	event := pctx.Event
@@ -107,11 +120,52 @@ func (s *DedupStage) Process(ctx context.Context, pctx *PipelineContext) error {
 		return fmt.Errorf("dedup: severity 兜底失败: %w", err)
 	}
 	pctx.Event = event
+	if event.Source == "alertmanager" && event.UpstreamFingerprint != "" && pctx.IntegrationID != "" {
+		return s.processAuthoritative(ctx, pctx, event)
+	}
 
 	if event.Status == domain.StatusResolved {
 		return s.processResolved(ctx, pctx, event)
 	}
 	return s.processFiring(ctx, pctx, event)
+}
+
+func (s *DedupStage) processAuthoritative(ctx context.Context, pctx *PipelineContext, event domain.AlertEvent) error {
+	repo, ok := s.alerts.(authoritativeAlertRepo)
+	if !ok {
+		return fmt.Errorf("dedup: 告警仓储未实现 Alertmanager 权威镜像接口")
+	}
+	now := s.clock.Now()
+	alert, created, previous, err := repo.UpsertAuthoritativeOccurrence(ctx, pctx.Tx, event, pctx.IntegrationID, now, 0)
+	if err != nil {
+		return fmt.Errorf("dedup: 镜像 Alertmanager occurrence 失败: %w", err)
+	}
+	pctx.Alert = alert
+	pctx.Created = created
+	pctx.AuthoritativeSource = true
+
+	if alert.SourceState == domain.SourceStateResolved && previous != "" && previous != domain.SourceStateResolved {
+		entry := domain.TimelineEntry{
+			AlertID: alert.ID,
+			Actor:   "alertmanager-webhook",
+			Action:  domain.TimelineActionResolve,
+			Detail:  map[string]any{"reason": string(domain.ResolveReasonSource)},
+			At:      now,
+		}
+		if _, err := s.timeline.Append(ctx, pctx.Tx, entry); err != nil {
+			return fmt.Errorf("dedup: 写入 Alertmanager resolved 时间线失败: %w", err)
+		}
+	}
+	if alert.SourceState == domain.SourceStateFiring && previous == domain.SourceStateUnknown {
+		entry := domain.TimelineEntry{
+			AlertID: alert.ID, Actor: "alertmanager-webhook",
+			Action: domain.TimelineActionSourceRecovered, At: now,
+		}
+		if _, err := s.timeline.Append(ctx, pctx.Tx, entry); err != nil {
+			return fmt.Errorf("dedup: 写入 Alertmanager source_recovered 时间线失败: %w", err)
+		}
+	}
+	return nil
 }
 
 // applySeverityFallback 就地修正 event.Severity：合法值原样保留；缺失/非法时调用

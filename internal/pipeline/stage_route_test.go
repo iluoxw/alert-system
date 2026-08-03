@@ -165,6 +165,24 @@ func TestRouteStage_Process_CacheHit_WithinTTL_DoesNotRequery(t *testing.T) {
 	}
 }
 
+func TestRouteStage_InvalidateCache_RequeriesImmediately(t *testing.T) {
+	routes := &fakeRouteRepo{routes: []store.Route{{
+		ID: "r1", Priority: 1, Matchers: mkMatcher("env", "prod"), TargetTeamID: "team-a",
+	}}}
+	clock := &mutableClock{t: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)}
+	stage := newRouteStageForTest(routes, &fakeRouteAlertRepo{}, "team-default", clock)
+	if err := stage.Process(context.Background(), &PipelineContext{Alert: domain.Alert{ID: "a1", Labels: map[string]string{"env": "prod"}}}); err != nil {
+		t.Fatal(err)
+	}
+	stage.InvalidateCache()
+	if err := stage.Process(context.Background(), &PipelineContext{Alert: domain.Alert{ID: "a2", Labels: map[string]string{"env": "prod"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if routes.calls != 2 {
+		t.Fatalf("主动失效后应立即重查，calls=%d", routes.calls)
+	}
+}
+
 // ④ 缓存过期：超过 10s TTL 后下一次 Process 应重新查库刷新缓存。
 func TestRouteStage_Process_CacheExpiry_RequeriesAfterTTL(t *testing.T) {
 	routes := &fakeRouteRepo{routes: []store.Route{

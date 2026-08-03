@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 
+	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
+	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
 	"alert-system/internal/pipeline"
+	"alert-system/internal/runbook"
 	"alert-system/internal/scheduler"
 	"alert-system/internal/store"
 )
@@ -24,8 +27,7 @@ import (
 // worker 运行在同一个进程里；而 cmd/server 是 package main，无法被 test/e2e 导入。
 // pipeline/notify/oncall 的装配（含六个 scheduler kind 绑定、"意图/发送解耦" outbox）
 // 已收拢进 internal/app.Build，与 cmd/server/main.go 共用同一份逻辑——本文件只负责
-// E2E 独有的部分：httptest.Server、mock 渠道生效所需的两个 ingest adapter（无
-// Grafana）。
+// E2E 独有的部分：httptest.Server、mock 渠道生效所需的 ingest adapter。
 
 // system 持有一次 E2E 运行组装出的全部依赖：既需要经真实 HTTP（httptest.Server）
 // 驱动四个场景，也需要偶尔越过 HTTP 直接调用 store 仓储做 bootstrap seed（见
@@ -42,12 +44,21 @@ type system struct {
 	EscalationPolicies   *store.EscalationPolicyRepo
 	NotificationPolicies *store.NotificationPolicyRepo
 	Integrations         *store.IntegrationRepo
+	AlertSources         *store.AlertSourceRepo
 	Silences             *store.SilenceRepo
 	Alerts               *store.AlertRepo
 	Ops                  *store.OpsRepo
+	Faults               *store.FaultRepo
+	Topology             *store.TopologyRepo
+	Incidents            *store.IncidentRepo
+	Runbooks             *store.RunbookRepo
+	Services             *store.ServiceCatalogRepo
+	AlertMappings        *store.AlertMappingRepo
+	RunbookExecutor      *runbook.FakeExecutor
 
-	scheduler *scheduler.Scheduler
-	pipeline  *pipeline.Pipeline
+	scheduler  *scheduler.Scheduler
+	pipeline   *pipeline.Pipeline
+	reconciler *alertsource.Reconciler
 }
 
 // buildSystem 组装全部依赖并起一个 httptest.Server，但不启动 scheduler/pipeline
@@ -68,12 +79,20 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	escalationPolicies := store.NewEscalationPolicyRepo()
 	notificationPolicies := store.NewNotificationPolicyRepo()
 	integrations := store.NewIntegrationRepo()
+	alertSources := store.NewAlertSourceRepo()
 	silences := store.NewSilenceRepo()
 	changeEvents := store.NewChangeEventRepo()
 	notificationLogs := store.NewNotificationLogRepo()
 	sessions := store.NewSessionRepo()
 	memberships := store.NewMembershipRepo()
 	opsRepo := store.NewOpsRepo()
+	faults := store.NewFaultRepo()
+	topology := store.NewTopologyRepo()
+	incidents := store.NewIncidentRepo()
+	runbooks := store.NewRunbookRepo()
+	runbookExecutor := runbook.NewFakeExecutor()
+	serviceCatalog := store.NewServiceCatalogRepo()
+	alertMappings := store.NewAlertMappingRepo()
 
 	// pipeline/notify/oncall 全部依赖 + 六个 scheduler kind 的绑定，与
 	// cmd/server/main.go 共用同一份装配逻辑，见 internal/app.Build。
@@ -87,9 +106,14 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		NotificationPolicies: notificationPolicies,
 		Silences:             silences,
 		NotificationLogs:     notificationLogs,
+		Incidents:            incidents,
 		Teams:                teams,
 		Users:                users,
 		Ops:                  opsRepo,
+		ServiceCatalog:       serviceCatalog,
+		AlertMappings:        alertMappings,
+		Topology:             topology,
+		Faults:               faults,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
 
@@ -99,13 +123,15 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		return nil, fmt.Errorf("e2e: ops 定时器启动对账失败: %w", err)
 	}
 
-	// ingest：alertmanager 用于场景①/R13（真实 Alertmanager webhook 格式，
-	// ResolvePolicy 固定 source），generic 用于场景③（唯一能显式指定
-	// resolve_policy=ttl 的 adapter，见任务报告的 alertmanager-adapter 缝隙）。
+	// 既有本地路由/分组/通知场景改走 Grafana 兼容入口；Alertmanager 在新架构中
+	// 是唯一 Alert 权威来源，只镜像事实，不再重复执行本地路由/静默/通知。
+	// generic 继续用于显式指定 resolve_policy=ttl 的兼容场景。
 	registry := ingest.NewRegistry()
 	registry.Register(ingest.NewAlertmanagerAdapter(domain.SeverityWarning))
+	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
+	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
 
 	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
 
@@ -121,14 +147,22 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		Integrations:         integrations,
 		Silences:             silences,
 		AlertSilences:        alerts,
+		CacheInvalidator:     a.CacheInvalidator,
 	})
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
+	router.RegisterAlertSourceRoutes(alertSources, reconciler)
+	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	router.RegisterIncidentRoutes(incidentService)
+	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
+	router.RegisterRunbookRoutes(runbookService)
+	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterHealthRoutes(st.Pool.Ping)
-	router.MountUnauthenticated(http.MethodPost, "/ingest/:integration_id", ingestServer.Handler())
+	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)
 
@@ -143,11 +177,20 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		EscalationPolicies:   escalationPolicies,
 		NotificationPolicies: notificationPolicies,
 		Integrations:         integrations,
+		AlertSources:         alertSources,
 		Silences:             silences,
 		Alerts:               alerts,
 		Ops:                  opsRepo,
+		Faults:               faults,
+		Topology:             topology,
+		Incidents:            incidents,
+		Runbooks:             runbooks,
+		Services:             serviceCatalog,
+		AlertMappings:        alertMappings,
+		RunbookExecutor:      runbookExecutor,
 		scheduler:            sched,
 		pipeline:             pl,
+		reconciler:           reconciler,
 	}, nil
 }
 
@@ -155,6 +198,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 func (s *system) run(ctx context.Context) {
 	go s.scheduler.Run(ctx)
 	go s.pipeline.Run(ctx)
+	go s.reconciler.Run(ctx)
 }
 
 // close 关闭 httptest.Server 与数据库连接池。

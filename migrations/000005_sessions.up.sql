@@ -1,8 +1,8 @@
 -- sessions: self-rolled login sessions for the management API (R8.1/R8.3).
 -- No third-party session store: the plaintext token is only ever handed to the
--- client via Set-Cookie; the DB keeps token_hash = hex(sha256(token)), same
--- encoding convention as integrations.token_hash (see internal/ingest/server.go
--- hashToken). expires_at is the fixed absolute expiry set at login and never
+-- client via Set-Cookie; the DB keeps token_hash = hex(sha256(token)). This is
+-- independent from the managed ingest hook credential. expires_at is the fixed
+-- absolute expiry set at login and never
 -- extended; last_seen_at is the sliding-renewal watermark, bumped on every
 -- authenticated request (session valid only while both are in the future).
 CREATE TABLE sessions (

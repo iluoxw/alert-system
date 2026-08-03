@@ -122,10 +122,10 @@ type scheduleCall struct {
 
 // fakeStormScheduler 记录 Schedule/ScheduleIfAbsent 调用，不做真实持久化。
 type fakeStormScheduler struct {
-	scheduleCalls          []scheduleCall
-	scheduleIfAbsentCalls  []scheduleCall
-	scheduleErr            error
-	scheduleIfAbsentErr    error
+	scheduleCalls         []scheduleCall
+	scheduleIfAbsentCalls []scheduleCall
+	scheduleErr           error
+	scheduleIfAbsentErr   error
 }
 
 func (f *fakeStormScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error {

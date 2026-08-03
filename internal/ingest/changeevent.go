@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -123,18 +124,25 @@ func (h *changeEventHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// authorized 校验 Authorization: Bearer / X-Ingest-Token 头（extractToken 定义于
-// server.go，同包复用）与构造时注入的静态 token 是否一致，常量时间比较避免时序侧信道，
-// 约定与 validToken（server.go）一致。
+// authorized 校验变更事件专用的静态凭据。该入口不属于 Alertmanager managed hook。
 func (h *changeEventHandler) authorized(r *http.Request) bool {
 	if h.token == "" {
 		return false
 	}
-	token := extractToken(r)
+	token := extractChangeEventToken(r)
 	if token == "" {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(h.token)) == 1
+}
+
+func extractChangeEventToken(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if token, ok := strings.CutPrefix(auth, "Bearer "); ok {
+			return strings.TrimSpace(token)
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-Ingest-Token"))
 }
 
 // reject 写入统一错误响应并记录结构化拒绝日志（对齐 server.go 的 reject：不落 token，

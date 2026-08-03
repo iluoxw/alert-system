@@ -109,21 +109,28 @@ func (a *AlertmanagerAdapter) translate(payload alertmanagerWebhook, alert alert
 	if err != nil {
 		return domain.AlertEvent{}, fmt.Errorf("序列化 signal_context 失败: %w", err)
 	}
+	sourceUpdatedAt := alert.StartsAt
+	if status == domain.StatusResolved && !alert.EndsAt.IsZero() {
+		sourceUpdatedAt = alert.EndsAt
+	}
 
 	return domain.AlertEvent{
-		RuleID:           ruleID,
-		SignalKind:       domain.SignalKindMetric,
-		Severity:         severity,
-		SeverityFallback: fallback,
-		Status:           status,
-		Title:            titleFromAnnotations(alert.Annotations, ruleID),
-		Labels:           alert.Labels,
-		Source:           alertmanagerKind,
-		ResourceRef:      normalizeResourceRef(alert.Labels),
-		ResolvePolicy:    domain.ResolvePolicySource,
-		SignalContext:    signalContext,
-		StartsAt:         alert.StartsAt,
-		EndsAt:           alert.EndsAt,
+		RuleID:              ruleID,
+		UpstreamFingerprint: alert.Fingerprint,
+		SignalKind:          domain.SignalKindMetric,
+		Severity:            severity,
+		SeverityFallback:    fallback,
+		Status:              status,
+		Title:               titleFromAnnotations(alert.Annotations, ruleID),
+		Labels:              alert.Labels,
+		Source:              alertmanagerKind,
+		ResourceRef:         normalizeResourceRef(alert.Labels),
+		ResolvePolicy:       domain.ResolvePolicySource,
+		SignalContext:       signalContext,
+		StartsAt:            alert.StartsAt,
+		EndsAt:              alert.EndsAt,
+		SourceUpdatedAt:     sourceUpdatedAt,
+		SuppressionState:    domain.SuppressionStateNone,
 	}, nil
 }
 

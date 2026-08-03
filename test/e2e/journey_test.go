@@ -105,8 +105,8 @@ func TestScenarioJourney_ZeroToPersonNotification(t *testing.T) {
 	// （那样会把种子团队那条误判为断言通过）。----
 	startsAt := time.Now()
 	post := func() {
-		if _, _, err := client.postIngest(seedResult.AlertmanagerIntegrationID, seedResult.AlertmanagerToken,
-			alertmanagerPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
+		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+			compatibleWebhookPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}
 	}

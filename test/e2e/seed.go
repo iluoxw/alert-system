@@ -16,14 +16,17 @@ import (
 // 供各场景登录后经真实 HTTP admin API 创建 route/schedule/escalation-policy/
 // notification-policy/integration/silence。
 const (
-	seedAdminUsername = "e2e-admin"
-	seedAdminPassword = "e2e-admin-pass-000" //nolint:gosec // 测试固定密码，非生产凭据
+	seedAdminUsername    = "e2e-admin"
+	seedAdminPassword    = "e2e-admin-pass-000" //nolint:gosec // 测试固定密码，非生产凭据
+	seedApproverUsername = "e2e-approver"
+	seedApproverPassword = "e2e-approver-pass-000" //nolint:gosec // 测试固定密码，非生产凭据
 )
 
 // seedIdentities 是 bootstrapAdmin 的产出。
 type seedIdentities struct {
-	Team *store.Team
-	User *store.User
+	Team     *store.Team
+	User     *store.User
+	Approver *store.User
 }
 
 // bootstrapAdmin 直接调用 store 仓储创建团队、管理员用户及其 admin 角色成员关系。
@@ -42,6 +45,7 @@ func bootstrapAdmin(ctx context.Context, st *store.Store, teams *store.TeamRepo,
 
 	var team *store.Team
 	var user *store.User
+	var approver *store.User
 	err = st.WithTx(ctx, func(tx pgx.Tx) error {
 		var txErr error
 		team, txErr = teams.Create(ctx, tx, "e2e-team")
@@ -58,6 +62,17 @@ func bootstrapAdmin(ctx context.Context, st *store.Store, teams *store.TeamRepo,
 		if txErr != nil {
 			return fmt.Errorf("创建种子管理员失败: %w", txErr)
 		}
+		approverHash, hashErr := bcrypt.GenerateFromPassword([]byte(seedApproverPassword), bcrypt.DefaultCost)
+		if hashErr != nil {
+			return fmt.Errorf("生成审批人密码哈希失败: %w", hashErr)
+		}
+		approver, txErr = users.Create(ctx, tx, store.User{
+			Username: seedApproverUsername, PasswordHash: string(approverHash),
+			DisplayName: "E2E Independent Approver", Email: "e2e-approver@example.com", Enabled: true,
+		})
+		if txErr != nil {
+			return fmt.Errorf("创建种子审批人失败: %w", txErr)
+		}
 		// memberships 仓储（internal/store/memberships.go）只有 IsAdminAnyTeam 一个
 		// 查询方法，没有 Create——建 admin 成员关系用原生 SQL，与
 		// migrations/000002_org_routing.up.sql 的 memberships 表结构（
@@ -67,12 +82,17 @@ func bootstrapAdmin(ctx context.Context, st *store.Store, teams *store.TeamRepo,
 		`, user.ID, team.ID); txErr != nil {
 			return fmt.Errorf("创建种子管理员成员关系失败: %w", txErr)
 		}
+		if _, txErr = tx.Exec(ctx, `
+			INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'member')
+		`, approver.ID, team.ID); txErr != nil {
+			return fmt.Errorf("创建种子审批人成员关系失败: %w", txErr)
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &seedIdentities{Team: team, User: user}, nil
+	return &seedIdentities{Team: team, User: user, Approver: approver}, nil
 }
 
 // seedShift 直接调用 store.ShiftRepo 创建一条覆盖"现在"的值班班次：
@@ -103,13 +123,12 @@ func seedShift(ctx context.Context, st *store.Store, shifts *store.ShiftRepo, sc
 // seedConfigResult 汇总 seedConfig 经真实 HTTP admin API 创建出的配置，供各场景
 // 测试构造 ingest payload（token）时使用。
 type seedConfigResult struct {
-	TeamID string
+	TeamID         string
+	AdminUserID    string
+	ApproverUserID string
 
-	AlertmanagerIntegrationID string
-	AlertmanagerToken         string
-
-	GenericIntegrationID string
-	GenericToken         string
+	GrafanaWebhookPath string
+	GenericWebhookPath string
 }
 
 // seedConfig 用 bootstrapAdmin 产出的管理员账号登录后，经真实 /api/v1/admin/*
@@ -118,9 +137,9 @@ type seedConfigResult struct {
 // 仓储建一条覆盖当前时刻的班次——schedules 有 CRUD 端点但 shifts 没有）、升级
 // 策略（Levels 的 Targets 是团队 ID，oncall.Resolver 按团队 ID 查值班表求值，不是
 // 用户 ID，见 internal/oncall/escalation.go）、全局默认通知策略（team_id=""+
-// matchers=[]，R13.5 三级兜底链的最后一级）、两个 ingest 集成（alertmanager 用于
-// 场景①②/R13/⑤；generic 用于场景③，因为 AlertmanagerAdapter.translate 硬编码
-// ResolvePolicySource，没有办法产出 resolve_policy=ttl 的事件，见任务报告）。
+// matchers=[]，R13.5 三级兜底链的最后一级）、两个 webhook 集成（grafana 用于
+// 仍需验证本地路由/分组/通知的场景①②/R13/⑤；generic 用于场景③）。真正的
+// Alertmanager 权威源由专门的 authority E2E 场景创建，不能复用来测试本地通知。
 //
 // 所有等待时长都用秒级短配置压缩：group_wait/group_interval=1s 让分组尽快 flush，
 // escalation 两级 wait=0/6s，notification steps 的 warning 两级 wait=0/3s（对应
@@ -135,6 +154,21 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 	}
 
 	teamID := ids.Team.ID
+
+	// E2B 黄金回放一次会产生多条 firing Alert。它们的目标是验证 Alert→Fault，
+	// 不应在共享 TestMain 中启动真实的重复通知/人员升级链并污染后续场景。静默在
+	// pipeline 第一次处理任何回放事件前创建，避免 SilenceStage 10s 缓存窗口；匹配
+	// 范围只覆盖固定 scenario_id，不影响其他 E2E 告警。
+	if _, _, err := client.doJSON(http.MethodPost, "/api/v1/admin/silences", map[string]any{
+		"matchers": []map[string]string{{
+			"name": "scenario_id", "op": "=", "value": "e2b-failed-to-place-sandbox",
+		}},
+		"starts_at": time.Now().Add(-time.Hour).Format(time.RFC3339Nano),
+		"ends_at":   time.Now().Add(6 * time.Hour).Format(time.RFC3339Nano),
+		"comment":   "isolate e2b golden replay notifications",
+	}, nil); err != nil {
+		return nil, fmt.Errorf("e2e: 创建 E2B 回放隔离静默失败: %w", err)
+	}
 
 	if _, _, err := client.doJSON(http.MethodPost, "/api/v1/admin/routes", map[string]any{
 		"priority":                100,
@@ -205,29 +239,28 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 		return nil, fmt.Errorf("e2e: 创建种子通知策略失败: %w", err)
 	}
 
-	amID, amToken, err := createIntegration(client, "alertmanager", "e2e-alertmanager")
+	grafanaWebhookPath, err := createIntegration(client, "grafana", "e2e-grafana")
 	if err != nil {
 		return nil, err
 	}
-	genID, genToken, err := createIntegration(client, "generic", "e2e-generic")
+	genericWebhookPath, err := createIntegration(client, "generic", "e2e-generic")
 	if err != nil {
 		return nil, err
 	}
 
 	return &seedConfigResult{
-		TeamID:                    teamID,
-		AlertmanagerIntegrationID: amID,
-		AlertmanagerToken:         amToken,
-		GenericIntegrationID:      genID,
-		GenericToken:              genToken,
+		TeamID:             teamID,
+		AdminUserID:        ids.User.ID,
+		ApproverUserID:     ids.Approver.ID,
+		GrafanaWebhookPath: grafanaWebhookPath,
+		GenericWebhookPath: genericWebhookPath,
 	}, nil
 }
 
 // createIntegration 经 POST /api/v1/admin/integrations 创建一个 integration，
-// 返回其 ID 与一次性返回的明文 token（createIntegrationRequest/createIntegration
-// 见 internal/api/config.go：token 只在创建响应里出现一次，TokenHash 由服务端算好
-// 存库，测试代码不需要、也没有必要自己复现 hex(sha256(...)) 的 hash 口径）。
-func createIntegration(client *apiClient, kind, name string) (id string, token string, err error) {
+// 返回一次性下发的 webhook_path。hook_id 的 SHA-256 由服务端存库，测试代码不会
+// 自己复现 hash 口径。
+func createIntegration(client *apiClient, kind, name string) (webhookPath string, err error) {
 	var resp map[string]any
 	status, body, err := client.doJSON(http.MethodPost, "/api/v1/admin/integrations", map[string]any{
 		"kind":             kind,
@@ -235,15 +268,18 @@ func createIntegration(client *apiClient, kind, name string) (id string, token s
 		"default_severity": "warning",
 	}, &resp)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if status != http.StatusCreated {
-		return "", "", fmt.Errorf("e2e: 创建种子集成（kind=%s）失败 status=%d body=%s", kind, status, body)
+		return "", fmt.Errorf("e2e: 创建种子集成（kind=%s）失败 status=%d body=%s", kind, status, body)
 	}
-	id, _ = resp["id"].(string)
-	token, _ = resp["token"].(string)
-	if id == "" || token == "" {
-		return "", "", fmt.Errorf("e2e: 种子集成（kind=%s）响应缺少 id/token: %+v", kind, resp)
+	id, _ := resp["id"].(string)
+	webhookPath, _ = resp["webhook_path"].(string)
+	if id == "" || webhookPath == "" {
+		return "", fmt.Errorf("e2e: 种子集成（kind=%s）响应缺少 id/webhook_path: %+v", kind, resp)
 	}
-	return id, token, nil
+	if _, exists := resp["token"]; exists {
+		return "", fmt.Errorf("e2e: 种子集成（kind=%s）响应不应包含兼容 token: %+v", kind, resp)
+	}
+	return webhookPath, nil
 }

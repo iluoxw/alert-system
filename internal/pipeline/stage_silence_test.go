@@ -246,6 +246,24 @@ func TestSilenceStage_CacheRefreshesAfterTTL(t *testing.T) {
 	}
 }
 
+func TestSilenceStage_InvalidateCache_RequeriesImmediately(t *testing.T) {
+	base := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
+	listRepo := &fakeSilenceListRepo{}
+	stage := newSilenceStageForTest(listRepo, &fakeSilenceAlertRepo{}, &mutableClock{t: base})
+	pctx := &PipelineContext{Alert: domain.Alert{ID: "a1", Status: domain.StatusFiring}}
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatal(err)
+	}
+	stage.InvalidateCache()
+	pctx.Alert.ID = "a2"
+	if err := stage.Process(context.Background(), pctx); err != nil {
+		t.Fatal(err)
+	}
+	if listRepo.calls != 2 {
+		t.Fatalf("主动失效后应立即重查，calls=%d", listRepo.calls)
+	}
+}
+
 func TestSilenceStage_ListErrorPropagates(t *testing.T) {
 	listRepo := &fakeSilenceListRepo{err: errors.New("boom")}
 	alertRepo := &fakeSilenceAlertRepo{}

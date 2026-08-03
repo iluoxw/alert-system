@@ -92,6 +92,7 @@ func (h *configHandlers) createSilence(c *gin.Context) {
 		h.handleStoreErr(c, err, "创建静默")
 		return
 	}
+	h.invalidateSilences()
 	c.JSON(http.StatusCreated, silenceJSON(*out))
 }
 
@@ -153,6 +154,7 @@ func (h *configHandlers) updateSilence(c *gin.Context) {
 		h.handleStoreErr(c, err, "更新静默")
 		return
 	}
+	h.invalidateSilences()
 	c.Status(http.StatusNoContent)
 }
 
@@ -175,5 +177,6 @@ func (h *configHandlers) deleteSilence(c *gin.Context) {
 		h.handleStoreErr(c, err, "删除静默")
 		return
 	}
+	h.invalidateSilences()
 	c.Status(http.StatusNoContent)
 }

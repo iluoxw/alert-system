@@ -314,3 +314,36 @@ func TestAddNote_EntryShape(t *testing.T) {
 		t.Errorf("Detail[note] = %v, want 去空白后的备注内容", entry.Detail["note"])
 	}
 }
+
+func TestResolve_AlertmanagerAuthorityRejectsManualResolve(t *testing.T) {
+	alert := Alert{
+		ID: "a-am", Status: StatusFiring, SourceState: SourceStateFiring,
+		SourceIntegrationID: "source-1", UpstreamFingerprint: "abc123",
+	}
+	updated, entry, err := Resolve(alert, "alice", ResolveReasonManual, "", time.Now())
+	if !errors.Is(err, ErrAuthoritativeSourceManualResolve) {
+		t.Fatalf("err=%v, want ErrAuthoritativeSourceManualResolve", err)
+	}
+	if updated.Status != StatusFiring || entry.Action != "" {
+		t.Fatalf("被拒绝的手工恢复不应修改状态或产出时间线: updated=%+v entry=%+v", updated, entry)
+	}
+}
+
+func TestAck_AlertmanagerAuthorityOnlyChangesResponseAxis(t *testing.T) {
+	now := time.Now()
+	alert := Alert{
+		ID: "a-am", Status: StatusFiring, SourceState: SourceStateFiring,
+		ResponseState:       ResponseStateUnacknowledged,
+		SourceIntegrationID: "source-1", UpstreamFingerprint: "abc123", StartsAt: now.Add(-time.Minute),
+	}
+	updated, _, err := Ack(alert, "user-1", "alice", now)
+	if err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if updated.SourceState != SourceStateFiring || updated.ResponseState != ResponseStateAcknowledged {
+		t.Fatalf("Ack 轴错误: source=%s response=%s", updated.SourceState, updated.ResponseState)
+	}
+	if updated.Status != StatusAcknowledged {
+		t.Fatalf("legacy status projection=%s", updated.Status)
+	}
+}

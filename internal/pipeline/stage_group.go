@@ -95,22 +95,27 @@ func (realGroupClock) Now() time.Time { return time.Now() }
 
 // GroupStage 是管道的分组 stage（R9，组键计算的三分支见 aiops-foundation R1/R2 扩展，
 // 详见 Process 内注释）：
+//
 //   - route.GroupMode == "window" 时窗口全归并：该路由所有告警不论 fingerprint/
 //     labels 归入同一个固定组（group_key 见 windowGroupKey）；
+//
 //   - 否则 route 未配置 group_by 时，仍按 Alertmanager 语义形成"单例组"（该 route+
 //     该告警独占一个组，group_key 见 singletonGroupKey）；
+//
 //   - 否则配置了 group_by 时，group_key = route_id + hash(group_by 取值)（见
 //     computeGroupKey），保留键 __template__ 取 domain.TemplateFingerprint(alert.Title)
 //     而非 label 值，可与普通 label 键混用；
 //
-//   三种 group_key 都写回 alerts.group_key，继续走完全相同的
-//   UpdateRouting/HasFired/ScheduleIfAbsent 流程——group_wait/group_interval 依旧
-//   生效，不存在脱离组机制之外的"直发"路径；组首（该 group_key 从未触发过定时器）
-//   注册 group_wait 延迟的到期定时器，组内后续加入者若已有 pending 定时器则不重置
-//   其 fire_at（ScheduleIfAbsent 的语义），保证升级序列以组首时间为基准；组已完成
-//   过至少一轮到期通知后的后续更新改用 group_interval 延迟注册（节流）；
+//     三种 group_key 都写回 alerts.group_key，继续走完全相同的
+//     UpdateRouting/HasFired/ScheduleIfAbsent 流程——group_wait/group_interval 依旧
+//     生效，不存在脱离组机制之外的"直发"路径；组首（该 group_key 从未触发过定时器）
+//     注册 group_wait 延迟的到期定时器，组内后续加入者若已有 pending 定时器则不重置
+//     其 fire_at（ScheduleIfAbsent 的语义），保证升级序列以组首时间为基准；组已完成
+//     过至少一轮到期通知后的后续更新改用 group_interval 延迟注册（节流）；
+//
 //   - resolved 告警不再入组、不注册新定时器，但不清空其 group_key（组视图仍需
 //     看到已恢复成员）；
+//
 //   - 零值 Alert（迟到 resolved 未命中现存告警）直接跳过。
 //
 // 组状态的唯一真相是 alerts.group_key 列 + timers 表，本 stage 不维护任何内存态。

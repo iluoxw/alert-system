@@ -61,6 +61,8 @@ type PolicyRepo interface {
 type TimerScheduler interface {
 	Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error
 	Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error
+	TryLockRefShared(ctx context.Context, tx pgx.Tx, refID string) (bool, error)
+	LockRefExclusive(ctx context.Context, tx pgx.Tx, refID string) error
 }
 
 // Clock 抽象"当前时间"，与 scheduler.Clock/oncall.Clock 同一模式，供测试注入 fake
@@ -166,6 +168,9 @@ func (e *Engine) Start(ctx context.Context, tx pgx.Tx, alert domain.Alert, baseT
 // advance 内部另有一道针对同一三个条件（firing/未 Ack/未静默）的被动检查（见
 // shouldContinueEscalation），即使 Stop 未被及时调用，定时器真正到期时也不会误发。
 func (e *Engine) Stop(ctx context.Context, tx pgx.Tx, alertID string) error {
+	if err := e.scheduler.LockRefExclusive(ctx, tx, alertID); err != nil {
+		return fmt.Errorf("notify: 等待渠道升级处理完成失败: %w", err)
+	}
 	if err := e.scheduler.Cancel(ctx, tx, TimerKindChannelEscalation, alertID); err != nil {
 		return fmt.Errorf("notify: 取消渠道升级定时器失败: %w", err)
 	}
@@ -179,6 +184,13 @@ func (e *Engine) Handle(ctx context.Context, tx pgx.Tx, refID string, payload []
 	var p stepPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("notify: 反序列化渠道升级 payload 失败: %w", err)
+	}
+	locked, err := e.scheduler.TryLockRefShared(ctx, tx, refID)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return nil
 	}
 	return e.advance(ctx, tx, refID, p.Step)
 }

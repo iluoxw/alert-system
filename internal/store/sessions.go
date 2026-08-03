@@ -10,9 +10,9 @@ import (
 )
 
 // Session 对应 sessions 表：自产登录会话（R8.1/R8.3，不引入第三方 session 库）。
-// TokenHash 是 hex(sha256(明文 token))，与 integrations.token_hash 同一编码约定
-// （见 internal/ingest/server.go hashToken）；明文 token 只经 Set-Cookie 下发给
-// 客户端，DB 里只存哈希。ExpiresAt 是登录时确定、此后不再变化的固定过期时间；
+// TokenHash 是 hex(sha256(明文会话 token))；明文只经 Set-Cookie 下发给客户端，
+// DB 里只存哈希。它与 Alertmanager hook 凭据是两套独立机制。ExpiresAt 是登录时
+// 确定、此后不再变化的固定过期时间；
 // LastSeenAt 是滑动续期水位线，每次带有效 session 的请求都会推进（"固定过期 +
 // 滑动续期"：会话在两者都未过期时才有效，任一到期即失效）。
 type Session struct {

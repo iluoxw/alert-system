@@ -22,6 +22,8 @@ import (
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	"alert-system/internal/hook"
+	impactprojection "alert-system/internal/impact"
+	alertmapping "alert-system/internal/mapping"
 	"alert-system/internal/notify"
 	"alert-system/internal/oncall"
 	"alert-system/internal/ops"
@@ -49,9 +51,14 @@ type Repos struct {
 	NotificationPolicies *store.NotificationPolicyRepo
 	Silences             *store.SilenceRepo
 	NotificationLogs     *store.NotificationLogRepo
+	Incidents            *store.IncidentRepo
 	Teams                *store.TeamRepo
 	Users                *store.UserRepo
 	Ops                  *store.OpsRepo
+	ServiceCatalog       *store.ServiceCatalogRepo
+	AlertMappings        *store.AlertMappingRepo
+	Topology             *store.TopologyRepo
+	Faults               *store.FaultRepo
 }
 
 // App 是 Build 组装完毕后调用方需要的公共依赖：Scheduler/Pipeline 供调用方决定
@@ -59,11 +66,15 @@ type Repos struct {
 // Stopper/Lifecycle 供 api.NewServer/router.RegisterAlertRoutes 注入，保证飞书卡片
 // 回调与 REST API 两条处置路径共用同一套"停止升级链/生命周期定时器"实现。
 type App struct {
-	Scheduler *scheduler.Scheduler
-	Pipeline  *pipeline.Pipeline
-	Sender    *notify.Sender
-	Stopper   CompositeStopper
-	Lifecycle *notify.LifecycleHandlers
+	Scheduler        *scheduler.Scheduler
+	Pipeline         *pipeline.Pipeline
+	Sender           *notify.Sender
+	Stopper          CompositeStopper
+	Lifecycle        *notify.LifecycleHandlers
+	CacheInvalidator *pipeline.ConfigCacheInvalidator
+	IncidentOutbox   *IncidentOutbox
+	AlertProjector   *alertmapping.Projector
+	ImpactProjector  *impactprojection.Projector
 }
 
 // Build 组装唯一的 scheduler 实例、notify.Sender、outbox、oncall.Chain/notify.Engine/
@@ -80,6 +91,9 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched := scheduler.New(st, cfg.SchedulerPollInterval)
 
 	sender := notify.NewSender(st, repos.NotificationLogs, repos.Timeline)
+	if repos.Incidents != nil {
+		sender.IncidentTimeline = repos.Incidents
+	}
 	// 任务 9：到人发送在 Sender.Send 第 0 段解析 TargetUserID -> 实际渠道地址，
 	// 具体解析实现见下方 userContactResolver（基于 UserRepo 的薄适配器）。
 	sender.Resolver = userContactResolver{users: repos.Users}
@@ -94,6 +108,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 		personnelChannel: cfg.PersonnelChannel,
 		now:              time.Now,
 	}
+	incidentOutbox := &IncidentOutbox{scheduler: sched, now: time.Now}
 
 	resolver := oncall.NewResolver(repos.Schedules, repos.Shifts)
 	chain := oncall.NewChain(repos.Alerts, repos.Timeline, repos.EscalationPolicies, resolver, sched, outbox)
@@ -133,13 +148,16 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	eventQueue := store.NewEventQueue()
 	hooks := hook.New()
 	dedupStage := pipeline.NewDedupStage(repos.Alerts, repos.Timeline, sched, nil, cfg.FlapWindowSeconds, cfg.FlapThreshold)
+	impactProjector := impactprojection.NewProjector(repos.Topology, repos.Faults)
+	projector := alertmapping.NewProjector(repos.AlertMappings, repos.ServiceCatalog, repos.Topology, repos.Faults, impactProjector)
+	mappingStage := pipeline.NewMappingStage(projector)
 	routeStage := pipeline.NewRouteStage(repos.Routes, repos.Alerts, defaultTeamID)
 	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox, repos.Routes, stormState)
 	silenceStage := pipeline.NewSilenceStage(repos.Silences, repos.Alerts)
 	inhibitStage := pipeline.NewInhibitStage()
 
 	pl := pipeline.New(st, eventQueue, hooks, []pipeline.Stage{
-		dedupStage, routeStage, groupStage, silenceStage, inhibitStage,
+		dedupStage, mappingStage, routeStage, groupStage, silenceStage, inhibitStage,
 	})
 
 	// ---- 全局单例的数据保留清理任务（C5，第十个 kind）----
@@ -167,11 +185,15 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched.RegisterHandler(TimerKindStormSummary, storm.Handle)
 
 	return &App{
-		Scheduler: sched,
-		Pipeline:  pl,
-		Sender:    sender,
-		Stopper:   stopper,
-		Lifecycle: lifecycle,
+		Scheduler:        sched,
+		Pipeline:         pl,
+		Sender:           sender,
+		Stopper:          stopper,
+		Lifecycle:        lifecycle,
+		CacheInvalidator: pipeline.NewConfigCacheInvalidator(routeStage, silenceStage),
+		IncidentOutbox:   incidentOutbox,
+		AlertProjector:   projector,
+		ImpactProjector:  impactProjector,
 	}
 }
 

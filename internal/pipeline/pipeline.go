@@ -20,6 +20,10 @@ const defaultBatchSize = 20
 // 的固定 tick 更快感知到新事件（不像 scheduler 那样用固定周期的 ticker）。
 const idleBackoff = 200 * time.Millisecond
 
+// errorBackoff 避免数据库或事务级错误形成无等待的重试风暴。单条事件的 stage
+// 失败会在保存点回滚后标记 failed，不会进入这里；这里处理的是批次本身无法完成。
+const errorBackoff = time.Second
+
 // Stage 是管道处理阶段的统一接口。去重/路由/分组/静默/抑制（实际执行顺序，见
 // cmd/server/main.go 装配处的注释）等具体 stage（internal/pipeline/stage_*.go，
 // 均属于本包，由后续任务实现）都实现该接口。
@@ -28,6 +32,13 @@ const idleBackoff = 200 * time.Millisecond
 type Stage interface {
 	Name() string
 	Process(ctx context.Context, pctx *PipelineContext) error
+}
+
+// AuthoritativeSourceStage 是权威 Alert 镜像仍允许执行的 stage 标记。未显式实现的
+// 本地 route/group/silence/inhibit/notify stage 会被跳过；后续 Alert→Fault mapping
+// 可实现该接口加入权威链路，而无需重新放开本地通知控制面。
+type AuthoritativeSourceStage interface {
+	RunForAuthoritativeSource() bool
 }
 
 // RouteResult 是路由 stage（任务 16）的产出：命中的路由规则（或默认团队兜底）及其
@@ -70,8 +81,9 @@ type RouteResult struct {
 //     让「进入抖动」的提示能送出去——这个"当次"只有去重 stage 知道，靠此标记传递。
 //   - Tx 是本轮 pollOnce 所在的数据库事务：去重 stage 需要在同一事务内完成
 //     UpsertByFingerprint/UpdateStatus 与 Schedule/Cancel TTL 定时器，才能与
-//     pollOnce 最终的 MarkProcessed/MarkFailed 一并原子提交或回滚（store/scheduler
-//     全套仓储方法都以 pgx.Tx 为入参，正是为了让调用方在编译期无法绕开这个约束）。
+//     pollOnce 为每条事件创建保存点，使单条事件的业务写入与 MarkProcessed 原子提交；
+//     stage 出错时先回滚该保存点，再由外层批次事务写 MarkFailed。这样即使错误来自
+//     PostgreSQL、已使当前保存点事务中止，也不会让事件卡在 pending 里快速重试。
 type PipelineContext struct {
 	Event           domain.AlertEvent
 	IntegrationID   string
@@ -79,7 +91,9 @@ type PipelineContext struct {
 	Created         bool
 	Route           RouteResult
 	FlappingStarted bool
-	Tx              pgx.Tx
+	// AuthoritativeSource 由 dedup/mirror stage 在识别到 Alertmanager occurrence 后置位。
+	AuthoritativeSource bool
+	Tx                  pgx.Tx
 }
 
 // Pipeline 是管道编排器：从 EventQueue 消费事件，依序驱动 stages，每个 stage
@@ -112,6 +126,12 @@ func New(st *store.Store, queue *store.EventQueue, hooks *hook.Registry, stages 
 // 影响 stage 的执行结果（R11.6）。
 func (p *Pipeline) process(ctx context.Context, pctx *PipelineContext) error {
 	for _, s := range p.stages {
+		if pctx.AuthoritativeSource {
+			allowed, ok := s.(AuthoritativeSourceStage)
+			if !ok || !allowed.RunForAuthoritativeSource() {
+				continue
+			}
+		}
 		p.hooks.Fire(ctx, s.Name(), hook.Before, pctx.Alert)
 		if err := s.Process(ctx, pctx); err != nil {
 			return fmt.Errorf("pipeline: stage %s 处理失败: %w", s.Name(), err)
@@ -122,9 +142,9 @@ func (p *Pipeline) process(ctx context.Context, pctx *PipelineContext) error {
 }
 
 // pollOnce 在一个事务内取出最多 batchSize 条待处理事件，逐条反序列化为
-// PipelineContext 并驱动 stage 链，成功则 MarkProcessed，某个 stage 失败则
-// MarkFailed（记录该 stage 的错误原因）。返回本轮实际取到的事件数，0 表示队列
-// 已空，供 Run 据此退避。
+// PipelineContext 并驱动 stage 链。每条事件使用一个 PostgreSQL 保存点：成功时在
+// 保存点内 MarkProcessed 并提交；某个 stage 失败时回滚保存点，再由仍可用的外层
+// 批次事务 MarkFailed。返回本轮实际取到的事件数，0 表示队列已空，供 Run 据此退避。
 func (p *Pipeline) pollOnce(ctx context.Context) (int, error) {
 	var n int
 	err := p.store.WithTx(ctx, func(tx pgx.Tx) error {
@@ -134,16 +154,27 @@ func (p *Pipeline) pollOnce(ctx context.Context) (int, error) {
 		}
 		n = len(batch)
 		for _, ev := range batch {
-			pctx := &PipelineContext{Event: ev.Event, IntegrationID: ev.IntegrationID, Tx: tx}
+			eventTx, err := tx.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("pipeline: 为事件 %s 创建保存点失败: %w", ev.ID, err)
+			}
+			pctx := &PipelineContext{Event: ev.Event, IntegrationID: ev.IntegrationID, Tx: eventTx}
 			if err := p.process(ctx, pctx); err != nil {
 				log.Printf("pipeline: 事件 %s 处理失败: %v", ev.ID, err)
+				if rerr := eventTx.Rollback(ctx); rerr != nil && rerr != pgx.ErrTxClosed {
+					return fmt.Errorf("pipeline: 回滚事件 %s 保存点失败: %w", ev.ID, rerr)
+				}
 				if merr := p.queue.MarkFailed(ctx, tx, ev.ID, err.Error()); merr != nil {
 					return merr
 				}
 				continue
 			}
-			if merr := p.queue.MarkProcessed(ctx, tx, []string{ev.ID}); merr != nil {
+			if merr := p.queue.MarkProcessed(ctx, eventTx, []string{ev.ID}); merr != nil {
+				_ = eventTx.Rollback(ctx)
 				return merr
+			}
+			if cerr := eventTx.Commit(ctx); cerr != nil {
+				return fmt.Errorf("pipeline: 提交事件 %s 保存点失败: %w", ev.ID, cerr)
 			}
 		}
 		return nil
@@ -164,6 +195,12 @@ func (p *Pipeline) Run(ctx context.Context) {
 		n, err := p.pollOnce(ctx)
 		if err != nil {
 			log.Printf("pipeline: 轮询失败: %v", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(errorBackoff):
+			}
+			continue
 		}
 		if n == 0 {
 			select {

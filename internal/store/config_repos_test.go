@@ -104,6 +104,52 @@ func TestRouteRepo_Create_PriorityConflict(t *testing.T) {
 	}
 }
 
+func TestIntegrationRepo_RotateHookIDHashAndEnforceUniqueHookIdentity(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	integrations := NewIntegrationRepo()
+
+	var source *Integration
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var createErr error
+		source, createErr = integrations.Create(ctx, tx, Integration{
+			Kind: "alertmanager", Name: "managed-hook-source", HookIDHash: "old-hook-hash",
+			DefaultSeverity: string(domain.SeverityWarning), Enabled: true,
+		})
+		return createErr
+	})
+	if err != nil {
+		t.Fatalf("创建 integration 失败: %v", err)
+	}
+
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		return integrations.RotateHookIDHash(ctx, tx, source.ID, "new-hook-hash")
+	})
+	if err != nil {
+		t.Fatalf("轮换 hook hash 失败: %v", err)
+	}
+	var got *Integration
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		var getErr error
+		got, getErr = integrations.GetByID(ctx, tx, source.ID)
+		return getErr
+	})
+	if err != nil || got.HookIDHash != "new-hook-hash" {
+		t.Fatalf("轮换后 HookIDHash=%q err=%v, want new-hook-hash", got.HookIDHash, err)
+	}
+
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		_, createErr := integrations.Create(ctx, tx, Integration{
+			Kind: "alertmanager", Name: "duplicate-hook-source", HookIDHash: "new-hook-hash",
+			DefaultSeverity: string(domain.SeverityWarning), Enabled: true,
+		})
+		return createErr
+	})
+	if err == nil {
+		t.Fatal("重复 hook_id_hash 应被 integrations_hook_id_hash_uidx 拒绝")
+	}
+}
+
 // TestNotificationPolicyRepo_GetGlobalDefault 验证全局默认查询只取
 // team_id IS NULL 且 matchers 为空的那一条，不会被同为 team_id IS NULL 但携带
 // matchers 的「全局范围业务绑定策略」干扰。

@@ -456,8 +456,19 @@ func (s *cfgIntegrationStore) Update(ctx context.Context, tx pgx.Tx, in store.In
 	if !ok {
 		return store.ErrNotFound
 	}
-	in.CreatedAt, in.TokenHash = existing.CreatedAt, existing.TokenHash
+	in.CreatedAt, in.HookIDHash = existing.CreatedAt, existing.HookIDHash
 	s.byID[in.ID] = in
+	return nil
+}
+
+func (s *cfgIntegrationStore) RotateHookIDHash(ctx context.Context, tx pgx.Tx, id, hookIDHash string) error {
+	in, ok := s.byID[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	in.HookIDHash = hookIDHash
+	in.UpdatedAt = time.Now()
+	s.byID[id] = in
 	return nil
 }
 
@@ -697,7 +708,7 @@ func TestCreateUser_Success_PasswordNeverInResponse(t *testing.T) {
 	}
 }
 
-// ---- integrations（R1.3：token 明文只在创建响应出现一次）----
+// ---- integrations（managed hook UUID 只在创建/轮换响应出现）----
 
 func TestCreateIntegration_TokenRevealedOnceThenNeverAgain(t *testing.T) {
 	env := newCfgTestEnv(t)
@@ -711,12 +722,16 @@ func TestCreateIntegration_TokenRevealedOnceThenNeverAgain(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
 		t.Fatalf("解析创建响应失败: %v", err)
 	}
-	token, _ := created["token"].(string)
-	if token == "" {
-		t.Fatalf("创建响应应包含明文 token，实际: %s", w.Body.String())
+	hookID, _ := created["hook_id"].(string)
+	webhookPath, _ := created["webhook_path"].(string)
+	if hookID == "" {
+		t.Fatalf("创建响应应包含 hook_id，实际: %s", w.Body.String())
 	}
-	if len(token) < 32 {
-		t.Errorf("token 看起来太短（base64 编码 32 字节应显著长于此）: %q", token)
+	if len(hookID) != 36 || webhookPath != "/ingest/v1/hook/"+hookID {
+		t.Fatalf("hook UUID/path 不符合契约: hook_id=%q path=%q", hookID, webhookPath)
+	}
+	if _, exists := created["token"]; exists {
+		t.Fatalf("创建响应不应包含兼容 token 字段: %s", w.Body.String())
 	}
 	id, _ := created["id"].(string)
 
@@ -724,11 +739,52 @@ func TestCreateIntegration_TokenRevealedOnceThenNeverAgain(t *testing.T) {
 	if w2.Code != http.StatusOK {
 		t.Fatalf("查询 status = %d, want 200; body=%s", w2.Code, w2.Body.String())
 	}
-	if bytes.Contains(w2.Body.Bytes(), []byte(token)) {
-		t.Errorf("查询响应不应再包含明文 token: %s", w2.Body.String())
+	if bytes.Contains(w2.Body.Bytes(), []byte(hookID)) {
+		t.Errorf("查询响应不应再包含明文 hook UUID: %s", w2.Body.String())
 	}
-	if bytes.Contains(w2.Body.Bytes(), []byte("token_hash")) || bytes.Contains(w2.Body.Bytes(), []byte(`"token"`)) {
-		t.Errorf("查询响应不应包含任何 token/token_hash 字段: %s", w2.Body.String())
+	for _, forbidden := range [][]byte{[]byte("token_hash"), []byte(`"token"`), []byte("hook_id"), []byte("webhook_path")} {
+		if bytes.Contains(w2.Body.Bytes(), forbidden) {
+			t.Errorf("查询响应泄露接入凭据字段 %q: %s", forbidden, w2.Body.String())
+		}
+	}
+}
+
+func TestRotateAlertSourceHook_InvalidatesStoredCredentialWithoutChangingSourceID(t *testing.T) {
+	env := newCfgTestEnv(t)
+	createdResp := env.do(t, http.MethodPost, "/api/v1/admin/integrations", map[string]any{
+		"kind": "alertmanager", "name": "prod-alertmanager", "default_severity": "warning",
+	})
+	if createdResp.Code != http.StatusCreated {
+		t.Fatalf("创建 status=%d body=%s", createdResp.Code, createdResp.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(createdResp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := created["id"].(string)
+	oldHook, _ := created["hook_id"].(string)
+
+	rotatedResp := env.do(t, http.MethodPost, "/api/v1/admin/alert-sources/"+id+"/rotate-hook", nil)
+	if rotatedResp.Code != http.StatusOK {
+		t.Fatalf("轮换 status=%d body=%s", rotatedResp.Code, rotatedResp.Body.String())
+	}
+	var rotated map[string]any
+	if err := json.Unmarshal(rotatedResp.Body.Bytes(), &rotated); err != nil {
+		t.Fatal(err)
+	}
+	newHook, _ := rotated["hook_id"].(string)
+	if newHook == "" || newHook == oldHook {
+		t.Fatalf("轮换未生成新 hook: old=%q new=%q", oldHook, newHook)
+	}
+	if rotated["id"] != id || rotated["webhook_path"] != "/ingest/v1/hook/"+newHook {
+		t.Fatalf("轮换响应未保持 source 身份或 path 异常: %+v", rotated)
+	}
+	if _, exists := rotated["token"]; exists {
+		t.Fatalf("轮换响应不应包含兼容 token 字段: %+v", rotated)
+	}
+	stored := env.integrations.byID[id]
+	if stored.HookIDHash != hashIntegrationHookID(newHook) || stored.HookIDHash == hashIntegrationHookID(oldHook) {
+		t.Fatalf("数据库凭据哈希未原子替换")
 	}
 }
 
