@@ -60,8 +60,9 @@ type txRunner interface {
 
 // SendRequest 是一次具体的发送请求：某个告警/分组的某一级升级序列，要发到哪个渠道的哪个 target。
 type SendRequest struct {
-	AlertID  string // 与 GroupKey 二选一：单告警通知填这个
-	GroupKey string // 与 AlertID 二选一：分组通知填这个
+	AlertID    string // AlertID、GroupKey、IncidentID 三选一
+	GroupKey   string
+	IncidentID string `json:"incident_id,omitempty"`
 
 	// Step 对应升级序列的第几级；不属于升级序列的发送传 nil。用指针而非 int 是对齐
 	// store.NotificationLogEntry.Step 的既有约定——0 是合法的第 0 级，nil 才表示"无关序列"。
@@ -96,6 +97,12 @@ type Sender struct {
 	tx       txRunner
 	logs     logStore
 	timeline timelineAppender
+
+	// IncidentTimeline 可选注入。Incident 通报沿用相同可靠发送器，但发送结果写入
+	// Incident 自己的统一时间线，而不是伪造一条 Alert 时间线。
+	IncidentTimeline interface {
+		AppendIncidentTimeline(ctx context.Context, tx pgx.Tx, entry domain.IncidentTimelineEntry) (string, error)
+	}
 
 	// lookup 默认是包级 Get（生产环境走全局渠道注册表）；测试可替换成指向局部 map 的
 	// 闭包，避免各测试用例之间共享全局注册表状态。
@@ -134,6 +141,9 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 // 不同的键，不会被误判为重投。
 func idempotencyKey(req SendRequest) string {
 	resourceKey := req.AlertID
+	if resourceKey == "" {
+		resourceKey = req.IncidentID
+	}
 	if resourceKey == "" {
 		resourceKey = req.GroupKey
 	}
@@ -246,6 +256,7 @@ func (s *Sender) placeholder(ctx context.Context, req SendRequest, key string) (
 		created, insertErr := s.logs.Insert(ctx, tx, store.NotificationLogEntry{
 			AlertID:        req.AlertID,
 			GroupKey:       req.GroupKey,
+			IncidentID:     req.IncidentID,
 			Channel:        req.ChannelKind,
 			Target:         req.Target,
 			Step:           req.Step,
@@ -303,14 +314,6 @@ func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, 
 // alreadySent 短路兜底，这里不需要也不做额外去重——failed 后重投再 sent 会产生
 // 一条 failed + 一条 sent，是真实发送历史，予以保留。
 func (s *Sender) appendResultTimeline(ctx context.Context, tx pgx.Tx, req SendRequest, action domain.TimelineAction, attempts int, status, detailError string) error {
-	alertIDs := req.Msg.AlertIDs
-	if req.AlertID != "" {
-		alertIDs = []string{req.AlertID}
-	}
-	if len(alertIDs) == 0 {
-		return nil
-	}
-
 	var step any
 	if req.Step != nil {
 		step = *req.Step
@@ -324,6 +327,29 @@ func (s *Sender) appendResultTimeline(ctx context.Context, tx pgx.Tx, req SendRe
 	}
 	if detailError != "" {
 		detail["error"] = detailError
+	}
+
+	if req.IncidentID != "" && s.IncidentTimeline != nil {
+		summary := "Incident 通报发送成功"
+		if status != "sent" {
+			summary = "Incident 通报发送失败"
+		}
+		if _, err := s.IncidentTimeline.AppendIncidentTimeline(ctx, tx, domain.IncidentTimelineEntry{
+			IncidentID: req.IncidentID, ActorDisplay: "notify-sender",
+			Kind: domain.IncidentTimelineCommunication, Summary: summary,
+			Detail: detail, DedupeKey: "notify:" + idempotencyKey(req) + ":" + status,
+			OccurredAt: time.Now(),
+		}); err != nil {
+			return err
+		}
+	}
+
+	alertIDs := req.Msg.AlertIDs
+	if req.AlertID != "" {
+		alertIDs = []string{req.AlertID}
+	}
+	if len(alertIDs) == 0 {
+		return nil
 	}
 
 	now := time.Now()

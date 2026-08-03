@@ -226,11 +226,12 @@ func (r *ChangeEventRepo) ListRecentByResource(ctx context.Context, tx pgx.Tx, r
 }
 
 // NotificationLogEntry 对应 notification_log 表：每次发送尝试的记录，用于重试计数
-// 与幂等去重（R6.3）。AlertID 与 GroupKey 二选一（单告警通知 vs 分组聚合通知，R9）。
+// 与幂等去重（R6.3）。AlertID、GroupKey、IncidentID 三者必须且只能指定一个。
 type NotificationLogEntry struct {
 	ID             string
-	AlertID        string // 可为空字符串；与 GroupKey 二选一
-	GroupKey       string // 可为空字符串；与 AlertID 二选一
+	AlertID        string
+	GroupKey       string
+	IncidentID     string
 	Channel        string
 	Target         string
 	Step           *int // 对应升级序列的第几级；无关升级序列的发送为 nil
@@ -242,25 +243,25 @@ type NotificationLogEntry struct {
 	UpdatedAt      time.Time
 }
 
-const notificationLogColumns = `id, alert_id, group_key, channel, target, step, idempotency_key, status, attempts, last_error, created_at, updated_at`
+const notificationLogColumns = `id, alert_id, group_key, incident_id, channel, target, step, idempotency_key, status, attempts, last_error, created_at, updated_at`
 
 func scanNotificationLog(row configRowScanner) (NotificationLogEntry, error) {
 	var e NotificationLogEntry
-	var alertID, groupKey, lastError *string
-	err := row.Scan(&e.ID, &alertID, &groupKey, &e.Channel, &e.Target, &e.Step,
+	var alertID, groupKey, incidentID, lastError *string
+	err := row.Scan(&e.ID, &alertID, &groupKey, &incidentID, &e.Channel, &e.Target, &e.Step,
 		&e.IdempotencyKey, &e.Status, &e.Attempts, &lastError, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return NotificationLogEntry{}, err
 	}
 	e.AlertID = nullableString(alertID)
 	e.GroupKey = nullableString(groupKey)
+	e.IncidentID = nullableString(incidentID)
 	e.LastError = nullableString(lastError)
 	return e, nil
 }
 
-// ErrNotificationLogInvalid 在 AlertID 与 GroupKey 均为空时返回（违反
-// notification_log 的 CHECK 约束：二者必须至少指定一个）。
-var ErrNotificationLogInvalid = errors.New("store: notification_log 必须指定 alert_id 或 group_key 之一")
+// ErrNotificationLogInvalid 在关联资源不是三选一时返回。
+var ErrNotificationLogInvalid = errors.New("store: notification_log 必须且只能指定 alert_id、group_key、incident_id 之一")
 
 // ErrIdempotencyConflict 在 Insert 撞上已存在的 idempotency_key 时返回：
 // at-least-once 的通知 handler 可能对同一次发送重试调用 Insert，调用方应据此
@@ -275,15 +276,22 @@ func NewNotificationLogRepo() *NotificationLogRepo { return &NotificationLogRepo
 // Insert 写入一条发送记录。idempotency_key 冲突时不覆盖已有记录，返回
 // ErrIdempotencyConflict（ON CONFLICT DO NOTHING，避免并发重试产生的竞态覆盖）。
 func (r *NotificationLogRepo) Insert(ctx context.Context, tx pgx.Tx, e NotificationLogEntry) (*NotificationLogEntry, error) {
-	if e.AlertID == "" && e.GroupKey == "" {
+	resourceCount := 0
+	for _, value := range []string{e.AlertID, e.GroupKey, e.IncidentID} {
+		if value != "" {
+			resourceCount++
+		}
+	}
+	if resourceCount != 1 {
 		return nil, ErrNotificationLogInvalid
 	}
 	row := tx.QueryRow(ctx, `
-		INSERT INTO notification_log (alert_id, group_key, channel, target, step, idempotency_key)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO notification_log (alert_id, group_key, incident_id, channel, target, step, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING `+notificationLogColumns,
-		nullableStringArg(e.AlertID), nullableStringArg(e.GroupKey), e.Channel, e.Target, e.Step, e.IdempotencyKey)
+		nullableStringArg(e.AlertID), nullableStringArg(e.GroupKey), nullableStringArg(e.IncidentID),
+		e.Channel, e.Target, e.Step, e.IdempotencyKey)
 	out, err := scanNotificationLog(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrIdempotencyConflict

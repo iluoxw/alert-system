@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "source": "e2b-local-replay",
+  "environment": "local-replay",
+  "observed_at": "2026-07-20T02:00:00Z",
+  "nodes": [
+    {
+      "external_ref": "e2b.orchestrator.pool",
+      "kind": "resource",
+      "name": "E2B Orchestrator Pool",
+      "provider": "e2b",
+      "labels": {"component": "orchestrator", "pool": "default"}
+    },
+    {
+      "external_ref": "e2b.orchestrator.node-a",
+      "kind": "resource",
+      "name": "E2B Orchestrator Node A",
+      "provider": "e2b",
+      "labels": {"component": "orchestrator", "node": "node-a"}
+    },
+    {
+      "external_ref": "e2b.orchestrator.node-b",
+      "kind": "resource",
+      "name": "E2B Orchestrator Node B",
+      "provider": "e2b",
+      "labels": {"component": "orchestrator", "node": "node-b"}
+    },
+    {
+      "external_ref": "e2b.api",
+      "kind": "resource",
+      "name": "E2B API",
+      "provider": "e2b",
+      "labels": {"component": "api"}
+    },
+    {
+      "external_ref": "e2b.client-proxy",
+      "kind": "resource",
+      "name": "E2B Client Proxy",
+      "provider": "e2b",
+      "labels": {"component": "client-proxy"}
+    },
+    {
+      "external_ref": "e2b.redis",
+      "kind": "resource",
+      "name": "E2B Redis Metadata",
+      "provider": "e2b",
+      "labels": {"component": "redis"}
+    },
+    {
+      "external_ref": "e2b.object-storage",
+      "kind": "resource",
+      "name": "E2B Snapshot Object Storage",
+      "provider": "e2b",
+      "labels": {"component": "object-storage"}
+    },
+    {
+      "external_ref": "e2b.sandbox-runtime",
+      "kind": "infrastructure_capability",
+      "name": "E2B Sandbox Runtime",
+      "provider": "e2b",
+      "labels": {"capability": "sandbox-runtime", "tier": "critical"}
+    },
+    {
+      "external_ref": "insforge.preview-runtime",
+      "kind": "business_system",
+      "name": "Insforge Preview Runtime",
+      "provider": "insforge",
+      "labels": {"business": "insforge", "tier": "critical"}
+    }
+  ],
+  "edges": [
+    {
+      "from_external_ref": "e2b.orchestrator.node-a",
+      "to_external_ref": "e2b.orchestrator.pool",
+      "relation": "part_of",
+      "criticality": "high"
+    },
+    {
+      "from_external_ref": "e2b.orchestrator.node-b",
+      "to_external_ref": "e2b.orchestrator.pool",
+      "relation": "part_of",
+      "criticality": "high"
+    },
+    {
+      "from_external_ref": "e2b.api",
+      "to_external_ref": "e2b.orchestrator.pool",
+      "relation": "depends_on",
+      "criticality": "critical"
+    },
+    {
+      "from_external_ref": "e2b.client-proxy",
+      "to_external_ref": "e2b.api",
+      "relation": "depends_on",
+      "criticality": "critical"
+    },
+    {
+      "from_external_ref": "e2b.sandbox-runtime",
+      "to_external_ref": "e2b.client-proxy",
+      "relation": "depends_on",
+      "criticality": "critical"
+    },
+    {
+      "from_external_ref": "e2b.sandbox-runtime",
+      "to_external_ref": "e2b.redis",
+      "relation": "depends_on",
+      "criticality": "critical"
+    },
+    {
+      "from_external_ref": "e2b.sandbox-runtime",
+      "to_external_ref": "e2b.object-storage",
+      "relation": "depends_on",
+      "criticality": "critical"
+    },
+    {
+      "from_external_ref": "insforge.preview-runtime",
+      "to_external_ref": "e2b.sandbox-runtime",
+      "relation": "depends_on",
+      "criticality": "critical"
+    }
+  ]
+}

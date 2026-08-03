@@ -39,6 +39,12 @@ func maskTarget(kind, target string) string {
 	}
 }
 
+// MaskTargetForAudit 返回适合 API、时间线和日志展示的通知目标。发送路径必须继续
+// 使用原始 target；任何面向人的响应都只能使用此脱敏值。
+func MaskTargetForAudit(kind, target string) string {
+	return maskTarget(kind, target)
+}
+
 // maskEmail 保留 local 部分首字符，其余替换为 ***，domain 部分保留：a***@domain。
 func maskEmail(target string) string {
 	at := strings.Index(target, "@")

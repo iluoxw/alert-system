@@ -83,6 +83,18 @@ type fakeTimeline struct {
 	entries []domain.TimelineEntry
 }
 
+type fakeIncidentTimeline struct {
+	mu      sync.Mutex
+	entries []domain.IncidentTimelineEntry
+}
+
+func (f *fakeIncidentTimeline) AppendIncidentTimeline(ctx context.Context, tx pgx.Tx, entry domain.IncidentTimelineEntry) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, entry)
+	return "itl-1", nil
+}
+
 func (f *fakeTimeline) Append(ctx context.Context, tx pgx.Tx, entry domain.TimelineEntry) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -417,6 +429,30 @@ func TestSender_OpsGroupKeyWithoutAlertIDs_DoesNotAppendTimeline(t *testing.T) {
 	}
 	if got := tl.count(); got != 0 {
 		t.Fatalf("ops 合成消息无关联告警，期望不追加时间线，实际 %d 条", got)
+	}
+}
+
+func TestSender_IncidentNotificationWritesIncidentTimeline(t *testing.T) {
+	ch := &fakeChannel{kind: "lark"}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	incidentTimeline := &fakeIncidentTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.IncidentTimeline = incidentTimeline
+
+	req := SendRequest{IncidentID: "incident-1", ChannelKind: "lark", Target: "chat-1", Round: 1}
+	if err := s.Send(context.Background(), req); err != nil {
+		t.Fatalf("Send 失败: %v", err)
+	}
+	if tl.count() != 0 {
+		t.Fatalf("Incident 通报不应写 Alert 时间线")
+	}
+	if len(incidentTimeline.entries) != 1 || incidentTimeline.entries[0].Kind != domain.IncidentTimelineCommunication {
+		t.Fatalf("Incident 通报结果未写统一时间线: %+v", incidentTimeline.entries)
+	}
+	entry, err := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(req))
+	if err != nil || entry.IncidentID != "incident-1" {
+		t.Fatalf("notification_log 未关联 Incident: entry=%+v err=%v", entry, err)
 	}
 }
 

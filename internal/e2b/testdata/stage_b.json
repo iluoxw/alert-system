@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "scenario_id": "e2b-failed-to-place-sandbox",
+  "phase": "stage_b",
+  "observed_at": "2026-07-20T02:20:00Z",
+  "signals": [
+    {
+      "rule_id": "e2b-sandbox-resume-object-missing",
+      "signal_kind": "log",
+      "severity": "warning",
+      "status": "firing",
+      "title": "Sandbox resume object is missing",
+      "labels": {
+        "alertname": "E2BSandboxResumeObjectMissing",
+        "e2b.evidence_class": "object_missing",
+        "sandbox_id_hash": "sid-a91c"
+      },
+      "resource_external_ref": "e2b.object-storage",
+      "resolve_policy": "manual",
+      "context": {"error_class": "object_not_found", "object_key_hash": "obj-21af"},
+      "starts_at": "2026-07-20T02:01:00Z"
+    },
+    {
+      "rule_id": "e2b-sandbox-resume-object-missing",
+      "signal_kind": "log",
+      "severity": "warning",
+      "status": "firing",
+      "title": "Sandbox resume object is missing",
+      "labels": {
+        "alertname": "E2BSandboxResumeObjectMissing",
+        "e2b.evidence_class": "object_missing",
+        "sandbox_id_hash": "sid-b72e"
+      },
+      "resource_external_ref": "e2b.object-storage",
+      "resolve_policy": "manual",
+      "context": {"error_class": "object_not_found", "object_key_hash": "obj-781c"},
+      "starts_at": "2026-07-20T02:01:20Z"
+    },
+    {
+      "rule_id": "e2b-invalid-resume-retry-rate",
+      "signal_kind": "metric",
+      "severity": "warning",
+      "status": "firing",
+      "title": "Invalid sandbox resume retries are increasing",
+      "labels": {
+        "alertname": "E2BInvalidResumeRetryRate",
+        "e2b.evidence_class": "invalid_resume_retry"
+      },
+      "resource_external_ref": "e2b.api",
+      "resolve_policy": "source",
+      "context": {"attempt_count": 1328, "window_seconds": 300, "distinct_request_count": 43},
+      "starts_at": "2026-07-20T02:02:00Z"
+    },
+    {
+      "rule_id": "e2b-firecracker-gauge-drift",
+      "signal_kind": "metric",
+      "severity": "critical",
+      "status": "firing",
+      "title": "Firecracker process count exceeds running gauge",
+      "labels": {
+        "alertname": "E2BFirecrackerGaugeDrift",
+        "e2b.evidence_class": "firecracker_gauge_drift"
+      },
+      "resource_external_ref": "e2b.orchestrator.pool",
+      "resolve_policy": "source",
+      "context": {"firecracker_processes": 187, "running_gauge": 91, "drift": 96},
+      "starts_at": "2026-07-20T02:03:00Z"
+    },
+    {
+      "rule_id": "e2b-node-exhausted",
+      "signal_kind": "log",
+      "severity": "critical",
+      "status": "firing",
+      "title": "Orchestrator reports Node exhausted",
+      "labels": {
+        "alertname": "E2BNodeExhausted",
+        "e2b.evidence_class": "node_exhausted"
+      },
+      "resource_external_ref": "e2b.orchestrator.pool",
+      "resolve_policy": "source",
+      "context": {"affected_nodes": 3, "error_class": "node_exhausted"},
+      "starts_at": "2026-07-20T02:15:00Z"
+    },
+    {
+      "rule_id": "e2b-envd-timeout",
+      "signal_kind": "metric",
+      "severity": "critical",
+      "status": "firing",
+      "title": "Sandbox envd readiness timed out",
+      "labels": {
+        "alertname": "E2BEnvdTimeout",
+        "e2b.evidence_class": "envd_timeout"
+      },
+      "resource_external_ref": "e2b.sandbox-runtime",
+      "resolve_policy": "source",
+      "context": {"timeout_seconds": 60, "request_failures": 7},
+      "starts_at": "2026-07-20T02:16:00Z"
+    },
+    {
+      "rule_id": "e2b-sandbox-create-slo-breach",
+      "signal_kind": "metric",
+      "severity": "critical",
+      "status": "firing",
+      "title": "Sandbox create user SLO is breached",
+      "labels": {
+        "alertname": "E2BSandboxCreateSLOBreach",
+        "e2b.evidence_class": "sandbox_create_slo_breach",
+        "affected_business_system": "insforge.preview-runtime"
+      },
+      "resource_external_ref": "e2b.sandbox-runtime",
+      "resolve_policy": "source",
+      "context": {"request_failure_rate": 0.21, "attempt_failure_rate": 0.73, "window_seconds": 300},
+      "starts_at": "2026-07-20T02:17:00Z"
+    },
+    {
+      "rule_id": "e2b-lifecycle-probe-failed",
+      "signal_kind": "trace",
+      "severity": "critical",
+      "status": "firing",
+      "title": "Sandbox create-pause-resume lifecycle probe failed",
+      "labels": {
+        "alertname": "E2BLifecycleProbeFailed",
+        "e2b.evidence_class": "lifecycle_probe_failure",
+        "affected_business_system": "insforge.preview-runtime"
+      },
+      "resource_external_ref": "e2b.sandbox-runtime",
+      "resolve_policy": "source",
+      "context": {"failed_step": "resume", "probe_run_id": "probe-20260720-0218"},
+      "starts_at": "2026-07-20T02:18:00Z"
+    },
+    {
+      "rule_id": "network-f5-stream-stall",
+      "signal_kind": "metric",
+      "severity": "warning",
+      "status": "firing",
+      "title": "F5 upstream stream stall detected",
+      "labels": {
+        "alertname": "F5StreamStall",
+        "e2b.evidence_class": "f5_stream_stall"
+      },
+      "resource_external_ref": "e2b.client-proxy",
+      "resolve_policy": "source",
+      "context": {"direction": "upstream", "diagnostic": "separate_fault_chain"},
+      "starts_at": "2026-07-20T02:04:10Z"
+    }
+  ],
+  "observations": [
+    {
+      "kind": "slo",
+      "name": "sandbox_create_success_rate",
+      "value": 0.79,
+      "threshold": 0.99,
+      "breached": true,
+      "observed_at": "2026-07-20T02:20:00Z"
+    }
+  ],
+  "expectations": {
+    "capability_fault_status": "active",
+    "incident_suggested": true,
+    "instance_fault_count": 2
+  }
+}

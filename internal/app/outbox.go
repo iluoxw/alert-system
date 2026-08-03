@@ -86,6 +86,9 @@ func (o *notifyOutbox) scheduleSend(ctx context.Context, tx pgx.Tx, req notify.S
 func notifySendRefID(req notify.SendRequest) string {
 	resourceKey := req.AlertID
 	if resourceKey == "" {
+		resourceKey = req.IncidentID
+	}
+	if resourceKey == "" {
 		resourceKey = req.GroupKey
 	}
 	step := "-"
