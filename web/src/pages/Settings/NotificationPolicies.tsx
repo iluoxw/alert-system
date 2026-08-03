@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Button, Card, Form, Input, InputNumber, Select } from 'antd'
+import { Button, Card, Form, Input, InputNumber, Select, Tooltip } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
+import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { CrudTable } from '../../components/CrudTable'
 import { MatchersEditor } from '../../components/MatchersEditor'
 import type { MatcherSet, NotificationPolicy, NotificationPolicyRequest, Severity } from '../../api/client'
@@ -16,6 +16,11 @@ import {
 
 const severities: Severity[] = ['critical', 'warning', 'info']
 const severityLabel: Record<Severity, string> = { critical: '严重', warning: '警告', info: '提示' }
+const channelOptions = [
+  { value: 'lark', label: '飞书' },
+  { value: 'webhook', label: 'Webhook' },
+  { value: 'email', label: '邮件' },
+]
 
 export function NotificationPolicies() {
   const [teamFilter, setTeamFilter] = useState<string | undefined>()
@@ -31,7 +36,7 @@ export function NotificationPolicies() {
       render: (id: string) => (id ? teamOptions.find((o) => o.value === id)?.label ?? id : '全局'),
     },
     {
-      title: 'matchers',
+      title: '匹配条件',
       dataIndex: 'matchers',
       key: 'matchers',
       render: (matchers: MatcherSet) =>
@@ -75,18 +80,16 @@ export function NotificationPolicies() {
           </Form.Item>
           <Form.Item
             name="team_id"
-            label="所属团队（留空 + matchers 留空 = 全局默认策略）"
+            label="所属团队"
+            extra="团队和匹配条件均留空时，将作为全局默认策略。"
           >
             <Select allowClear options={teamOptions} showSearch optionFilterProp="label" />
           </Form.Item>
-          <Form.Item name="matchers" label="matchers（留空表示不限制业务/服务）">
+          <Form.Item name="matchers" label="匹配条件" extra="留空时不限制业务或服务。">
             <MatchersEditor />
           </Form.Item>
 
-          {/* 按 severity 分层的渠道升级序列（R13.1/R13.2）：channels 是渠道 kind
-              自由文本输入，后端会校验是否已在渠道注册表注册，未注册返回 422 并
-              指出具体 kind——前端不预置渠道枚举，靠后端校验反馈即可，避免维护
-              一份容易过期的渠道类型白名单。 */}
+          {/* 可选项与服务端当前注册的三类通知渠道保持一致，避免用户提交无效内部值。 */}
           {severities.map((severity) => (
             <Card key={severity} size="small" title={`${severityLabel[severity]} 级别渠道升级序列`} style={{ marginBottom: 12 }}>
               <Form.List name={['steps', severity]}>
@@ -98,7 +101,18 @@ export function NotificationPolicies() {
                         size="small"
                         type="inner"
                         style={{ marginBottom: 8 }}
-                        extra={<MinusCircleOutlined onClick={() => remove(field.name)} />}
+                        extra={(
+                          <Tooltip title="删除这一级">
+                            <Button
+                              type="text"
+                              danger
+                              size="small"
+                              icon={<DeleteOutlined />}
+                              onClick={() => remove(field.name)}
+                              aria-label="删除渠道升级级别"
+                            />
+                          </Tooltip>
+                        )}
                       >
                         <Form.Item
                           name={[field.name, 'wait_seconds']}
@@ -109,10 +123,11 @@ export function NotificationPolicies() {
                         </Form.Item>
                         <Form.Item
                           name={[field.name, 'channels']}
-                          label="渠道 kind（可多个，回车分隔）"
-                          rules={[{ required: true, message: '请至少输入一个渠道' }]}
+                          label="通知渠道"
+                          extra="仅显示系统已支持的渠道类型；具体目标地址在服务器或用户联系方式中配置。"
+                          rules={[{ required: true, message: '请至少选择一个通知渠道' }]}
                         >
-                          <Select mode="tags" tokenSeparators={[',']} open={false} />
+                          <Select mode="multiple" options={channelOptions} placeholder="选择通知渠道" />
                         </Form.Item>
                         <Form.Item
                           name={[field.name, 'mode']}
@@ -122,8 +137,8 @@ export function NotificationPolicies() {
                         >
                           <Select
                             options={[
-                              { value: 'replace', label: 'replace（替换为更强渠道）' },
-                              { value: 'spread', label: 'spread（叠加扩散）' },
+                              { value: 'replace', label: '替换前一级渠道' },
+                              { value: 'spread', label: '保留并叠加新渠道' },
                             ]}
                           />
                         </Form.Item>

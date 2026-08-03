@@ -10,13 +10,22 @@
 
 export type Severity = 'critical' | 'warning' | 'info'
 export type Status = 'firing' | 'acknowledged' | 'resolved'
+export type SourceState = 'firing' | 'resolved' | 'unknown'
+export type ResponseState = 'unacknowledged' | 'acknowledged'
+export type SuppressionState = 'none' | 'silenced' | 'inhibited'
 
 // Alert 对应 internal/api/alerts.go 的 alertResponse（字段与 json tag 一一对应）。
 // AckedAt/EndsAt 后端未设置时序列化为 null，对应 string | null。
 export interface Alert {
   id: string
   fingerprint: string
+  upstream_fingerprint?: string
   status: Status
+  source_state: SourceState
+  response_state: ResponseState
+  suppression_state: SuppressionState
+  suppression_details?: Record<string, string[]>
+  authoritative: boolean
   severity: Severity
   severity_fallback: boolean
   title: string
@@ -27,6 +36,10 @@ export interface Alert {
   resolve_policy: string
   ttl_seconds?: number
   source_integration_id?: string
+  source_updated_at?: string | null
+  last_reconciled_at?: string | null
+  reconcile_miss_count: number
+  source_resolution_reason?: string
   dedup_count: number
   group_key?: string
   team_id?: string
@@ -53,6 +66,10 @@ export interface AlertListResponse {
 export interface AlertFilter {
   severity?: Severity
   status?: Status
+  sourceState?: SourceState
+  responseState?: ResponseState
+  suppressionState?: SuppressionState
+  sourceId?: string
   teamId?: string
   labels?: Record<string, string>
   limit?: number
@@ -143,6 +160,10 @@ export function listAlerts(filter: AlertFilter): Promise<AlertListResponse> {
   const params = new URLSearchParams()
   if (filter.severity) params.set('severity', filter.severity)
   if (filter.status) params.set('status', filter.status)
+  if (filter.sourceState) params.set('source_state', filter.sourceState)
+  if (filter.responseState) params.set('response_state', filter.responseState)
+  if (filter.suppressionState) params.set('suppression_state', filter.suppressionState)
+  if (filter.sourceId) params.set('source_id', filter.sourceId)
   if (filter.teamId) params.set('team_id', filter.teamId)
   if (filter.labels) {
     for (const [k, v] of Object.entries(filter.labels)) {
@@ -212,6 +233,8 @@ export type TimelineAction =
   | 'notify_sent'
   | 'notify_failed'
   | 'note'
+  | 'source_unknown'
+  | 'source_recovered'
 
 // TimelineEntry 对应 timelineEntryResponse（省略了 alert_id，由所在详情响应的
 // alert.id 隐含）。
@@ -236,6 +259,178 @@ export interface AlertDetailResponse {
   alert: Alert
   timeline: TimelineEntry[]
   recent_changes: ChangeEvent[]
+}
+
+// ============================================================
+// 服务目录与确定性 Alert Mapping
+// ============================================================
+
+export type EntityLayer = 'infrastructure' | 'platform' | 'application'
+export type ServiceTier = 'tier-0' | 'tier-1' | 'tier-2' | 'tier-3'
+export type AlertMappingStatus = 'mapped' | 'unmapped' | 'conflict' | 'ignored'
+
+export interface EntityNode {
+  id: string
+  entity_key: string
+  layer: EntityLayer
+  managed: boolean
+  source: string
+  external_ref: string
+  kind: string
+  name: string
+  environment: string
+  owner_team_id?: string
+  labels?: Record<string, string>
+  attributes?: Record<string, unknown>
+  last_observed_at: string
+}
+
+export interface EntityAlias {
+  id?: string
+  namespace: string
+  value: string
+  entity_id?: string
+  enabled: boolean
+}
+
+export interface ServiceRegistration {
+  id: string
+  entity: EntityNode
+  owner_team_id: string
+  owner_team_name: string
+  description: string
+  tier: ServiceTier
+  dashboard_url: string
+  runbook_url: string
+  enabled: boolean
+  aliases: EntityAlias[]
+  dependencies: DependencyEdge[]
+  created_at: string
+  updated_at: string
+}
+
+export interface ServiceRequest {
+  entity_key: string
+  name: string
+  environment: string
+  owner_team_id: string
+  description: string
+  tier: ServiceTier
+  dashboard_url?: string
+  runbook_url?: string
+  enabled: boolean
+  aliases: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
+  dependencies: ServiceDependencyRequest[]
+  labels?: Record<string, string>
+}
+
+export interface ServiceDependencyRequest {
+  to_entity_id: string
+  criticality: 'low' | 'medium' | 'high' | 'critical'
+}
+
+export interface AlertMappingPolicy {
+  id: string
+  name: string
+  priority: number
+  source_integration_id?: string
+  matchers: MatcherSet
+  target_entity_id?: string
+  alias_namespace?: string
+  alias_label?: string
+  fault_kind: string
+  fault_scope: FaultScope
+  evidence_role: EvidenceRole
+  correlation_labels: string[]
+  confidence: number
+  enabled: boolean
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export type AlertMappingPolicyRequest = Omit<AlertMappingPolicy, 'id' | 'version' | 'created_at' | 'updated_at'>
+
+export interface AlertMappingResult {
+  alert_id: string
+  status: AlertMappingStatus
+  policy_id?: string
+  policy_name?: string
+  entity_id?: string
+  entity_key?: string
+  entity_name?: string
+  fault_id?: string
+  reason_code: string
+  explanation: string
+  correlation_key?: string
+  evaluated_at: string
+}
+
+export interface AlertMappingResultItem {
+  result: AlertMappingResult
+  alert: Alert
+}
+
+export interface AlertMappingSummary {
+  mapped: number
+  unmapped: number
+  conflict: number
+  ignored: number
+}
+
+export async function listServices(limit?: number): Promise<{ services: ServiceRegistration[] }> {
+  const response = await request<{ services: ServiceRegistration[] | null }>(`/services${withQuery({ limit })}`)
+  return {
+    services: (response.services ?? []).map((service) => ({
+      ...service,
+      aliases: service.aliases ?? [],
+      dependencies: service.dependencies ?? [],
+    })),
+  }
+}
+
+export function createService(body: ServiceRequest): Promise<ServiceRegistration> {
+  return request('/admin/services', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function updateServiceRegistration(id: string, body: ServiceRequest): Promise<ServiceRegistration> {
+  return request(`/admin/services/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+export function listAlertMappingPolicies(): Promise<{ policies: AlertMappingPolicy[] }> {
+  return request('/admin/alert-mappings')
+}
+
+export function createAlertMappingPolicy(body: AlertMappingPolicyRequest): Promise<AlertMappingPolicy> {
+  return request('/admin/alert-mappings', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function updateAlertMappingPolicy(id: string, body: AlertMappingPolicyRequest): Promise<AlertMappingPolicy> {
+  return request(`/admin/alert-mappings/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+export function deleteAlertMappingPolicy(id: string): Promise<void> {
+  return request(`/admin/alert-mappings/${id}`, { method: 'DELETE' })
+}
+
+export function previewAlertMappingPolicy(policy: AlertMappingPolicyRequest, limit = 20): Promise<{ matches: Alert[]; count: number }> {
+  return request('/admin/alert-mappings/preview', { method: 'POST', body: JSON.stringify({ policy, limit }) })
+}
+
+export function listAlertMappingResults(status?: AlertMappingStatus, limit?: number): Promise<{ items: AlertMappingResultItem[] }> {
+  return request(`/alert-mapping/results${withQuery({ status, limit })}`)
+}
+
+export function getAlertMappingSummary(): Promise<AlertMappingSummary> {
+  return request('/alert-mapping/summary')
+}
+
+export function getAlertMapping(alertId: string): Promise<AlertMappingResult> {
+  return request(`/alerts/${alertId}/mapping`)
+}
+
+export function reprocessAlertMapping(alertId: string): Promise<AlertMappingResult> {
+  return request(`/admin/alert-mapping/results/${alertId}/reprocess`, { method: 'POST' })
 }
 
 // AlertActionResponse 对应 ack/resolve/handoff 三个处置端点的响应体（都只回传
@@ -734,7 +929,15 @@ export interface Integration {
 }
 
 export interface IntegrationCreateResponse extends Integration {
-  token: string // 明文，仅此一次
+  hook_id: string // URL bearer credential，仅此一次
+  webhook_path: string
+}
+
+export interface IngestHookCredential {
+  id: string
+  name: string
+  hook_id: string
+  webhook_path: string
 }
 
 export interface IntegrationRequest {
@@ -759,6 +962,63 @@ export function updateIntegration(id: string, body: IntegrationRequest): Promise
 }
 export function deleteIntegration(id: string): Promise<void> {
   return request(`/admin/integrations/${id}`, { method: 'DELETE' })
+}
+
+export function rotateIntegrationHook(id: string): Promise<IngestHookCredential> {
+  return request(`/admin/integrations/${id}/rotate-hook`, { method: 'POST' })
+}
+
+export type AlertSourceHealth = 'disabled' | 'unconfigured' | 'unknown' | 'healthy' | 'degraded' | 'stale'
+
+export interface AlertSourceConfig {
+  api_url: string
+  bearer_token_env: string
+  reconcile_interval_seconds: number
+  stale_after_seconds: number
+  missing_confirmations: number
+}
+
+export interface AlertSource {
+  id: string
+  name: string
+  enabled: boolean
+  default_severity: Severity
+  config: AlertSourceConfig
+  health: AlertSourceHealth
+  last_error: string
+  consecutive_failures: number
+  snapshot_version: number
+  firing_count: number
+  unknown_count: number
+  suppressed_count: number
+  last_webhook_at: string | null
+  last_reconcile_at: string | null
+  last_success_at: string | null
+  last_error_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface AlertSourceReconcileResult {
+  source_id: string
+  snapshot_version: number
+  seen: number
+  unknown: number
+  resolved: number
+  recovered: number
+  completed_at: string
+}
+
+export function listAlertSources(limit?: number): Promise<{ sources: AlertSource[] }> {
+  return request(`/admin/alert-sources${withQuery({ limit })}`)
+}
+
+export function reconcileAlertSource(id: string): Promise<AlertSourceReconcileResult> {
+  return request(`/admin/alert-sources/${id}/reconcile`, { method: 'POST' })
+}
+
+export function rotateAlertSourceHook(id: string): Promise<IngestHookCredential> {
+  return request(`/admin/alert-sources/${id}/rotate-hook`, { method: 'POST' })
 }
 
 // ---- silences ----
@@ -799,4 +1059,414 @@ export function updateSilence(id: string, body: SilenceRequest): Promise<void> {
 }
 export function deleteSilence(id: string): Promise<void> {
   return request(`/admin/silences/${id}`, { method: 'DELETE' })
+}
+
+// ============================================================
+// Infrastructure-first 运行面：Resource → Fault → Incident
+// ============================================================
+
+export type ResourceNodeKind = 'resource' | 'infrastructure_capability' | 'business_system'
+export type FaultStatus = 'candidate' | 'active' | 'monitoring' | 'resolved'
+export type FaultScope = 'instance' | 'capability'
+export type EvidenceRole = 'direct_impact' | 'cause_candidate' | 'trigger' | 'amplifier' | 'symptom' | 'supporting' | 'excluded'
+export type IncidentStatus = 'declared' | 'mitigating' | 'monitoring' | 'resolved'
+
+export interface ResourceNode {
+  id: string
+  entity_key: string
+  layer: EntityLayer
+  managed: boolean
+  source: string
+  external_ref: string
+  kind: ResourceNodeKind
+  name: string
+  provider?: string
+  environment?: string
+  owner_team_id?: string
+  labels?: Record<string, string>
+  attributes?: Record<string, unknown>
+  last_observed_at?: string
+}
+
+export interface DependencyEdge {
+  id: string
+  source: string
+  from_node_id: string
+  to_node_id: string
+  from_external_ref: string
+  to_external_ref: string
+  from_node_name?: string
+  to_node_name?: string
+  relation: 'depends_on' | 'part_of'
+  criticality?: 'low' | 'medium' | 'high' | 'critical'
+  origin: 'observed' | 'declared'
+  evidence?: Record<string, unknown>
+  observed_at?: string
+}
+
+export interface Fault {
+  id: string
+  correlation_key: string
+  scope: FaultScope
+  status: FaultStatus
+  severity: Severity
+  kind: string
+  title: string
+  summary: string
+  resource_node_id?: string
+  entity_ref: string
+  confidence: number
+  metadata: Record<string, unknown>
+  first_detected_at: string
+  last_evaluated_at: string
+  resolved_at?: string
+}
+
+export interface Incident {
+  id: string
+  number: number
+  status: IncidentStatus
+  severity: Severity
+  title: string
+  summary: string
+  declared_by: string
+  communication_channel: string
+  communication_target_ref: string
+  declared_at: string
+  mitigated_at?: string
+  monitoring_at?: string
+  resolved_at?: string
+}
+
+export interface InfrastructureOverviewResponse {
+  summary: {
+    resource_count: number
+    capability_count: number
+    business_system_count: number
+    active_fault_count: number
+    critical_fault_count: number
+    confirmed_business_impact_count: number
+    last_observed_at?: string
+  }
+  nodes: ResourceNode[]
+  faults: Fault[]
+  incidents: Incident[]
+}
+
+export interface InfrastructureNodeDetailResponse {
+  node: ResourceNode
+  edges: DependencyEdge[]
+  faults: Fault[]
+}
+
+export interface FaultEvidence {
+  fault_id: string
+  alert_id: string
+  role: EvidenceRole
+  rationale: string
+  confidence: number
+  decision_origin: 'automation' | 'human'
+  decided_by?: string
+  decided_at?: string
+}
+
+export interface FaultImpact {
+  fault_id: string
+  node_id: string
+  state: 'potential' | 'confirmed' | 'ruled_out'
+  path: string[]
+  rationale: string
+  confidence: number
+  decision_origin: 'automation' | 'human'
+  decided_by?: string
+  decided_at?: string
+}
+
+export interface FaultDetailResponse {
+  fault: Fault
+  evidence: Array<{ evidence: FaultEvidence; alert: Alert }>
+  impacts: Array<{ impact: FaultImpact; node: ResourceNode; path_nodes: ResourceNode[] }>
+  incident: Incident | null
+}
+
+export function getInfrastructureOverview(): Promise<InfrastructureOverviewResponse> {
+  return request('/infrastructure/overview')
+}
+
+export function listInfrastructureNodes(kind?: ResourceNodeKind): Promise<{ items: ResourceNode[] }> {
+  return request(`/infrastructure/nodes${withQuery({ kind })}`)
+}
+
+export function getInfrastructureNode(id: string): Promise<InfrastructureNodeDetailResponse> {
+  return request(`/infrastructure/nodes/${id}`)
+}
+
+export interface ManagedEntityRequest {
+  entity_key: string
+  layer: 'infrastructure' | 'platform'
+  name: string
+  provider: string
+  environment: string
+  owner_team_id: string
+  labels?: Record<string, string>
+}
+
+export function createManagedEntity(body: ManagedEntityRequest): Promise<ResourceNode> {
+  return request('/admin/entities', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ResourceNode> {
+  return request(`/admin/entities/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+export function listFaults(status?: FaultStatus): Promise<{ items: Fault[] }> {
+  return request(`/faults${withQuery({ status })}`)
+}
+
+export function getFault(id: string): Promise<FaultDetailResponse> {
+  return request(`/faults/${id}`)
+}
+
+export function decideFaultEvidence(faultId: string, alertId: string, body: {
+  role: EvidenceRole
+  rationale: string
+  confidence: number
+}): Promise<FaultEvidence> {
+  return request(`/faults/${faultId}/evidence/${alertId}`, {
+    method: 'PUT', body: JSON.stringify(body),
+  })
+}
+
+export function decideFaultImpact(faultId: string, nodeId: string, body: {
+  state: FaultImpact['state']
+  rationale: string
+  confidence: number
+}): Promise<FaultImpact> {
+  return request(`/faults/${faultId}/impacts/${nodeId}`, {
+    method: 'PUT', body: JSON.stringify(body),
+  })
+}
+
+// ---- Incident collaboration ----
+
+export type IncidentRole = 'incident_commander' | 'technical_lead' | 'communications_lead' | 'business_liaison'
+export type IncidentTaskStatus = 'open' | 'in_progress' | 'done' | 'canceled'
+export type IncidentTimelineKind = 'fact' | 'hypothesis' | 'decision' | 'automation' | 'communication' | 'status_change' | 'task_update' | 'role_assignment'
+export type IncidentFaultRelation = 'primary' | 'supporting'
+export type IncidentFaultDisposition = 'included' | 'excluded'
+
+export interface IncidentFaultLink {
+  incident_id: string
+  fault_id: string
+  relation: IncidentFaultRelation
+  disposition: IncidentFaultDisposition
+  disposition_rationale: string
+  decided_by?: string
+  decided_at?: string
+  linked_at: string
+}
+
+export interface IncidentRoleAssignment {
+  incident_id: string
+  role: IncidentRole
+  user_id: string
+  assigned_by: string
+  assigned_at: string
+}
+
+export interface IncidentTask {
+  id: string
+  incident_id: string
+  title: string
+  description: string
+  status: IncidentTaskStatus
+  owner_user_id?: string
+  created_by: string
+  due_at?: string
+  completed_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface IncidentTimelineEntry {
+  id: string
+  incident_id: string
+  actor_user_id?: string
+  actor_display: string
+  kind: IncidentTimelineKind
+  summary: string
+  detail: Record<string, unknown>
+  occurred_at: string
+}
+
+export interface RecoveryCriterion {
+  id: string
+  incident_id: string
+  key: string
+  description: string
+  gate: 'mitigation' | 'resolution'
+  required: boolean
+  status: 'pending' | 'passed' | 'failed'
+  evidence: Record<string, unknown>
+  evaluated_by?: string
+  observed_at?: string
+}
+
+export interface IncidentDetailResponse {
+  incident: Incident
+  faults: IncidentFaultLink[]
+  roles: IncidentRoleAssignment[]
+  tasks: IncidentTask[]
+  timeline: IncidentTimelineEntry[]
+  recovery_criteria: RecoveryCriterion[]
+}
+
+export function listIncidents(status?: IncidentStatus): Promise<{ items: Incident[] }> {
+  return request(`/incidents${withQuery({ status })}`)
+}
+
+export async function getIncident(id: string): Promise<IncidentDetailResponse> {
+  const detail = await request<IncidentDetailResponse>(`/incidents/${id}`)
+  return {
+    ...detail,
+    faults: detail.faults ?? [],
+    roles: detail.roles ?? [],
+    tasks: detail.tasks ?? [],
+    timeline: detail.timeline ?? [],
+    recovery_criteria: detail.recovery_criteria ?? [],
+  }
+}
+
+export function declareIncident(body: {
+  fault_id: string
+  title: string
+  summary: string
+  severity: Severity
+  communication_channel: string
+  communication_target_ref: string
+}): Promise<{ incident: Incident; created: boolean }> {
+  return request('/incidents', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function linkIncidentFault(incidentId: string, faultId: string): Promise<{ link: IncidentFaultLink; created: boolean }> {
+  return request(`/incidents/${incidentId}/faults`, {
+    method: 'POST', body: JSON.stringify({ fault_id: faultId }),
+  })
+}
+
+export function setIncidentPrimaryFault(incidentId: string, faultId: string): Promise<{ link: IncidentFaultLink }> {
+  return request(`/incidents/${incidentId}/faults/${faultId}/primary`, { method: 'PUT' })
+}
+
+export function setIncidentFaultDisposition(incidentId: string, faultId: string, body: {
+  disposition: IncidentFaultDisposition; rationale: string
+}): Promise<{ link: IncidentFaultLink }> {
+  return request(`/incidents/${incidentId}/faults/${faultId}/disposition`, {
+    method: 'PUT', body: JSON.stringify(body),
+  })
+}
+
+export function transitionIncidentFault(incidentId: string, faultId: string, body: {
+  to: 'monitoring' | 'resolved'; rationale: string
+}): Promise<{ fault: Fault }> {
+  return request(`/incidents/${incidentId}/faults/${faultId}/transitions`, {
+    method: 'POST', body: JSON.stringify(body),
+  })
+}
+
+export function assignIncidentRole(incidentId: string, role: IncidentRole, userId: string): Promise<IncidentRoleAssignment> {
+  return request(`/incidents/${incidentId}/roles/${role}`, {
+    method: 'PUT', body: JSON.stringify({ user_id: userId }),
+  })
+}
+
+export function createIncidentTask(incidentId: string, body: {
+  title: string; description?: string; owner_user_id?: string; due_at?: string
+}): Promise<IncidentTask> {
+  return request(`/incidents/${incidentId}/tasks`, { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function updateIncidentTask(incidentId: string, taskId: string, body: {
+  status: IncidentTaskStatus; owner_user_id?: string
+}): Promise<IncidentTask> {
+  return request(`/incidents/${incidentId}/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+
+export function addIncidentTimeline(incidentId: string, body: {
+  kind: 'fact' | 'hypothesis' | 'decision'; summary: string; detail?: Record<string, unknown>
+}): Promise<IncidentTimelineEntry> {
+  return request(`/incidents/${incidentId}/timeline`, { method: 'POST', body: JSON.stringify(body) })
+}
+
+export function updateRecoveryCriterion(incidentId: string, key: string, body: {
+  status: 'pending' | 'passed' | 'failed'; evidence: Record<string, unknown>; observed_at: string
+}): Promise<RecoveryCriterion> {
+  return request(`/incidents/${incidentId}/recovery-criteria/${key}`, {
+    method: 'PUT', body: JSON.stringify(body),
+  })
+}
+
+export function transitionIncident(incidentId: string, to: IncidentStatus): Promise<Incident> {
+  return request(`/incidents/${incidentId}/transitions`, { method: 'POST', body: JSON.stringify({ to }) })
+}
+
+// ---- Guarded Runbooks ----
+
+export interface RunbookDefinition {
+  action_key: string
+  name: string
+  description: string
+  risk_level: 'readonly' | 'coordination' | 'mutating'
+  enabled: boolean
+  uat_only: boolean
+  runtime_available: boolean
+  runtime_reason?: string
+}
+
+export interface RunbookRun {
+  id: string
+  incident_id: string
+  action_key: string
+  mode: 'coordination' | 'readonly' | 'dry_run' | 'apply'
+  status: 'running' | 'succeeded' | 'failed' | 'rejected'
+  parameters: Record<string, unknown>
+  plan: Record<string, unknown>
+  plan_sha256?: string
+  plan_expires_at?: string
+  source_plan_run_id?: string
+  requested_by: string
+  executed_by?: string
+  requested_at: string
+  completed_at?: string
+  result: Record<string, unknown>
+  error?: string
+}
+
+export async function listRunbookDefinitions(): Promise<{ items: RunbookDefinition[] }> {
+  const response = await request<{ items: RunbookDefinition[] | null }>('/runbooks')
+  return { items: response.items ?? [] }
+}
+
+export async function listRunbookRuns(incidentId: string): Promise<{ items: RunbookRun[] }> {
+  const response = await request<{ items: RunbookRun[] | null }>(`/incidents/${incidentId}/runbook-runs`)
+  return { items: response.items ?? [] }
+}
+
+export function executeRunbook(incidentId: string, actionKey: string, parameters: Record<string, unknown>): Promise<RunbookRun> {
+  return request(`/incidents/${incidentId}/runbook-runs`, {
+    method: 'POST', body: JSON.stringify({ action_key: actionKey, parameters }),
+  })
+}
+
+export function approveRunbook(incidentId: string, runId: string, planSHA256: string, comment: string): Promise<void> {
+  return request(`/incidents/${incidentId}/runbook-runs/${runId}/approval`, {
+    method: 'POST', body: JSON.stringify({ plan_sha256: planSHA256, decision: 'approved', comment }),
+  })
+}
+
+export function applyRunbook(incidentId: string, planRunId: string, confirmPlanSHA256: string): Promise<RunbookRun> {
+  return request(`/incidents/${incidentId}/runbook-apply`, {
+    method: 'POST',
+    body: JSON.stringify({ plan_run_id: planRunId, confirm_plan_sha256: confirmPlanSHA256, retries_stopped: true }),
+  })
 }

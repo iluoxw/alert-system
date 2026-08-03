@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Button, Card, Form, InputNumber, Select } from 'antd'
+import { Button, Card, Form, InputNumber, Select, Tooltip } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
+import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { CrudTable } from '../../components/CrudTable'
 import { SeverityConfigEditor } from '../../components/SeverityConfigEditor'
 import type { EscalationPolicy, EscalationPolicyRequest } from '../../api/client'
@@ -66,13 +66,13 @@ export function EscalationPolicies() {
           <Form.Item name="team_id" label="所属团队" rules={[{ required: true, message: '请选择所属团队' }]}>
             <Select options={teamOptions} showSearch optionFilterProp="label" />
           </Form.Item>
-          <Form.Item label="升级链（依次等待→通知下一级责任团队，R5.4）">
+          <Form.Item label="升级路径" extra="当前责任方未响应时，按顺序等待并通知下一级团队。">
             <Form.List
               name="levels"
               rules={[
                 {
                   validator: async (_, levels) => {
-                    if (!levels || levels.length === 0) throw new Error('levels 不能为空')
+                    if (!levels || levels.length === 0) throw new Error('请至少添加一个升级级别')
                   },
                 },
               ]}
@@ -84,7 +84,18 @@ export function EscalationPolicies() {
                       key={field.key}
                       size="small"
                       style={{ marginBottom: 8 }}
-                      extra={<MinusCircleOutlined onClick={() => remove(field.name)} />}
+                      extra={(
+                        <Tooltip title="删除这一级">
+                          <Button
+                            type="text"
+                            danger
+                            size="small"
+                            icon={<DeleteOutlined />}
+                            onClick={() => remove(field.name)}
+                            aria-label="删除升级级别"
+                          />
+                        </Tooltip>
+                      )}
                     >
                       <Form.Item
                         name={[field.name, 'wait_seconds']}
@@ -115,7 +126,7 @@ export function EscalationPolicies() {
               )}
             </Form.List>
           </Form.Item>
-          <Form.Item label="Severity 覆写升级节奏（R1，不配置=全部使用默认节奏）">
+          <Form.Item label="按告警级别调整节奏" extra="不配置时，所有告警级别使用上方默认升级路径。">
             <Form.Item noStyle shouldUpdate={(prev, cur) => prev.levels !== cur.levels}>
               {(formInstance) => (
                 <Form.Item name="severity_config" noStyle>

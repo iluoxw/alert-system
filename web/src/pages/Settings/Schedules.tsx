@@ -6,6 +6,7 @@ import {
   Button,
   DatePicker,
   Drawer,
+  Empty,
   Form,
   Input,
   InputNumber,
@@ -22,6 +23,7 @@ import { WarningOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import type { Dayjs } from 'dayjs'
 import { CrudTable } from '../../components/CrudTable'
+import { TimezoneSelect } from '../../components/TimezoneSelect'
 import type { GenerateShiftsRequest, Schedule, ScheduleRequest, Shift, ShiftRequest } from '../../api/client'
 import {
   ApiError,
@@ -235,7 +237,12 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
       render: (_: unknown, record: Shift) => (
         <Space>
           <a onClick={() => openEdit(record)}>编辑</a>
-          <Popconfirm title="确认删除该班次？" onConfirm={() => deleteMutation.mutate(record.id!)}>
+          <Popconfirm
+            title="确认删除该班次？"
+            okText="确认删除"
+            cancelText="取消"
+            onConfirm={() => deleteMutation.mutate(record.id!)}
+          >
             <a style={{ color: '#ff4d4f' }}>删除</a>
           </Popconfirm>
         </Space>
@@ -325,15 +332,25 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
         <Button onClick={openGenerate}>生成轮换</Button>
       </Space>
 
-      <Table<Shift> rowKey="id" columns={shiftColumns} dataSource={shifts} loading={isLoading} pagination={false} />
+      <Table<Shift>
+        rowKey="id"
+        columns={shiftColumns}
+        dataSource={shifts}
+        loading={isLoading}
+        pagination={false}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无未来班次" /> }}
+      />
 
       <Modal
         title={editing ? '编辑班次' : '新建班次'}
         open={formOpen}
         onCancel={() => setFormOpen(false)}
         onOk={submitShiftForm}
+        okText={editing ? '保存修改' : '创建班次'}
+        cancelText="取消"
+        maskClosable={false}
         confirmLoading={createMutation.isPending || updateMutation.isPending}
-        destroyOnHidden
+        forceRender
       >
         <ConflictAlert lines={formConflicts} />
         <Form<ShiftFormValues> form={form} layout="vertical">
@@ -341,10 +358,24 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
             <Select options={memberOptions} showSearch optionFilterProp="label" optionRender={renderMemberOption} />
           </Form.Item>
           <Form.Item name="starts_at" label="开始时间" rules={[{ required: true, message: '请选择开始时间' }]}>
-            <DatePicker showTime style={{ width: '100%' }} />
+            <DatePicker
+              showTime={{ format: 'HH:mm' }}
+              format="YYYY-MM-DD HH:mm"
+              needConfirm={false}
+              placeholder="选择开始日期与时间"
+              style={{ width: '100%' }}
+              getPopupContainer={(trigger) => trigger.parentElement ?? document.body}
+            />
           </Form.Item>
           <Form.Item name="ends_at" label="结束时间" rules={[{ required: true, message: '请选择结束时间' }]}>
-            <DatePicker showTime style={{ width: '100%' }} />
+            <DatePicker
+              showTime={{ format: 'HH:mm' }}
+              format="YYYY-MM-DD HH:mm"
+              needConfirm={false}
+              placeholder="选择结束日期与时间"
+              style={{ width: '100%' }}
+              getPopupContainer={(trigger) => trigger.parentElement ?? document.body}
+            />
           </Form.Item>
         </Form>
       </Modal>
@@ -353,7 +384,8 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
         title="生成轮换班次"
         open={generateOpen}
         onCancel={() => setGenerateOpen(false)}
-        destroyOnHidden
+        maskClosable={false}
+        forceRender
         width={720}
         footer={[
           <Button key="cancel" onClick={() => setGenerateOpen(false)}>
@@ -385,7 +417,14 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
             <InputNumber min={1} addonAfter="分钟" style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="starts_at" label="起始时刻" rules={[{ required: true, message: '请选择起始时刻' }]}>
-            <DatePicker showTime style={{ width: '100%' }} />
+            <DatePicker
+              showTime={{ format: 'HH:mm' }}
+              format="YYYY-MM-DD HH:mm"
+              needConfirm={false}
+              placeholder="选择轮换开始日期与时间"
+              style={{ width: '100%' }}
+              getPopupContainer={(trigger) => trigger.parentElement ?? document.body}
+            />
           </Form.Item>
           <Form.Item name="rounds" label="周期数（成员完整轮换几轮）" rules={[{ required: true, message: '请输入周期数' }]}>
             <InputNumber min={1} style={{ width: '100%' }} />
@@ -403,6 +442,7 @@ function ShiftManagerDrawer({ schedule, onClose }: { schedule: Schedule; onClose
               dataSource={preview}
               pagination={false}
               size="small"
+              locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无预览班次" /> }}
             />
           </>
         )}
@@ -463,7 +503,7 @@ export function Schedules() {
               <Input />
             </Form.Item>
             <Form.Item name="timezone" label="时区（IANA，如 Asia/Shanghai）" initialValue="UTC">
-              <Input />
+              <TimezoneSelect />
             </Form.Item>
           </>
         )}

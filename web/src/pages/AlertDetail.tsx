@@ -9,6 +9,7 @@ import {
   Descriptions,
   Input,
   Modal,
+  Select,
   Space,
   Spin,
   Tag,
@@ -17,27 +18,22 @@ import {
   message,
 } from 'antd'
 import { ArrowLeftOutlined, CheckCircleOutlined, CloseCircleOutlined, EditOutlined } from '@ant-design/icons'
-import type { AlertStats, Severity, Status, TimelineAction } from '../api/client'
+import type { AlertStats, TimelineAction } from '../api/client'
 import {
   ApiError,
   ackAlert,
   addAlertNote,
   fetchAlertStats,
+  getAlertMapping,
   getAlertDetail,
   handoffAlert,
   resolveAlert,
 } from '../api/client'
 import { useNameMaps } from '../hooks/useNameMaps'
 import { LinkifiedText } from '../utils/linkify'
+import { QuietBadge, ResponseStateBadge, SeverityBadge, SourceStateBadge, SuppressionStateBadge } from '../components/AlertBadges'
 
 const { Title, Text } = Typography
-
-// severity/status 配色与文案直接复用 AlertList.tsx 的既有约定，保持列表页与
-// 详情页视觉一致，不重新定义一套。
-const severityColor: Record<Severity, string> = { critical: 'red', warning: 'orange', info: 'blue' }
-const severityLabel: Record<Severity, string> = { critical: '严重', warning: '警告', info: '提示' }
-const statusColor: Record<Status, string> = { firing: 'volcano', acknowledged: 'geekblue', resolved: 'green' }
-const statusLabel: Record<Status, string> = { firing: '未处理', acknowledged: '已认领', resolved: '已恢复' }
 
 const timelineActionLabel: Record<TimelineAction, string> = {
   ack: '认领',
@@ -49,6 +45,8 @@ const timelineActionLabel: Record<TimelineAction, string> = {
   notify_sent: '通知成功',
   notify_failed: '通知失败',
   note: '备注',
+  source_unknown: '来源状态待确认',
+  source_recovered: '来源同步恢复',
 }
 
 // note 的 dot 用 EditOutlined 灰色图标替代默认色点（见下方 Timeline items 的
@@ -63,6 +61,8 @@ const timelineActionColor: Record<TimelineAction, string> = {
   notify_sent: 'green',
   notify_failed: 'red',
   note: 'gray',
+  source_unknown: 'orange',
+  source_recovered: 'blue',
 }
 
 // resolve 的 reason 枚举对应 internal/domain/state.go 的 ResolveReason；stats 端点
@@ -193,11 +193,18 @@ function renderNoteDetail(detail: NoteDetail) {
   return <Text>{detail.note}</Text>
 }
 
+function renderGenericDetail(detail: Record<string, unknown>) {
+  if (typeof detail.response_time_seconds === 'number') {
+    return <Text type="secondary">响应耗时 {formatDuration(detail.response_time_seconds)}</Text>
+  }
+  return <Text type="secondary">操作详情已记录</Text>
+}
+
 export function AlertDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { teamName, userName } = useNameMaps()
+  const { teamName, userName, users, isDirectoryLoading } = useNameMaps()
   const [messageApi, contextHolder] = message.useMessage()
   const [handoffOpen, setHandoffOpen] = useState(false)
   const [handoffTarget, setHandoffTarget] = useState('')
@@ -208,6 +215,7 @@ export function AlertDetail() {
 
   const detailQueryKey = ['alert-detail', id]
   const statsQueryKey = ['alert-stats', id]
+  const mappingQueryKey = ['alert-mapping', id]
 
   // 15s 轮询：SSE（useAlertEvents）负责秒级推送 invalidate，这里是断线兜底
   // （二者叠加不冲突）。噪声画像 stats query 不加轮询——统计变化慢，靠 SSE
@@ -228,6 +236,19 @@ export function AlertDetail() {
   } = useQuery<AlertStats>({
     queryKey: statsQueryKey,
     queryFn: () => fetchAlertStats(id!),
+    enabled: !!id,
+  })
+
+  const { data: mapping } = useQuery({
+    queryKey: mappingQueryKey,
+    queryFn: async () => {
+      try {
+        return await getAlertMapping(id!)
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null
+        throw error
+      }
+    },
     enabled: !!id,
   })
 
@@ -301,32 +322,35 @@ export function AlertDetail() {
   }
 
   const { alert, timeline, recent_changes: recentChanges } = data
-  const isFiring = alert.status === 'firing'
-  const isResolved = alert.status === 'resolved'
-  const isSilenced = !!alert.silenced_by && alert.silenced_by.length > 0
+  const isFiring = alert.source_state !== 'resolved' && alert.response_state === 'unacknowledged'
+  const isResolved = alert.source_state === 'resolved'
+  const isSuppressed = alert.suppression_state !== 'none'
   const annotations = extractAnnotations(alert.signal_context)
 
   return (
-    <div style={{ padding: 24, maxWidth: 1000, margin: '0 auto' }}>
+    <div className="alert-detail-page">
       {contextHolder}
-      <Space style={{ marginBottom: 16 }}>
-        <Button icon={<ArrowLeftOutlined />} onClick={() => navigate(-1)}>
-          返回
-        </Button>
-      </Space>
+      <Button className="alert-detail-back" type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate(-1)}>
+        返回告警工作台
+      </Button>
+
+      <div className="alert-detail-grid">
+        <main className="alert-detail-main">
 
       {/* 顶部信息密度：状态/等级/资源/去重计数/静默标识一屏可见（对齐 PagerTree） */}
-      <Card style={{ marginBottom: 16 }}>
+      <Card className="alert-detail-card alert-hero-card">
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Space wrap size={8}>
-            <Tag color={severityColor[alert.severity]}>{severityLabel[alert.severity]}</Tag>
-            <Tag color={statusColor[alert.status]}>{statusLabel[alert.status]}</Tag>
-            {isSilenced && <Tag>已静默</Tag>}
-            {alert.flapping && <Tag color="gold">抖动中</Tag>}
-            <Title level={4} style={{ margin: 0 }}>
-              {alert.title}
-            </Title>
+            <SeverityBadge severity={alert.severity} />
+            <SourceStateBadge state={alert.source_state} />
+            <ResponseStateBadge state={alert.response_state} />
+            {isSuppressed && <SuppressionStateBadge state={alert.suppression_state} />}
+            {alert.flapping && <QuietBadge label="抖动中" />}
           </Space>
+          <Title level={3} className="alert-hero-title">{alert.title}</Title>
+          <Text className="alert-hero-meta">
+            {alert.source} · 首次出现 {new Date(alert.starts_at).toLocaleString()}
+          </Text>
 
           <Descriptions size="small" column={2} bordered>
             <Descriptions.Item label="来源">{alert.source}</Descriptions.Item>
@@ -340,6 +364,7 @@ export function AlertDetail() {
                 {Object.entries(alert.resource_ref).map(([k, v]) => (
                   <Tag key={k}>{`${k}=${v}`}</Tag>
                 ))}
+                {Object.keys(alert.resource_ref).length === 0 && <Text type="secondary">暂无关联资源</Text>}
               </Space>
             </Descriptions.Item>
             <Descriptions.Item label="标签" span={2}>
@@ -347,6 +372,7 @@ export function AlertDetail() {
                 {Object.entries(alert.labels).map(([k, v]) => (
                   <Tag key={k}>{`${k}=${v}`}</Tag>
                 ))}
+                {Object.keys(alert.labels).length === 0 && <Text type="secondary">暂无标签</Text>}
               </Space>
             </Descriptions.Item>
             {Object.keys(annotations).length > 0 && (
@@ -363,33 +389,11 @@ export function AlertDetail() {
             )}
           </Descriptions>
 
-          {/* 处置按钮：按状态联动可用性——firing 全可用；acknowledged 只剩
-              resolve/handoff；resolved 全部禁用（幂等操作允许重复点但无意义，
-              这里直接禁用避免用户误以为还能操作）。备注不受状态限制——事后
-              补记是合法场景（R3.3），任何状态下都可用。 */}
-          <Space>
-            <Button onClick={() => ackMutation.mutate()} disabled={!isFiring} loading={ackMutation.isPending}>
-              认领
-            </Button>
-            <Button
-              onClick={() => setResolveOpen(true)}
-              disabled={isResolved}
-              loading={resolveMutation.isPending}
-            >
-              恢复
-            </Button>
-            <Button onClick={() => setHandoffOpen(true)} disabled={isResolved}>
-              移交
-            </Button>
-            <Button icon={<EditOutlined />} onClick={() => setNoteOpen(true)}>
-              备注
-            </Button>
-          </Space>
         </Space>
       </Card>
 
       {/* 噪声画像（ui-enrichment C1）：独立 query，失败不影响详情页主体渲染。 */}
-      <Card title="噪声画像" style={{ marginBottom: 16 }} loading={statsLoading}>
+      <Card className="alert-detail-card" title="告警频率与历史" loading={statsLoading}>
         {statsError ? (
           <AntAlert type="warning" showIcon message="噪声画像加载失败" />
         ) : (
@@ -424,11 +428,11 @@ export function AlertDetail() {
 
       {alert.signal_context != null && (
         <Collapse
-          style={{ marginBottom: 16 }}
+          className="alert-detail-card"
           items={[
             {
               key: 'signal_context',
-              label: '原始信号上下文（signal_context）',
+              label: '查看原始信号',
               children: (
                 <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                   {JSON.stringify(alert.signal_context, null, 2)}
@@ -439,7 +443,7 @@ export function AlertDetail() {
         />
       )}
 
-      <Card title="时间线" style={{ marginBottom: 16 }}>
+      <Card className="alert-detail-card" title="处置时间线">
         {timeline.length === 0 ? (
           <Text type="secondary">暂无记录</Text>
         ) : (
@@ -448,11 +452,11 @@ export function AlertDetail() {
               color: timelineActionColor[entry.action],
               dot: entry.action === 'note' ? <EditOutlined style={{ color: '#8c8c8c' }} /> : undefined,
               children: (
-                <Space direction="vertical" size={0}>
-                  <Text strong>
-                    {entry.actor} · {timelineActionLabel[entry.action]}
-                  </Text>
-                  <Text type="secondary">{new Date(entry.at).toLocaleString()}</Text>
+                <div className="timeline-entry">
+                  <div className="timeline-entry__head">
+                    <Text strong>{entry.actor} · {timelineActionLabel[entry.action]}</Text>
+                    <Text type="secondary">{new Date(entry.at).toLocaleString()}</Text>
+                  </div>
                   {entry.action === 'notify_sent' || entry.action === 'notify_failed' ? (
                     renderNotifyDetail(entry.action, (entry.detail ?? {}) as NotifyDetail)
                   ) : entry.action === 'handoff' ? (
@@ -464,17 +468,17 @@ export function AlertDetail() {
                   ) : (
                     entry.detail &&
                     Object.keys(entry.detail).length > 0 && (
-                      <Text type="secondary">{JSON.stringify(entry.detail)}</Text>
+                      renderGenericDetail(entry.detail)
                     )
                   )}
-                </Space>
+                </div>
               ),
             }))}
           />
         )}
       </Card>
 
-      <Card title="最近变更（关联资源/CMDB）">
+      <Card className="alert-detail-card" title="关联资源的最近变更">
         {recentChanges.length === 0 ? (
           <Text type="secondary">暂无记录</Text>
         ) : (
@@ -497,20 +501,89 @@ export function AlertDetail() {
           </Space>
         )}
       </Card>
+        </main>
+
+        <aside className="alert-detail-aside">
+          <Card className="alert-detail-card alert-action-panel" title="处置操作">
+            <div className="alert-action-panel__buttons">
+              <Button
+                type={isFiring ? 'primary' : 'default'}
+                onClick={() => ackMutation.mutate()}
+                disabled={!isFiring}
+                loading={ackMutation.isPending}
+              >
+                认领告警
+              </Button>
+              <Button onClick={() => setResolveOpen(true)} disabled={isResolved || alert.authoritative} loading={resolveMutation.isPending}>
+                标记恢复
+              </Button>
+              <Button onClick={() => setHandoffOpen(true)} disabled={isResolved}>
+                移交处理
+              </Button>
+              <Button icon={<EditOutlined />} onClick={() => setNoteOpen(true)}>
+                添加备注
+              </Button>
+            </div>
+          </Card>
+
+          <Card className="alert-detail-card" title="故障映射">
+            {!mapping ? (
+              <Text type="secondary">尚未产生映射结果</Text>
+            ) : (
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Tag color={mapping.status === 'mapped' ? 'success' : mapping.status === 'conflict' ? 'error' : 'warning'}>
+                  {mapping.status === 'mapped' ? '已映射' : mapping.status === 'conflict' ? '身份冲突' : '待治理'}
+                </Tag>
+                <Text>{mapping.explanation}</Text>
+                {mapping.entity_key && <Text code>{mapping.entity_key}</Text>}
+                {mapping.policy_name && <Text type="secondary">策略：{mapping.policy_name}</Text>}
+                {mapping.fault_id && <Button block onClick={() => navigate(`/faults/${mapping.fault_id}`)}>打开故障工作区</Button>}
+              </Space>
+            )}
+          </Card>
+
+          <Card className="alert-detail-card" title="责任与状态">
+            <Descriptions size="small" column={1} colon={false}>
+              <Descriptions.Item label="责任团队">{teamName(alert.team_id)}</Descriptions.Item>
+              <Descriptions.Item label="当前处理人">{userName(alert.acked_by)}</Descriptions.Item>
+              <Descriptions.Item label="来源状态"><SourceStateBadge state={alert.source_state} /></Descriptions.Item>
+              <Descriptions.Item label="响应状态"><ResponseStateBadge state={alert.response_state} /></Descriptions.Item>
+              <Descriptions.Item label="抑制状态"><SuppressionStateBadge state={alert.suppression_state} /></Descriptions.Item>
+              <Descriptions.Item label="最近对账">{alert.last_reconciled_at ? new Date(alert.last_reconciled_at).toLocaleString() : '尚未对账'}</Descriptions.Item>
+              <Descriptions.Item label="重复次数">{alert.dedup_count} 次</Descriptions.Item>
+              <Descriptions.Item label="最近出现">{new Date(alert.last_seen_at).toLocaleString()}</Descriptions.Item>
+            </Descriptions>
+          </Card>
+        </aside>
+      </div>
 
       <Modal
-        title="移交告警"
+        title="移交处理人"
         open={handoffOpen}
-        onCancel={() => setHandoffOpen(false)}
+        onCancel={() => { setHandoffOpen(false); setHandoffTarget('') }}
         onOk={() => handoffMutation.mutate(handoffTarget)}
+        okText="确认移交"
+        cancelText="取消"
         confirmLoading={handoffMutation.isPending}
         okButtonProps={{ disabled: handoffTarget.trim() === '' }}
       >
-        <Input
-          placeholder="移交目标（用户名/团队标识）"
+        <Text strong style={{ display: 'block', marginBottom: 6 }}>移交给</Text>
+        <Select
+          showSearch
+          virtual={false}
+          optionFilterProp="label"
+          placeholder="选择移交处理人"
+          aria-label="选择移交处理人"
+          loading={isDirectoryLoading}
+          notFoundContent={isDirectoryLoading ? '正在加载成员…' : '没有可移交的成员'}
+          options={users.map((user) => ({ value: user.id, label: user.display_name }))}
           value={handoffTarget}
-          onChange={(e) => setHandoffTarget(e.target.value)}
+          onChange={setHandoffTarget}
+          style={{ width: '100%' }}
         />
+        <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+          仅可移交给已登记成员；团队归属由告警路由负责，不在此处改写。
+        </Text>
       </Modal>
 
       <Modal
@@ -518,6 +591,8 @@ export function AlertDetail() {
         open={resolveOpen}
         onCancel={() => setResolveOpen(false)}
         onOk={() => resolveMutation.mutate(resolveNote)}
+        okText="确认恢复"
+        cancelText="取消"
         confirmLoading={resolveMutation.isPending}
       >
         <Input.TextArea
@@ -535,6 +610,8 @@ export function AlertDetail() {
         open={noteOpen}
         onCancel={() => setNoteOpen(false)}
         onOk={() => noteMutation.mutate(noteText)}
+        okText="保存备注"
+        cancelText="取消"
         confirmLoading={noteMutation.isPending}
         okButtonProps={{ disabled: noteText.trim() === '' }}
       >

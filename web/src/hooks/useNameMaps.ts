@@ -46,5 +46,11 @@ export function useNameMaps() {
     return userMap.get(id) ?? fallbackName(id)
   }
 
-  return { teamName, userName }
+  return {
+    teamName,
+    userName,
+    teams: teamsQuery.data ?? [],
+    users: usersQuery.data ?? [],
+    isDirectoryLoading: teamsQuery.isLoading || usersQuery.isLoading,
+  }
 }

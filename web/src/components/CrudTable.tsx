@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Alert as AntAlert, Button, Form, Modal, Popconfirm, Space, Table, message } from 'antd'
+import { Alert as AntAlert, Button, Empty, Form, Modal, Popconfirm, Space, Table, message } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { PlusOutlined } from '@ant-design/icons'
 import { ApiError } from '../api/client'
@@ -126,6 +126,8 @@ export function CrudTable<T extends { id: string }, TFormValues extends object>(
           {updateFn && <a onClick={() => openEdit(record)}>编辑</a>}
           <Popconfirm
             title={deleteConfirmTitle ?? `确认删除该${resourceLabel}？`}
+            okText="确认删除"
+            cancelText="取消"
             onConfirm={() => deleteMutation.mutate(record.id)}
           >
             <a style={{ color: '#ff4d4f' }}>删除</a>
@@ -136,16 +138,16 @@ export function CrudTable<T extends { id: string }, TFormValues extends object>(
   ]
 
   return (
-    <div>
+    <section className="resource-surface">
       {contextHolder}
-      <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Space>{extraToolbar}</Space>
+      <div className="resource-toolbar">
+        <Space>{extraToolbar ?? <span className="resource-toolbar__hint">配置变更保存后立即生效</span>}</Space>
         {createFn && (
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             新建{resourceLabel}
           </Button>
         )}
-      </Space>
+      </div>
 
       {error && (
         <AntAlert
@@ -156,7 +158,22 @@ export function CrudTable<T extends { id: string }, TFormValues extends object>(
         />
       )}
 
-      <Table<T> rowKey="id" columns={allColumns} dataSource={data ?? []} loading={isLoading} pagination={false} />
+      <Table<T>
+        rowKey="id"
+        columns={allColumns}
+        dataSource={data ?? []}
+        loading={isLoading}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+        locale={{
+          emptyText: (
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description={`还没有${resourceLabel}，可从右上角开始创建`}
+            />
+          ),
+        }}
+      />
 
       <Modal
         title={editing ? `编辑${resourceLabel}` : `新建${resourceLabel}`}
@@ -164,12 +181,15 @@ export function CrudTable<T extends { id: string }, TFormValues extends object>(
         onCancel={() => setModalOpen(false)}
         onOk={handleSubmit}
         confirmLoading={createMutation.isPending || updateMutation.isPending}
+        width={720}
+        okText={editing ? '保存修改' : `创建${resourceLabel}`}
+        cancelText="取消"
         destroyOnHidden
       >
         <Form<TFormValues> form={form} layout="vertical">
           {renderFields(editing)}
         </Form>
       </Modal>
-    </div>
+    </section>
   )
 }

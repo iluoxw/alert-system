@@ -34,11 +34,13 @@ export function MatchersEditor({ value, onChange }: MatchersEditorProps) {
         <Space key={index}>
           <Input
             placeholder="标签名"
+            aria-label={`第 ${index + 1} 个匹配条件的标签名`}
             style={{ width: 140 }}
             value={row.name}
             onChange={(e) => updateRow(index, { name: e.target.value })}
           />
           <Select<MatchOp>
+            aria-label={`第 ${index + 1} 个匹配条件的运算符`}
             style={{ width: 130 }}
             value={row.op}
             options={opOptions}
@@ -46,15 +48,22 @@ export function MatchersEditor({ value, onChange }: MatchersEditorProps) {
           />
           <Input
             placeholder="标签值/正则"
+            aria-label={`第 ${index + 1} 个匹配条件的标签值`}
             style={{ width: 160 }}
             value={row.value}
             onChange={(e) => updateRow(index, { value: e.target.value })}
           />
-          <MinusCircleOutlined onClick={() => removeRow(index)} />
+          <Button
+            type="text"
+            danger
+            icon={<MinusCircleOutlined />}
+            onClick={() => removeRow(index)}
+            aria-label={`删除第 ${index + 1} 个匹配条件`}
+          />
         </Space>
       ))}
       <Button type="dashed" icon={<PlusOutlined />} onClick={addRow}>
-        添加 matcher
+        添加匹配条件
       </Button>
     </Space>
   )

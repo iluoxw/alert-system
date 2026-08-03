@@ -5,6 +5,7 @@ import { CrudTable } from '../components/CrudTable'
 import { MatchersEditor } from '../components/MatchersEditor'
 import type { MatcherSet, Silence } from '../api/client'
 import { createSilence, deleteSilence, listSilences } from '../api/client'
+import { useNameMaps } from '../hooks/useNameMaps'
 
 const { RangePicker } = DatePicker
 
@@ -17,18 +18,21 @@ interface SilenceFormValues {
 }
 
 export function Silences() {
+  const { userName } = useNameMaps()
   const columns: ColumnsType<Silence> = [
     {
       title: '状态',
       key: 'active',
       width: 90,
       render: (_, record) => {
-        const active = dayjs().isAfter(record.starts_at) && dayjs().isBefore(record.ends_at)
-        return active ? <Tag color="green">生效中</Tag> : <Tag>已过期</Tag>
+        const now = dayjs()
+        if (now.isBefore(record.starts_at)) return <Tag color="blue">待生效</Tag>
+        if (now.isBefore(record.ends_at)) return <Tag color="green">生效中</Tag>
+        return <Tag>已过期</Tag>
       },
     },
     {
-      title: 'matchers',
+      title: '匹配条件',
       dataIndex: 'matchers',
       key: 'matchers',
       render: (matchers: MatcherSet) => matchers.map((m) => `${m.name}${m.op}${m.value}`).join(', '),
@@ -39,7 +43,7 @@ export function Silences() {
       render: (_, record) =>
         `${new Date(record.starts_at).toLocaleString()} ~ ${new Date(record.ends_at).toLocaleString()}`,
     },
-    { title: '创建人', dataIndex: 'created_by', key: 'created_by', width: 120 },
+    { title: '创建人', dataIndex: 'created_by', key: 'created_by', width: 120, render: (id: string) => userName(id) },
     { title: '备注', dataIndex: 'comment', key: 'comment', ellipsis: true },
   ]
 
@@ -65,15 +69,16 @@ export function Silences() {
         <>
           <Form.Item
             name="matchers"
-            label="matchers（命中该规则的告警会被静默，不能为空）"
+            label="匹配条件"
+            extra="同时满足以下条件的告警将在指定时间内暂停通知。"
             rules={[{ required: true, validator: async (_, v: MatcherSet) => {
-              if (!v || v.length === 0) throw new Error('matchers 不能为空')
+              if (!v || v.length === 0) throw new Error('请至少添加一个匹配条件')
             } }]}
           >
             <MatchersEditor />
           </Form.Item>
           <Form.Item name="range" label="生效时间窗" rules={[{ required: true, message: '请选择生效时间窗' }]}>
-            <RangePicker showTime style={{ width: '100%' }} />
+            <RangePicker showTime style={{ width: '100%' }} placeholder={['开始时间', '结束时间']} />
           </Form.Item>
           <Form.Item name="comment" label="备注">
             <Input.TextArea rows={2} />

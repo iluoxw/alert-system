@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Button, Drawer, Form, Input, Modal, Popconfirm, Select, Space, Table, message } from 'antd'
+import { Button, Drawer, Empty, Form, Input, Modal, Popconfirm, Select, Space, Table, message } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { CrudTable } from '../../components/CrudTable'
 import type { Member, Team, TeamRequest } from '../../api/client'
@@ -19,8 +19,8 @@ import {
 } from '../../api/client'
 
 const roleOptions = [
-  { value: 'admin', label: 'admin' },
-  { value: 'member', label: 'member' },
+  { value: 'admin', label: '团队管理员' },
+  { value: 'member', label: '成员' },
 ]
 
 // TeamMembersDrawer 是团队行「成员」操作打开的抽屉：成员列表 + 添加/改角色/移除，
@@ -54,7 +54,11 @@ function TeamMembersDrawer({
   const memberUserIds = new Set(members.map((m) => m.user_id))
   const userOptions = (usersData ?? [])
     .filter((u) => !memberUserIds.has(u.id))
-    .map((u) => ({ value: u.id, label: u.display_name }))
+    .map((u) => ({
+      value: u.id,
+      label: `${u.display_name || u.username}（${u.username}）`,
+      searchText: `${u.display_name} ${u.username}`,
+    }))
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: membersKey })
 
@@ -116,7 +120,8 @@ function TeamMembersDrawer({
         <Select
           value={role}
           options={roleOptions}
-          style={{ width: 120 }}
+          style={{ width: 136 }}
+          aria-label={`调整 ${record.display_name || record.username} 的角色`}
           onChange={(next: 'admin' | 'member') =>
             confirmIfSelfDemote(record, next !== 'admin', () =>
               updateRoleMutation.mutate({ userId: record.user_id, role: next }),
@@ -132,6 +137,8 @@ function TeamMembersDrawer({
       render: (_: unknown, record: Member) => (
         <Popconfirm
           title="确认移除该成员？"
+          okText="确认移除"
+          cancelText="取消"
           onConfirm={() => confirmIfSelfDemote(record, true, () => removeMutation.mutate(record.user_id))}
         >
           <a style={{ color: '#ff4d4f' }}>移除</a>
@@ -141,19 +148,26 @@ function TeamMembersDrawer({
   ]
 
   return (
-    <Drawer title={`团队成员：${teamName}`} open onClose={onClose} width={520} destroyOnHidden>
+    <Drawer title={`团队成员 · ${teamName}`} open onClose={onClose} width={680} destroyOnHidden>
       {contextHolder}
-      <Space style={{ marginBottom: 16 }}>
+      <Space wrap style={{ marginBottom: 16 }}>
         <Select
           placeholder="选择要添加的用户"
-          style={{ width: 220 }}
+          style={{ width: 300 }}
           options={userOptions}
           value={addingUserId}
           onChange={setAddingUserId}
           showSearch
-          optionFilterProp="label"
+          filterOption={(input, option) => String(option?.searchText ?? '').toLowerCase().includes(input.toLowerCase())}
+          aria-label="选择要添加的用户"
         />
-        <Select value={addingRole} options={roleOptions} style={{ width: 100 }} onChange={setAddingRole} />
+        <Select
+          value={addingRole}
+          options={roleOptions}
+          style={{ width: 136 }}
+          onChange={setAddingRole}
+          aria-label="新成员角色"
+        />
         <Button
           type="primary"
           disabled={!addingUserId}
@@ -163,7 +177,15 @@ function TeamMembersDrawer({
           添加
         </Button>
       </Space>
-      <Table<Member> rowKey="user_id" columns={columns} dataSource={members} loading={isLoading} pagination={false} />
+      <Table<Member>
+        rowKey="user_id"
+        columns={columns}
+        dataSource={members}
+        loading={isLoading}
+        pagination={false}
+        scroll={{ x: 560 }}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="团队还没有成员" /> }}
+      />
     </Drawer>
   )
 }

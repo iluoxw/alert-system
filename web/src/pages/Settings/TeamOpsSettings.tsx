@@ -1,25 +1,33 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Alert as AntAlert, Button, Form, Input, InputNumber, Select, Space, Switch, TimePicker, message } from 'antd'
-import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
+import {
+  Alert as AntAlert,
+  Button,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Select,
+  Spin,
+  Switch,
+  TimePicker,
+  message,
+} from 'antd'
+import { TimezoneSelect } from '../../components/TimezoneSelect'
+import {
+  BellOutlined,
+  CalendarOutlined,
+  DeleteOutlined,
+  GlobalOutlined,
+  PlusOutlined,
+  RadarChartOutlined,
+} from '@ant-design/icons'
 import dayjs from 'dayjs'
 import type { Dayjs } from 'dayjs'
 import { ApiError } from '../../api/client'
 import type { OpsChannelTarget, OpsSettingsRequest } from '../../api/client'
 import { getOpsSettings, listTeams, updateOpsSettings } from '../../api/client'
 
-// TeamOpsSettings 是「运营任务」设置 tab（ops-enhancements 任务 12，R2 配置入口）：
-// 按团队维度配置日报/陈旧告警清扫/值班播报三个周期任务与共用通知渠道，对接
-// internal/api/ops_settings.go 的 GET/PUT 端点。这里不是 CrudTable 的列表+弹窗
-// 模式（每个团队只有一条配置，不是多条记录的增删改查），而是"选团队→加载单条
-// 配置→编辑→整体保存"的表单页。
-//
-// PUT 是全量替换语义（后端不补默认、不接受部分字段），所以表单必须先由 GET 结果
-// 完整初始化，保存时把所有字段原样带上——不能只提交用户改动过的字段。
-
-// 表单内部形状：时刻字段用 TimePicker 产出的 dayjs 对象，提交前转换成 HH:mm
-// 字符串（与 Silences.tsx 的 range 字段处理方式一致，转换只发生在提交/回显边界，
-// 表单内部不做隐式的 getValueProps/normalize）。
 interface OpsSettingsFormValues {
   timezone: string
   daily_report_enabled: boolean
@@ -31,14 +39,26 @@ interface OpsSettingsFormValues {
   channels: OpsChannelTarget[]
 }
 
+const channelOptions = [
+  { value: 'lark', label: '飞书应用机器人' },
+  { value: 'lark_webhook', label: '飞书群机器人 Webhook' },
+  { value: 'webhook', label: 'Webhook' },
+  { value: 'email', label: '邮件' },
+]
+
 export function TeamOpsSettings() {
   const [teamId, setTeamId] = useState<string | undefined>()
+  const [dirty, setDirty] = useState(false)
   const [form] = Form.useForm<OpsSettingsFormValues>()
-  const [messageApi, contextHolder] = message.useMessage()
+  const [messageApi, messageContextHolder] = message.useMessage()
+  const [modal, modalContextHolder] = Modal.useModal()
   const queryClient = useQueryClient()
 
-  const { data: teamsData } = useQuery({ queryKey: ['admin', 'teams'], queryFn: async () => (await listTeams()).teams })
-  const teamOptions = (teamsData ?? []).map((t) => ({ value: t.id, label: t.name }))
+  const { data: teamsData, isLoading: teamsLoading } = useQuery({
+    queryKey: ['admin', 'teams'],
+    queryFn: async () => (await listTeams()).teams,
+  })
+  const teamOptions = (teamsData ?? []).map((team) => ({ value: team.id, label: team.name }))
 
   const queryKey = ['admin', 'ops-settings', teamId]
   const { data, isLoading, isFetching, error } = useQuery({
@@ -46,6 +66,10 @@ export function TeamOpsSettings() {
     queryFn: () => getOpsSettings(teamId!),
     enabled: !!teamId,
   })
+
+  const dailyReportEnabled = Form.useWatch('daily_report_enabled', form)
+  const staleSweepEnabled = Form.useWatch('stale_sweep_enabled', form)
+  const oncallBroadcastEnabled = Form.useWatch('oncall_broadcast_enabled', form)
 
   useEffect(() => {
     if (!data) return
@@ -59,16 +83,46 @@ export function TeamOpsSettings() {
       oncall_broadcast_time: dayjs(data.oncall_broadcast_time, 'HH:mm'),
       channels: data.channels,
     })
+    setDirty(false)
   }, [data, form])
+
+  useEffect(() => {
+    if (!dirty) return
+    const preventAccidentalExit = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', preventAccidentalExit)
+    return () => window.removeEventListener('beforeunload', preventAccidentalExit)
+  }, [dirty])
 
   const saveMutation = useMutation({
     mutationFn: (values: OpsSettingsRequest) => updateOpsSettings(teamId!, values),
     onSuccess: (saved) => {
-      messageApi.success('运营任务配置已保存')
+      messageApi.success('周期任务配置已保存')
       queryClient.setQueryData(queryKey, saved)
+      setDirty(false)
     },
-    onError: (err) => messageApi.error(err instanceof ApiError ? err.message : '保存运营任务配置失败'),
+    onError: (err) => messageApi.error(err instanceof ApiError ? err.message : '保存周期任务配置失败'),
   })
+
+  const selectTeam = (nextTeamId: string) => {
+    if (!dirty) {
+      setTeamId(nextTeamId)
+      return
+    }
+    modal.confirm({
+      title: '放弃未保存的修改？',
+      content: '切换团队会重新加载该团队的周期任务配置。',
+      okText: '放弃并切换',
+      cancelText: '继续编辑',
+      okButtonProps: { danger: true },
+      onOk: () => {
+        setDirty(false)
+        setTeamId(nextTeamId)
+      },
+    })
+  }
 
   const handleSave = async () => {
     const values = await form.validateFields()
@@ -85,117 +139,198 @@ export function TeamOpsSettings() {
   }
 
   return (
-    <div>
-      {contextHolder}
-      <Select
-        placeholder="选择团队"
-        style={{ width: 240, marginBottom: 16 }}
-        options={teamOptions}
-        value={teamId}
-        onChange={setTeamId}
-        showSearch
-        optionFilterProp="label"
-      />
+    <div className="resource-surface team-ops-settings">
+      {messageContextHolder}
+      {modalContextHolder}
 
-      {!teamId && <AntAlert type="info" message="请先选择要配置的团队" />}
+      <div className="team-context-bar">
+        <div>
+          <span className="team-context-bar__label">配置范围</span>
+          <strong>选择责任团队</strong>
+          <p>任务按团队独立运行，不会影响其他服务负责人。</p>
+        </div>
+        <Select
+          placeholder="选择团队"
+          options={teamOptions}
+          value={teamId}
+          onChange={selectTeam}
+          loading={teamsLoading}
+          showSearch
+          optionFilterProp="label"
+          virtual={false}
+          aria-label="选择要配置的团队"
+          className="team-context-bar__select"
+        />
+      </div>
+
+      {!teamId && (
+        <div className="settings-empty-state" role="status">
+          <CalendarOutlined />
+          <strong>先选择一个团队</strong>
+          <span>随后可以查看并编辑日报、清扫和值班播报。</span>
+        </div>
+      )}
 
       {error && (
         <AntAlert
           type="error"
-          message="加载运营任务配置失败"
+          showIcon
+          message="加载周期任务配置失败"
           description={error instanceof Error ? error.message : String(error)}
-          style={{ marginBottom: 16 }}
         />
       )}
 
+      {teamId && (isLoading || (isFetching && !data)) && (
+        <div className="settings-loading-state" aria-label="正在加载周期任务配置">
+          <Spin />
+        </div>
+      )}
+
       {teamId && data && (
-        <Form<OpsSettingsFormValues> form={form} layout="vertical" disabled={isLoading || isFetching} style={{ maxWidth: 480 }}>
-          <Form.Item name="timezone" label="时区（IANA 名称）" rules={[{ required: true, message: '请输入时区' }]}>
-            <Input placeholder="Asia/Shanghai" />
-          </Form.Item>
+        <Form<OpsSettingsFormValues>
+          form={form}
+          layout="vertical"
+          disabled={isLoading || isFetching}
+          className="team-ops-settings__form"
+          onValuesChange={() => setDirty(true)}
+        >
+          <section className="settings-form-section" aria-labelledby="ops-basics-title">
+            <div className="settings-form-section__heading">
+              <GlobalOutlined />
+              <div>
+                <h3 id="ops-basics-title">基础配置</h3>
+                <p>所有计划时刻都以团队时区计算。</p>
+              </div>
+            </div>
+            <Form.Item name="timezone" label="团队时区" rules={[{ required: true, message: '请选择 IANA 时区' }]}>
+              <TimezoneSelect aria-label="团队时区（IANA 名称）" />
+            </Form.Item>
+          </section>
 
-          <Form.Item label="日报">
-            <Space align="start">
-              <Form.Item name="daily_report_enabled" valuePropName="checked" noStyle>
-                <Switch />
-              </Form.Item>
-              <Form.Item
-                name="daily_report_time"
-                rules={[{ required: true, message: '请选择日报发送时刻' }]}
-                noStyle
-              >
-                <TimePicker format="HH:mm" />
-              </Form.Item>
-            </Space>
-          </Form.Item>
+          <section className="settings-form-section" aria-labelledby="ops-jobs-title">
+            <div className="settings-form-section__heading">
+              <RadarChartOutlined />
+              <div>
+                <h3 id="ops-jobs-title">任务计划</h3>
+                <p>启用任务后再配置运行时刻或扫描间隔。</p>
+              </div>
+            </div>
 
-          <Form.Item label="陈旧告警清扫">
-            <Space align="start">
-              <Form.Item name="stale_sweep_enabled" valuePropName="checked" noStyle>
-                <Switch />
+            <div className={`automation-task-row${dailyReportEnabled ? ' is-enabled' : ''}`}>
+              <div className="automation-task-row__identity">
+                <strong>运行日报</strong>
+                <span>汇总团队告警、Fault 和 Incident 进展。</span>
+              </div>
+              <div className="automation-task-row__toggle">
+                <Form.Item name="daily_report_enabled" valuePropName="checked" noStyle>
+                  <Switch aria-label="启用运行日报" />
+                </Form.Item>
+                <span>{dailyReportEnabled ? '已启用' : '已停用'}</span>
+              </div>
+              <Form.Item name="daily_report_time" label="发送时间" rules={[{ required: true, message: '请选择日报发送时间' }]}>
+                <TimePicker format="HH:mm" disabled={!dailyReportEnabled} aria-label="运行日报发送时间" />
               </Form.Item>
+            </div>
+
+            <div className={`automation-task-row${staleSweepEnabled ? ' is-enabled' : ''}`}>
+              <div className="automation-task-row__identity">
+                <strong>陈旧告警清扫</strong>
+                <span>扫描长期未确认的关键告警并重新提醒。</span>
+              </div>
+              <div className="automation-task-row__toggle">
+                <Form.Item name="stale_sweep_enabled" valuePropName="checked" noStyle>
+                  <Switch aria-label="启用陈旧告警清扫" />
+                </Form.Item>
+                <span>{staleSweepEnabled ? '已启用' : '已停用'}</span>
+              </div>
               <Form.Item
                 name="stale_sweep_interval_seconds"
+                label="扫描间隔"
                 rules={[
                   { required: true, message: '请输入扫描间隔' },
                   { type: 'number', min: 60, message: '扫描间隔不能小于 60 秒' },
                 ]}
-                noStyle
               >
-                <InputNumber min={60} addonAfter="秒" />
+                <InputNumber min={60} addonAfter="秒" disabled={!staleSweepEnabled} aria-label="陈旧告警扫描间隔（秒）" />
               </Form.Item>
-            </Space>
-          </Form.Item>
+            </div>
 
-          <Form.Item label="值班播报">
-            <Space align="start">
-              <Form.Item name="oncall_broadcast_enabled" valuePropName="checked" noStyle>
-                <Switch />
+            <div className={`automation-task-row${oncallBroadcastEnabled ? ' is-enabled' : ''}`}>
+              <div className="automation-task-row__identity">
+                <strong>值班播报</strong>
+                <span>把当前值班人员和交接信息发送到团队渠道。</span>
+              </div>
+              <div className="automation-task-row__toggle">
+                <Form.Item name="oncall_broadcast_enabled" valuePropName="checked" noStyle>
+                  <Switch aria-label="启用值班播报" />
+                </Form.Item>
+                <span>{oncallBroadcastEnabled ? '已启用' : '已停用'}</span>
+              </div>
+              <Form.Item name="oncall_broadcast_time" label="播报时间" rules={[{ required: true, message: '请选择值班播报时间' }]}>
+                <TimePicker format="HH:mm" disabled={!oncallBroadcastEnabled} aria-label="值班播报时间" />
               </Form.Item>
-              <Form.Item
-                name="oncall_broadcast_time"
-                rules={[{ required: true, message: '请选择值班播报时刻' }]}
-                noStyle
-              >
-                <TimePicker format="HH:mm" />
-              </Form.Item>
-            </Space>
-          </Form.Item>
+            </div>
+          </section>
 
-          <Form.Item label="通知渠道（三个周期任务共用，后端会校验 kind 是否已注册）">
+          <section className="settings-form-section" aria-labelledby="ops-channels-title">
+            <div className="settings-form-section__heading">
+              <BellOutlined />
+              <div>
+                <h3 id="ops-channels-title">投递目标</h3>
+                <p>三个周期任务共用这些通知渠道，可配置多个目标。</p>
+              </div>
+            </div>
             <Form.List name="channels">
               {(fields, { add, remove }) => (
-                <>
-                  {fields.map((field) => (
-                    <Space key={field.key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                <div className="channel-target-list">
+                  {fields.length === 0 && (
+                    <div className="channel-target-list__empty">尚未配置投递目标，启用任务前建议至少添加一个渠道。</div>
+                  )}
+                  {fields.map((field, index) => (
+                    <div className="channel-target-row" key={field.key}>
+                      <span className="channel-target-row__index">{String(index + 1).padStart(2, '0')}</span>
                       <Form.Item
                         name={[field.name, 'kind']}
-                        rules={[{ required: true, message: '请输入渠道 kind' }]}
-                        noStyle
+                        label="渠道类型"
+                        rules={[{ required: true, message: '请选择通知渠道' }]}
                       >
-                        <Input placeholder="渠道 kind，如 lark" style={{ width: 160 }} />
+                        <Select
+                          placeholder="选择渠道"
+                          options={channelOptions}
+                          virtual={false}
+                          aria-label={`通知渠道 ${index + 1} 类型`}
+                        />
                       </Form.Item>
                       <Form.Item
                         name={[field.name, 'target']}
-                        rules={[{ required: true, message: '请输入渠道 target' }]}
-                        noStyle
+                        label="通知目标"
+                        rules={[{ required: true, message: '请输入通知目标' }]}
                       >
-                        <Input placeholder="target，如 webhook/chat id" style={{ width: 260 }} />
+                        <Input placeholder="Webhook 地址、会话 ID 或邮箱" aria-label={`通知渠道 ${index + 1} 目标`} />
                       </Form.Item>
-                      <MinusCircleOutlined onClick={() => remove(field.name)} />
-                    </Space>
+                      <Button
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => remove(field.name)}
+                        aria-label={`删除通知渠道 ${index + 1}`}
+                      />
+                    </div>
                   ))}
-                  <Button type="dashed" block icon={<PlusOutlined />} onClick={() => add({ kind: '', target: '' })}>
-                    添加渠道
+                  <Button className="channel-target-list__add" icon={<PlusOutlined />} onClick={() => add({ kind: '', target: '' })}>
+                    添加投递目标
                   </Button>
-                </>
+                </div>
               )}
             </Form.List>
-          </Form.Item>
+          </section>
 
-          <Button type="primary" onClick={handleSave} loading={saveMutation.isPending}>
-            保存
-          </Button>
+          <footer className="settings-form-footer">
+            <span className={dirty ? 'is-dirty' : ''}>{dirty ? '有未保存的修改' : '当前配置已同步'}</span>
+            <Button type="primary" onClick={handleSave} loading={saveMutation.isPending} disabled={!dirty}>
+              保存配置
+            </Button>
+          </footer>
         </Form>
       )}
     </div>

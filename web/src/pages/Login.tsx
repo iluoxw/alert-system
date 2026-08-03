@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Button, Card, Form, Input, message } from 'antd'
+import { Button, Card, Form, Input, Typography, message } from 'antd'
+import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
 import { ApiError, login } from '../api/client'
 
 interface LoginFormValues {
@@ -35,31 +36,44 @@ export function Login() {
   }
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', marginTop: 120 }}>
+    <main className="login-page">
       {contextHolder}
-      <Card title="告警系统登录" style={{ width: 360 }}>
+      <section className="login-intro">
+        <div className="login-brand"><SafetyCertificateOutlined /> SRE Control</div>
+        <div className="login-intro__content">
+          <span>统一响应工作台</span>
+          <h1>让每一条告警都有明确责任与处置节奏。</h1>
+          <p>集中查看活动告警、值班安排和升级路径，在同一个工作台完成协作响应。</p>
+        </div>
+        <small>Alert operations console</small>
+      </section>
+      <section className="login-panel">
+        <Card className="login-card">
+          <Typography.Title level={2}>登录控制台</Typography.Title>
+          <Typography.Paragraph type="secondary">使用内部账号继续进入告警响应工作台。</Typography.Paragraph>
         <Form<LoginFormValues> layout="vertical" onFinish={handleFinish}>
           <Form.Item
             label="用户名"
             name="username"
             rules={[{ required: true, message: '请输入用户名' }]}
           >
-            <Input autoFocus autoComplete="username" />
+            <Input prefix={<UserOutlined />} placeholder="输入用户名" autoFocus autoComplete="username" />
           </Form.Item>
           <Form.Item
             label="密码"
             name="password"
             rules={[{ required: true, message: '请输入密码' }]}
           >
-            <Input.Password autoComplete="current-password" />
+            <Input.Password prefix={<LockOutlined />} placeholder="输入密码" autoComplete="current-password" />
           </Form.Item>
           <Form.Item>
             <Button type="primary" htmlType="submit" block loading={submitting}>
-              登录
+              登录并继续
             </Button>
           </Form.Item>
         </Form>
       </Card>
-    </div>
+      </section>
+    </main>
   )
 }

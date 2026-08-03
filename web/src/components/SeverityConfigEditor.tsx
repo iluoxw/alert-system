@@ -117,7 +117,7 @@ export function SeverityConfigEditor({ value, onChange, levelCount, showSuggeste
     <div>
       {showSuggestedFill && (
         <Button size="small" onClick={fillSuggested} style={{ marginBottom: 8 }}>
-          填入建议值（生产验证参数，可修改）
+          使用建议节奏
         </Button>
       )}
       {severities.map((severity) => {
@@ -136,18 +136,18 @@ export function SeverityConfigEditor({ value, onChange, levelCount, showSuggeste
                 </Text>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   {cells.map((cell, i) => (
-                    <InputNumber
-                      key={i}
-                      addonBefore={`L${i + 1}`}
-                      min={0}
-                      step={0.5}
-                      precision={2}
-                      placeholder={firstBlank !== -1 && i > firstBlank ? '需先填上一级' : '默认'}
-                      style={{ width: 150 }}
-                      disabled={isSkipped || (firstBlank !== -1 && i > firstBlank)}
-                      value={cell == null ? null : secondsToMinutes(cell)}
-                      onChange={(minutes) => setWait(severity, i, minutes)}
-                    />
+                    <div className="severity-wait-field" key={i}>
+                      <span>L{i + 1}</span>
+                      <InputNumber
+                        min={0}
+                        step={0.5}
+                        precision={2}
+                        placeholder={firstBlank !== -1 && i > firstBlank ? '需先填上一级' : '默认'}
+                        disabled={isSkipped || (firstBlank !== -1 && i > firstBlank)}
+                        value={cell == null ? null : secondsToMinutes(cell)}
+                        onChange={(minutes) => setWait(severity, i, minutes)}
+                      />
+                    </div>
                   ))}
                 </div>
               </div>

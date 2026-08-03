@@ -17,7 +17,7 @@ export function RoutesPage() {
   const columns: ColumnsType<RouteConfig> = [
     { title: '优先级', dataIndex: 'priority', key: 'priority', width: 90 },
     {
-      title: 'matchers',
+      title: '匹配条件',
       dataIndex: 'matchers',
       key: 'matchers',
       render: (matchers: MatcherSet) =>
@@ -60,7 +60,7 @@ export function RoutesPage() {
           >
             <InputNumber style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="matchers" label="matchers（留空表示全局默认路由）">
+          <Form.Item name="matchers" label="匹配条件" extra="留空时作为全局默认路由。">
             <MatchersEditor />
           </Form.Item>
           <Form.Item name="target_team_id" label="目标团队" rules={[{ required: true, message: '请选择目标团队' }]}>
@@ -89,7 +89,7 @@ export function RoutesPage() {
                   </Form.Item>
                   <Form.Item
                     name="group_by"
-                    label="分组键（group_by，按标签名分组）"
+                    label="分组字段"
                     help={isWindow ? '窗口全归并模式下不使用分组键' : undefined}
                   >
                     <Select mode="tags" tokenSeparators={[',']} open={false} disabled={isWindow} />
@@ -98,13 +98,13 @@ export function RoutesPage() {
               )
             }}
           </Form.Item>
-          <Form.Item name="group_wait_seconds" label="分组等待秒数" initialValue={0}>
+          <Form.Item name="group_wait_seconds" label="首次分组等待（秒）" initialValue={5}>
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
-          <Form.Item name="group_interval_seconds" label="分组间隔秒数" initialValue={0}>
+          <Form.Item name="group_interval_seconds" label="同组通知间隔（秒）" initialValue={60}>
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
-          <Form.Item name="repeat_interval_seconds" label="重复通知间隔秒数" initialValue={0}>
+          <Form.Item name="repeat_interval_seconds" label="重复提醒间隔（秒）" initialValue={3600}>
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
           <Form.Item
