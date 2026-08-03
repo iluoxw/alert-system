@@ -32,6 +32,9 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 
 详细契约、非功能目标、失败模式与 E2E 门禁见 `docs/plans/2026-08-02-alertmanager-authoritative-sre-control-design.md`。
 
+同步里程碑的事务边界、并发控制、兼容迁移和验收细则见
+`docs/plans/2026-08-02-alertmanager-authority-sync-implementation.md`。
+
 ## Consequences
 
 ### Positive
@@ -90,5 +93,6 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 - [Prometheus Alertmanager overview](https://prometheus.io/docs/alerting/latest/alertmanager/)
 - [Alertmanager configuration](https://prometheus.io/docs/alerting/latest/configuration/)
 - [Alertmanager API](https://github.com/prometheus/alertmanager#api)
+- [Alertmanager API v2 OpenAPI](https://github.com/prometheus/alertmanager/blob/main/api/v2/openapi.yaml)
 - [Thanos Rule](https://thanos.io/tip/components/rule.md/)
 - [VictoriaMetrics vmalert](https://docs.victoriametrics.com/victoriametrics/vmalert/)

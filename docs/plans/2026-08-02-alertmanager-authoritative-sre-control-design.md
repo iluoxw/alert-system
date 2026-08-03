@@ -288,7 +288,8 @@ UI 与 API 不为 E2B、CCH 创建核心分支；两者都通过同一接入契�
 ## 11. 安全与审计
 
 - Alertmanager API 使用只读凭据，数据库只保存 secret reference；
-- webhook 使用独立 token，并支持 TLS/mTLS、来源限制、payload 大小和速率限制；
+- webhook 使用独立、可轮换的 managed hook UUID，明文只出现在创建/轮换响应，数据库
+  只保存哈希；并支持 TLS/mTLS、来源限制、payload 大小和速率限制；
 - source、mapping、service、team 的变更需要管理员权限并完整审计；
 - mapping 发布保留校验结果、预览样本、版本、操作者和回滚记录；
 - 外部证据引用默认脱敏，日志和 label 不得直接渲染为可信 HTML；
