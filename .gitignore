@@ -7,8 +7,10 @@
 
 # 本地会话与工具运行时文件（spec 文档本身入库，logs/tmp 不入）
 .remember/
+.learnings/
 .spec-workflow/logs/
 .spec-workflow/tmp/
+.superdesign/tmp/
 
 # 环境变量（含密钥，永不入库）
 .env

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-control-config
+  labels:
+    app.kubernetes.io/name: sre-control
+data:
+  HTTP_PORT: "8081"
+  SCHEDULER_POLL_INTERVAL: "5s"
+  SESSION_TTL: "168h"
+  SESSION_IDLE_TTL: "30m"
+  SESSION_COOKIE_SECURE: "true"
+  REPEAT_INTERVAL: "30m"
+  SMTP_STARTTLS: "true"
+  PERSONNEL_CHANNEL: "email"
+  RETENTION_TIMERS_DAYS: "7"
+  RETENTION_NOTIFICATION_LOG_DAYS: "90"
+  RETENTION_SWEEP_INTERVAL: "1h"
+  RETENTION_BATCH_SIZE: "1000"
+  FLAP_WINDOW_SECONDS: "0"
+  FLAP_THRESHOLD: "3"

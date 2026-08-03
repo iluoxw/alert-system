@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sre-control
+resources:
+  - ../../base
+images:
+  - name: sre-control-api
+    newName: registry.example.com/sre-control-api
+    newTag: 0.1.0
+  - name: sre-control-web
+    newName: registry.example.com/sre-control-web
+    newTag: 0.1.0
+  - name: sre-control-migrate
+    newName: registry.example.com/sre-control-migrate
+    newTag: 0.1.0

@@ -3,6 +3,25 @@
 > 面向接手人的交付记录：按时间倒序，每节列「交付了什么、关键决策、验收状态」。
 > 架构不变量与协作约定见 `CLAUDE.md`（改代码前必读）；规格文档见 `.spec-workflow/specs/`。
 
+## [v0.1.0] 2026-08-02 — 首个可部署 MVP 基线
+
+- Alert Source 接入升级为 managed hook：SRE Control 分发
+  `/ingest/v1/hook/{hook_uuid}`，URL 独立完成来源识别与鉴权；hook 仅存哈希、仅显示
+  一次并支持轮换，source_id 与历史关联保持稳定。旧 source_id + Bearer 路径已删除。
+- 容器构建统一使用 Docker Buildx：本地镜像显式 `--load`，仓库发布通过 `--push`
+  生成可配置的多架构 manifest list。
+
+- 根 `Dockerfile` 提供 `api`、`web`、`migrate` 三个 target；API/Web 均为非 root
+  运行时，镜像写入版本与 Git revision 标签，不包含明文凭据。
+- Makefile 扩展为本地 CI 和发布入口：`make ci` 复现 GitHub Actions，
+  `make release-check` 加做镜像 smoke test 与 Kubernetes 校验。
+- Kubernetes 采用 Web+API 同 Pod、同源 nginx 代理、migrate initContainer；配置
+  startup/liveness/readiness probes、资源边界、只读根文件系统和 restricted Pod 安全项。
+- `overlays/local` 提供 PostgreSQL StatefulSet、PVC 和开发 Secret；production overlay
+  只保留镜像与应用基线，真实 Secret/数据库由部署环境负责。
+- 管理员初始化改为显式 Job，不随每次滚动发布自动重置密码。
+- 设计与验收边界见 `docs/plans/2026-08-02-mvp-container-kubernetes-deployment-design.md`。
+
 ## 接手须知（2026-08-01 时点）
 
 - 全部交付已提交：aiops-foundation 与 ui-enrichment 合并在 `621810a`（两 spec 在 state.go/alerts.go/AlertDetail.tsx 等共享文件上深度交织，文件级拆分无法保证各提交点独立构建），实时化在 `06b48e8`，文档收口在其后一提交。
