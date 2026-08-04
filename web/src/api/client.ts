@@ -8,6 +8,8 @@
 // （{"error":"unauthenticated"}）时，通过 onUnauthorized 回调统一处理跳转登录页
 // （见 setUnauthorizedHandler），调用方不需要每处自行判断 401。
 
+import { apiV1Url } from '../config/runtime'
+
 export type Severity = 'critical' | 'warning' | 'info'
 export type Status = 'firing' | 'acknowledged' | 'resolved'
 export type SourceState = 'firing' | 'resolved' | 'unknown'
@@ -110,7 +112,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api/v1${path}`, {
+  const res = await fetch(apiV1Url(path), {
     credentials: 'include',
     headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
     ...init,

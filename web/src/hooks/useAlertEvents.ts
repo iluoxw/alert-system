@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { apiV1Url } from '../config/runtime'
 
 // 节流窗口：告警风暴时后端可能密集推送 alert_changed 事件，2s 内的多条事件
 // 合并为一次 invalidate，避免每条事件都触发一次重拉。invalidateQueries 只
@@ -21,7 +22,7 @@ export function useAlertEvents(): void {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
-    const es = new EventSource('/api/v1/events')
+    const es = new EventSource(apiV1Url('/events'), { withCredentials: true })
 
     const scheduleInvalidate = () => {
       if (pendingRef.current) return

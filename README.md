@@ -112,7 +112,7 @@ make release-check
 | 镜像 | 默认标签 | 用途 |
 |---|---|---|
 | API | `sre-control-api:0.1.0` | Go API、后台 worker，并携带一次性 `seed-admin` 工具 |
-| Web | `sre-control-web:0.1.0` | nginx SPA 与同源反向代理 |
+| Web | `sre-control-web:0.1.0` | 静态 SPA 与运行时 `API_BASE_URL` 配置 |
 | Migrate | `sre-control-migrate:0.1.0` | golang-migrate + 当前版本 SQL |
 
 ```bash
@@ -125,16 +125,35 @@ image store，保证后续 smoke test 和 `kind load` 能直接读取；如需�
 `DOCKER_LOCAL_PLATFORM=linux/amd64`，如需指定 builder 可设置
 `DOCKER_BUILDX_BUILDER=<name>`。
 
-推送到镜像仓库时显式指定仓库前缀；该目标直接通过 Buildx `--push` 发布
-`linux/amd64,linux/arm64` manifest list：
+默认构建使用 `registry.gz.cvte.cn/library` 下的 Go、Alpine 和 Node 基础镜像，Go/NPM
+依赖分别通过 `goproxy.cn`、`registry.npmmirror.com` 获取；所有地址都可通过 Makefile
+同名变量覆盖。Web 运行时和迁移镜像都从内网基础镜像构建，不依赖 Docker Hub。
+
+推送到镜像仓库时显式指定仓库前缀；该目标直接通过 Buildx `--push` 发布。当前内网
+基础镜像基线默认只发布 `linux/amd64`，待全部基础镜像具备多架构 manifest 后再显式
+覆盖 `DOCKER_PUSH_PLATFORMS`：
 
 ```bash
-IMAGE_REGISTRY=registry.example.com/team make docker-push
-# 只发布 amd64：DOCKER_PUSH_PLATFORMS=linux/amd64 IMAGE_REGISTRY=... make docker-push
+IMAGE_REGISTRY=registry.gz.cvte.cn/ai-tools make docker-push
+# 失败后可只重试一个 target：make docker-push-web IMAGE_REGISTRY=...
+# 基础镜像就绪后发布多架构：DOCKER_PUSH_PLATFORMS=linux/amd64,linux/arm64 IMAGE_REGISTRY=... make docker-push
 ```
 
 镜像不包含数据库、飞书或 SMTP 凭据；所有敏感配置只在运行时通过环境变量或
 Kubernetes Secret 注入。
+
+Web 镜像必须在运行时设置 `API_BASE_URL`。前端只采用一种链路：浏览器直接请求该
+地址，容器内 Nginx 只提供静态文件，不代理 API。变量可使用同源路径（推荐 `/api`）
+或带协议的公开地址（例如 `https://sre-control.example.com/api`）；前端会在其后拼接
+`/v1`。缺失、裸域名或含非法字符时容器会直接退出。
+
+使用 `/api` 时，外部 Ingress/Gateway 或平台负载均衡必须将 `/api` 路由到 API
+Service 的 `8081` 端口，并将 `/` 路由到 Web 的 `80` 端口；`/ingest` 与
+`/callbacks` 也必须直接路由到 API。使用不同 origin 的绝对地址时，API 或网关还要
+通过 `CORS_ALLOWED_ORIGINS` 配置允许凭据的精确 Web origin（逗号分隔），不能使用
+`*`；跨站点部署还必须同时评估 session cookie 的 SameSite 策略，推荐保持同站点。
+集群内部地址（如
+`firebreak-server:8081`）无法被用户浏览器解析，不能作为 `API_BASE_URL`。
 
 ## Kubernetes 部署
 
@@ -148,15 +167,19 @@ make kind-load                     # 非 kind 集群跳过
 make k8s-deploy
 make k8s-wait
 make k8s-bootstrap-admin           # 本地默认 admin/admin123
-make k8s-port-forward              # http://localhost:5173
+make k8s-port-forward              # Web http://localhost:5173；API http://localhost:8080
 ```
+
+local overlay 将 Web 的 `API_BASE_URL` 设为 `http://localhost:8080/api`，并仅允许
+`http://localhost:5173` 跨 origin 携带登录 cookie；这两个端口必须同时转发。
 
 本地 Secret 中的固定口令只能用于个人开发集群。生产部署使用
 `deploy/k8s/overlays/production`，先将镜像名改为真实仓库，并通过 External Secrets、
 Sealed Secrets 或平台 Secret 管理能力创建 `sre-control-secrets`。示例字段见
 `secret.example.yaml`，该文件不参与 kustomization。
 
-应用 Pod 包含 Web 与 API 两个容器；数据库迁移由 initContainer 在业务启动前执行。
+应用 Pod 包含 Web 与 API 两个容器，Service 分别暴露 `80`（Web）与 `8081`（API），
+路径路由由集群入口层完成；数据库迁移由 initContainer 在业务启动前执行。
 新数据库会自动创建 `schema_migrations`。若目标数据库过去通过 `deploy/initdb` 手工应用
 过 SQL、但没有 migration ledger，必须先人工核对并建立正确 baseline，不能直接执行
 `migrate up` 猜测版本。
