@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Button, Card, Form, Input, Typography, message } from 'antd'
-import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
+import { LockOutlined, UserOutlined } from '@ant-design/icons'
 import { ApiError, login } from '../api/client'
 
 interface LoginFormValues {
@@ -39,7 +39,10 @@ export function Login() {
     <main className="login-page">
       {contextHolder}
       <section className="login-intro">
-        <div className="login-brand"><SafetyCertificateOutlined /> SRE Control</div>
+        <div className="login-brand">
+          <img src="/brand/firebreak-icon.png" alt="" />
+          <span>Firebreak</span>
+        </div>
         <div className="login-intro__content">
           <span>统一响应工作台</span>
           <h1>让每一条告警都有明确责任与处置节奏。</h1>
@@ -49,6 +52,7 @@ export function Login() {
       </section>
       <section className="login-panel">
         <Card className="login-card">
+          <img className="login-card__brand" src="/brand/firebreak-badge.png" alt="Firebreak" />
           <Typography.Title level={2}>登录控制台</Typography.Title>
           <Typography.Paragraph type="secondary">使用内部账号继续进入告警响应工作台。</Typography.Paragraph>
         <Form<LoginFormValues> layout="vertical" onFinish={handleFinish}>
