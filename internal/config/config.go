@@ -4,8 +4,10 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -58,6 +60,7 @@ type Config struct {
 	SessionTTL          time.Duration // 会话固定过期时长
 	SessionIdleTTL      time.Duration // 会话滑动续期窗口
 	SessionCookieSecure bool          // session cookie 的 Secure 标志，本地 http 联调可关闭
+	CORSAllowedOrigins  []string      // 浏览器跨 origin 直连 API 时允许的精确 Web origin
 
 	RepeatInterval time.Duration // R6.5 重复提醒周期，main 装配注入 notify.LifecycleHandlers
 
@@ -130,9 +133,10 @@ type fileConfig struct {
 	SchedulerPollInterval string         `yaml:"scheduler_poll_interval"`
 	Lark                  fileLarkConfig `yaml:"lark"`
 
-	SessionTTL          string `yaml:"session_ttl"`
-	SessionIdleTTL      string `yaml:"session_idle_ttl"`
-	SessionCookieSecure bool   `yaml:"session_cookie_secure"`
+	SessionTTL          string   `yaml:"session_ttl"`
+	SessionIdleTTL      string   `yaml:"session_idle_ttl"`
+	SessionCookieSecure bool     `yaml:"session_cookie_secure"`
+	CORSAllowedOrigins  []string `yaml:"cors_allowed_origins"`
 
 	RepeatInterval string `yaml:"repeat_interval"`
 
@@ -228,6 +232,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid retention.sweep_interval %q: %w", fc.Retention.SweepInterval, err)
 	}
+	corsAllowedOrigins, err := normalizeOrigins(fc.CORSAllowedOrigins)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPPort:              fc.HTTPPort,
@@ -242,6 +250,7 @@ func Load(path string) (Config, error) {
 		SessionTTL:          sessionTTL,
 		SessionIdleTTL:      sessionIdleTTL,
 		SessionCookieSecure: fc.SessionCookieSecure,
+		CORSAllowedOrigins:  corsAllowedOrigins,
 		RepeatInterval:      repeatInterval,
 		SMTP: SMTPConfig{
 			Host:     fc.SMTP.Host,
@@ -299,6 +308,9 @@ func applyEnvOverrides(fc *fileConfig) {
 			fc.SessionCookieSecure = b
 		}
 	}
+	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+		fc.CORSAllowedOrigins = strings.Split(v, ",")
+	}
 	if v := os.Getenv("REPEAT_INTERVAL"); v != "" {
 		fc.RepeatInterval = v
 	}
@@ -355,4 +367,29 @@ func applyEnvOverrides(fc *fileConfig) {
 			fc.FlapThreshold = n
 		}
 	}
+}
+
+func normalizeOrigins(values []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(values))
+	origins := make([]string, 0, len(values))
+	for _, value := range values {
+		origin := strings.TrimSpace(value)
+		if origin == "" {
+			continue
+		}
+		if origin == "*" {
+			return nil, fmt.Errorf("invalid cors_allowed_origins %q: wildcard is incompatible with credentialed requests", origin)
+		}
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("invalid cors_allowed_origins %q: expected an http(s) origin without path", origin)
+		}
+		normalized := u.Scheme + "://" + u.Host
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		origins = append(origins, normalized)
+	}
+	return origins, nil
 }

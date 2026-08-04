@@ -15,15 +15,28 @@ K8S_OVERLAY ?= deploy/k8s/overlays/local
 DOCKER_BUILD_PROGRESS ?= plain
 DOCKER_BUILDX_BUILDER ?=
 DOCKER_LOCAL_PLATFORM ?=
-DOCKER_PUSH_PLATFORMS ?= linux/amd64,linux/arm64
+DOCKER_PUSH_PLATFORMS ?= linux/amd64
+GO_BASE_IMAGE ?= registry.gz.cvte.cn/library/golang:1.25-alpine
+ALPINE_BASE_IMAGE ?= registry.gz.cvte.cn/library/alpine:3.22
+NODE_BASE_IMAGE ?= registry.gz.cvte.cn/library/node:22-alpine
+GO111MODULE ?= on
+GOPROXY ?= https://goproxy.cn,direct
+GOSUMDB ?= sum.golang.google.cn
+NPM_REGISTRY ?= https://registry.npmmirror.com
 BUILDX_BUILDER_ARG := $(if $(DOCKER_BUILDX_BUILDER),--builder $(DOCKER_BUILDX_BUILDER),)
 BUILDX_LOCAL_PLATFORM_ARG := $(if $(DOCKER_LOCAL_PLATFORM),--platform $(DOCKER_LOCAL_PLATFORM),)
+DOCKER_BASE_IMAGE_ARGS := --build-arg GO_BASE_IMAGE=$(GO_BASE_IMAGE) --build-arg ALPINE_BASE_IMAGE=$(ALPINE_BASE_IMAGE) --build-arg NODE_BASE_IMAGE=$(NODE_BASE_IMAGE)
+DOCKER_GO_MODULE_ARGS := --build-arg GO111MODULE=$(GO111MODULE) --build-arg GOPROXY=$(GOPROXY) --build-arg GOSUMDB=$(GOSUMDB)
+DOCKER_WEB_ARGS := --build-arg NPM_REGISTRY=$(NPM_REGISTRY)
+DOCKER_METADATA_ARGS := --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT)
+DOCKER_BUILD_ARGS := $(DOCKER_BASE_IMAGE_ARGS) $(DOCKER_GO_MODULE_ARGS) $(DOCKER_WEB_ARGS) $(DOCKER_METADATA_ARGS)
 
 .DEFAULT_GOAL := help
 
 .PHONY: help version build build-tools run seed-admin fmt-check vet test test-ci \
 	backend-ci web-install web-build web-lint frontend-ci ci release-check tidy \
-	web-audit docker-check docker-build docker-build-api docker-build-web docker-build-migrate docker-smoke docker-push \
+	web-audit docker-check docker-build docker-build-api docker-build-web docker-build-migrate docker-smoke \
+	docker-push docker-push-check docker-push-api docker-push-web docker-push-migrate \
 	k8s-render k8s-validate k8s-deploy k8s-wait k8s-port-forward k8s-bootstrap-admin \
 	kind-load
 
@@ -31,7 +44,7 @@ help: ## 显示可用目标
 	@awk 'BEGIN {FS = ":.*## "; printf "SRE Control %s\n\n", "$(VERSION)"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 version: ## 输出版本和镜像名
-	@printf 'version=%s\napi=%s\nweb=%s\nmigrate=%s\n' "$(VERSION)" "$(API_IMAGE)" "$(WEB_IMAGE)" "$(MIGRATE_IMAGE)"
+	@printf 'version=%s\napi=%s\nweb=%s\nmigrate=%s\ngo_base=%s\nalpine_base=%s\nnode_base=%s\ngo111module=%s\ngoproxy=%s\ngosumdb=%s\nnpm_registry=%s\n' "$(VERSION)" "$(API_IMAGE)" "$(WEB_IMAGE)" "$(MIGRATE_IMAGE)" "$(GO_BASE_IMAGE)" "$(ALPINE_BASE_IMAGE)" "$(NODE_BASE_IMAGE)" "$(GO111MODULE)" "$(GOPROXY)" "$(GOSUMDB)" "$(NPM_REGISTRY)"
 
 build: ## 构建服务端二进制
 	@mkdir -p bin
@@ -87,32 +100,43 @@ tidy: ## 整理 Go modules
 	go mod tidy
 
 docker-check: ## 解析 Dockerfile 并列出全部构建 target（无需拉取基础镜像）
-	docker buildx build $(BUILDX_BUILDER_ARG) --call=targets --progress=$(DOCKER_BUILD_PROGRESS) .
+	docker buildx build $(BUILDX_BUILDER_ARG) $(DOCKER_BUILD_ARGS) --call=targets --progress=$(DOCKER_BUILD_PROGRESS) .
 
 docker-build: docker-build-api docker-build-web docker-build-migrate ## 构建全部本地镜像
 
 docker-build-api: ## 构建 API 镜像
-	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) --load --progress=$(DOCKER_BUILD_PROGRESS) --target api --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(API_IMAGE) .
+	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
 
 docker-build-web: ## 构建 Web 镜像
-	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) --load --progress=$(DOCKER_BUILD_PROGRESS) --target web --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(WEB_IMAGE) .
+	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target web -t $(WEB_IMAGE) .
 
 docker-build-migrate: ## 构建数据库迁移镜像
-	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) --load --progress=$(DOCKER_BUILD_PROGRESS) --target migrate --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(MIGRATE_IMAGE) .
+	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target migrate -t $(MIGRATE_IMAGE) .
 
 docker-smoke: ## 验证镜像入口、非 root 用户和 nginx 配置
 	@test "$$(docker image inspect $(API_IMAGE) --format '{{.Config.User}}')" = "10001:10001"
 	docker run --rm --entrypoint /bin/sh $(API_IMAGE) -ec 'test "$$(id -u)" = 10001 && test -x /app/alert-system && test -x /app/seed-admin'
 	@test "$$(docker image inspect $(WEB_IMAGE) --format '{{.Config.User}}')" = "101:101"
-	docker run --rm --entrypoint nginx $(WEB_IMAGE) -t
+	docker run --rm -e API_BASE_URL=/api $(WEB_IMAGE) --check
+	docker run --rm -e API_BASE_URL=https://sre-control.example.com/api $(WEB_IMAGE) --check
+	@if docker run --rm $(WEB_IMAGE) --check >/dev/null 2>&1; then printf '%s\n' 'Web 镜像未拒绝缺失的 API_BASE_URL'; exit 1; fi
+	@if docker run --rm -e API_BASE_URL='sre-control.example.com/api' $(WEB_IMAGE) --check >/dev/null 2>&1; then printf '%s\n' 'Web 镜像未拒绝非法的 API_BASE_URL'; exit 1; fi
 	@test "$$(docker image inspect $(MIGRATE_IMAGE) --format '{{.Config.User}}')" = "65532:65532"
 	docker run --rm $(MIGRATE_IMAGE) -version
 
-docker-push: ## 使用 buildx 构建并推送多架构镜像（需要 IMAGE_REGISTRY）
+docker-push-check:
 	@test -n "$(IMAGE_REGISTRY)" || { printf '%s\n' 'IMAGE_REGISTRY 不能为空'; exit 2; }
-	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target api --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(API_IMAGE) .
-	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target web --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(WEB_IMAGE) .
-	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target migrate --build-arg VERSION=$(VERSION) --build-arg VCS_REF=$(GIT_COMMIT) -t $(MIGRATE_IMAGE) .
+
+docker-push: docker-push-api docker-push-web docker-push-migrate ## 使用 buildx 构建并推送镜像
+
+docker-push-api: docker-push-check ## 构建并推送 API 镜像
+	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
+
+docker-push-web: docker-push-check ## 构建并推送 Web 镜像
+	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target web -t $(WEB_IMAGE) .
+
+docker-push-migrate: docker-push-check ## 构建并推送迁移镜像
+	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target migrate -t $(MIGRATE_IMAGE) .
 
 k8s-render: ## 渲染本地 Kubernetes overlay
 	@kubectl kustomize $(K8S_OVERLAY)
@@ -127,8 +151,8 @@ k8s-wait: ## 等待 PostgreSQL 与 SRE Control 就绪
 	kubectl -n $(K8S_NAMESPACE) rollout status statefulset/sre-control-postgres --timeout=180s
 	kubectl -n $(K8S_NAMESPACE) rollout status deployment/sre-control --timeout=180s
 
-k8s-port-forward: ## 将本地 5173 转发到集群 Web Service
-	kubectl -n $(K8S_NAMESPACE) port-forward service/sre-control 5173:80
+k8s-port-forward: ## 将本地 5173/8080 分别转发到集群 Web/API Service
+	kubectl -n $(K8S_NAMESPACE) port-forward service/sre-control 5173:80 8080:8081
 
 k8s-bootstrap-admin: ## 运行一次管理员引导 Job（本地默认 admin/admin123）
 	kubectl -n $(K8S_NAMESPACE) delete job sre-control-seed-admin --ignore-not-found

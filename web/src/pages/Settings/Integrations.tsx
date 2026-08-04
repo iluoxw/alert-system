@@ -32,6 +32,7 @@ import type {
   IntegrationCreateResponse,
   Severity,
 } from '../../api/client'
+import { publicApiUrl } from '../../config/runtime'
 import {
   createIntegration,
   deleteIntegration,
@@ -406,18 +407,18 @@ export function Integrations() {
         <Paragraph>接入来源：<strong>{hookModal?.name}</strong></Paragraph>
         <Paragraph>Webhook URL：</Paragraph>
         <Text code copyable style={{ wordBreak: 'break-all' }}>
-          {hookModal ? `${window.location.origin}${hookModal.webhook_path}` : ''}
+          {hookModal ? publicApiUrl(hookModal.webhook_path) : ''}
         </Text>
         <Paragraph style={{ marginTop: 18, marginBottom: 6 }}>Alertmanager receiver 关键配置：</Paragraph>
         <Paragraph
           copyable={{
             text: hookModal
-              ? `webhook_configs:\n  - url: '${window.location.origin}${hookModal.webhook_path}'\n    send_resolved: true`
+              ? `webhook_configs:\n  - url: '${publicApiUrl(hookModal.webhook_path)}'\n    send_resolved: true`
               : '',
           }}
         >
           <pre className="source-webhook-example">{hookModal
-            ? `webhook_configs:\n  - url: '${window.location.origin}${hookModal.webhook_path}'\n    send_resolved: true`
+            ? `webhook_configs:\n  - url: '${publicApiUrl(hookModal.webhook_path)}'\n    send_resolved: true`
             : ''}</pre>
         </Paragraph>
       </Modal>

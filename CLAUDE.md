@@ -27,6 +27,14 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 - 队列/定时器：不引入外部 MQ，统一用 PG `timers` 表（决策：先 PG 队列）
 - 容器构建统一使用 `docker buildx build`；本地构建必须显式 `--load`，发布镜像使用
   `--push`，禁止退回传统 `docker build`/`docker push` 流程。
+- 内网发布禁止隐式访问 Docker Hub 或 `proxy.golang.org`：Go/Alpine/Node 基础镜像、
+  GOPROXY/GOSUMDB 和 NPM registry 必须经 Makefile 构建参数显式注入；默认发布平台为
+  当前内网基础镜像完整支持的 `linux/amd64`。三个镜像必须提供可单独重试的 push target，
+  避免单个 target 失败后重复构建已成功镜像。
+- Web 镜像不得写死 API 地址，也不得通过容器内 Nginx 代理 API。运行时必须将
+  `API_BASE_URL` 注入浏览器配置；缺失或非法值应 fail fast。Nginx 只负责静态文件，
+  同源路径分流由集群 Ingress/Gateway 或平台负载均衡负责。跨 origin 直连只能通过
+  `CORS_ALLOWED_ORIGINS` 精确白名单开放，禁止带凭据时使用通配符。
 
 ## 目录结构
 

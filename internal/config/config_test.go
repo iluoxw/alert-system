@@ -82,6 +82,35 @@ scheduler_poll_interval: "10s"
 	}
 }
 
+func TestLoad_CORSAllowedOriginsFromEnv(t *testing.T) {
+	t.Setenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173, https://web.example.com")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"http://localhost:5173", "https://web.example.com"}
+	if len(cfg.CORSAllowedOrigins) != len(want) {
+		t.Fatalf("CORSAllowedOrigins = %#v, want %#v", cfg.CORSAllowedOrigins, want)
+	}
+	for i := range want {
+		if cfg.CORSAllowedOrigins[i] != want[i] {
+			t.Fatalf("CORSAllowedOrigins[%d] = %q, want %q", i, cfg.CORSAllowedOrigins[i], want[i])
+		}
+	}
+}
+
+func TestLoad_RejectsUnsafeCORSOrigins(t *testing.T) {
+	for _, value := range []string{"*", "web.example.com", "https://web.example.com/path"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("CORS_ALLOWED_ORIGINS", value)
+			if _, err := Load(""); err == nil {
+				t.Fatalf("Load() error = nil for %q", value)
+			}
+		})
+	}
+}
+
 func TestLoad_MissingFileFallsBackToDefaults(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err != nil {
