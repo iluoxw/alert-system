@@ -33,7 +33,7 @@ body,
 
 body {
   margin: 0;
-  min-width: 720px;
+  min-width: 320px;
   background: var(--canvas);
   color: var(--text);
   font-family: 'Avenir Next', Avenir, 'PingFang SC', 'Microsoft YaHei', sans-serif;
@@ -889,13 +889,11 @@ select {
   font-weight: 700;
 }
 
-.login-brand .anticon {
+.login-brand img {
   width: 36px;
   height: 36px;
-  display: grid;
-  place-items: center;
   border-radius: 8px;
-  background: #2d6cdf;
+  object-fit: contain;
 }
 
 .login-intro__content {
@@ -951,6 +949,13 @@ select {
   padding: 38px;
 }
 
+.login-card__brand {
+  width: min(210px, 62%);
+  height: auto;
+  display: block;
+  margin-bottom: 28px;
+}
+
 .login-card h2.ant-typography {
   margin-bottom: 6px;
   font-size: 26px;
@@ -998,15 +1003,23 @@ select {
 }
 
 .app-brand__mark {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
   flex: 0 0 auto;
-  border-radius: 6px;
-  color: #fff;
-  background: var(--primary);
-  font-size: 16px;
+  padding: 2px;
+  border-radius: 7px;
+  background: #f8fafc;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .16);
+  overflow: hidden;
+}
+
+.app-brand__mark img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 
 .app-brand__name { white-space: nowrap; }
@@ -2391,5 +2404,345 @@ select {
   .source-stat-row > .ant-col {
     flex-basis: 100%;
     max-width: 100%;
+  }
+}
+
+/* Mobile shell: keep navigation and dense operational data usable without widening the page. */
+@media (max-width: 900px) {
+  .app-sidebar {
+    display: none;
+  }
+
+  .app-main-layout {
+    width: 100%;
+  }
+
+  .app-topbar {
+    min-height: 108px;
+    height: auto;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 9px 12px 11px;
+  }
+
+  .app-topbar__context,
+  .app-topbar__actions {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .app-topbar__context {
+    min-height: 40px;
+    gap: 10px;
+  }
+
+  .app-topbar__context h1 {
+    min-width: 0;
+    overflow: hidden;
+    flex: 1;
+    font-size: 18px;
+    text-overflow: ellipsis;
+  }
+
+  .app-sidebar-toggle,
+  .app-topbar__actions > .ant-btn {
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+  }
+
+  .app-global-search {
+    width: auto;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .app-content {
+    min-height: calc(100vh - 108px);
+  }
+
+  .app-mobile-drawer .ant-drawer-content,
+  .app-mobile-drawer .ant-drawer-body {
+    color: #f8fafc;
+    background: var(--nav);
+  }
+
+  .app-mobile-drawer .ant-drawer-body {
+    position: relative;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .app-mobile-drawer .app-brand {
+    height: 64px;
+    padding-inline: 18px;
+  }
+
+  .app-mobile-drawer .app-sidebar__menu {
+    height: calc(100dvh - 140px);
+    padding-inline: 10px;
+  }
+
+  .app-mobile-drawer .app-user-panel {
+    min-height: 76px;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 13px 14px;
+  }
+
+  .app-mobile-drawer .app-user-panel__identity {
+    display: flex;
+  }
+
+  .login-panel {
+    padding: 24px;
+  }
+
+  .ops-ledger-page,
+  .fault-ledger-workspace,
+  .ops-page,
+  .ops-detail-page,
+  .incident-room-page,
+  .service-directory-page,
+  .workbench-page,
+  .settings-shell,
+  .alert-detail-page {
+    padding: 12px;
+  }
+
+  .settings-page-heading {
+    min-height: 0;
+    padding-top: 4px;
+  }
+
+  .settings-page-heading h2 {
+    font-size: 21px;
+  }
+
+  .resource-surface,
+  .source-registry-card .ant-card-body {
+    padding: 12px;
+  }
+
+  .resource-surface .ant-table-wrapper,
+  .source-registry-card .ant-table-wrapper,
+  .workbench-table {
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .resource-surface .ant-table,
+  .source-registry-card .ant-table,
+  .workbench-table .ant-table {
+    min-width: 640px;
+  }
+
+  .source-registry-card .ant-card-head-wrapper,
+  .resource-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .source-registry-card .ant-card-extra,
+  .resource-toolbar .ant-btn {
+    margin-inline-start: 0;
+    align-self: flex-start;
+  }
+
+  .ant-modal-root .ant-modal {
+    width: calc(100vw - 24px) !important;
+    max-width: calc(100vw - 24px);
+    margin: 12px auto;
+    padding-bottom: 0;
+  }
+
+  .ant-modal .ant-modal-header,
+  .ant-modal .ant-modal-body,
+  .ant-modal .ant-modal-footer {
+    padding-inline: 16px;
+  }
+}
+
+@media (max-width: 600px) {
+  .login-panel {
+    min-height: 100dvh;
+    padding: 14px;
+  }
+
+  .login-card.ant-card {
+    width: 100%;
+    border-radius: 8px;
+  }
+
+  .login-card .ant-card-body {
+    padding: 24px 20px;
+  }
+
+  .login-card__brand {
+    width: 174px;
+    margin-bottom: 22px;
+  }
+
+  .login-card h2.ant-typography {
+    font-size: 23px;
+  }
+
+  .app-environment {
+    padding-inline: 7px;
+  }
+
+  .operations-summary-grid,
+  .incident-queue-summary,
+  .workbench-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .operations-summary-card {
+    min-height: 108px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 9px;
+    padding: 11px;
+  }
+
+  .operations-summary-card > div {
+    width: 100%;
+  }
+
+  .operations-summary-card strong {
+    font-size: 25px;
+  }
+
+  .incident-queue-summary article {
+    min-height: 78px;
+    gap: 6px;
+    padding: 10px;
+  }
+
+  .incident-queue-summary article > .anticon {
+    width: 20px;
+  }
+
+  .incident-queue-summary article > span {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .incident-queue-summary strong {
+    font-size: 22px;
+  }
+
+  .ledger-panel-head,
+  .command-rail-panel > header {
+    align-items: flex-start;
+  }
+
+  .incident-queue-panel .ledger-panel-head {
+    flex-direction: column;
+  }
+
+  .incident-queue-panel .ant-segmented {
+    width: 100%;
+  }
+
+  .incident-queue-panel .ant-segmented-group {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .fault-ledger-table,
+  .incident-queue-list {
+    min-width: 0;
+  }
+
+  .fault-ledger-table__header {
+    display: none;
+  }
+
+  .fault-ledger-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 9px 12px;
+    padding: 12px;
+  }
+
+  .fault-ledger-row__fault {
+    grid-column: 1 / -1;
+  }
+
+  .fault-ledger-row__impact {
+    grid-column: 1;
+  }
+
+  .fault-ledger-row > span:nth-child(3),
+  .fault-ledger-row > span:nth-child(5) {
+    justify-self: end;
+  }
+
+  .incident-queue-list > a {
+    min-height: 122px;
+    grid-template-columns: 4px repeat(3, minmax(0, 1fr)) 14px;
+    grid-template-rows: auto auto auto;
+    gap: 8px 7px;
+    padding: 12px 10px;
+  }
+
+  .incident-queue-list > a > i {
+    grid-column: 1;
+    grid-row: 1 / 4;
+  }
+
+  .incident-queue-list__identity {
+    grid-column: 2 / 5;
+    grid-row: 1;
+  }
+
+  .incident-queue-list > a > span:nth-of-type(2) { grid-column: 2; grid-row: 2; }
+  .incident-queue-list > a > span:nth-of-type(3) { grid-column: 3; grid-row: 2; }
+  .incident-queue-list > a > span:nth-of-type(4) { grid-column: 4; grid-row: 2; }
+  .incident-queue-list > a > em { grid-column: 2 / 5; grid-row: 3; }
+  .incident-queue-list > a > .anticon { grid-column: 5; grid-row: 1 / 4; }
+
+  .operations-priority-list > a {
+    grid-template-columns: 4px minmax(0, 1fr) auto;
+  }
+
+  .operations-priority-list > a > .anticon {
+    display: none;
+  }
+
+  .operations-layer-list {
+    grid-template-columns: 1fr;
+  }
+
+  .operations-layer-list > div {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .operations-layer-list > div:last-child {
+    border-bottom: 0;
+  }
+
+  .service-directory-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .service-directory-card dl {
+    grid-template-columns: 1fr;
+  }
+
+  .service-directory-card dl > div {
+    padding: 8px 0;
+    border-right: 0;
+    border-bottom: 1px solid #edf0f3;
+  }
+
+  .service-directory-card dl > div:last-child {
+    border-bottom: 0;
   }
 }

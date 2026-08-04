@@ -10,7 +10,7 @@ import {
   useLocation,
   useNavigate,
 } from 'react-router-dom'
-import { Avatar, Badge, Button, ConfigProvider, Input, Layout, Menu, Spin, Tooltip } from 'antd'
+import { Avatar, Badge, Button, ConfigProvider, Drawer, Input, Layout, Menu, Spin, Tooltip } from 'antd'
 import {
   AlertOutlined,
   AppstoreOutlined,
@@ -22,7 +22,6 @@ import {
   MenuUnfoldOutlined,
   RadarChartOutlined,
   ReloadOutlined,
-  SafetyCertificateOutlined,
   SearchOutlined,
   StopOutlined,
 } from '@ant-design/icons'
@@ -54,7 +53,7 @@ import { ServiceDirectory } from './pages/ServiceDirectory'
 
 const { Header, Sider, Content } = Layout
 
-const sidebarStorageKey = 'sre-control.sidebar-collapsed'
+const sidebarStorageKey = 'firebreak.sidebar-collapsed'
 
 function storedSidebarCollapsed() {
   if (typeof window === 'undefined') return false
@@ -118,6 +117,7 @@ function AppLayout() {
   const [searchText, setSearchText] = useState('')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(storedSidebarCollapsed)
   const [isNarrowViewport, setIsNarrowViewport] = useState(narrowViewport)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const effectiveSidebarCollapsed = sidebarCollapsed || isNarrowViewport
   // 全站只订阅一条 SSE 连接：AppLayout 是所有已登录页面的公共父组件。
   useAlertEvents()
@@ -134,7 +134,10 @@ function AppLayout() {
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 900px)')
-    const updateViewport = () => setIsNarrowViewport(media.matches)
+    const updateViewport = () => {
+      setIsNarrowViewport(media.matches)
+      if (!media.matches) setMobileNavOpen(false)
+    }
     updateViewport()
     media.addEventListener('change', updateViewport)
     return () => media.removeEventListener('change', updateViewport)
@@ -216,12 +219,47 @@ function AppLayout() {
         ? '静默策略'
         : location.pathname.startsWith('/settings')
           ? '控制中心'
-          : 'SRE Control'
+          : 'Firebreak'
 
   const runSearch = () => {
     const keyword = searchText.trim()
     navigate(keyword ? `/alerts?q=${encodeURIComponent(keyword)}` : '/alerts')
   }
+
+  const goToNavigation = (key: string) => {
+    navigate(key)
+    setMobileNavOpen(false)
+  }
+
+  const navigationPanel = (mobile = false) => (
+    <>
+      <div className="app-brand">
+        <span className="app-brand__mark">
+          <img src="/brand/firebreak-icon.png" alt="" />
+        </span>
+        <span className="app-brand__name">Firebreak</span>
+      </div>
+      <Menu
+        theme="dark"
+        mode="inline"
+        inlineCollapsed={!mobile && effectiveSidebarCollapsed}
+        selectedKeys={[selectedKey]}
+        items={navItems}
+        onClick={({ key }) => goToNavigation(key)}
+        className="app-sidebar__menu"
+      />
+      <div className="app-user-panel">
+        <Avatar size={36}>{data?.username?.slice(0, 1).toUpperCase() ?? 'U'}</Avatar>
+        <div className="app-user-panel__identity">
+          <strong>{data?.username ?? '用户'}</strong>
+          <span>当前值班 · {data?.is_admin ? 'Platform SRE' : '值班成员'}</span>
+        </div>
+        <Tooltip title="退出登录">
+          <Button type="text" icon={<LogoutOutlined />} onClick={handleLogout} aria-label="退出登录" />
+        </Tooltip>
+      </div>
+    </>
+  )
 
   return (
     <Layout className="app-shell">
@@ -236,43 +274,33 @@ function AppLayout() {
         theme="dark"
         aria-label="主导航"
       >
-        <div className="app-brand">
-          <span className="app-brand__mark"><SafetyCertificateOutlined /></span>
-          <span className="app-brand__name">SRE Control</span>
-        </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          inlineCollapsed={effectiveSidebarCollapsed}
-          selectedKeys={[selectedKey]}
-          items={navItems}
-          onClick={({ key }) => navigate(key)}
-          className="app-sidebar__menu"
-        />
-        <div className="app-user-panel">
-          <Avatar size={36}>{data?.username?.slice(0, 1).toUpperCase() ?? 'U'}</Avatar>
-          <div className="app-user-panel__identity">
-            <strong>{data?.username ?? '用户'}</strong>
-            <span>当前值班 · {data?.is_admin ? 'Platform SRE' : '值班成员'}</span>
-          </div>
-          <Tooltip title="退出登录">
-            <Button type="text" icon={<LogoutOutlined />} onClick={handleLogout} aria-label="退出登录" />
-          </Tooltip>
-        </div>
+        {navigationPanel()}
       </Sider>
+      <Drawer
+        open={mobileNavOpen}
+        onClose={() => setMobileNavOpen(false)}
+        placement="left"
+        width={280}
+        closable={false}
+        className="app-mobile-drawer"
+        aria-label="移动主导航"
+      >
+        {navigationPanel(true)}
+      </Drawer>
       <Layout className="app-main-layout">
         <Header className="app-topbar">
           <div className="app-topbar__context">
-            <Tooltip title={isNarrowViewport ? '窄屏下导航保持收起' : effectiveSidebarCollapsed ? '展开导航' : '收起导航'}>
+            <Tooltip title={isNarrowViewport ? '打开主导航' : effectiveSidebarCollapsed ? '展开导航' : '收起导航'}>
               <span>
                 <Button
                   type="text"
                   className="app-sidebar-toggle"
-                  icon={effectiveSidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-                  onClick={() => setSidebarCollapsed((current) => !current)}
-                  disabled={isNarrowViewport}
-                  aria-label={effectiveSidebarCollapsed ? '展开主导航' : '收起主导航'}
-                  aria-expanded={!effectiveSidebarCollapsed}
+                  icon={isNarrowViewport || effectiveSidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                  onClick={() => isNarrowViewport
+                    ? setMobileNavOpen(true)
+                    : setSidebarCollapsed((current) => !current)}
+                  aria-label={isNarrowViewport ? '打开主导航' : effectiveSidebarCollapsed ? '展开主导航' : '收起主导航'}
+                  aria-expanded={isNarrowViewport ? mobileNavOpen : !effectiveSidebarCollapsed}
                 />
               </span>
             </Tooltip>
