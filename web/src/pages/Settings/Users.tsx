@@ -13,6 +13,7 @@ interface UserFormValues {
   display_name: string
   email?: string
   enabled: boolean
+  lark_open_id?: string
 }
 
 export function Users() {
@@ -20,6 +21,7 @@ export function Users() {
     { title: '用户名', dataIndex: 'username', key: 'username' },
     { title: '显示名', dataIndex: 'display_name', key: 'display_name' },
     { title: '邮箱', dataIndex: 'email', key: 'email' },
+    { title: '飞书身份', dataIndex: 'lark_open_id', key: 'lark_open_id', render: (v?: string) => v || '未绑定' },
     {
       title: '启用',
       dataIndex: 'enabled',
@@ -43,13 +45,14 @@ export function Users() {
           enabled: v.enabled,
         })
       }
-      updateFn={(id, v) => updateUser(id, { display_name: v.display_name, email: v.email, enabled: v.enabled })}
+      updateFn={(id, v) => updateUser(id, { display_name: v.display_name, email: v.email, enabled: v.enabled, lark_open_id: v.lark_open_id })}
       deleteFn={deleteUser}
       columns={columns}
       toFormValues={(record) => ({
         display_name: record.display_name,
         email: record.email,
         enabled: record.enabled,
+        lark_open_id: record.lark_open_id,
       })}
       renderFields={(editing) => (
         <>
@@ -69,6 +72,11 @@ export function Users() {
           <Form.Item name="email" label="邮箱" rules={[{ type: 'email', message: '邮箱格式不正确' }]}>
             <Input placeholder="留空表示暂无邮箱联系方式" />
           </Form.Item>
+          {editing && (
+            <Form.Item name="lark_open_id" label="飞书 Open ID" extra="用于飞书卡片操作身份映射，例如 ou_xxx；留空表示解除绑定。">
+              <Input placeholder="ou_xxx" />
+            </Form.Item>
+          )}
           <Form.Item name="enabled" label="启用" valuePropName="checked" initialValue={true}>
             <Switch />
           </Form.Item>

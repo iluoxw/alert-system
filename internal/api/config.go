@@ -58,6 +58,7 @@ type ConfigUserStore interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id string) (*store.User, error)
 	List(ctx context.Context, tx pgx.Tx, limit int) ([]store.User, error)
 	Update(ctx context.Context, tx pgx.Tx, id, displayName, email string, enabled bool) error
+	UpdateLarkOpenID(ctx context.Context, tx pgx.Tx, id, openID string) error
 	Delete(ctx context.Context, tx pgx.Tx, id string) error
 }
 
@@ -677,6 +678,7 @@ func userJSON(u store.User) gin.H {
 		"username":     u.Username,
 		"display_name": u.DisplayName,
 		"email":        u.Email,
+		"lark_open_id": u.LarkOpenID,
 		"enabled":      u.Enabled,
 		"created_at":   u.CreatedAt,
 		"updated_at":   u.UpdatedAt,
@@ -778,9 +780,10 @@ func (h *configHandlers) getUser(c *gin.Context) {
 }
 
 type updateUserRequest struct {
-	DisplayName string `json:"display_name"`
-	Email       string `json:"email"`
-	Enabled     bool   `json:"enabled"`
+	DisplayName string  `json:"display_name"`
+	Email       string  `json:"email"`
+	Enabled     bool    `json:"enabled"`
+	LarkOpenID  *string `json:"lark_open_id"`
 }
 
 func (h *configHandlers) updateUser(c *gin.Context) {
@@ -795,7 +798,13 @@ func (h *configHandlers) updateUser(c *gin.Context) {
 	ctx := c.Request.Context()
 	id := c.Param("id")
 	err := h.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		return h.deps.Users.Update(ctx, tx, id, req.DisplayName, req.Email, req.Enabled)
+		if err := h.deps.Users.Update(ctx, tx, id, req.DisplayName, req.Email, req.Enabled); err != nil {
+			return err
+		}
+		if req.LarkOpenID == nil {
+			return nil
+		}
+		return h.deps.Users.UpdateLarkOpenID(ctx, tx, id, *req.LarkOpenID)
 	})
 	if err != nil {
 		h.handleStoreErr(c, err, "更新用户")

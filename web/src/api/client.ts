@@ -633,6 +633,7 @@ export interface User {
   username: string
   display_name: string
   email: string
+  lark_open_id?: string
   enabled: boolean
   created_at: string
   updated_at: string
@@ -650,6 +651,7 @@ export interface UpdateUserRequest {
   display_name: string
   email?: string
   enabled: boolean
+  lark_open_id?: string
 }
 
 export function listUsers(limit?: number): Promise<{ users: User[] }> {
