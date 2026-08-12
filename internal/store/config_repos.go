@@ -207,6 +207,19 @@ func (r *UserRepo) GetByUsername(ctx context.Context, tx pgx.Tx, username string
 	return &out, nil
 }
 
+// GetByLarkOpenID 按飞书 open_id 映射 Firebreak 用户。只返回启用状态由调用方
+// 决定，这样身份绑定查询与后台目录查询可以复用同一套仓储语义。
+func (r *UserRepo) GetByLarkOpenID(ctx context.Context, tx pgx.Tx, openID string) (*User, error) {
+	out, err := scanUser(tx.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE lark_open_id = $1`, openID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: 按飞书 open_id 查询用户失败: %w", err)
+	}
+	return &out, nil
+}
+
 func (r *UserRepo) List(ctx context.Context, tx pgx.Tx, limit int) ([]User, error) {
 	rows, err := tx.Query(ctx, `SELECT `+userColumns+` FROM users ORDER BY username LIMIT $1`, clampLimit(limit))
 	if err != nil {
@@ -235,6 +248,19 @@ func (r *UserRepo) Update(ctx context.Context, tx pgx.Tx, id, displayName, email
 	`, id, displayName, nullableStringArg(email), enabled)
 	if err != nil {
 		return fmt.Errorf("store: 更新用户失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateLarkOpenID 更新飞书身份映射。openID 为空表示解除绑定；数据库上的唯一
+// 索引负责防止一个飞书身份绑定多个 Firebreak 用户。
+func (r *UserRepo) UpdateLarkOpenID(ctx context.Context, tx pgx.Tx, id, openID string) error {
+	tag, err := tx.Exec(ctx, `UPDATE users SET lark_open_id = $2 WHERE id = $1`, id, nullableStringArg(openID))
+	if err != nil {
+		return fmt.Errorf("store: 更新飞书身份映射失败: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

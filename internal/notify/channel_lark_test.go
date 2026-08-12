@@ -135,6 +135,38 @@ func TestLarkChannel_Send_GroupCard_NoAckResolveButtons(t *testing.T) {
 	}
 }
 
+func TestBuildAlertCard_ResourceActionsOnlyExposeImplementedOperations(t *testing.T) {
+	cases := []struct {
+		name, resourceType, action string
+	}{
+		{name: "fault", resourceType: "fault", action: "advance"},
+		{name: "incident", resourceType: "incident", action: "mitigate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content, err := buildAlertCard(Message{ResourceType: tc.resourceType, ResourceID: "00000000-0000-0000-0000-000000000001", Title: tc.name})
+			if err != nil {
+				t.Fatalf("buildAlertCard 失败: %v", err)
+			}
+			var card map[string]any
+			if err := json.Unmarshal([]byte(content), &card); err != nil {
+				t.Fatalf("卡片 JSON 解析失败: %v", err)
+			}
+			elements, _ := card["elements"].([]any)
+			actionEl, _ := elements[len(elements)-1].(map[string]any)
+			actions, _ := actionEl["actions"].([]any)
+			if len(actions) != 1 {
+				t.Fatalf("%s 卡片应只有 1 个已实现动作，实际 %d", tc.resourceType, len(actions))
+			}
+			button, _ := actions[0].(map[string]any)
+			value, _ := button["value"].(map[string]any)
+			if value["resource_type"] != tc.resourceType || value["action"] != tc.action || value["version"] != float64(1) {
+				t.Fatalf("动作信封不符合预期: %v", value)
+			}
+		})
+	}
+}
+
 // 场景：卡片发送遇到权限不足错误 → 降级为纯文本+链接重发一次。
 func TestLarkChannel_Send_PermissionDenied_DegradesToText(t *testing.T) {
 	m := &fakeLarkMessenger{

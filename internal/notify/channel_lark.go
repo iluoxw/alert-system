@@ -115,20 +115,46 @@ func buildAlertCard(msg Message) (string, error) {
 	}
 
 	var actions []larkcard.MessageCardActionElement
-	if msg.GroupKey == "" && len(msg.AlertIDs) == 1 {
-		alertID := msg.AlertIDs[0]
-		actions = append(actions,
-			larkcard.NewMessageCardEmbedButton().
-				Text(larkcard.NewMessageCardPlainText().Content("认领").Build()).
-				Type(larkcard.MessageCardButtonTypePrimary).
-				Value(map[string]interface{}{"action": "ack", "alert_id": alertID}).
-				Build(),
-			larkcard.NewMessageCardEmbedButton().
-				Text(larkcard.NewMessageCardPlainText().Content("解决").Build()).
-				Type(larkcard.MessageCardButtonTypeDefault).
-				Value(map[string]interface{}{"action": "resolve", "alert_id": alertID}).
-				Build(),
-		)
+	resourceType := msg.ResourceType
+	resourceID := msg.ResourceID
+	if resourceType == "" && resourceID == "" && msg.GroupKey == "" && len(msg.AlertIDs) == 1 {
+		resourceType = "alert"
+		resourceID = msg.AlertIDs[0]
+	}
+	if msg.GroupKey == "" && resourceType != "" && resourceID != "" {
+		prefix := msg.ActionRequestPrefix
+		if prefix == "" {
+			prefix = msg.ResourceID
+		}
+		value := func(name string) map[string]interface{} {
+			out := map[string]interface{}{
+				"resource_type": resourceType,
+				"resource_id":   resourceID,
+				"action":        name,
+				"request_id":    prefix + ":" + name,
+				"version":       1,
+			}
+			// 兼容已部署的旧回调消费者和旧测试；新服务优先读取 resource_id。
+			if resourceType == "alert" {
+				out["alert_id"] = resourceID
+			}
+			return out
+		}
+		switch resourceType {
+		case "alert":
+			actions = append(actions,
+				larkcard.NewMessageCardEmbedButton().Text(larkcard.NewMessageCardPlainText().Content("认领").Build()).Type(larkcard.MessageCardButtonTypePrimary).Value(value("ack")).Build(),
+				larkcard.NewMessageCardEmbedButton().Text(larkcard.NewMessageCardPlainText().Content("解决").Build()).Type(larkcard.MessageCardButtonTypeDefault).Value(value("resolve")).Build(),
+			)
+		case "fault":
+			actions = append(actions,
+				larkcard.NewMessageCardEmbedButton().Text(larkcard.NewMessageCardPlainText().Content("推进故障").Build()).Type(larkcard.MessageCardButtonTypePrimary).Value(value("advance")).Build(),
+			)
+		case "incident":
+			actions = append(actions,
+				larkcard.NewMessageCardEmbedButton().Text(larkcard.NewMessageCardPlainText().Content("进入处置").Build()).Type(larkcard.MessageCardButtonTypePrimary).Value(value("mitigate")).Build(),
+			)
+		}
 	}
 	if msg.DetailURL != "" {
 		actions = append(actions,

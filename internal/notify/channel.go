@@ -20,6 +20,12 @@ type Message struct {
 	DetailURL  string            // 详情跳转链接（告警详情页/分组详情页）
 	Labels     map[string]string // 公共标签（分组场景下为 group_by 收敛后的公共标签集）
 	OccurredAt time.Time         // 触发/最近一次事件发生时间
+
+	// ResourceType/ResourceID/ActionRequestPrefix 是交互卡片的统一资源动作信封。
+	// 当前支持 alert/fault/incident；普通文本渠道可以忽略这些字段。
+	ResourceType        string
+	ResourceID          string
+	ActionRequestPrefix string
 }
 
 // Channel 是一个可发送通知的出站渠道（webhook/飞书/短信/电话……）。

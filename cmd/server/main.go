@@ -162,7 +162,10 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发，与下面 REST API
 	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes）共用同一套
 	// stopper/lifecycle，保证两条处置路径的"停止升级链/生命周期定时器"不变量一致。----
-	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
+	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle).
+		SetLarkIdentityStore(users).
+		SetLarkActionStore(store.NewLarkCardActionRepo()).
+		SetLarkFaultStore(faults)
 
 	// ---- 告警变更实时推送：PG 触发器 pg_notify（migrations/000011）→ 专用连接
 	// LISTEN → 进程内 Bus → SSE。RunListener 是常驻 goroutine，独立于 st 的连接池，
@@ -187,6 +190,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterAlertSourceRoutes(alertSources, alertSourceReconciler)
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
 	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor, runbook.WithUATPolicy(uatPolicy))
 	router.RegisterRunbookRoutes(runbookService)

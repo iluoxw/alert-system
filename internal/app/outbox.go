@@ -263,13 +263,18 @@ func opsGroupKey(teamID, kind string) string {
 
 // buildAlertMessage 把单个告警组装成渠道无关的 Message（Sender/Channel 的载荷）。
 func buildAlertMessage(alert domain.Alert) notify.Message {
+	prefix := alert.ID
+	if !alert.UpdatedAt.IsZero() {
+		prefix += ":" + fmt.Sprint(alert.UpdatedAt.UnixNano())
+	}
 	return notify.Message{
-		AlertIDs:   []string{alert.ID},
-		Severity:   string(alert.Severity),
-		Title:      alert.Title,
-		Body:       alert.Title,
-		Labels:     alert.Labels,
-		OccurredAt: alert.StartsAt,
+		AlertIDs:     []string{alert.ID},
+		Severity:     string(alert.Severity),
+		Title:        alert.Title,
+		Body:         alert.Title,
+		Labels:       alert.Labels,
+		OccurredAt:   alert.StartsAt,
+		ResourceType: "alert", ResourceID: alert.ID, ActionRequestPrefix: prefix,
 	}
 }
 

@@ -51,7 +51,9 @@ func (o *IncidentOutbox) QueueIncidentNotification(ctx context.Context, tx pgx.T
 				"incident_status":     string(incident.Status),
 				"incident_event":      string(notification.Event),
 			},
-			OccurredAt: notification.OccurredAt,
+			OccurredAt:   notification.OccurredAt,
+			ResourceType: "incident", ResourceID: incident.ID,
+			ActionRequestPrefix: fmt.Sprintf("%s:%d", incident.ID, notification.OccurredAt.UnixNano()),
 		},
 		Round: notification.OccurredAt.UnixNano(),
 	}
