@@ -139,6 +139,16 @@ func (s *cfgUserStore) Update(ctx context.Context, tx pgx.Tx, id, displayName, e
 	return nil
 }
 
+func (s *cfgUserStore) UpdateLarkOpenID(ctx context.Context, tx pgx.Tx, id, openID string) error {
+	u, ok := s.byID[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	u.LarkOpenID = openID
+	s.byID[id] = u
+	return nil
+}
+
 func (s *cfgUserStore) Delete(ctx context.Context, tx pgx.Tx, id string) error {
 	if _, ok := s.byID[id]; !ok {
 		return store.ErrNotFound

@@ -133,7 +133,10 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
 	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
 
-	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
+	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle).
+		SetLarkIdentityStore(users).
+		SetLarkActionStore(store.NewLarkCardActionRepo()).
+		SetLarkFaultStore(faults)
 
 	auth := api.NewPasswordAuthenticator(users)
 	router := api.NewRouter(cfg, users, sessions, memberships, st, auth, larkServer.Handler(), logger)
@@ -152,6 +155,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterAlertSourceRoutes(alertSources, reconciler)
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
 	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
 	router.RegisterRunbookRoutes(runbookService)

@@ -19,6 +19,8 @@ import (
 // testDSN 与 docker-compose.yml 里 postgres 服务暴露的宿主机端口一致（15432）。
 const testDSN = "postgres://alert_system:alert_system@localhost:15432/alert_system?sslmode=disable"
 
+const composeProject = "firebreak-e2e"
+
 var (
 	sys        *system
 	seedResult *seedConfigResult
@@ -38,6 +40,9 @@ func TestMain(m *testing.M) {
 // runTestMain 是 TestMain 的主体：用 error 返回值代替到处手写 os.Exit(1)，defer 也就
 // 能正常执行（docker compose down、system.close）。
 func runTestMain(m *testing.M) (int, error) {
+	// E2E 数据目录是测试专用 tmpfs；先清理上一次异常退出遗留的容器，
+	// 再强制重建，避免固定种子名称与旧容器数据冲突。
+	composeDown()
 	if err := composeUp(); err != nil {
 		return 0, fmt.Errorf("启动 docker compose 失败: %w", err)
 	}
@@ -88,14 +93,14 @@ func runTestMain(m *testing.M) (int, error) {
 }
 
 func composeUp() error {
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "up", "-d", "--wait")
+	cmd := exec.Command("docker", "compose", "-p", composeProject, "-f", "docker-compose.yml", "up", "-d", "--wait", "--force-recreate", "--remove-orphans")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func composeDown() {
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "down", "-v")
+	cmd := exec.Command("docker", "compose", "-p", composeProject, "-f", "docker-compose.yml", "down", "-v")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	_ = cmd.Run() // 清理失败不应该掩盖测试本身的结果，只记录不 panic
