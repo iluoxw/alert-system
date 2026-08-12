@@ -59,6 +59,12 @@ Go 编写的告警管理系统（MVP）：接入已触发的告警事件（metri
 飞书卡片交互回调地址是 `/callbacks/lark/card`，需要飞书开放平台能访问到（本地联调
 需要内网穿透工具把该地址暴露为公网可达）。
 
+卡片动作只接受已验签且已绑定 Firebreak 用户的请求。管理员在“设置 → 用户”中维护
+飞书 `open_id`；当前支持 Alert 的认领/解决、Fault 的逐级推进、Incident 的进入处置。
+每次点击使用 `request_id` 幂等，并在 `lark_card_actions` 中记录操作和结果快照。详细
+边界与后续 Agent 扩展点见
+[`docs/plans/2026-08-13-feishu-card-action-design.md`](docs/plans/2026-08-13-feishu-card-action-design.md)。
+
 ## 告警接入（webhook）
 
 外部系统（Alertmanager / Grafana / 自定义脚本）通过 webhook 推送已触发的告警事件：
