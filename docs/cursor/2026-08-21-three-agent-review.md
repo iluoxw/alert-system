@@ -128,11 +128,11 @@
 
 ---
 
-## 5. 后续：明确该拍的决策（合并后的唯一清单）
+## 5. 后续：明确该拍的决策（合并后的对照清单）
 
-只保留现在不拍就会在生产里说不清的条目。实现任务另立项，这里只拍产品。
+下面仍是对照三套报告后的合并项，方便和其他 Agent 对读。**对本仓库动手请改读 [what-to-do-next](./2026-08-21-what-to-do-next.md)**：团队渠道表已经存在，缺的是 outbox 接线；映射队列和宣布门槛已经落地，不是缺口。
 
-### P0（本迭代必须写进 CLAUDE / ADR，再动代码）
+### P0（对照用；不要当「从零建设」任务书）
 
 **P0-1 团队触达身份（采 Grok）**
 
@@ -188,7 +188,7 @@
 | 目的 | 主读 | 辅读 |
 | --- | --- | --- |
 | 统一对象语言、防抄错 | Cursor 对比 §1–§4 | Grok 对比 §2–§3 |
-| 开会拍 P0 | **本文 §5** + Grok 对比 §12 | — |
+| 开会拍 P0 | **[what-to-do-next](./2026-08-21-what-to-do-next.md)**（钉到本仓库假完成） | 本文 §5 仍是对照三套报告后的合并清单，偏通用 |
 | 排工程（trace / inhibit / 缓存提示） | Codex 对比 §6、§12、§15 | `internal/pipeline/stage_inhibit.go`、`internal/app/outbox.go` |
 | 核对 Flashduty 降噪/分派字段 | Grok Flashduty §5–§7 | Codex Flashduty §6–§7 |
 | 核对 PagerDuty 服务/通知现场 | Cursor PagerDuty §4–§5 或 Grok PagerDuty §2–§5 | Codex 仅文档部分 |
@@ -201,4 +201,4 @@ Cursor 对比报告继续适合当对外摘要；Grok 对比报告当内部决�
 
 Codex 最像严谨的现场+代码备忘录，但 PD 现场断了、有一处开源事实写错，inhibit P0 需要收窄。Cursor 最像给负责人看的战略对照，世界观对，实现裂缝和一处 PD 表单证据偏满。Grok 最像能直接开会的决策书，也是唯一把「团队群目标 / 卡片 Ack / override / 空班」写成必须二选一的报告。
 
-后续只做一件事：把本文 §5 的 P0 五条写进 CLAUDE/ADR，再按那五条改代码。功能对等表可以停了。
+后续不要再把 §5 抄进 CLAUDE。下一件实事是 [what-to-do-next](./2026-08-21-what-to-do-next.md)：先修 `outbox.go` 用 TeamID 当飞书 chat_id、飞书 Ack 空 `actorID`、侧栏假值班文案。功能对等表和「该学竞品什么」可以停了。
