@@ -96,3 +96,111 @@ Flashduty 对标 PagerDuty（[comparison.md](https://docs.flashduty.com/zh/on-ca
 ---
 
 ## 2. 控制台信息架构：三级导航、产品切换、套餐门控
+
+本节以 **SREMonitor 已登录控制台** 为准（[console.flashcat.cloud](https://console.flashcat.cloud)，Pass 1）。文档侧栏是 `llms.txt` 的信息架构，和真实 UI 高度同构，但菜单名、顺序、灰度和门控文案必须以控制台为准。
+
+组织身份：Owner 角色，Org ID `2618591231671`，用户菜单显示「SREMonitor · Owner」。UI 语言为 English，预置数据与部分 placeholder 残留中文（`默认模板`、`输入模板名称检索`、`自定义事件`、`邮件 Email`）。i18n 在数据 / 预置层不完整。
+
+### 2.1 三级壳
+
+控制台是一个固定壳 + 内容区的 SaaS SPA，不是文档那种「一个产品一个站点」。
+
+**第一列：最左侧约 50px 图标轨 = 产品切换器（persistent，icon-only）**
+
+- Flashduty logo → 营销站 `www.flashduty.com`
+- **AI SRE** → `/ai-sre/chat`（带 beta 徽标，chat-first）
+- **On-call** → `/channel`（默认落地产品）
+- **RUM** → `/rum/dashboard/overview`
+- **Monitors** → `/monit/rule/list`
+- 底部簇：客服耳机、语言切换（文A）、主题（太阳 = 亮 / 暗）、帮助（?）、历史 / 通知（红徽标 `"3"`）、反馈（屏幕图标）、设备 / APP 图标、用户头像 `"SR"` → `/profile`
+
+**第二列：约 165px 带标签的模块导航**（顶部写模块名 + 折叠开关）
+
+| 产品轨 | 二级菜单（控制台实勘） |
+| --- | --- |
+| On-call | Channels · Incidents · Status Pages · Post Incident · Analytics（Usage, Insights）· Integrations · Configuration（Schedules, Calendars, Templates, Mappings, Custom Forms, Custom Fields）· Quick start（带动画 spinner / avatar） |
+| AI SRE | New chat · Automations · Artifacts · Plugins · Knowledges · Environments · Chats list（搜索 + 过滤） |
+| RUM | Analytics · Applications · Performance · Error Tracking · Session Explorer · Session Replay |
+| Monitors | Overview · Entity Tree · Alerting rules · Targets · Datasources · Alerting engines · Event Monitoring |
+| Platform（走头像，不在第二列） | Personal（Profile, Notification, APP Key, Flashduty APP）· Billing（Plan, Billing overview, Billing）· Organization（Organization, Members, Teams, Roles, SSO）· Audit（Audit logs） |
+
+**第三列：内容区。** 页标题右侧几乎每页都有文档深链（"Learn about channels"、"What is an incident" …），右上角固定一颗紫色 **AI SRE** pill，打开侧栏助手。这是「教学型 SaaS」：空态、文档链、Quick start 动画同时存在。
+
+头像菜单是 **三栏 popover**：Personal Center（姓名 / 邮箱、Profile、Notification、APP Key、Flashduty APP、Sign out）| Organization（Plan、Billing overview、Billing、Organization、Members、More）| **Switch Identity**（组织切换；当前只有 "SREMonitor · Owner" ✓）。文档口径与此对齐：个人中心管通知偏好 / APP Key（每账号最多 5 个）/ App 扫码绑定；组织管团队、角色、SSO、审计；主体账号的头像 / 名称即组织身份（[personal-settings.md](https://docs.flashduty.com/zh/on-call/configuration/personal-settings.md)）。
+
+### 2.2 文档 IA 与控制台 IA 的对齐
+
+文档顶层（[llms.txt](https://docs.flashduty.com/llms.txt)）是：平台 / 组织、On-call、Monitors、RUM、AI SRE、开发者、合规。控制台把「开发者 / 合规」收进文档站和头像里的 Plan / Audit，不占产品轨。On-call 文档树（协作空间 / 故障 / 复盘 / 状态页 / 分析 / 集成 / 配置）和二级菜单一一对应，只是英文标签化了：Channel = 协作空间，Post Incident = 复盘，Mappings = 过滤条件 / 标签映射。
+
+文档点名、Pass 1 核过的 URL：
+
+| URL | 含义 | 控制台状态 |
+| --- | --- | --- |
+| `/channel` | 协作空间列表 | 已访。1 张 Default 卡片 |
+| `/channel/detail/2618595391671` | Default 空间详情 | 已访。`?tab=` 切配置 |
+| `/incident` | 全局故障列表 | 已访。空表 |
+| `/status-page` | 状态页 | 已访。Public 0/1，Internal 0/0 |
+| `/post-incident` | 复盘 | Pro 门控 |
+| `/dashboard/usage` | 用量 | 已访。Notifications / Incidents 两张图 |
+| `/dashboard/insights/overview` | Insights | Standard 门控 |
+| `/settings/source/alert` | 告警集成 | 已访 |
+| `/settings/source/change` | 变更事件 | 已访。仅 Standard Change Event |
+| `/settings/source/im` | IM | 已访。钉钉 / 飞书 / Slack / Teams / 企微 |
+| `/settings/source/webhook` | 出站 | 已访。Alert / Incident / Custom Action / Jira / SDP / ServiceNow |
+| `/oncall` | 值班表 | 已访。首次创建空态 |
+| `/calendar` | 服务日历 | Pro 门控 |
+| `/template` | 通知模板 | 已访。一条不可改的系统预置 |
+| `/mapping` | 映射 | 已访。配额 0/20，创建禁用 |
+| `/forms` | 自定义表单 | 已访。Declare / Acknowledge / Close 三个生命周期表单，均 Not configured |
+| `/fields` | 自定义字段 | Standard 门控 |
+| `/profile` | 个人资料 | 已访 |
+| `/ai-sre/chat` | AI SRE | 已访。问候 + composer |
+| `/rum/dashboard/overview` | RUM | 已访。仅模块导航，内容仍在 Loading |
+| `/monit/rule/list` | Monitors 规则 | 已访。要求先装 Alert engine |
+
+文档还写了 `https://api.flashcat.cloud`（唯一 Open API / Event API）和 `https://mcp.flashcat.cloud/mcp`（远程 MCP）。控制台前端自己打的是同源 `/api/…`，例如 `GET /api/team/list`（Pass 1）。
+
+### 2.3 套餐门控：这套租户是 Free / 低档
+
+Pass 1 没有打开定价页，所以**不写现价**。能写死的是门控表现和文档版本要求。
+
+控制台统一空态：猫咪吉祥物 + 盾锁，文案 *"This feature is only available for Pro/Standard and above users"*，紫色 **"Upgrade now"**。命中页面：
+
+| 页面 | 路径 | 门控档 | 实勘 |
+| --- | --- | --- | --- |
+| Post Incident | `/post-incident` | Pro | No permission |
+| Analytics → Insights | `/dashboard/insights/overview` | Standard | No permission |
+| Configuration → Calendars | `/calendar` | Pro | No permission |
+| Configuration → Custom Fields | `/fields` | Standard | No permission |
+
+文档补充的功能门控（各页「版本要求」，未在本租户逐一点开核验）：聚合 / 风暴 / 抑制需标准版+；模板、作战室、新奇故障、外部提报、行动项、AI 产物公开链需专业版+（[permission-design.md](https://docs.flashduty.com/zh/platform/permission-design.md) 及各功能页）。
+
+配额和禁用按钮也是门控的一部分，而且做得很外显：
+
+- Channels：`Create channel` **disabled**，带 `oper-forbid` class。文档：免费版只能建 **1** 个协作空间（[create-edit.md](https://docs.flashduty.com/zh/on-call/channel/create-edit.md)）。本租户恰好 1 个 Default，创建按钮灭掉，和文档一致。
+- Status Pages：Public Status Page **0/1**（可点 Create）；Internal Status Page **0/0**（创建按钮 disabled）。
+- Templates：`Create custom template` disabled；表里一条 `默认模板 / 系统预置模板，不可更改`。
+- Mappings：标题旁 **「0 / 20 Created」**，`Create mapping schema` disabled。
+- Custom Forms：三个生命周期表单都在，只是「Not configured」——表单框架免费可见，字段定制才 Standard。
+
+结论：SREMonitor 是一条被故意做瘦的 Free / 低档租户。On-call 主路径（Channel、Incident、Integrations、Schedules、Usage、默认分派）能看；分析、复盘、日历、自定义字段、再建空间被挡。Pass 1 据此判断「租户在 Free/low tier」，材料里没有打开 Plan 页做二次确认。
+
+### 2.4 各页实勘摘要（不编列、不编空态）
+
+**Channels `/channel`。** 标题 "Channel" + 文档链。工具栏：Teams 下拉、"My starred" 开关、搜索 "Enter channel name or description"、帮助、**Create channel**（禁用）、按 "Create time" 升降序、grid / list 视图切换。卡片网格；仅一张 **Default**，绿色状态点 + 「0 Triggered / 0 Processing」。
+
+**Incidents `/incident`。** 分段页签 "Assigned to me / My channel"；状态下拉 "Open"；时间 "Last 30 days"；搜索图标；warning badge；"View alerts" 链；紫色 **Create**；导出；列设置齿轮；"+ Filters" chip。表头全选 checkbox。空态 *"No data found, try other filters"*。这是「先给筛选器、再给空态」的检索型列表，不是引导创建型。
+
+**Usage `/dashboard/usage`。** 两张图：Notifications、Incidents。维度下拉（Channel）、Day / Week / Month、范围 "Last 2 weeks"。折线系列 SMS / Email / Voice（粉 / 紫 / 青）。即使是 Free 租户，用量看板也在——计费和「你已经用了多少触达」是同一产品面。
+
+**Integrations `/settings/source/alert`。** 标题 "Multiple ways to receive alerts"。顶 Tab：**Alert events / Change events / Instant messages / Webhook / Other**，右侧还可按 integration key 搜。双栏：左目录（可搜索 logo 卡片，链到 `/settings/source/<kind>/add/<slug>`），右实例表（Integration, Team, Latest event time, Status, Actions），带 Status / Type / Teams 过滤，分页 "Total 0 items"、10/page。Change events 只有 Standard Change Event。IM：DingTalk、Feishu/Lark、Slack、Microsoft Teams、WeCom（表列无 Latest event time）。Webhook：Alert Webhook、Custom Action、Incident Webhook、Jira、ServiceDesk Plus、ServiceNow。
+
+告警源目录 Pass 1 看到约 **55** 项，中国云厂商长尾很重，字母序排在一组 curated「popular」头之后。点名见到的包括 Prometheus、Grafana、Zabbix、Nightingale/Flashcat、Uptime Kuma、Sentry、Dynatrace、Splunk、Nagios、PagerDuty、Cloudflare、Keep、ElastAlert2、Skywalking、Graylog、Harbor、HTTP Pull、OceanBase、zilliz、ZStack，以及阿里 / 腾讯 / 华为 / 百度 / 火山 / 京东 / UCloud / AWS / Azure / GCP 云监控家族。文档 `llms.txt` 写的是 **100+**。两个数字不要合并：目录卡片数是 Pass 1 点数，文档是全量清单口径（还含邮件、蓝鲸、观测云、监控宝、Meraki、Monit 等，控制台 Other / 搜索里可能还有，Pass 1 未穷举）。
+
+**Schedules `/oncall`。** 富空态：吉祥物 + "Create first schedule"，解释文案提到 daily rules、holiday overrides、roles via support，CTA "Start schedule planning"。角色库要找支持开通——这和文档「账户级角色库（主 / 备或自定义如 SRE 响应官）」一致。
+
+**Quick start** 在 On-call 二级菜单最底部，带旋转头像，Pass 1 未点开。它和每页文档链、空态 CTA 是同一套 onboarding 系统。
+
+---
+
+## 3. 核心对象模型：Event → Alert → Incident，Channel = 协作空间
