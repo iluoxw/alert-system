@@ -476,4 +476,4 @@ Flashduty 把「找到人」和「找到人之后怎么闭环」拆成 On-call �
 - 用协作空间同时充当拓扑、权限、路由、聊天室，最后会变成「什么都是 Channel」。
 - 把 AI 做成一级导航但核心 Fault 图还没稳。Flashduty 可以，因为它已经是成熟 On-call SaaS。
 
-更完整的三方对照见同目录 `2026-08-20-flashduty-pagerduty-sre-control-comparison.md`。
+更完整的三方对照见同目录 `2026-08-21-alert-system-comparison.md`。

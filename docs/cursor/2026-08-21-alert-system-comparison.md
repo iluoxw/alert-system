@@ -9,8 +9,8 @@
 
 完整单品分析：
 
-- `docs/research/2026-08-20-flashduty-product-analysis.md`
-- `docs/research/2026-08-20-pagerduty-product-analysis.md`
+- [`2026-08-21-flashcat-flashduty-analysis.md`](./2026-08-21-flashcat-flashduty-analysis.md)
+- [`2026-08-21-pagerduty-analysis.md`](./2026-08-21-pagerduty-analysis.md)
 
 ---
 
@@ -369,7 +369,7 @@ PagerDuty 开源手册是为了占领「事故响应该怎么做」的话语权�
 4. 未匹配策略就丢通知。
 5. 把 AI SRE 做成一级导航或管道决策者。
 6. 为了功能对等去追状态页、750 集成、智能聚合主路径。
-7. 在页面常驻「我们如何对标 PagerDuty/Flashduty」。对比只留在 `docs/research/`。
+7. 在页面常驻「我们如何对标 PagerDuty/Flashduty」。对比只留在 `docs/cursor/`。
 
 ---
 

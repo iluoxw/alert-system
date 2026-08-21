@@ -467,4 +467,4 @@ Events API（v2）是事实标准：很多监控工具「兼容 PagerDuty」只�
 
 这些以官方文档和销售页为辅证，不当作控制台实测。
 
-与快猫星云、以及本仓库 SRE Control 的对照，见 `2026-08-20-flashduty-pagerduty-sre-control-comparison.md`。
+与快猫星云、以及本仓库 SRE Control 的对照，见 `2026-08-21-alert-system-comparison.md`。
