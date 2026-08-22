@@ -88,7 +88,9 @@ func TestManagedServiceRelationCrossSourceTraversalAndStale(t *testing.T) {
 			return err
 		}
 		service, err = services.Create(ctx, tx, domain.ServiceRegistration{
-			Entity:      domain.ResourceNode{EntityKey: "service/cch/prod", Name: "CCH", Environment: "prod", OwnerTeamID: team.ID},
+			Entity: domain.ResourceNode{EntityKey: "service/cch/prod", Name: "CCH", Environment: "prod",
+				OwnerTeamID: team.ID, Layer: domain.EntityLayerApplication,
+				Kind: domain.ResourceNodeKindBusinessSystem},
 			OwnerTeamID: team.ID, Tier: domain.ServiceTier1, Enabled: true,
 			Dependencies: []domain.DependencyEdge{{
 				ToNodeID: platform.ID, Relation: domain.DependencyRelationDependsOn,

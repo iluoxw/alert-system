@@ -6,7 +6,10 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { ApartmentOutlined, AppstoreOutlined, DatabaseOutlined, EditOutlined, PlusOutlined, TeamOutlined } from '@ant-design/icons'
-import type { EntityAlias, ManagedEntityRequest, ResourceNode, ServiceRegistration, ServiceRequest, ServiceTier } from '../../api/client'
+import type {
+  EntityAlias, ManagedEntityRequest, ResourceNode, ServiceEntityLayer, ServiceRegistration,
+  ServiceRequest, ServiceTier,
+} from '../../api/client'
 import {
   createManagedEntity, createService, listInfrastructureNodes, listServices, listTeamsLite,
   updateManagedEntity, updateServiceRegistration,
@@ -14,7 +17,7 @@ import {
 
 const { Text } = Typography
 
-interface ServiceFormValues extends Omit<ServiceRequest, 'aliases'> {
+interface ServiceFormValues extends Omit<ServiceRequest, 'aliases' | 'entity_kind'> {
   aliases: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
 }
 
@@ -26,6 +29,23 @@ const tierOptions: Array<{ value: ServiceTier; label: string }> = [
   { value: 'tier-2', label: 'Tier 2 · 标准业务' },
   { value: 'tier-3', label: 'Tier 3 · 低风险服务' },
 ]
+
+// layer 与 kind 是一对一绑定的合法 pair，所以表单只暴露一个“服务类型”选项，
+// kind 由 layer 推导，避免用户拼出 platform/business_system 这类非法组合。
+const serviceLayerOptions: Array<{ value: ServiceEntityLayer; label: string }> = [
+  { value: 'application', label: '业务系统 · 消费共享能力' },
+  { value: 'platform', label: '基础设施能力 · 被多个业务系统共享' },
+]
+
+const serviceKindByLayer = {
+  application: 'business_system',
+  platform: 'infrastructure_capability',
+} as const
+
+const serviceLayerLabels: Record<string, string> = {
+  application: '业务系统',
+  platform: '基础设施能力',
+}
 
 export function ServiceCatalog() {
   const queryClient = useQueryClient()
@@ -54,6 +74,8 @@ export function ServiceCatalog() {
         ...values,
         entity_key: values.entity_key.trim(),
         name: values.name.trim(),
+        entity_layer: values.entity_layer,
+        entity_kind: serviceKindByLayer[values.entity_layer],
         environment: values.environment.trim(),
         description: values.description?.trim() ?? '',
         dashboard_url: values.dashboard_url?.trim() ?? '',
@@ -64,7 +86,7 @@ export function ServiceCatalog() {
       return editing ? updateServiceRegistration(editing.id, payload) : createService(payload)
     },
     onSuccess: () => {
-      messageApi.success(editing ? '服务登记已更新' : '应用服务已登记')
+      messageApi.success(editing ? '服务登记已更新' : '服务已登记')
       setOpen(false)
       setEditing(null)
       form.resetFields()
@@ -76,7 +98,8 @@ export function ServiceCatalog() {
   const openCreate = () => {
     setEditing(null)
     form.setFieldsValue({
-      entity_key: '', name: '', environment: 'prod', owner_team_id: '', description: '',
+      entity_key: '', name: '', entity_layer: 'application', environment: 'prod',
+      owner_team_id: '', description: '',
       tier: 'tier-2', dashboard_url: '', runbook_url: '', enabled: true,
       aliases: [{ namespace: 'prometheus.service', value: '', enabled: true }],
       dependencies: [],
@@ -89,6 +112,7 @@ export function ServiceCatalog() {
     form.setFieldsValue({
       entity_key: service.entity.entity_key,
       name: service.entity.name,
+      entity_layer: service.entity.layer === 'platform' ? 'platform' : 'application',
       environment: service.entity.environment,
       owner_team_id: service.owner_team_id,
       description: service.description,
@@ -143,13 +167,21 @@ export function ServiceCatalog() {
 
   const columns: ColumnsType<ServiceRegistration> = [
     {
-      title: '应用服务', key: 'service', width: 300,
+      title: '服务', key: 'service', width: 300,
       render: (_, service) => (
         <div className="catalog-primary-cell">
           <strong>{service.entity.name}</strong>
           <code>{service.entity.entity_key}</code>
           <span>{service.description || '暂无服务说明'}</span>
         </div>
+      ),
+    },
+    {
+      title: '服务类型', key: 'classification', width: 150,
+      render: (_, service) => (
+        <Tag color={service.entity.layer === 'platform' ? 'geekblue' : 'default'}>
+          {serviceLayerLabels[service.entity.layer] ?? service.entity.layer}
+        </Tag>
       ),
     },
     {
@@ -220,7 +252,7 @@ export function ServiceCatalog() {
       {serviceQuery.error && <Alert showIcon type="error" message="服务目录加载失败" description={serviceQuery.error instanceof Error ? serviceQuery.error.message : '请稍后重试'} />}
       {entityQuery.error && <Alert showIcon type="error" message="实体目录加载失败" description={entityQuery.error instanceof Error ? entityQuery.error.message : '请稍后重试'} />}
       <Row gutter={16} className="source-stat-row">
-        <Col span={6}><Card><Statistic title="应用服务" value={services.length} prefix={<AppstoreOutlined />} /></Card></Col>
+        <Col span={6}><Card><Statistic title="登记服务" value={services.length} prefix={<AppstoreOutlined />} /></Card></Col>
         <Col span={6}><Card><Statistic title="依赖实体" value={managedProviders.length} prefix={<DatabaseOutlined />} /></Card></Col>
         <Col span={6}><Card><Statistic title="责任团队" value={new Set(services.map((item) => item.owner_team_id)).size} prefix={<TeamOutlined />} /></Card></Col>
         <Col span={6}><Card><Statistic title="显式依赖关系" value={services.reduce((sum, item) => sum + item.dependencies.length, 0)} prefix={<ApartmentOutlined />} /></Card></Col>
@@ -228,8 +260,8 @@ export function ServiceCatalog() {
       <Card className="source-registry-card entity-relation-card">
         <Tabs items={[
           {
-            key: 'services', label: `应用服务 ${services.length}`,
-            children: <><div className="catalog-tab-toolbar"><div><strong>应用服务与责任边界</strong><span>登记 Alias，并声明当前服务依赖哪些共享能力。</span></div><Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>登记应用服务</Button></div><Table rowKey="id" columns={columns} dataSource={services} loading={serviceQuery.isLoading} pagination={false} scroll={{ x: 1280 }} locale={{ emptyText: '尚未登记应用服务。先建立服务与团队责任边界，再配置 Alert Mapping。' }} /></>,
+            key: 'services', label: `服务 ${services.length}`,
+            children: <><div className="catalog-tab-toolbar"><div><strong>服务与责任边界</strong><span>登记业务系统或基础设施能力，声明 Alias 与当前服务依赖的共享能力。</span></div><Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>登记服务</Button></div><Table rowKey="id" columns={columns} dataSource={services} loading={serviceQuery.isLoading} pagination={false} scroll={{ x: 1440 }} locale={{ emptyText: '尚未登记服务。先建立服务与团队责任边界，再配置 Alert Mapping。' }} /></>,
           },
           {
             key: 'entities', label: `基础设施 / 平台 ${managedProviders.length}`,
@@ -238,7 +270,7 @@ export function ServiceCatalog() {
         ]} />
       </Card>
 
-      <Modal title={editing ? '编辑应用服务' : '登记应用服务'} open={open} width={840}
+      <Modal title={editing ? '编辑服务登记' : '登记服务'} open={open} width={840}
         okText="保存登记" cancelText="取消" confirmLoading={saveMutation.isPending}
         onCancel={() => setOpen(false)} onOk={() => form.submit()} destroyOnHidden>
         <Form form={form} layout="vertical" onFinish={(values) => saveMutation.mutate(values)}>
@@ -247,6 +279,10 @@ export function ServiceCatalog() {
             <Form.Item name="entity_key" label="Canonical entity key" tooltip="全局稳定、不可复用；建议 service/<name>/<env>"
               rules={[{ required: true }, { pattern: /^[a-z0-9][a-z0-9._:/-]{2,127}$/, message: '仅支持小写字母、数字及 ._:/-' }]}>
               <Input placeholder="service/cch/prod" disabled={Boolean(editing)} />
+            </Form.Item>
+            <Form.Item name="entity_layer" label="服务类型" tooltip="创建后不可修改；分类迁移需要人工重新裁决已确认影响"
+              rules={[{ required: true }]}>
+              <Select virtual={false} disabled={Boolean(editing)} options={serviceLayerOptions} />
             </Form.Item>
             <Form.Item name="environment" label="环境" rules={[{ required: true }]}><Input placeholder="prod" /></Form.Item>
             <Form.Item name="owner_team_id" label="负责团队" rules={[{ required: true }]}>

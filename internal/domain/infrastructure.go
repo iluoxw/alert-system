@@ -40,6 +40,34 @@ func (l EntityLayer) IsValid() bool {
 	return l == EntityLayerInfrastructure || l == EntityLayerPlatform || l == EntityLayerApplication
 }
 
+var ErrInvalidServiceClassification = errors.New("domain: 服务登记分类非法")
+
+// ValidateServiceClassification 收敛 Service Registration 可用的 (layer, kind) 组合。
+// Service 表达“对外提供、有责任团队和 tier 的能力”，只有两种形态：
+//
+//	application/business_system            消费共享能力的业务系统
+//	platform/infrastructure_capability     被多个业务系统共享的基础设施能力（如 E2B）
+//
+// infrastructure/resource 是被能力承载的底层资源，不能直接登记成 Service；跨 pair
+// 混搭会让层级分类与爆炸半径方向同时失真，因此一律拒绝，不做归一化猜测。
+func ValidateServiceClassification(layer EntityLayer, kind ResourceNodeKind) error {
+	switch {
+	case layer == EntityLayerApplication && kind == ResourceNodeKindBusinessSystem:
+		return nil
+	case layer == EntityLayerPlatform && kind == ResourceNodeKindInfrastructureCapability:
+		return nil
+	default:
+		return fmt.Errorf("%w: layer=%q kind=%q", ErrInvalidServiceClassification, layer, kind)
+	}
+}
+
+// DefaultServiceClassification 是不带分类字段的旧 V1 登记请求的兼容缺省值。
+// 它只允许出现在 create 路径：update 必须保留当前分类，否则旧客户端一次编辑就会把
+// platform 能力静默降级成 application。
+func DefaultServiceClassification() (EntityLayer, ResourceNodeKind) {
+	return EntityLayerApplication, ResourceNodeKindBusinessSystem
+}
+
 // DependencyRelation 采用“from 消费/依赖 to”的方向。爆炸半径从故障节点出发，
 // 沿 dependency_edges.to_node_id -> from_node_id 反向遍历。
 type DependencyRelation string

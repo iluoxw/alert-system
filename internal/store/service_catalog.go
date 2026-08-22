@@ -14,11 +14,12 @@ import (
 )
 
 var (
-	ErrServiceNotFound           = errors.New("store: 应用服务不存在")
-	ErrServiceEntityKeyImmutable = errors.New("store: canonical entity key 创建后不可修改")
-	ErrServiceDependencyInvalid  = errors.New("store: 服务依赖非法")
-	ErrMappingPolicyNotFound     = errors.New("store: Alert Mapping 策略不存在")
-	ErrMappingResultNotFound     = errors.New("store: Alert Mapping 结果不存在")
+	ErrServiceNotFound                = errors.New("store: 应用服务不存在")
+	ErrServiceEntityKeyImmutable      = errors.New("store: canonical entity key 创建后不可修改")
+	ErrServiceClassificationImmutable = errors.New("store: 服务分类创建后不可修改")
+	ErrServiceDependencyInvalid       = errors.New("store: 服务依赖非法")
+	ErrMappingPolicyNotFound          = errors.New("store: Alert Mapping 策略不存在")
+	ErrMappingResultNotFound          = errors.New("store: Alert Mapping 结果不存在")
 )
 
 type ServiceCatalogRepo struct{}
@@ -29,6 +30,13 @@ func validateService(service domain.ServiceRegistration) error {
 	if strings.TrimSpace(service.Entity.EntityKey) == "" || strings.TrimSpace(service.Entity.Name) == "" ||
 		strings.TrimSpace(service.Entity.Environment) == "" || service.OwnerTeamID == "" || !service.Tier.IsValid() {
 		return fmt.Errorf("store: 应用服务字段非法")
+	}
+	// 空分类只在 update 上有意义（沿用当前登记）；非空时必须是合法 pair，不留给
+	// DB CHECK 兜底，也不在这里悄悄补缺省。
+	if service.Entity.Layer != "" || service.Entity.Kind != "" {
+		if err := domain.ValidateServiceClassification(service.Entity.Layer, service.Entity.Kind); err != nil {
+			return err
+		}
 	}
 	for _, alias := range service.Aliases {
 		if strings.TrimSpace(alias.Namespace) == "" || strings.TrimSpace(alias.Value) == "" {
@@ -53,6 +61,11 @@ func (r *ServiceCatalogRepo) Create(ctx context.Context, tx pgx.Tx, service doma
 	if err := validateService(service); err != nil {
 		return domain.ServiceRegistration{}, err
 	}
+	// create 必须携带显式分类：旧客户端兼容缺省属于 API 边界，store 不再写死
+	// application/business_system。
+	if err := domain.ValidateServiceClassification(service.Entity.Layer, service.Entity.Kind); err != nil {
+		return domain.ServiceRegistration{}, err
+	}
 	now := time.Now()
 	labels, err := marshalJSONObject(service.Entity.Labels)
 	if err != nil {
@@ -67,11 +80,12 @@ func (r *ServiceCatalogRepo) Create(ctx context.Context, tx pgx.Tx, service doma
 		INSERT INTO resource_nodes (
 			entity_key, layer, managed, source, external_ref, kind, name, provider,
 			environment, owner_team_id, labels, attributes, last_observed_at
-		) VALUES ($1, 'application', true, 'service_registry', $1, 'business_system',
+		) VALUES ($1, $8, true, 'service_registry', $1, $9,
 			$2, '', $3, $4, $5, $6, $7)
 		RETURNING id
 	`, service.Entity.EntityKey, service.Entity.Name, service.Entity.Environment,
-		service.OwnerTeamID, labels, attributes, now).Scan(&entityID); err != nil {
+		service.OwnerTeamID, labels, attributes, now,
+		service.Entity.Layer, service.Entity.Kind).Scan(&entityID); err != nil {
 		return domain.ServiceRegistration{}, fmt.Errorf("store: 创建服务实体失败: %w", err)
 	}
 	if err := tx.QueryRow(ctx, `
@@ -97,17 +111,30 @@ func (r *ServiceCatalogRepo) Update(ctx context.Context, tx pgx.Tx, id string, s
 		return domain.ServiceRegistration{}, err
 	}
 	var entityID, currentEntityKey string
+	var currentLayer domain.EntityLayer
+	var currentKind domain.ResourceNodeKind
 	if err := tx.QueryRow(ctx, `
-		SELECT sr.entity_id::text, n.entity_key
+		SELECT sr.entity_id::text, n.entity_key, n.layer, n.kind
 		FROM service_registrations sr JOIN resource_nodes n ON n.id = sr.entity_id
 		WHERE sr.id = $1
-	`, id).Scan(&entityID, &currentEntityKey); errors.Is(err, pgx.ErrNoRows) {
+	`, id).Scan(&entityID, &currentEntityKey, &currentLayer, &currentKind); errors.Is(err, pgx.ErrNoRows) {
 		return domain.ServiceRegistration{}, ErrServiceNotFound
 	} else if err != nil {
 		return domain.ServiceRegistration{}, err
 	}
 	if service.Entity.EntityKey != currentEntityKey {
 		return domain.ServiceRegistration{}, ErrServiceEntityKeyImmutable
+	}
+	switch {
+	case service.Entity.Layer == "" && service.Entity.Kind == "":
+		// 旧客户端不带分类字段：在同一事务内沿用当前登记，绝不回落到 application。
+		// 直接沿用而不重新校验，这样历史遗留分类也不会因为一次无关编辑被拒绝。
+		service.Entity.Layer, service.Entity.Kind = currentLayer, currentKind
+	case service.Entity.Layer != currentLayer || service.Entity.Kind != currentKind:
+		// 分类迁移会改写层级、爆炸半径方向与 confirmed Impact 归属，必须人工重新裁决。
+		return domain.ServiceRegistration{}, fmt.Errorf("%w: %s/%s -> %s/%s",
+			ErrServiceClassificationImmutable, currentLayer, currentKind,
+			service.Entity.Layer, service.Entity.Kind)
 	}
 	labels, err := marshalJSONObject(service.Entity.Labels)
 	if err != nil {
@@ -120,10 +147,11 @@ func (r *ServiceCatalogRepo) Update(ctx context.Context, tx pgx.Tx, id string, s
 	if _, err := tx.Exec(ctx, `
 		UPDATE resource_nodes SET name = $2,
 			environment = $3, owner_team_id = $4, labels = $5, attributes = $6,
-			last_observed_at = now(), managed = true, layer = 'application'
+			last_observed_at = now(), managed = true, layer = $7, kind = $8
 		WHERE id = $1
 	`, entityID, service.Entity.Name, service.Entity.Environment,
-		service.OwnerTeamID, labels, attributes); err != nil {
+		service.OwnerTeamID, labels, attributes,
+		service.Entity.Layer, service.Entity.Kind); err != nil {
 		return domain.ServiceRegistration{}, fmt.Errorf("store: 更新服务实体失败: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `

@@ -67,9 +67,42 @@ type dependencyRequest struct {
 	Criticality domain.DependencyCriticality `json:"criticality"`
 }
 
+// reasonCodedError 让 422 响应同时带稳定机器码和中文说明。前端按 reason_code 分支，
+// 不解析文案；文案可以本地化调整而不破坏调用方。
+type reasonCodedError struct {
+	code    string
+	message string
+	wrapped error
+}
+
+func (e *reasonCodedError) Error() string { return e.message }
+func (e *reasonCodedError) Unwrap() error { return e.wrapped }
+
+func reasonCodeOf(err error) string {
+	var coded *reasonCodedError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	return ""
+}
+
+// respondUnprocessable 统一 422 输出形状：error 是给人看的说明，reason_code 是给前端
+// 分支用的稳定机器码（没有机器码时不输出该键，保持既有响应形状不变）。
+func respondUnprocessable(c *gin.Context, err error) {
+	body := gin.H{"error": err.Error()}
+	if code := reasonCodeOf(err); code != "" {
+		body["reason_code"] = code
+	}
+	c.JSON(http.StatusUnprocessableEntity, body)
+}
+
 type serviceRequest struct {
-	EntityKey    string              `json:"entity_key"`
-	Name         string              `json:"name"`
+	EntityKey string `json:"entity_key"`
+	Name      string `json:"name"`
+	// EntityLayer/EntityKind 是 V2 的可选服务分类。用 pointer 才能区分"旧客户端未传"
+	// 与"显式传空字符串"：前者按 create 缺省 / update 保留处理，后者一律 422。
+	EntityLayer  *string             `json:"entity_layer"`
+	EntityKind   *string             `json:"entity_kind"`
 	Environment  string              `json:"environment"`
 	OwnerTeamID  string              `json:"owner_team_id"`
 	Description  string              `json:"description"`
@@ -82,6 +115,39 @@ type serviceRequest struct {
 	Labels       map[string]string   `json:"labels"`
 }
 
+// classification 解析可选的 entity_layer/entity_kind。两者都未传时返回空 pair 表示
+// "未传"，由 create 补缺省、update 在事务内保留当前值；只传一个字段无法判断意图，
+// 直接拒绝而不是猜另一半。
+func (request serviceRequest) classification() (domain.EntityLayer, domain.ResourceNodeKind, error) {
+	if request.EntityLayer == nil && request.EntityKind == nil {
+		return "", "", nil
+	}
+	if request.EntityLayer == nil || request.EntityKind == nil {
+		return "", "", &reasonCodedError{
+			code:    "service_classification_incomplete",
+			message: "entity_layer 与 entity_kind 必须同时提供",
+		}
+	}
+	layer := domain.EntityLayer(strings.TrimSpace(*request.EntityLayer))
+	kind := domain.ResourceNodeKind(strings.TrimSpace(*request.EntityKind))
+	if err := domain.ValidateServiceClassification(layer, kind); err != nil {
+		return "", "", &reasonCodedError{
+			code:    "service_classification_invalid",
+			message: "服务类型只支持 application/business_system 或 platform/infrastructure_capability",
+			wrapped: err,
+		}
+	}
+	return layer, kind, nil
+}
+
+// applyCreateClassificationDefault 只在 create 路径补旧 V1 兼容缺省。update 绝不能
+// 调它——那会让不带分类字段的旧客户端把 platform 服务改回 application。
+func applyCreateClassificationDefault(service *domain.ServiceRegistration) {
+	if service.Entity.Layer == "" && service.Entity.Kind == "" {
+		service.Entity.Layer, service.Entity.Kind = domain.DefaultServiceClassification()
+	}
+}
+
 func (request serviceRequest) domain() (domain.ServiceRegistration, error) {
 	request.EntityKey = strings.TrimSpace(request.EntityKey)
 	request.Name = strings.TrimSpace(request.Name)
@@ -90,13 +156,17 @@ func (request serviceRequest) domain() (domain.ServiceRegistration, error) {
 		!uuidPattern.MatchString(request.OwnerTeamID) || !request.Tier.IsValid() {
 		return domain.ServiceRegistration{}, errors.New("应用服务字段非法")
 	}
+	layer, kind, err := request.classification()
+	if err != nil {
+		return domain.ServiceRegistration{}, err
+	}
 	enabled := true
 	if request.Enabled != nil {
 		enabled = *request.Enabled
 	}
 	service := domain.ServiceRegistration{
-		Entity: domain.ResourceNode{EntityKey: request.EntityKey, Layer: domain.EntityLayerApplication,
-			Managed: true, Kind: domain.ResourceNodeKindBusinessSystem, Name: request.Name,
+		Entity: domain.ResourceNode{EntityKey: request.EntityKey, Layer: layer,
+			Managed: true, Kind: kind, Name: request.Name,
 			Environment: request.Environment, OwnerTeamID: request.OwnerTeamID, Labels: request.Labels},
 		OwnerTeamID: request.OwnerTeamID, Description: strings.TrimSpace(request.Description),
 		Tier: request.Tier, DashboardURL: strings.TrimSpace(request.DashboardURL),
@@ -148,6 +218,22 @@ func (h *serviceCatalogHandlers) handleStoreError(c *gin.Context, err error) {
 	}
 	if errors.Is(err, store.ErrServiceEntityKeyImmutable) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "canonical entity key 创建后不可修改"})
+		return
+	}
+	if errors.Is(err, store.ErrServiceClassificationImmutable) {
+		respondUnprocessable(c, &reasonCodedError{
+			code:    "service_classification_immutable",
+			message: "服务类型创建后不可修改；分类迁移需要人工重新裁决 confirmed Impact",
+			wrapped: err,
+		})
+		return
+	}
+	if errors.Is(err, domain.ErrInvalidServiceClassification) {
+		respondUnprocessable(c, &reasonCodedError{
+			code:    "service_classification_invalid",
+			message: "服务类型只支持 application/business_system 或 platform/infrastructure_capability",
+			wrapped: err,
+		})
 		return
 	}
 	if errors.Is(err, store.ErrServiceDependencyInvalid) {
@@ -203,9 +289,10 @@ func (h *serviceCatalogHandlers) createService(c *gin.Context) {
 	}
 	service, err := request.domain()
 	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+		respondUnprocessable(c, err)
 		return
 	}
+	applyCreateClassificationDefault(&service)
 	err = h.router.tx.WithTx(c, func(tx pgx.Tx) error {
 		var err error
 		service, err = h.services.Create(c, tx, service)
@@ -231,9 +318,10 @@ func (h *serviceCatalogHandlers) updateService(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
+	// update 不补缺省：分类为空表示"沿用当前登记"，由 store 在同一事务内读取并保留。
 	service, err := request.domain()
 	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+		respondUnprocessable(c, err)
 		return
 	}
 	err = h.router.tx.WithTx(c, func(tx pgx.Tx) error {

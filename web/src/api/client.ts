@@ -271,6 +271,10 @@ export interface AlertDetailResponse {
 
 export type EntityLayer = 'infrastructure' | 'platform' | 'application'
 export type ServiceTier = 'tier-0' | 'tier-1' | 'tier-2' | 'tier-3'
+// Service 只允许两种分类组合：业务系统消费共享能力，基础设施能力被多个业务系统共享。
+// infrastructure/resource 是底层资源，不能登记为 Service。
+export type ServiceEntityLayer = 'application' | 'platform'
+export type ServiceEntityKind = 'business_system' | 'infrastructure_capability'
 export type AlertMappingStatus = 'mapped' | 'unmapped' | 'conflict' | 'ignored'
 
 export interface EntityNode {
@@ -316,6 +320,10 @@ export interface ServiceRegistration {
 export interface ServiceRequest {
   entity_key: string
   name: string
+  // 分类是一个整体：只发一个字段后端返回 422 service_classification_incomplete。
+  // 控制中心 create/edit 始终发送明确 pair，不依赖后端缺省。
+  entity_layer: ServiceEntityLayer
+  entity_kind: ServiceEntityKind
   environment: string
   owner_team_id: string
   description: string
