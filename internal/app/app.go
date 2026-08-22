@@ -102,8 +102,11 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 用零值字段构造 outbox 打破这个环：NotifyEscalation/NotifyRepeat/DispatchStep
 	// 不 touch o.engine/o.chain，真正用到它们的 NotifyGroup 要到 pipeline 起转后才会
 	// 被调用，那时 engine/chain 已经赋值完毕。
+	opsSettingsAdapter := opsSettingsRepo{repos.Ops}
 	outbox := &notifyOutbox{
 		scheduler:        sched,
+		teamChannels:     opsSettingsAdapter,
+		timeline:         repos.Timeline,
 		repeatInterval:   cfg.RepeatInterval,
 		personnelChannel: cfg.PersonnelChannel,
 		now:              time.Now,
@@ -125,7 +128,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 相同，不需要额外适配器。resolver 复用上面 oncall.NewResolver 的同一个实例，
 	// 不重复构造。----
 	opsHandlers := ops.NewHandlers(
-		opsSettingsRepo{repos.Ops},
+		opsSettingsAdapter,
 		opsTeamRepo{repos.Teams},
 		opsDailyStatsRepo{repos.Ops},
 		repos.Ops,
@@ -167,7 +170,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// StormStateRepo/CountByRouteSince，路由信息复用 repos.Routes；GroupStage 的
 	// storm 判定（任务 9）到期时会 ScheduleIfAbsent(storm_summary, routeID, ...)
 	// 触发这里注册的 handler ----
-	storm := newStormHandler(stormState, repos.Routes, repos.Alerts, sched)
+	storm := newStormHandler(stormState, repos.Routes, repos.Alerts, sched, outbox)
 
 	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep + storm_summary
 	// 全部在这里绑定；未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此
@@ -237,6 +240,19 @@ func (a opsSettingsRepo) GetSettings(ctx context.Context, tx pgx.Tx, teamID stri
 	}
 	settings := toOpsSettings(*s)
 	return &settings, nil
+}
+
+// TeamChannels 实现 teamNotificationChannelRepo。团队从未保存设置与明确保存空数组
+// 都返回空切片；只有真实查询/反序列化错误才向上传播。
+func (a opsSettingsRepo) TeamChannels(ctx context.Context, tx pgx.Tx, teamID string) ([]ops.ChannelTarget, error) {
+	s, err := a.repo.GetSettings(ctx, tx, teamID)
+	if errors.Is(err, store.ErrNotFound) {
+		return []ops.ChannelTarget{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return toOpsSettings(*s).Channels, nil
 }
 
 // opsDailyStatsRepo 把 *store.OpsRepo 适配成 ops.DailyStatsRepo：只有 DailyStats

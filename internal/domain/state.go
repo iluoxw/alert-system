@@ -19,7 +19,8 @@ const (
 	TimelineActionHandoff TimelineAction = "handoff"
 
 	// TimelineActionNotify 已废弃：仅保留供历史数据渲染兼容，新代码改用
-	// TimelineActionNotifySent/TimelineActionNotifyFailed（R3，区分发送成功/失败）。
+	// TimelineActionNotifySent/TimelineActionNotifyFailed 表示实际发送结果；没有真实
+	// 渠道、尚未尝试发送时使用 TimelineActionNotifySkipped。
 	//
 	// Deprecated: 使用 TimelineActionNotifySent 或 TimelineActionNotifyFailed。
 	TimelineActionNotify   TimelineAction = "notify"
@@ -28,6 +29,9 @@ const (
 
 	TimelineActionNotifySent   TimelineAction = "notify_sent"
 	TimelineActionNotifyFailed TimelineAction = "notify_failed"
+	// TimelineActionNotifySkipped 表示发送意图因缺少可解析的真实渠道目标而没有进入
+	// notify_send。它与外部发送失败正交：attempts 恒为 0，不能伪装成 failed。
+	TimelineActionNotifySkipped TimelineAction = "notify_skipped"
 
 	// TimelineActionFlappingStart/TimelineActionFlappingEnd 标记 flapping 防抖
 	// （aiops-foundation R4/C4）的置位与惰性解除，由 dedup stage 在状态转移点产生。

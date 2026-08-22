@@ -166,6 +166,14 @@ func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {
 		}
 		return false
 	}, "组到期后 mock 飞书渠道收到组通知（分组 stage flush -> NotifyGroup -> notify_send -> Sender.Send）")
+	for _, sent := range mockLark.Sent() {
+		if sent.Msg.GroupKey != "" && containsString(sent.Msg.AlertIDs, alert.ID) {
+			if sent.Target != seedTeamLarkTarget || sent.Target == seedResult.TeamID {
+				t.Fatalf("e2e: 组通知应使用 ops-settings 中的真实 target %q，实际 %q（team_id=%q）", seedTeamLarkTarget, sent.Target, seedResult.TeamID)
+			}
+			break
+		}
+	}
 
 	status, body, err = client.doJSON(http.MethodPost, "/api/v1/alerts/"+alert.ID+"/ack", nil, nil)
 	if err != nil {
@@ -346,17 +354,17 @@ func TestScenarioR13_ChannelEscalationEmailThenLark(t *testing.T) {
 
 	waitFor(t, 10*time.Second, 200*time.Millisecond, func() bool {
 		for _, s := range mockEmail.Sent() {
-			if containsString(s.Msg.AlertIDs, alert.ID) {
+			if containsString(s.Msg.AlertIDs, alert.ID) && s.Target == seedTeamEmailTarget {
 				return true
 			}
 		}
 		return false
-	}, "第 0 级立即经 email 发送（notification-policies 里 warning 序列的第一级）")
+	}, "第 0 级立即经 email 发送到 ops-settings 配置的团队 target（notification-policies 里 warning 序列的第一级）")
 
 	waitFor(t, 10*time.Second, 200*time.Millisecond, func() bool {
 		for _, s := range mockLark.Sent() {
 			// 与场景①/②的组通知区分：渠道升级第 1 级发的是单告警消息，GroupKey 为空。
-			if s.Msg.GroupKey == "" && containsString(s.Msg.AlertIDs, alert.ID) {
+			if s.Msg.GroupKey == "" && containsString(s.Msg.AlertIDs, alert.ID) && s.Target == seedTeamLarkTarget {
 				return true
 			}
 		}
@@ -400,7 +408,7 @@ func TestScenario5_UngroupedRouteStillNotifies(t *testing.T) {
 
 	waitFor(t, 10*time.Second, 200*time.Millisecond, func() bool {
 		for _, s := range mockLark.Sent() {
-			if containsString(s.Msg.AlertIDs, alert.ID) {
+			if containsString(s.Msg.AlertIDs, alert.ID) && s.Target == seedTeamLarkTarget {
 				return true
 			}
 		}

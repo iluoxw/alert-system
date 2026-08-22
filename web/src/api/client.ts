@@ -223,7 +223,8 @@ export function listUsersLite(limit?: number): Promise<{ users: UserLite[] }> {
 
 // TimelineAction 对应 internal/domain/state.go 的 TimelineAction 枚举。
 // notify 为历史动作（已废弃但历史数据仍存在，需兼容渲染）；
-// notify_sent/notify_failed 是其替代，区分发送成功/失败（R3）；
+// notify_sent/notify_failed/notify_skipped 是其替代，区分发送成功、失败和因缺
+// 真实团队渠道而未尝试（R3）；
 // note 是独立备注（ui-enrichment R3），不代表任何状态转移。
 export type TimelineAction =
   | 'ack'
@@ -234,6 +235,7 @@ export type TimelineAction =
   | 'silence'
   | 'notify_sent'
   | 'notify_failed'
+  | 'notify_skipped'
   | 'note'
   | 'source_unknown'
   | 'source_recovered'
