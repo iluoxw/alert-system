@@ -1,6 +1,6 @@
 # Service Observability Phase 2：alert-system 基础数据实施计划
 
-> 状态：Cursor Cloud Agent / Claude Fable 5 High 已在 `fca22d39dbe51d9525d165ad26d7e63707642847` 完成首轮评审，结论为 `APPROVE WITH REQUIRED CHANGES`；本修订须复审收敛后才能开始编码。
+> 状态：Cursor Cloud Agent / Claude Fable 5 High 已在 `e2ae6405fc9d3f27c8dc45f33d486a72309c613a` 完成第二轮复审；首轮 findings 均已闭合，仅剩 golden binding 全局唯一性这一项 required clarification，须在窄复核通过后才能开始编码。
 >
 > 执行者：Cursor Cloud Agent / Claude Opus 5 High。
 >
@@ -118,14 +118,14 @@ Data precedence：
 
 ```text
 profile absent -> unconfigured
-any source forbidden/unavailable/unknown, or failure-induced freshness=unknown -> partial
+any source forbidden/unavailable/unknown, or adapter/evaluation failure-induced freshness=unknown -> partial
 else any source freshness=stale or cache snapshot stale -> stale
 else -> complete
 ```
 
 `availability=empty` 是一次成功查询，不自动把 Data 变成 Partial；Empty 只作用于对应 section。
 
-source/Page View availability 词表没有 `expired`；source 过期只通过 `freshness=stale/unknown` 与合法 availability 表达。`expired` 仅属于 EvidenceRef availability，projector 不得把它写入 source 或 signal availability。
+这里的 failure-induced `freshness=unknown` 仅指 adapter 查询、解析或 evaluator 失败，表示系统无法判断新鲜度；cache miss 的占位型 Unknown 继续遵循 §4.5 的占位语义，不得伪装成一次 source failure。source/Page View availability 词表没有 `expired`；source 过期只通过 `freshness=stale/unknown` 与合法 availability 表达。`expired` 仅属于 EvidenceRef availability，projector 不得把它写入 source 或 signal availability。
 
 ### 4.5 Snapshot cache
 
@@ -266,7 +266,7 @@ resolver 的输入严格是 v1 文档中的环境内真实 registration/entity I
 3. schema validation；
 4. 递归拒绝 forbidden key：`query/promql/sql/logql/shell/secret/token/headers/prompt/html/executable`；只检查 key，不对合法说明文字做 substring 猜测；
 5. focus `value_pattern` 必须可由 Go RE2 编译；恰好一个 primary focus；
-6. journey/view/signal/tool refs 全部存在且唯一；view order/key 唯一；threshold direction 与 degraded/critical 顺序合法；proxy 必须有 reason；恰好一个 `renderer=golden_overview` view，且其 `signal_refs` 恰好引用 latency/traffic/errors/saturation 各一个、不得重复或静默截断，保证三种 Page View 的 `golden_signals` 恒为四项且不超过 schema 上限；
+6. journey/view/signal/tool refs 全部存在且唯一；view order/key 唯一；threshold direction 与 degraded/critical 顺序合法；proxy 必须有 reason；`signal_bindings` 中 `family=golden` 的 binding 恰好为四个，semantic 必须为 latency/traffic/errors/saturation 各一个；同时恰好一个 `renderer=golden_overview` view，其 `signal_refs` 必须与这四个 binding 一一对应，不允许重复、静默截断或存在未被该 view 引用的额外 golden binding，保证三种 Page View 的 `golden_signals` 恒为四项且不超过 schema 上限；
 7. service ID、root entity IDs 通过 resolver 存在；root 必须与 service 同环境（或 `global`），并且是 service entity 本身，或可从 service entity 经 declared `depends_on/part_of` canonical graph 有界到达；
 8. tool refs 全部存在于已发布 catalog；
 9. 每 service 只能有一个 `status=published` active profile。
@@ -513,7 +513,7 @@ GET /api/v1/service-observability/:service_id/workspace
 **工作区参数**
 
 - `environment/focus_kind/focus_value/from/to/timezone`；
-- from/to 均缺省时，以服务端单次取到的 `now` 和有效 `window_seconds` 生成 `[now-window, now]`；只传一个返回 422；显式 from/to 必须同时出现并为绝对 UTC；timezone 只影响显示；
+- from/to 均缺省时，以服务端单次取到的 `now` 和 Profile `limits.default_window_seconds`（无 Profile 时无 workspace，因此没有额外 fallback）生成 `[now-window, now]`；只传一个返回 422；显式 from/to 必须同时出现并为绝对 UTC；timezone 只影响显示；
 - workspace environment 与 registration 不匹配时统一 404；
 - invalid focus -> 422 `invalid_focus`；scope 超限 -> 422 `scope_too_broad`；Profile 未配置 -> 409 `profile_unconfigured`；service 不存在 -> 404 `service_not_found`。
 
@@ -737,6 +737,7 @@ Slice A 的 exact base 由本计划复审通过后的远端 HEAD 决定；Slice 
 
 Phase 2 完成后，Phase 3 只需要替换/补充 ports：
 
+- 定义生产 Service Profile 在注册完成后按环境渲染、校验、发布和回滚的配置流程，不改变 v1 中 service/entity ID 的字段语义；
 - Prometheus-compatible semantic signal adapter；
 - OpenObserve focus/log/trace/access adapter；
 - EvidenceRef broker、RBAC/audit/limits/cancellation；
