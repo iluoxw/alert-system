@@ -79,6 +79,64 @@ func TestScheduler_Invoke_HandlerPanic_RecoveredAsError(t *testing.T) {
 	}
 }
 
+func TestScheduler_InvokeDetached_DispatchesWithoutTx(t *testing.T) {
+	var gotRefID string
+	var gotPayload []byte
+	h := func(_ context.Context, refID string, payload []byte) error {
+		gotRefID = refID
+		gotPayload = payload
+		return nil
+	}
+
+	err := invokeDetached(context.Background(), h, dueTimer{kind: "notify_send", refID: "alert-1", payload: []byte(`{"x":1}`)})
+	if err != nil {
+		t.Fatalf("invokeDetached err = %v, want nil", err)
+	}
+	if gotRefID != "alert-1" {
+		t.Fatalf("handler 收到的 refID = %q, want %q", gotRefID, "alert-1")
+	}
+	if string(gotPayload) != `{"x":1}` {
+		t.Fatalf("handler 收到的 payload = %s, want %s", gotPayload, `{"x":1}`)
+	}
+}
+
+func TestScheduler_InvokeDetached_HandlerError_Propagates(t *testing.T) {
+	wantErr := errors.New("boom")
+	h := func(_ context.Context, _ string, _ []byte) error { return wantErr }
+
+	if err := invokeDetached(context.Background(), h, dueTimer{kind: "notify_send"}); !errors.Is(err, wantErr) {
+		t.Fatalf("invokeDetached err = %v, want 包含 %v", err, wantErr)
+	}
+}
+
+// 事务外执行的 handler panic 同样必须被 recover 成一个普通失败：它跑在轮询 worker 的
+// goroutine 上（不是 fire-and-forget 协程），panic 逃逸会直接杀掉整个进程。
+func TestScheduler_InvokeDetached_HandlerPanic_RecoveredAsError(t *testing.T) {
+	h := func(_ context.Context, _ string, _ []byte) error { panic("boom") }
+
+	if err := invokeDetached(context.Background(), h, dueTimer{kind: "notify_send"}); err == nil {
+		t.Fatal("事务外 handler panic 必须被 recover 并转换为 error，而不是继续向上传播、杀死 worker")
+	}
+}
+
+// 分发时"事务外模式"优先：同一个 kind 两种模式都注册属于装配错误，但行为必须是确定的。
+func TestScheduler_DetachedHandlerFor_LookupIsIndependentOfTxHandlers(t *testing.T) {
+	s := &Scheduler{handlers: make(map[string]Handler), detached: make(map[string]DetachedHandler)}
+	s.RegisterHandler("notify_send", func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error { return nil })
+
+	if _, ok := s.detachedHandlerFor("notify_send"); ok {
+		t.Fatal("只注册了事务内 handler，detachedHandlerFor 不应命中")
+	}
+
+	s.RegisterDetachedHandler("notify_send", func(_ context.Context, _ string, _ []byte) error { return nil })
+	if _, ok := s.detachedHandlerFor("notify_send"); !ok {
+		t.Fatal("注册了事务外 handler 后 detachedHandlerFor 应命中")
+	}
+	if _, ok := s.handlerFor("notify_send"); !ok {
+		t.Fatal("RegisterDetachedHandler 不应静默删掉同 kind 的事务内 handler 注册")
+	}
+}
+
 // TestScheduler_RegisterHandler_ConcurrentSafe 用 -race 验证 handlers map 的并发
 // 读写安全：RegisterHandler 可能在 Run 已经启动、invoke 正在并发读取 handlers 时
 // 被调用（例如运行时动态补注册新 kind）。
@@ -92,6 +150,25 @@ func TestScheduler_RegisterHandler_ConcurrentSafe(t *testing.T) {
 			kind := fmt.Sprintf("kind-%d", i)
 			s.RegisterHandler(kind, func(_ context.Context, _ pgx.Tx, _ string, _ []byte) error { return nil })
 			_ = s.invoke(context.Background(), nil, dueTimer{kind: kind})
+		}(i)
+	}
+	wg.Wait()
+}
+
+// 同上，但覆盖 detached 注册表：processOneDue 在轮询 goroutine 里读它，
+// RegisterDetachedHandler 可能来自另一个 goroutine。
+func TestScheduler_RegisterDetachedHandler_ConcurrentSafe(t *testing.T) {
+	s := &Scheduler{handlers: make(map[string]Handler), detached: make(map[string]DetachedHandler)}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			kind := fmt.Sprintf("kind-%d", i)
+			s.RegisterDetachedHandler(kind, func(_ context.Context, _ string, _ []byte) error { return nil })
+			if h, ok := s.detachedHandlerFor(kind); ok {
+				_ = invokeDetached(context.Background(), h, dueTimer{kind: kind})
+			}
 		}(i)
 	}
 	wg.Wait()
