@@ -1,6 +1,6 @@
 # Service Observability Phase 2：alert-system 基础数据实施计划
 
-> 状态：待 Cursor Cloud Agent / Claude Fable 5 High 评审；评审收敛前不得开始编码。
+> 状态：Cursor Cloud Agent / Claude Fable 5 High 已在 `fca22d39dbe51d9525d165ad26d7e63707642847` 完成首轮评审，结论为 `APPROVE WITH REQUIRED CHANGES`；本修订须复审收敛后才能开始编码。
 >
 > 执行者：Cursor Cloud Agent / Claude Opus 5 High。
 >
@@ -28,6 +28,9 @@
 - 起始提交：`702726b90762a0c92e54ffeb7c7cea101b466c83`
 - 起始 tree：`dad381ce3b2a8e07845ba1e4b98af6994292db00`
 - 该 tree 已通过现有完整 Go、race、integration、web、contract 门禁。
+- Fable 5 首轮评审输入：`fca22d39dbe51d9525d165ad26d7e63707642847`。
+- Slice A 的实现基线是“计划复审收敛后、派发时的远端分支精确 HEAD”，由 Codex 写入 Cloud Agent 提示和 Phase 2 acceptance；计划文件不硬编码一个会因自身提交而立即过时的自引用 SHA。
+- `702726b...HEAD` 始终用于审计整个 Phase 2（含计划修订）的范围；实现代码的增量审计另以 acceptance 记录的 Slice A 派发 SHA 为基线。
 
 实现与评审只以以下内容为设计事实源：
 
@@ -74,10 +77,11 @@ authenticated API
 
 显式开发 fixture 模式：
 
-- 继续由 `VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE=true` 读取契约 examples；
+- 只有 `import.meta.env.DEV && VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE === 'true'` 才读取契约 examples；production build 在任何环境变量下都不能进入 fixture 模式或绕过 `AuthGate`；
 - 保留 main、Partial、Forbidden、Empty、Stale 五态；
 - 用于产品 demo、projector 契约回归和视觉 QA；
 - fixture 模式不得成为 API 网络错误的静默 fallback。
+- Phase 1 directory fixture 中带 synthetic `service_id` 的 `infrastructure/resource` 行只用于 demo 密度与治理入口，不是 live Service Registration；live directory 只枚举合法的 `application/business_system` 与 `platform/infrastructure_capability` registration，绝不为对齐 fixture 放宽登记分类。
 
 ### 4.2 Profile 发布语义
 
@@ -86,6 +90,9 @@ authenticated API
 - 单个 Profile schema/引用非法：服务继续启动，但该 Profile 被 quarantine，不进入 active registry；若能安全识别 service ID，总览显示 `profile=null`、Data Unconfigured，并给稳定配置错误 reason code；
 - 同一 service 存在多个 active published Profile：全部冲突项 quarantine，绝不按文件名或加载顺序猜一个；
 - E2B example 仅在测试和 fixture 模式加载。Phase 3 完成真实 discovery 后另行发布生产 E2B Profile v1。
+- v1 契约中的 `service_ref.service_id` 与 `root_entity_ids` 按字段本义分别绑定当前环境内真实的 `service_registrations.id` 与 `resource_nodes.id`，不得在实现中暗改为 `entity_key`。生产 Profile 是注册完成后由配置发布流程按环境渲染的 artifact；fixture 的符号 ID 只由测试 fake resolver 识别。若未来需要跨环境 portable `entity_key` 引用，应另行演进 schema/ADR，不在 Phase 2 偷换 v1 语义。
+- resolver 必须区分 typed `not_found` 与基础设施 `error`：确实不存在/不唯一使单个 Profile quarantine，稳定 reason 为 `profile_ref_not_found` / `profile_ref_ambiguous`；DB 不可用、查询失败或取消使 Registry 构造失败并阻断启动，禁止把暂时看不到折叠成 Unconfigured。
+- Phase 2 Registry 只在启动时加载一次；新 Profile 或 quarantine 修复需要进程重启，不实现热加载、定时重扫或管理 API。
 
 ### 4.3 当前授权口径
 
@@ -101,7 +108,7 @@ Profile v1 没有 optional signal 字段，所以所有 `signal_bindings` 都是
 1. signal `availability=available` 且 `observed_at` 未超过 Profile freshness TTL 才 eligible；
 2. 任一 eligible signal Critical -> service Critical；
 3. 否则任一 eligible signal Degraded -> service Degraded；
-4. 否则任一 required signal 缺失、Forbidden、Unavailable、Expired 或 Stale -> service Unknown；
+4. 否则任一 required signal 缺失、Forbidden、Unavailable，或 `freshness=stale/unknown` -> service Unknown；
 5. 只有全部 required signals 可用且未越阈值 -> service Healthy；
 6. 没有方向阈值的 Traffic/Rate 永远 Neutral，不进入 worst-of；它缺失时仍使 required coverage 不完整；
 7. Fault/Incident 数量不改写 Health；
@@ -111,12 +118,14 @@ Data precedence：
 
 ```text
 profile absent -> unconfigured
-any source forbidden/unavailable/expired/unknown -> partial
+any source forbidden/unavailable/unknown, or failure-induced freshness=unknown -> partial
 else any source freshness=stale or cache snapshot stale -> stale
 else -> complete
 ```
 
 `availability=empty` 是一次成功查询，不自动把 Data 变成 Partial；Empty 只作用于对应 section。
+
+source/Page View availability 词表没有 `expired`；source 过期只通过 `freshness=stale/unknown` 与合法 availability 表达。`expired` 仅属于 EvidenceRef availability，projector 不得把它写入 source 或 signal availability。
 
 ### 4.5 Snapshot cache
 
@@ -127,6 +136,7 @@ else -> complete
 - 固定 worker 数、bounded queue、per-key singleflight；队列满时保留 Unknown/Stale，不额外起 goroutine；
 - refresh 失败不覆盖最后成功快照；超过 max stale 后不得继续显示旧绿值；
 - cache 不保存 logs、traces、原始 evidence 或凭据；
+- cache 有固定 `max_entries`，超过 max stale 的死条目惰性回收；达到容量时按可注入时钟的 LRU 顺序确定性驱逐，cache miss 仍按 Unknown/Unconfigured 语义返回，不能为保留绿值突破上限；
 - 接口允许 Phase 3/后续替换为 PostgreSQL snapshot store。
 
 ## 5. 目标 package 与依赖方向
@@ -167,9 +177,10 @@ internal/app
    - `application/business_system`
    - `platform/infrastructure_capability`
 2. API request 新增可选 `entity_layer`、`entity_kind`：
-   - create 两字段均缺省时保持旧默认；
-   - update 缺省时保留当前 registration 的分类，避免旧客户端把 platform 服务改回 application；
-   - 半缺省且无法组成合法 pair 返回 422；
+   - JSON 层用 pointer/optional 字段区分“未传”与显式空字符串；显式空值返回 422；
+   - create 两字段均缺省时保持旧默认；只传一个字段返回 422；
+   - update 两字段均缺省时，在同一事务读取并保留当前 registration 分类，避免旧客户端把 platform 服务改回 application；只传一个字段返回 422；
+   - 分类创建后不可变：update 显式传入与当前相同的合法 pair 可接受，传入不同 pair 返回 422 `service_classification_immutable`；分类迁移涉及 confirmed Impact 人工裁决与重投影，不属于 Phase 2；
    - `infrastructure/resource` 不能登记为 Service；
 3. store create/update 使用传入的合法 layer/kind，不再写死；select round-trip 保留；
 4. 旧 V1 request 的 JSON 与响应不破坏；不需要新 migration，现有 DB CHECK 已支持目标值；
@@ -246,6 +257,8 @@ feat(serviceobs): add v1 contract models and offline validation
 
 Registry 构造时注入：profile filesystem、contract validator、Tool catalog、外部引用 resolver。不要在 package 内读取全局 env 或数据库。
 
+resolver 的输入严格是 v1 文档中的环境内真实 registration/entity ID；测试 fixture 通过 fake resolver 映射符号 ID。resolver 返回 typed `found/not_found/ambiguous/error`，其中 `not_found/ambiguous` quarantine 单个文档，基础设施 `error` 中止整个 Registry 构造。Registry 不做 `entity_key` fallback，也不在本 Phase 热加载。
+
 校验顺序：
 
 1. 文件必须是普通 `.json`，单文件上限 1 MiB、目录最多 1000 个候选文件，拒绝 symlink/目录穿越；
@@ -253,7 +266,7 @@ Registry 构造时注入：profile filesystem、contract validator、Tool catalo
 3. schema validation；
 4. 递归拒绝 forbidden key：`query/promql/sql/logql/shell/secret/token/headers/prompt/html/executable`；只检查 key，不对合法说明文字做 substring 猜测；
 5. focus `value_pattern` 必须可由 Go RE2 编译；恰好一个 primary focus；
-6. journey/view/signal/tool refs 全部存在且唯一；view order/key 唯一；threshold direction 与 degraded/critical 顺序合法；proxy 必须有 reason；
+6. journey/view/signal/tool refs 全部存在且唯一；view order/key 唯一；threshold direction 与 degraded/critical 顺序合法；proxy 必须有 reason；恰好一个 `renderer=golden_overview` view，且其 `signal_refs` 恰好引用 latency/traffic/errors/saturation 各一个、不得重复或静默截断，保证三种 Page View 的 `golden_signals` 恒为四项且不超过 schema 上限；
 7. service ID、root entity IDs 通过 resolver 存在；root 必须与 service 同环境（或 `global`），并且是 service entity 本身，或可从 service entity 经 declared `depends_on/part_of` canonical graph 有界到达；
 8. tool refs 全部存在于已发布 catalog；
 9. 每 service 只能有一个 `status=published` active profile。
@@ -270,7 +283,9 @@ Registry 暴露：
 
 - E2B example + fake resolver/canonical tool catalog 成功；
 - schema invalid、未知字段、forbidden key、非法 regex、0/2 primary、悬空 ref、缺 tool、缺 service/root、duplicate published 均 quarantine；
+- real-ID `not_found/ambiguous` quarantine；resolver DB/error/cancellation 使 Registry 构造失败；符号 fixture ID 不能被真实 resolver 当成 `entity_key` 猜测；
 - 单坏文件不阻断其它合法 Profile；目录本身不可读返回构造错误；
+- Registry 构造后修改文件不会热生效，重建/进程重启后才重新评估 quarantine；
 - 并发读无 race。
 
 **验证**
@@ -300,7 +315,7 @@ feat(serviceobs): load and quarantine file profiles at startup
 - above/below 两种 threshold；
 - Traffic/Rate 无 threshold 为 Neutral；
 - neutral 不改写 worst-of，但缺失仍影响 required coverage；
-- stale/forbidden/unavailable/expired/value null 为最小 Unknown；
+- signal 的 stale/freshness unknown、forbidden、unavailable、value null 为最小 Unknown；EvidenceRef `availability=expired` 单独覆盖，不得复用为 signal/source 状态；
 - proxy role/reason/threshold source 原样保留；
 - reason codes 只列最终状态的 binding；
 - profile absent -> Data Unconfigured；
@@ -327,6 +342,7 @@ feat(serviceobs): evaluate health and data truth tables
 
 - `internal/serviceobs/ports.go`
 - `internal/serviceobs/adapters/alertsystem/registration.go`
+- `internal/serviceobs/adapters/alertsystem/profileresolver.go`
 - `internal/serviceobs/adapters/alertsystem/topology.go`
 - `internal/serviceobs/adapters/alertsystem/domain.go`
 - `internal/serviceobs/adapters/alertsystem/adapters_test.go`
@@ -339,11 +355,12 @@ feat(serviceobs): evaluate health and data truth tables
 2. registration list 是 lightweight identity query，不为目录逐行读取 aliases/dependencies；只返回 enabled registrations，metadata filter 参数化；
 3. topology 从 service entity + Profile roots 构造 bounded canonical neighborhood：consumer/caller -> provider/callee；保留 declared provenance、criticality、observed_at；max nodes/relations 达限时显式 partial，不静默截断；
 4. 无 Profile 时仍以 service entity 与 registration declared dependencies 形成基础总览；
-5. domain 查询关联当前 service neighborhood 的 active Alert/Fault/Impact/Incident；focus 存在时只用白名单 focus kind 在 JSON labels/resource_ref 参数化匹配；
-6. Fault summary、confirmed/potential Impact、Incident 与 timeline 只投影已提交事实；不得创建领域对象或从 Fault 数量推导 Health；
+5. domain adapter 的实体范围独立由 service entity、Profile roots 与 registration-declared dependencies 有界计算，不依赖 topology adapter 的返回或成功；topology 失败只能降级 topology section，domain 不得变空也不得放宽到全库。domain 查询该稳定边界关联的 active Alert/Fault/Impact/Incident；focus 存在时只用白名单 focus kind 在 JSON labels/resource_ref 参数化匹配；
+6. Fault summary、confirmed/potential Impact、Incident 与 timeline 只投影已提交事实；不得创建领域对象或从 Fault 数量推导 Health。`confirmed_impacts` 统计该服务边界内 active Fault 关联的 distinct confirmed FaultImpact（爆炸半径口径），不是要求 platform service 自身成为 `business_system` Impact target；
 7. registration/topology/domain 各自在独立只读事务中完成，避免一个非关键 section 失败拖垮其它 section；每个 adapter 内部保持一致读，并返回自己的 observed/read timestamp；
 8. adapter context deadline/cancellation 原样下传；没有字符串拼 SQL；
-9. 当前 Phase 2 的 telemetry port 使用显式 `UnavailableObservationReader`，只返回对应 Unknown/Unavailable，不读取 fixture 或外部网络。
+9. 当前 Phase 2 的 telemetry port 使用显式 `UnavailableObservationReader`，只返回对应 Unknown/Unavailable，不读取 fixture 或外部网络；signal/source 使用稳定 `unknown_reason=telemetry_not_connected`。
+10. `profileresolver.go` 实现 Task 3 的真实 ID resolver：只按 registration/entity ID 查询并验证 managed、环境与可达性；`not_found/ambiguous` 与 DB/error/cancellation typed 分离，不做 entity_key fallback。
 
 **集成测试**
 
@@ -352,6 +369,8 @@ feat(serviceobs): evaluate health and data truth tables
 - service 边界正确；
 - 第二个 service 的领域事实不会串入；
 - focus 只收窄 domain refs；
+- topology 查询失败时 domain 仍按独立稳定边界返回，且不会扩大到第二个 service；
+- Profile ID not-found 与 resolver 基础设施错误分流；
 - bounds 与 cancellation；
 - 所有查询均为只读，数据库行数不变。
 
@@ -383,16 +402,17 @@ feat(serviceobs): read alert-system service topology and domain facts
 
 **实现要求**
 
-1. assembler 只组装事实：subject、service、profile、scope/focus、sources、signals、topology、evidence refs、domain state、policy；
-2. 每个 adapter 独立 deadline；非关键 adapter 失败转为 source/section status，只有 registration/认证等关键依赖失败才返回页面级 error；
-3. workspace query 先校验 Profile focus kind/value、绝对 UTC from/to、window 和 Profile/global bounds；无 focus 时只返回 service-level declared topology，不发明 observed journey；
-4. projector 只做稳定显示投影和格式化，不发原始查询；三页调用同一个 health evaluator；
-5. Profile 缺失：directory/overview 返回 identity/domain + profile null + Unconfigured；workspace 返回 typed `ErrProfileUnconfigured`；
-6. missing telemetry：只把 Golden/RED/USE/journey/observed/evidence 变 Unknown/Unavailable，declared topology 和 domain 保留；
-7. topology node/relation 没有 signal 时 Health Unknown，不能因存在即 Healthy；
-8. Traffic/Rate display 保留中性状态；HugePages proxy 明示 measurement role/reason；真实 USE saturation 缺失为 Unknown；
-9. deterministic summary 在本 Phase 只允许 `incomplete` 或由已提交单一事实产生的 `observation`；不得凭缺失遥测给 candidate/confirmed cause；
-10. request ID 服务端生成，assembled_at、observed_at、freshness 分离；所有 slice 输出稳定排序和非 null。
+1. assembler 只组装事实。`model.DiagnosticContext` 严格镜像 v1 schema；另定义不对外序列化的内部 `AssemblySnapshot` 超集，持有 DiagnosticContext、source/section status 与 Profile diagnostic。`subject` 映射为 contract actor，不得把 `subject`/`sources` 作为额外 JSON 字段塞进 `additionalProperties=false` 的 DiagnosticContext；
+2. 当前单租户部署的 `scope.tenant` 固定为稳定常量 `default`；`actor.permission_snapshot_id` 由服务端对 session user ID、规范化角色/capabilities 与 policy version `serviceobs-v1` 做 SHA-256 指纹生成，绝不采信 URL/客户端值；
+3. 每个 adapter 独立 deadline；非关键 adapter 失败转为 source/section status，只有 registration/认证等关键依赖失败才返回页面级 error；
+4. workspace query 先校验 Profile focus kind/value、绝对 UTC from/to、window 和 Profile/global bounds；无 focus 时只返回 service-level declared topology，不发明 observed journey；
+5. projector 只做稳定显示投影和格式化，不发原始查询；三页调用同一个 health evaluator；
+6. Profile 缺失：directory/overview 返回 identity/domain + profile null + Unconfigured；workspace 返回 typed `ErrProfileUnconfigured`；
+7. missing telemetry：只把 Golden/RED/USE/journey/observed/evidence 变 Unknown/Unavailable，declared topology 和 domain 保留；
+8. topology node/relation 没有 signal 时 Health Unknown，不能因存在即 Healthy；
+9. Traffic/Rate display 保留中性状态；HugePages proxy 明示 measurement role/reason；真实 USE saturation 缺失为 Unknown；
+10. deterministic summary 在本 Phase 只允许 `incomplete` 或由已提交单一事实产生的 `observation`；不得凭缺失遥测给 candidate/confirmed cause；
+11. request ID 服务端生成，assembled_at、observed_at、freshness 分离；所有 slice 输出稳定排序和非 null。
 
 **契约回归**
 
@@ -400,6 +420,7 @@ feat(serviceobs): read alert-system service topology and domain facts
 - 输出分别通过 Page View schema；
 - 断言 context -> view 的 identity/profile/scope/focus/signal/topology/domain refs 不漂移；
 - fixture 固定时钟下验证 main；场景 patch 仍由现有 contract verifier验证 Partial/Forbidden/Empty/Stale。
+- Phase 1 directory fixture 中少数 `profile=null + data_status=partial` 的关联资源行是 demo 密度输入，不作为 live evaluator 真值表断言；live 始终执行“profile absent -> Unconfigured”，禁止为贴 fixture 反改 evaluator。
 
 **验证**
 
@@ -431,10 +452,12 @@ feat(serviceobs): assemble context and project three page views
 - 同 key 并发只执行一次 refresh；
 - worker/queue 上限可证明，队列满不增生 goroutine；
 - refresh TTL 加入可注入、可测试的 bounded jitter，避免大量 service 同时过期形成惊群；
+- `max_entries` 为硬上限；新 key 达上限时按 LRU 确定性驱逐，超过 max stale 的条目在读/写路径惰性回收，Profile version/禁用 service 的死键不能无限累积；
 - refresh 成功原子替换；失败保留最后成功值；
 - 超过 max stale 后旧 Healthy 不再可见，退化 Unknown；
 - canceled caller 不取消已由 worker 接管的有界 refresh，但 shutdown context 能停止全部 worker；
 - race 测试通过；cache value 类型无法容纳 raw evidence/log/trace。
+- 容量、LRU、过期回收测试使用 fake clock，不依赖真实 sleep；容量压力只能导致 cache miss/Unknown，不得返回被驱逐的旧绿值。
 
 进程关闭时由 app lifecycle 停止 refresh workers；测试不得依赖 sleep，使用 fake clock/channel。
 
@@ -479,17 +502,19 @@ GET /api/v1/service-observability/:service_id/workspace
 - stable sort tuple + service ID 作为 opaque base64url cursor；cursor 最大 512 字符，并绑定版本、全部 filter、sort 与 direction 的 fingerprint；解码/版本/query fingerprint 不匹配返回 422，不传入 SQL；
 - 默认排序：Health severity、confirmed Impact、active Fault、tier、name、service ID；
 - directory 只读 cache；cache miss 不做 N×source 同步 fan-out。
-- `summary` 统计 metadata filter 后的完整候选集合，不只统计当前分页；Health/Data 统计只读相同 cache snapshot，不触发额外 refresh。
+- `summary` 统计 `environment/team_id/tier/q` metadata filter 后的完整候选集合，不只统计当前分页；`health/data_status` 是结果筛选，不改变 summary 分母与计数。Health/Data 统计只读相同 cache snapshot，不触发额外 refresh。
 
 **总览参数**
 
 - `environment`、`window_seconds`；默认来自 Profile 或 300s；
+- environment 未传时使用 registration environment；显式不匹配统一按 404 处理，避免泄露其它环境是否存在；
 - 单 section 失败仍 200 + Partial；service registry 失败 503；not found 404。
 
 **工作区参数**
 
 - `environment/focus_kind/focus_value/from/to/timezone`；
-- from/to 必须同时出现并为绝对 UTC；timezone 只影响显示；
+- from/to 均缺省时，以服务端单次取到的 `now` 和有效 `window_seconds` 生成 `[now-window, now]`；只传一个返回 422；显式 from/to 必须同时出现并为绝对 UTC；timezone 只影响显示；
+- workspace environment 与 registration 不匹配时统一 404；
 - invalid focus -> 422 `invalid_focus`；scope 超限 -> 422 `scope_too_broad`；Profile 未配置 -> 409 `profile_unconfigured`；service 不存在 -> 404 `service_not_found`。
 
 **安全/HTTP 测试**
@@ -530,6 +555,7 @@ feat(api): expose service observability page views
 SERVICE_OBSERVABILITY_PROFILE_DIR=
 SERVICE_OBSERVABILITY_CACHE_TTL=45s
 SERVICE_OBSERVABILITY_CACHE_MAX_STALE=5m
+SERVICE_OBSERVABILITY_CACHE_MAX_ENTRIES=4096
 SERVICE_OBSERVABILITY_REFRESH_WORKERS=4
 SERVICE_OBSERVABILITY_REFRESH_QUEUE=256
 SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS=86400
@@ -537,7 +563,7 @@ SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS=86400
 
 要求：
 
-- YAML/env/default 解析和非法值测试；worker/queue/TTL/max stale/window 必须为正且关系合法；
+- YAML/env/default 解析和非法值测试；worker/queue/TTL/max stale/max entries/window 必须为正且关系合法；
 - profile dir 为空是合法的 empty registry；显式不可读才启动失败；
 - app 装配 Tool catalog、Profile Registry、alert-system adapters、Unavailable telemetry reader、evaluator、cache、facade；
 - main 只注册 API 与 lifecycle，不包含投影规则；
@@ -575,9 +601,10 @@ feat(app): assemble service observability read path
 
 1. client 增加三条 typed API；Page View types 继续集中在 `serviceObservability/types.ts`，避免重复 shape；
 2. `data.ts` 是唯一数据源选择点：
-   - fixture env=true -> 契约 fixtures/scenarios；
+   - 只有 `import.meta.env.DEV && fixture env=true` -> 契约 fixtures/scenarios；
    - 否则 -> API；
    - API failure 不得 fallback fixture；
+   - production build 即使设置 fixture env 也必须走 API/AuthGate；
 3. React Query key 包含 service ID 与所有 server query；URL 是筛选/focus/time/topology/tab 的可分享事实源；
 4. directory 的 filter/sort/cursor 由 API 负责，并显式消费 `next_cursor` 提供继续加载；fixture 模式复用现有 client-side helper 以保持 demo；
 5. loading、404、409、422、503 分别有明确页面/section状态与 retry；Partial/Stale/Forbidden/Empty 仍渲染已有内容；
@@ -591,6 +618,7 @@ feat(app): assemble service observability read path
 更新 verifier 同时断言：
 
 - fixtures 四文件仍驱动显式 fixture mode；
+- fixture mode 保留 `import.meta.env.DEV` 双重门控，production bundle 无法启用 fixture 或绕过认证；
 - 三页 live path 调用三个 API；
 - 不存在 catch 后返回 fixture 的代码；
 - E2B-only literal 不进入 generic renderer；
@@ -630,12 +658,15 @@ cd web && npm run lint && npm run test:service-observability && npm run build
 **守护检查**
 
 ```bash
+# 整个 Phase 2 范围（含计划修订）
 git diff --name-only 702726b90762a0c92e54ffeb7c7cea101b466c83...HEAD
 rg -n 'Agent|Assistant|prompt|session|memory|stream' internal/serviceobs internal/api/service_observability.go web/src/pages/ServiceObservabilityWorkspace.tsx
 rg -n 'promql|logql|select .* from|authorization:|api[_-]?key|secret' web/src/serviceObservability web/src/pages/ServiceObservabilityWorkspace.tsx
 ```
 
-人工检查 diff 中不得包含三个 hold 路径；第二、第三条 `rg` 命中必须逐条解释，不能机械认为全是问题。
+acceptance 必须另行记录 Slice A 派发时 exact SHA，并用该 SHA 审计纯实现增量；这是运行时值，不硬编码进本计划。人工检查两种 diff 中均不得包含三个 hold 路径；第二、第三条 `rg` 命中必须逐条解释，不能机械认为全是问题。
+
+目录 cursor 对 query/version/filter/sort 做强校验，但进程内 cache 在翻页间仍可能更新；Phase 2 明确接受 triage 列表的弱快照一致性，极端情况下可能重排/重复，前端刷新可恢复。acceptance 将其记录为已知限制，不夸大为稳定快照分页；未来只有产品确需强一致时才引入 server-side snapshot token。
 
 **Codex 视觉验收**
 
@@ -687,6 +718,8 @@ docs(serviceobs): record phase 2 acceptance evidence
 3. Slice C：Task 8–11（API、app/config、web、完整验收）。
 
 每个 slice 都使用浏览器 `https://cursor.com/agents` 的 Cursor Cloud Agent，不使用本地 Cursor 客户端。若某 slice 的测试或接口边界未收敛，不提前启动后续 slice；禁止多个 slice 同时修改共享 package。
+
+Slice A 的 exact base 由本计划复审通过后的远端 HEAD 决定；Slice B/C 分别使用前一 slice 经 Codex 验收并 push 后的 exact HEAD。每次派发提示、Cloud `git rev-parse HEAD` 回执与 acceptance 文档三者必须一致。
 
 ## 9. Cursor Cloud Agent 交付格式
 
