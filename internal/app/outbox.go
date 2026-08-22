@@ -323,9 +323,13 @@ func earliestStartsAt(alerts []domain.Alert) time.Time {
 //
 // 因此签名里没有 tx，也不需要：scheduler 先在短事务里把这条定时器 claim 下来（带租约）
 // 并提交、释放行锁，之后才调用本函数；执行结果由 scheduler 另开短事务回写。崩溃安全性
-// 由租约负责（claimed 不是终态，租约过期后重新领取），重复投递由 Sender 的
-// notification_log 幂等键（含随 payload 持久化的 Round）收敛——与改造前一致的
-// at-least-once 口径。
+// 由租约负责（claimed 不是终态，租约过期后重新领取）。
+//
+// 口径与改造前完全一致地保持 at-least-once：Sender 的 notification_log 幂等键（含随
+// payload 持久化的 Round）只收敛逻辑性的重复调度，**消除不了**「HTTP/SMTP 已经发出、
+// 结果还没确认就崩溃」的重发窗口——重投时看到的记录是 pending 而不是 sent，消息会真的
+// 再发一次。这是外部 IO 无法参与数据库事务的固有代价（CLAUDE.md 不变量 4 已裁决接受），
+// 租约机制换掉的只是「崩溃后永远不再重投、通知永久丢失」这个更坏的行为。
 func notifySendPayloadHandler(sender *notify.Sender) scheduler.DetachedHandler {
 	return func(ctx context.Context, _ string, payload []byte) error {
 		var req notify.SendRequest
