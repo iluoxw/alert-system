@@ -254,7 +254,7 @@ Registry 构造时注入：profile filesystem、contract validator、Tool catalo
 4. 递归拒绝 forbidden key：`query/promql/sql/logql/shell/secret/token/headers/prompt/html/executable`；只检查 key，不对合法说明文字做 substring 猜测；
 5. focus `value_pattern` 必须可由 Go RE2 编译；恰好一个 primary focus；
 6. journey/view/signal/tool refs 全部存在且唯一；view order/key 唯一；threshold direction 与 degraded/critical 顺序合法；proxy 必须有 reason；
-7. service ID、root entity IDs 通过 resolver 存在，且 root 属于相同 environment/服务边界；
+7. service ID、root entity IDs 通过 resolver 存在；root 必须与 service 同环境（或 `global`），并且是 service entity 本身，或可从 service entity 经 declared `depends_on/part_of` canonical graph 有界到达；
 8. tool refs 全部存在于已发布 catalog；
 9. 每 service 只能有一个 `status=published` active profile。
 
@@ -341,7 +341,7 @@ feat(serviceobs): evaluate health and data truth tables
 4. 无 Profile 时仍以 service entity 与 registration declared dependencies 形成基础总览；
 5. domain 查询关联当前 service neighborhood 的 active Alert/Fault/Impact/Incident；focus 存在时只用白名单 focus kind 在 JSON labels/resource_ref 参数化匹配；
 6. Fault summary、confirmed/potential Impact、Incident 与 timeline 只投影已提交事实；不得创建领域对象或从 Fault 数量推导 Health；
-7. 同一 overview/workspace 组装中的 registration/topology/domain 读使用只读事务一致快照；
+7. registration/topology/domain 各自在独立只读事务中完成，避免一个非关键 section 失败拖垮其它 section；每个 adapter 内部保持一致读，并返回自己的 observed/read timestamp；
 8. adapter context deadline/cancellation 原样下传；没有字符串拼 SQL；
 9. 当前 Phase 2 的 telemetry port 使用显式 `UnavailableObservationReader`，只返回对应 Unknown/Unavailable，不读取 fixture 或外部网络。
 
@@ -430,6 +430,7 @@ feat(serviceobs): assemble context and project three page views
 - miss 返回 Unknown/Unconfigured placeholder 并入队；
 - 同 key 并发只执行一次 refresh；
 - worker/queue 上限可证明，队列满不增生 goroutine；
+- refresh TTL 加入可注入、可测试的 bounded jitter，避免大量 service 同时过期形成惊群；
 - refresh 成功原子替换；失败保留最后成功值；
 - 超过 max stale 后旧 Healthy 不再可见，退化 Unknown；
 - canceled caller 不取消已由 worker 接管的有界 refresh，但 shutdown context 能停止全部 worker；
@@ -576,7 +577,7 @@ feat(app): assemble service observability read path
    - 否则 -> API；
    - API failure 不得 fallback fixture；
 3. React Query key 包含 service ID 与所有 server query；URL 是筛选/focus/time/topology/tab 的可分享事实源；
-4. directory 的 filter/sort/cursor 由 API 负责；fixture 模式复用现有 client-side helper以保持 demo；
+4. directory 的 filter/sort/cursor 由 API 负责，并显式消费 `next_cursor` 提供继续加载；fixture 模式复用现有 client-side helper 以保持 demo；
 5. loading、404、409、422、503 分别有明确页面/section状态与 retry；Partial/Stale/Forbidden/Empty 仍渲染已有内容；
 6. “重试失败数据”在 live 模式调用 React Query refetch，不再修改 scenario；scenario 参数只在 fixture 模式有效；
 7. App shell 不在 live 模式全局 import fixture 来猜 service name；实际 service identity 来自 Page View；
@@ -675,7 +676,17 @@ docs(serviceobs): record phase 2 acceptance evidence
 - [ ] Phase 1 视觉和交互无退化；
 - [ ] acceptance 文档记录命令、结果、SHA、已知限制和下一 Phase 输入。
 
-## 8. Cursor Cloud Agent 交付格式
+## 8. Cloud Agent 执行切片
+
+本计划不交给单个超长 Cloud Agent 一次性吞完。Codex 按远端 exact SHA 串行调度三个 Opus 5 High 编码切片；每个切片完成后先本地验收并推送，下一切片才从新 SHA 开始：
+
+1. Slice A：Task 1–4（registration、contract/profile、evaluator）；
+2. Slice B：Task 5–7（alert-system adapters、assembler/projector、cache）；
+3. Slice C：Task 8–11（API、app/config、web、完整验收）。
+
+每个 slice 都使用浏览器 `https://cursor.com/agents` 的 Cursor Cloud Agent，不使用本地 Cursor 客户端。若某 slice 的测试或接口边界未收敛，不提前启动后续 slice；禁止多个 slice 同时修改共享 package。
+
+## 9. Cursor Cloud Agent 交付格式
 
 编码 Agent 每完成一个 Task 输出：
 
@@ -687,7 +698,7 @@ docs(serviceobs): record phase 2 acceptance evidence
 
 最终交付必须给出：branch、exact SHA、完整 diff 文件清单、所有验证结果、未执行项目及原因。不得自行 merge main；不得修改 hold 路径。
 
-## 9. 后续 Phase 输入
+## 10. 后续 Phase 输入
 
 Phase 2 完成后，Phase 3 只需要替换/补充 ports：
 
