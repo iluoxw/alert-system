@@ -1,0 +1,183 @@
+{
+  "schema_version": "1.0",
+  "view_kind": "service_overview",
+  "request_id": "req_overview_fixture_001",
+  "assembled_at": "2026-08-22T02:09:30Z",
+  "service": {
+    "service_id": "svc_e2b_fixture",
+    "entity_id": "entity_e2b_service",
+    "entity_key": "platform:e2b",
+    "name": "E2B",
+    "description": "安全、快速地创建和运行隔离 Sandbox 的平台能力。",
+    "layer": "platform",
+    "kind": "infrastructure_capability",
+    "environment": "production",
+    "owner_team_id": "team_platform_sre_fixture",
+    "owner_team_name": "Platform SRE",
+    "tier": "tier-1"
+  },
+  "profile": {
+    "profile_key": "e2b",
+    "profile_version": 1,
+    "status": "published"
+  },
+  "health": {
+    "status": "critical",
+    "reason_codes": ["red_api_orchestrator_errors_critical", "red_api_orchestrator_duration_critical"],
+    "evaluated_at": "2026-08-22T02:09:20Z"
+  },
+  "data_status": {
+    "state": "complete",
+    "sources": [
+      { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+      { "source_key": "canonical_topology", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z", "retryable": true },
+      { "source_key": "prometheus_e2b_uat", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:20Z", "retryable": true },
+      { "source_key": "alert_system_domain", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": true }
+    ]
+  },
+  "golden_signals": [
+    {
+      "binding_key": "golden_create_latency",
+      "label": "创建延迟 P95",
+      "family": "golden",
+      "semantic": "latency",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 3820,
+      "display_value": "3.82s",
+      "unit": "ms",
+      "aggregation": "p95",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 37,
+      "threshold_source": "profile:e2b:v1:golden_create_latency"
+    },
+    {
+      "binding_key": "golden_create_traffic",
+      "label": "创建流量",
+      "family": "golden",
+      "semantic": "traffic",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 14.6,
+      "display_value": "14.6/min",
+      "unit": "creates/min",
+      "aggregation": "rate",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "neutral",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 12
+    },
+    {
+      "binding_key": "golden_create_errors",
+      "label": "创建错误率",
+      "family": "golden",
+      "semantic": "errors",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 6.4,
+      "display_value": "6.4%",
+      "unit": "percent",
+      "aggregation": "avg",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 6.1,
+      "threshold_source": "profile:e2b:v1:golden_create_errors"
+    },
+    {
+      "binding_key": "golden_capacity_saturation",
+      "label": "最坏资源饱和度",
+      "family": "golden",
+      "semantic": "saturation",
+      "scope_kind": "resource",
+      "scope_ref": "entity_e2b_host_fleet",
+      "value": 91,
+      "display_value": "91%",
+      "unit": "percent",
+      "aggregation": "max",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "measurement_role": "proxy",
+      "proxy_reason": "Phase 1 使用最坏宿主 HugePages 使用率近似服务容量压力。",
+      "baseline_delta_percent": 15,
+      "threshold_source": "profile:e2b:v1:golden_capacity_saturation:hugepages_utilization_proxy"
+    }
+  ],
+  "domain_counts": {
+    "active_faults": 2,
+    "confirmed_impacts": 0,
+    "active_incidents": 0
+  },
+  "faults": [
+    {
+      "fault_id": "FLT-5F437252",
+      "title": "E2B Sandbox Placement 能力退化",
+      "state": "active",
+      "severity": "critical",
+      "owner_team_name": "Platform SRE",
+      "duration_seconds": 780,
+      "confirmed_impact_count": 0,
+      "potential_impact_count": 1,
+      "updated_at": "2026-08-22T02:09:28Z"
+    },
+    {
+      "fault_id": "FLT-6453F3E1",
+      "title": "Sandbox 实例无法恢复",
+      "state": "candidate",
+      "severity": "warning",
+      "owner_team_name": "Platform SRE",
+      "duration_seconds": 480,
+      "confirmed_impact_count": 0,
+      "potential_impact_count": 0,
+      "updated_at": "2026-08-22T02:08:40Z"
+    }
+  ],
+  "dependencies": [
+    { "entity_id": "entity_e2b_traefik", "name": "Traefik", "layer": "platform", "group_key": "request_entry", "group_label": "请求入口", "role": "边缘入口", "provenance": "declared_and_observed", "health": "healthy", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z" },
+    { "entity_id": "entity_e2b_api", "name": "API / Client Proxy", "layer": "platform", "group_key": "request_entry", "group_label": "请求入口", "role": "服务入口", "provenance": "declared_and_observed", "health": "degraded", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z" },
+    { "entity_id": "entity_e2b_orchestrator", "name": "Orchestrator Pool", "layer": "platform", "group_key": "orchestration_runtime", "group_label": "调度与运行", "role": "编排与调度", "provenance": "declared_and_observed", "health": "critical", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z" },
+    { "entity_id": "entity_e2b_sandbox_pool", "name": "Sandbox Pool", "layer": "infrastructure", "group_key": "orchestration_runtime", "group_label": "调度与运行", "role": "Firecracker 实例池", "provenance": "declared", "health": "unknown", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z" },
+    { "entity_id": "entity_e2b_host_fleet", "name": "Host Fleet", "layer": "infrastructure", "group_key": "orchestration_runtime", "group_label": "调度与运行", "role": "主机资源池", "provenance": "declared", "health": "degraded", "freshness": "fresh", "observed_at": "2026-08-22T02:09:20Z" },
+    { "entity_id": "entity_e2b_postgresql", "name": "PostgreSQL", "layer": "infrastructure", "group_key": "data_evidence", "group_label": "数据与证据", "role": "持久化状态", "provenance": "declared", "health": "unknown", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z" },
+    { "entity_id": "entity_e2b_redis", "name": "Redis", "layer": "infrastructure", "group_key": "data_evidence", "group_label": "数据与证据", "role": "调度缓存与协调", "provenance": "declared", "health": "unknown", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z" },
+    { "entity_id": "entity_e2b_storage", "name": "S3 / JuiceFS", "layer": "infrastructure", "group_key": "data_evidence", "group_label": "数据与证据", "role": "Sandbox 工作区存储", "provenance": "declared", "health": "unknown", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z" },
+    { "entity_id": "entity_e2b_openobserve", "name": "OpenObserve", "layer": "platform", "group_key": "data_evidence", "group_label": "数据与证据", "role": "日志与链路证据", "provenance": "declared_and_observed", "health": "healthy", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z" }
+  ],
+  "recent_events": [
+    { "event_id": "evt_recovery_fixture", "kind": "recovery", "title": "HugePages 使用率恢复至 72%", "source": "openobserve", "occurred_at": "2026-08-22T02:20:41Z", "entity_ids": ["entity_e2b_host_fleet"] },
+    { "event_id": "evt_request_failure_fixture", "kind": "fault", "title": "sbx_hp16c3 在 PLACE 阶段失败", "source": "alert_system", "occurred_at": "2026-08-22T02:09:22Z", "entity_ids": ["entity_e2b_orchestrator"], "relation_ids": ["rel_api_orchestrator"], "domain_ref": "FLT-5F437252" },
+    { "event_id": "evt_saturation_alert_fixture", "kind": "alert", "title": "HugePages 使用率 91%", "source": "alertmanager", "occurred_at": "2026-08-22T02:05:13Z", "entity_ids": ["entity_e2b_host_fleet"] },
+    { "event_id": "evt_deploy_fixture", "kind": "deployment", "title": "部署发布 v2026.08.22-1", "source": "deployment_system", "occurred_at": "2026-08-22T01:55:14Z" }
+  ],
+  "focus_kinds": [
+    { "key": "sandbox_id", "label": "Sandbox ID", "placeholder": "sbx_hp16c3", "value_pattern": "^sbx_[A-Za-z0-9]+$", "primary": true },
+    { "key": "trace_id", "label": "Trace ID", "placeholder": "输入 Trace ID", "value_pattern": "^[A-Fa-f0-9]{16,32}$", "primary": false }
+  ],
+  "links": [
+    { "kind": "dashboard", "label": "Dashboard", "href": "/external/e2b/dashboard" },
+    { "kind": "runbook", "label": "Runbook", "href": "/runbooks/e2b-sandbox-placement" },
+    { "kind": "service_registration", "label": "服务登记", "href": "/control/services/svc_e2b_fixture" }
+  ],
+  "sections": [
+    { "section_key": "identity", "state": "available", "retryable": false },
+    { "section_key": "golden", "state": "available", "retryable": true },
+    { "section_key": "faults", "state": "available", "retryable": true },
+    { "section_key": "dependencies", "state": "available", "retryable": true },
+    { "section_key": "events", "state": "available", "retryable": true }
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-observability/v1/tool-descriptor.schema.json",
+  "title": "Read-only ToolDescriptor v1",
+  "description": "Provider-neutral metadata for a server-owned, typed and auditable read-only tool.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "key",
+    "semantic_version",
+    "category",
+    "source_adapter",
+    "read_only",
+    "input_schema",
+    "output_schema",
+    "query_template_ref",
+    "required_permissions",
+    "limits",
+    "freshness_ttl_seconds",
+    "audit",
+    "redaction"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
+    },
+    "semantic_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "category": { "enum": ["context", "topology", "metrics", "logs", "traces", "domain"] },
+    "source_adapter": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,63}$",
+      "description": "A server-registered adapter key. The schema stays provider-neutral; the Tool Registry is the allowlist."
+    },
+    "description": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "read_only": { "const": true },
+    "input_schema": { "$ref": "#/$defs/jsonSchemaObject" },
+    "output_schema": { "$ref": "#/$defs/jsonSchemaObject" },
+    "query_template_ref": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+    },
+    "required_permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_.:-]{0,127}$"
+      },
+      "uniqueItems": true,
+      "minItems": 1,
+      "maxItems": 20
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_ms", "max_window_seconds", "max_rows", "max_cardinality"],
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 30000 },
+        "max_window_seconds": { "type": "integer", "minimum": 60, "maximum": 2592000 },
+        "max_rows": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "max_cardinality": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    },
+    "freshness_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["log_invocation", "log_result_metadata"],
+      "properties": {
+        "log_invocation": { "const": true },
+        "log_result_metadata": { "const": true }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_ref", "deny_raw_secrets"],
+      "properties": {
+        "policy_ref": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+        },
+        "deny_raw_secrets": { "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "jsonSchemaObject": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "$schema": { "type": "string", "format": "uri" },
+        "type": { "enum": ["object", "array"] }
+      }
+    }
+  }
+}

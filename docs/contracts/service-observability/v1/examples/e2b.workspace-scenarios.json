@@ -1,0 +1,264 @@
+{
+  "schema_version": "1.0",
+  "description": "RFC 6902 scenario fixtures derived from e2b.workspace-view.json. Each patched result must validate as Service Observability Page View v1.",
+  "base_fixture": "e2b.workspace-view.json",
+  "scenarios": [
+    {
+      "key": "telemetry_bundle_timeout_partial_unknown",
+      "label": "Telemetry bundle timeout: Partial + Unknown",
+      "visual_ref": "e2b-workspace-partial-unknown-v1.png",
+      "patch": [
+        { "op": "replace", "path": "/request_id", "value": "req_workspace_fixture_partial_unknown" },
+        { "op": "replace", "path": "/health/status", "value": "unknown" },
+        { "op": "replace", "path": "/health/reason_codes", "value": ["required_telemetry_signals_unavailable"] },
+        { "op": "replace", "path": "/data_status/state", "value": "partial" },
+
+        { "op": "replace", "path": "/data_status/sources/2/state", "value": "unavailable" },
+        { "op": "replace", "path": "/data_status/sources/2/freshness", "value": "unknown" },
+        { "op": "remove", "path": "/data_status/sources/2/observed_at" },
+        { "op": "add", "path": "/data_status/sources/2/reason_code", "value": "prometheus_timeout" },
+        { "op": "replace", "path": "/data_status/sources/3/state", "value": "unavailable" },
+        { "op": "replace", "path": "/data_status/sources/3/freshness", "value": "unknown" },
+        { "op": "remove", "path": "/data_status/sources/3/observed_at" },
+        { "op": "add", "path": "/data_status/sources/3/reason_code", "value": "openobserve_traces_timeout" },
+        { "op": "replace", "path": "/data_status/sources/4/state", "value": "unavailable" },
+        { "op": "replace", "path": "/data_status/sources/4/freshness", "value": "unknown" },
+        { "op": "remove", "path": "/data_status/sources/4/observed_at" },
+        { "op": "add", "path": "/data_status/sources/4/reason_code", "value": "openobserve_logs_timeout" },
+
+        { "op": "replace", "path": "/golden_signals/0/value", "value": null },
+        { "op": "replace", "path": "/golden_signals/0/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/golden_signals/0/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/golden_signals/0/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/golden_signals/0/health", "value": "unknown" },
+        { "op": "add", "path": "/golden_signals/0/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/golden_signals/1/value", "value": null },
+        { "op": "replace", "path": "/golden_signals/1/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/golden_signals/1/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/golden_signals/1/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/golden_signals/1/health", "value": "unknown" },
+        { "op": "add", "path": "/golden_signals/1/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/golden_signals/2/value", "value": null },
+        { "op": "replace", "path": "/golden_signals/2/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/golden_signals/2/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/golden_signals/2/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/golden_signals/2/health", "value": "unknown" },
+        { "op": "add", "path": "/golden_signals/2/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/golden_signals/3/value", "value": null },
+        { "op": "replace", "path": "/golden_signals/3/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/golden_signals/3/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/golden_signals/3/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/golden_signals/3/health", "value": "unknown" },
+        { "op": "add", "path": "/golden_signals/3/unknown_reason", "value": "telemetry_bundle_timeout" },
+
+        {
+          "op": "replace",
+          "path": "/journey",
+          "value": [
+            { "key": "accept", "label": "ACCEPT", "state": "ok", "entity_ids": ["entity_e2b_api"], "relation_ids": [], "evidence_ids": [] },
+            { "key": "place", "label": "PLACE", "state": "unknown", "entity_ids": ["entity_e2b_orchestrator", "entity_e2b_host_fleet"], "relation_ids": ["rel_api_orchestrator"], "evidence_ids": [], "reason_code": "telemetry_bundle_timeout" },
+            { "key": "fc_start", "label": "FC START", "state": "pending", "entity_ids": ["entity_e2b_sandbox_pool"], "relation_ids": [], "evidence_ids": [] },
+            { "key": "envd_ready", "label": "ENVD READY", "state": "pending", "entity_ids": ["entity_e2b_envd"], "relation_ids": [], "evidence_ids": [] },
+            { "key": "routed", "label": "ROUTED", "state": "pending", "entity_ids": ["entity_e2b_traefik"], "relation_ids": [], "evidence_ids": [] }
+          ]
+        },
+
+        { "op": "replace", "path": "/topology/partial", "value": true },
+        { "op": "replace", "path": "/topology/nodes/0/health", "value": "unknown" },
+        { "op": "replace", "path": "/topology/nodes/1/health", "value": "unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/health", "value": "unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/0/value", "value": null },
+        { "op": "replace", "path": "/topology/nodes/2/signals/0/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/0/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/0/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/0/health", "value": "unknown" },
+        { "op": "add", "path": "/topology/nodes/2/signals/0/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/2/value", "value": null },
+        { "op": "replace", "path": "/topology/nodes/2/signals/2/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/2/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/2/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/topology/nodes/2/signals/2/health", "value": "unknown" },
+        { "op": "add", "path": "/topology/nodes/2/signals/2/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/topology/relations/0/provenance", "value": "declared" },
+        { "op": "replace", "path": "/topology/relations/0/health", "value": "unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/0/value", "value": null },
+        { "op": "replace", "path": "/topology/relations/0/signals/0/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/0/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/0/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/topology/relations/0/signals/0/health", "value": "unknown" },
+        { "op": "add", "path": "/topology/relations/0/signals/0/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/topology/relations/0/signals/1/value", "value": null },
+        { "op": "replace", "path": "/topology/relations/0/signals/1/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/1/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/1/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/topology/relations/0/signals/1/health", "value": "unknown" },
+        { "op": "add", "path": "/topology/relations/0/signals/1/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/topology/relations/0/signals/2/value", "value": null },
+        { "op": "replace", "path": "/topology/relations/0/signals/2/display_value", "value": "Unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/2/freshness", "value": "unknown" },
+        { "op": "replace", "path": "/topology/relations/0/signals/2/availability", "value": "unavailable" },
+        { "op": "replace", "path": "/topology/relations/0/signals/2/health", "value": "unknown" },
+        { "op": "add", "path": "/topology/relations/0/signals/2/unknown_reason", "value": "telemetry_bundle_timeout" },
+        { "op": "replace", "path": "/topology/relations/1/health", "value": "unknown" },
+
+        {
+          "op": "replace",
+          "path": "/diagnostic_summary",
+          "value": {
+            "level": "incomplete",
+            "title": "诊断未完成：动态遥测查询超时",
+            "statements": ["Service Registration、declared topology、ACCEPT 事实与已有领域状态仍可用。", "Golden、RED、USE、PLACE 观测与 Evidence 当前不可判定；后续阶段仍为 pending。"],
+            "evidence_ids": [],
+            "missing_requirements": ["重试 Prometheus-compatible metrics", "重试 OpenObserve logs/traces"]
+          }
+        },
+        { "op": "replace", "path": "/evidence_refs", "value": [] },
+        {
+          "op": "replace",
+          "path": "/timeline",
+          "value": [
+            { "event_id": "evt_telemetry_gap_fixture", "kind": "telemetry_gap", "title": "Prometheus 与 OpenObserve 查询超时", "source": "service_observability", "occurred_at": "2026-08-22T02:09:22Z" }
+          ]
+        },
+        { "op": "replace", "path": "/sections/1/state", "value": "unavailable" },
+        { "op": "add", "path": "/sections/1/reason_code", "value": "prometheus_timeout" },
+        { "op": "replace", "path": "/sections/2/state", "value": "unavailable" },
+        { "op": "add", "path": "/sections/2/reason_code", "value": "openobserve_timeout" },
+        { "op": "add", "path": "/sections/3/reason_code", "value": "dynamic_overlay_unavailable_declared_topology_retained" },
+        { "op": "replace", "path": "/sections/4/state", "value": "unavailable" },
+        { "op": "add", "path": "/sections/4/reason_code", "value": "openobserve_timeout" }
+      ],
+      "assertions": [
+        { "path": "/data_status/state", "equals": "partial" },
+        { "path": "/health/status", "equals": "unknown" },
+        { "path": "/golden_signals/0/value", "equals": null },
+        { "path": "/journey/0/state", "equals": "ok" },
+        { "path": "/journey/1/state", "equals": "unknown" },
+        { "path": "/journey/2/state", "equals": "pending" },
+        { "path": "/topology/relations/0/provenance", "equals": "declared" },
+        { "path": "/evidence_refs", "length": 0 },
+        { "path": "/timeline", "length": 1 },
+        { "path": "/timeline/0/kind", "equals": "telemetry_gap" },
+        { "path": "/diagnostic_summary/level", "equals": "incomplete" }
+      ]
+    },
+    {
+      "key": "logs_forbidden_traces_allowed",
+      "label": "logs.read Forbidden, traces/metrics/domain remain available",
+      "visual_ref": "e2b-workspace-forbidden-logs-v2.png",
+      "patch": [
+        { "op": "replace", "path": "/request_id", "value": "req_workspace_fixture_logs_forbidden" },
+        { "op": "replace", "path": "/data_status/state", "value": "partial" },
+        { "op": "replace", "path": "/data_status/sources/4/state", "value": "forbidden" },
+        { "op": "replace", "path": "/data_status/sources/4/freshness", "value": "unknown" },
+        { "op": "remove", "path": "/data_status/sources/4/observed_at" },
+        { "op": "add", "path": "/data_status/sources/4/reason_code", "value": "logs_read_forbidden" },
+        { "op": "replace", "path": "/data_status/sources/4/retryable", "value": false },
+        { "op": "replace", "path": "/journey/1/evidence_ids", "value": ["ev_fixture_trace_001"] },
+        {
+          "op": "replace",
+          "path": "/diagnostic_summary",
+          "value": {
+            "level": "correlation",
+            "title": "PLACE 失败与宿主容量压力同窗出现",
+            "statements": ["Trace 保留 API 到 Orchestrator 的失败路径。", "当前身份无 logs.read，日志证据不参与候选原因判断。"],
+            "evidence_ids": ["ev_fixture_trace_001"],
+            "missing_requirements": ["需要 logs.read 或等价的直接 ResourceExhausted 证据，才能形成候选原因"]
+          }
+        },
+        { "op": "remove", "path": "/evidence_refs/0" },
+        { "op": "replace", "path": "/capabilities/view_logs", "value": false },
+        { "op": "add", "path": "/sections/4/reason_code", "value": "logs_forbidden_partial_evidence" },
+        { "op": "replace", "path": "/sections/4/retryable", "value": false }
+      ],
+      "assertions": [
+        { "path": "/data_status/state", "equals": "partial" },
+        { "path": "/health/status", "equals": "critical" },
+        { "path": "/capabilities/view_logs", "equals": false },
+        { "path": "/capabilities/view_traces", "equals": true },
+        { "path": "/evidence_refs", "length": 1 },
+        { "path": "/evidence_refs/0/kind", "equals": "trace" },
+        { "path": "/diagnostic_summary/level", "equals": "correlation" }
+      ]
+    },
+    {
+      "key": "focus_empty_valid_query",
+      "label": "Valid focus query with no matching request",
+      "patch": [
+        { "op": "replace", "path": "/request_id", "value": "req_workspace_fixture_focus_empty" },
+        { "op": "replace", "path": "/focus/value", "value": "sbx_notfound1" },
+        { "op": "remove", "path": "/focus/stage" },
+        {
+          "op": "replace",
+          "path": "/journey",
+          "value": [
+            { "key": "accept", "label": "ACCEPT", "state": "unknown", "entity_ids": ["entity_e2b_api"], "relation_ids": [], "evidence_ids": [], "reason_code": "focus_no_results" },
+            { "key": "place", "label": "PLACE", "state": "unknown", "entity_ids": ["entity_e2b_orchestrator"], "relation_ids": ["rel_api_orchestrator"], "evidence_ids": [], "reason_code": "focus_no_results" },
+            { "key": "fc_start", "label": "FC START", "state": "unknown", "entity_ids": ["entity_e2b_sandbox_pool"], "relation_ids": [], "evidence_ids": [], "reason_code": "focus_no_results" },
+            { "key": "envd_ready", "label": "ENVD READY", "state": "unknown", "entity_ids": ["entity_e2b_envd"], "relation_ids": [], "evidence_ids": [], "reason_code": "focus_no_results" },
+            { "key": "routed", "label": "ROUTED", "state": "unknown", "entity_ids": ["entity_e2b_traefik"], "relation_ids": [], "evidence_ids": [], "reason_code": "focus_no_results" }
+          ]
+        },
+        { "op": "replace", "path": "/topology/relations/0/provenance", "value": "declared" },
+        {
+          "op": "replace",
+          "path": "/diagnostic_summary",
+          "value": {
+            "level": "incomplete",
+            "title": "当前范围内没有匹配该 Sandbox ID 的请求",
+            "statements": ["查询已成功完成；Empty 不等于 Healthy。", "服务级 Golden/RED/USE 与 declared topology 仍可用于背景判断。"],
+            "evidence_ids": [],
+            "missing_requirements": ["确认 Sandbox ID 与时间窗后重新查询"]
+          }
+        },
+        { "op": "replace", "path": "/evidence_refs", "value": [] },
+        { "op": "remove", "path": "/timeline/0" },
+        { "op": "replace", "path": "/sections/2/state", "value": "empty" },
+        { "op": "add", "path": "/sections/2/reason_code", "value": "focus_no_results" },
+        { "op": "replace", "path": "/sections/4/state", "value": "empty" },
+        { "op": "add", "path": "/sections/4/reason_code", "value": "focus_no_results" }
+      ],
+      "assertions": [
+        { "path": "/data_status/state", "equals": "complete" },
+        { "path": "/sections/2/state", "equals": "empty" },
+        { "path": "/sections/4/state", "equals": "empty" },
+        { "path": "/evidence_refs", "length": 0 },
+        { "path": "/topology/relations/0/provenance", "equals": "declared" },
+        { "path": "/diagnostic_summary/level", "equals": "incomplete" }
+      ]
+    },
+    {
+      "key": "observed_relation_stale",
+      "label": "Observed path is stale while current metrics remain available",
+      "patch": [
+        { "op": "replace", "path": "/request_id", "value": "req_workspace_fixture_stale_relation" },
+        { "op": "replace", "path": "/data_status/state", "value": "stale" },
+        { "op": "replace", "path": "/data_status/sources/3/freshness", "value": "stale" },
+        { "op": "replace", "path": "/data_status/sources/3/observed_at", "value": "2026-08-22T02:00:00Z" },
+        { "op": "add", "path": "/data_status/sources/3/reason_code", "value": "observed_relation_ttl_exceeded" },
+        { "op": "replace", "path": "/topology/relations/0/freshness", "value": "stale" },
+        { "op": "replace", "path": "/evidence_refs/1/observed_at", "value": "2026-08-22T02:00:00Z" },
+        { "op": "replace", "path": "/evidence_refs/1/freshness", "value": "stale" },
+        {
+          "op": "replace",
+          "path": "/diagnostic_summary",
+          "value": {
+            "level": "correlation",
+            "title": "错误与容量压力仍存在，但 observed path 已过期",
+            "statements": ["Prometheus RED/USE 仍是当前窗口数据。", "API 到 Orchestrator 的 observed relation 超过 freshness TTL，只能作为灰色虚线背景。"],
+            "evidence_ids": ["ev_fixture_log_001"],
+            "missing_requirements": ["刷新 Trace 以确认当前请求路径"]
+          }
+        },
+        { "op": "add", "path": "/sections/3/reason_code", "value": "observed_relation_stale" }
+      ],
+      "assertions": [
+        { "path": "/data_status/state", "equals": "stale" },
+        { "path": "/health/status", "equals": "critical" },
+        { "path": "/topology/relations/0/freshness", "equals": "stale" },
+        { "path": "/evidence_refs/1/freshness", "equals": "stale" },
+        { "path": "/diagnostic_summary/level", "equals": "correlation" }
+      ]
+    }
+  ]
+}

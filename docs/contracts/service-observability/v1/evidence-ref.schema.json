@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-observability/v1/evidence-ref.schema.json",
+  "title": "EvidenceRef v1",
+  "description": "A bounded, auditable reference to evidence retained by its source system.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "source",
+    "kind",
+    "locator",
+    "correlation",
+    "observed_at",
+    "fetched_at",
+    "freshness",
+    "availability",
+    "summary",
+    "sensitivity",
+    "redactions"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "source": {
+      "enum": [
+        "openobserve",
+        "prometheus_compatible",
+        "alert_system",
+        "alertmanager",
+        "topology",
+        "human"
+      ]
+    },
+    "kind": {
+      "enum": [
+        "metric",
+        "log",
+        "trace",
+        "alert",
+        "topology_snapshot",
+        "fault",
+        "impact",
+        "incident",
+        "human_decision"
+      ]
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "dataset": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "record_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "query_template_ref": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+        },
+        "deep_link": { "type": "string", "format": "uri-reference", "maxLength": 2048 }
+      },
+      "anyOf": [
+        { "required": ["record_id"] },
+        { "required": ["query_template_ref"] },
+        { "required": ["deep_link"] }
+      ]
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_id"],
+      "properties": {
+        "service_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "focus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "value": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        "entity_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 100
+        },
+        "relation_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 200
+        },
+        "alert_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 100
+        }
+      }
+    },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "fetched_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "freshness": { "enum": ["fresh", "stale", "unknown"] },
+    "availability": { "enum": ["available", "expired", "forbidden", "unavailable"] },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "sensitivity": { "enum": ["public", "internal", "restricted"] },
+    "redactions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+      "uniqueItems": true,
+      "maxItems": 100
+    }
+  }
+}

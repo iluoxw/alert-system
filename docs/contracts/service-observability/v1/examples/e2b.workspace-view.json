@@ -1,0 +1,398 @@
+{
+  "schema_version": "1.0",
+  "view_kind": "observability_workspace",
+  "request_id": "req_workspace_fixture_001",
+  "context_version": 1,
+  "assembled_at": "2026-08-22T02:09:30Z",
+  "service": {
+    "service_id": "svc_e2b_fixture",
+    "entity_id": "entity_e2b_service",
+    "entity_key": "platform:e2b",
+    "name": "E2B",
+    "description": "安全、快速地创建和运行隔离 Sandbox 的平台能力。",
+    "layer": "platform",
+    "kind": "infrastructure_capability",
+    "environment": "production",
+    "owner_team_id": "team_platform_sre_fixture",
+    "owner_team_name": "Platform SRE",
+    "tier": "tier-1"
+  },
+  "profile": {
+    "profile_key": "e2b",
+    "profile_version": 1,
+    "status": "published"
+  },
+  "scope": {
+    "tenant": "default",
+    "environment": "production",
+    "from": "2026-08-22T02:04:22Z",
+    "to": "2026-08-22T02:09:22Z",
+    "timezone": "Asia/Shanghai"
+  },
+  "focus": {
+    "kind": "sandbox_id",
+    "value": "sbx_hp16c3",
+    "journey": "sandbox_create",
+    "stage": "place"
+  },
+  "health": {
+    "status": "critical",
+    "reason_codes": ["red_api_orchestrator_errors_critical", "red_api_orchestrator_duration_critical"],
+    "evaluated_at": "2026-08-22T02:09:20Z"
+  },
+  "data_status": {
+    "state": "complete",
+    "sources": [
+      { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+      { "source_key": "canonical_topology", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z", "retryable": true },
+      { "source_key": "prometheus_e2b_uat", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:20Z", "retryable": true },
+      { "source_key": "openobserve_e2b_traces", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z", "retryable": true },
+      { "source_key": "openobserve_e2b_logs", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:22Z", "retryable": true },
+      { "source_key": "alert_system_domain", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": true }
+    ]
+  },
+  "golden_signals": [
+    {
+      "binding_key": "golden_create_latency",
+      "label": "创建延迟 P95",
+      "family": "golden",
+      "semantic": "latency",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 3820,
+      "display_value": "3.82s",
+      "unit": "ms",
+      "aggregation": "p95",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 37,
+      "threshold_source": "profile:e2b:v1:golden_create_latency"
+    },
+    {
+      "binding_key": "golden_create_traffic",
+      "label": "创建流量",
+      "family": "golden",
+      "semantic": "traffic",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 14.6,
+      "display_value": "14.6/min",
+      "unit": "creates/min",
+      "aggregation": "rate",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "neutral",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 12
+    },
+    {
+      "binding_key": "golden_create_errors",
+      "label": "创建错误率",
+      "family": "golden",
+      "semantic": "errors",
+      "scope_kind": "service",
+      "scope_ref": "svc_e2b_fixture",
+      "value": 6.4,
+      "display_value": "6.4%",
+      "unit": "percent",
+      "aggregation": "avg",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "baseline_delta_percent": 6.1,
+      "threshold_source": "profile:e2b:v1:golden_create_errors"
+    },
+    {
+      "binding_key": "golden_capacity_saturation",
+      "label": "最坏资源饱和度",
+      "family": "golden",
+      "semantic": "saturation",
+      "scope_kind": "resource",
+      "scope_ref": "entity_e2b_host_fleet",
+      "value": 91,
+      "display_value": "91%",
+      "unit": "percent",
+      "aggregation": "max",
+      "window_seconds": 300,
+      "observed_at": "2026-08-22T02:09:20Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "health": "degraded",
+      "source_key": "prometheus_e2b_uat",
+      "measurement_role": "proxy",
+      "proxy_reason": "Phase 1 使用最坏宿主 HugePages 使用率近似服务容量压力。",
+      "baseline_delta_percent": 15,
+      "threshold_source": "profile:e2b:v1:golden_capacity_saturation:hugepages_utilization_proxy"
+    }
+  ],
+  "journey": [
+    { "key": "accept", "label": "ACCEPT", "state": "ok", "entity_ids": ["entity_e2b_api"], "relation_ids": [], "evidence_ids": [] },
+    { "key": "place", "label": "PLACE", "state": "failed", "entity_ids": ["entity_e2b_orchestrator", "entity_e2b_host_fleet"], "relation_ids": ["rel_api_orchestrator"], "evidence_ids": ["ev_fixture_log_001", "ev_fixture_trace_001"], "reason_code": "placement_resource_exhausted" },
+    { "key": "fc_start", "label": "FC START", "state": "pending", "entity_ids": ["entity_e2b_sandbox_pool"], "relation_ids": [], "evidence_ids": [] },
+    { "key": "envd_ready", "label": "ENVD READY", "state": "pending", "entity_ids": ["entity_e2b_envd"], "relation_ids": [], "evidence_ids": [] },
+    { "key": "routed", "label": "ROUTED", "state": "pending", "entity_ids": ["entity_e2b_traefik"], "relation_ids": [], "evidence_ids": [] }
+  ],
+  "topology": {
+    "snapshot_id": "topology_fixture_001",
+    "partial": false,
+    "nodes": [
+      { "entity_id": "entity_e2b_api", "name": "API / Client Proxy", "layer": "platform", "kind": "service", "health": "degraded", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_orchestrator", "name": "Orchestrator Pool", "layer": "platform", "kind": "service", "health": "critical", "freshness": "fresh", "signals": [] },
+      {
+        "entity_id": "entity_e2b_host_fleet",
+        "name": "Host Fleet",
+        "layer": "infrastructure",
+        "kind": "resource_fleet",
+        "health": "critical",
+        "freshness": "fresh",
+        "signals": [
+          {
+            "binding_key": "use_host_hugepages_utilization",
+            "label": "HugePages 使用率",
+            "family": "use",
+            "semantic": "utilization",
+            "scope_kind": "resource",
+            "scope_ref": "entity_e2b_host_fleet",
+            "value": 91,
+            "display_value": "91%",
+            "unit": "percent",
+            "aggregation": "max",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "fresh",
+            "availability": "available",
+            "health": "degraded",
+            "source_key": "prometheus_e2b_uat",
+            "threshold_source": "profile:e2b:v1:use_host_hugepages_utilization"
+          },
+          {
+            "binding_key": "use_host_placement_saturation",
+            "label": "Placement 资源饱和度",
+            "family": "use",
+            "semantic": "saturation",
+            "scope_kind": "resource",
+            "scope_ref": "entity_e2b_host_fleet",
+            "value": null,
+            "display_value": "Unknown",
+            "unit": "percent",
+            "aggregation": "max",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "unknown",
+            "availability": "unavailable",
+            "health": "unknown",
+            "source_key": "prometheus_e2b_uat",
+            "unknown_reason": "尚未接入 placement admission queue 或 wait pressure 指标"
+          },
+          {
+            "binding_key": "use_host_placement_errors",
+            "label": "Placement 资源拒绝率",
+            "family": "use",
+            "semantic": "errors",
+            "scope_kind": "resource",
+            "scope_ref": "entity_e2b_host_fleet",
+            "value": 8.1,
+            "display_value": "8.1%",
+            "unit": "percent",
+            "aggregation": "avg",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "fresh",
+            "availability": "available",
+            "health": "critical",
+            "source_key": "prometheus_e2b_uat",
+            "threshold_source": "profile:e2b:v1:use_host_placement_errors"
+          }
+        ]
+      },
+      { "entity_id": "entity_e2b_traefik", "name": "Traefik", "layer": "platform", "kind": "edge_gateway", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_sandbox_pool", "name": "Sandbox Pool", "layer": "infrastructure", "kind": "runtime_pool", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_envd", "name": "Envd", "layer": "platform", "kind": "sandbox_runtime", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_postgresql", "name": "PostgreSQL", "layer": "infrastructure", "kind": "database", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_redis", "name": "Redis", "layer": "infrastructure", "kind": "cache", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_storage", "name": "S3 / JuiceFS", "layer": "infrastructure", "kind": "workspace_storage", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "entity_id": "entity_e2b_openobserve", "name": "OpenObserve", "layer": "platform", "kind": "evidence_store", "health": "unknown", "freshness": "fresh", "signals": [] }
+    ],
+    "relations": [
+      {
+        "relation_id": "rel_api_orchestrator",
+        "source_entity_id": "entity_e2b_api",
+        "target_entity_id": "entity_e2b_orchestrator",
+        "kind": "calls",
+        "provenance": "declared_and_observed",
+        "health": "critical",
+        "freshness": "fresh",
+        "signals": [
+          {
+            "binding_key": "red_api_orchestrator_rate",
+            "label": "API 到 Orchestrator 请求率",
+            "family": "red",
+            "semantic": "rate",
+            "scope_kind": "relation",
+            "scope_ref": "rel_api_orchestrator",
+            "value": 18,
+            "display_value": "18 req/s",
+            "unit": "req/s",
+            "aggregation": "rate",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "fresh",
+            "availability": "available",
+            "health": "neutral",
+            "source_key": "prometheus_e2b_uat"
+          },
+          {
+            "binding_key": "red_api_orchestrator_errors",
+            "label": "API 到 Orchestrator 错误率",
+            "family": "red",
+            "semantic": "errors",
+            "scope_kind": "relation",
+            "scope_ref": "rel_api_orchestrator",
+            "value": 7.2,
+            "display_value": "7.2%",
+            "unit": "percent",
+            "aggregation": "avg",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "fresh",
+            "availability": "available",
+            "health": "critical",
+            "source_key": "prometheus_e2b_uat",
+            "threshold_source": "profile:e2b:v1:red_api_orchestrator_errors"
+          },
+          {
+            "binding_key": "red_api_orchestrator_duration",
+            "label": "API 到 Orchestrator P95",
+            "family": "red",
+            "semantic": "duration",
+            "scope_kind": "relation",
+            "scope_ref": "rel_api_orchestrator",
+            "value": 3480,
+            "display_value": "3.48s",
+            "unit": "ms",
+            "aggregation": "p95",
+            "window_seconds": 300,
+            "observed_at": "2026-08-22T02:09:20Z",
+            "freshness": "fresh",
+            "availability": "available",
+            "health": "critical",
+            "source_key": "prometheus_e2b_uat",
+            "threshold_source": "profile:e2b:v1:red_api_orchestrator_duration"
+          }
+        ]
+      },
+      { "relation_id": "rel_orchestrator_host_fleet", "source_entity_id": "entity_e2b_orchestrator", "target_entity_id": "entity_e2b_host_fleet", "kind": "schedules_on", "provenance": "declared", "health": "degraded", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_traefik_api", "source_entity_id": "entity_e2b_traefik", "target_entity_id": "entity_e2b_api", "kind": "routes_to", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_orchestrator_sandbox_pool", "source_entity_id": "entity_e2b_orchestrator", "target_entity_id": "entity_e2b_sandbox_pool", "kind": "places_on", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_sandbox_pool_envd", "source_entity_id": "entity_e2b_sandbox_pool", "target_entity_id": "entity_e2b_envd", "kind": "starts", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_envd_traefik", "source_entity_id": "entity_e2b_envd", "target_entity_id": "entity_e2b_traefik", "kind": "routes_via", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_orchestrator_postgresql", "source_entity_id": "entity_e2b_orchestrator", "target_entity_id": "entity_e2b_postgresql", "kind": "reads_writes", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_orchestrator_redis", "source_entity_id": "entity_e2b_orchestrator", "target_entity_id": "entity_e2b_redis", "kind": "coordinates_with", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_sandbox_pool_storage", "source_entity_id": "entity_e2b_sandbox_pool", "target_entity_id": "entity_e2b_storage", "kind": "mounts", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] },
+      { "relation_id": "rel_orchestrator_openobserve", "source_entity_id": "entity_e2b_orchestrator", "target_entity_id": "entity_e2b_openobserve", "kind": "emits_telemetry_to", "provenance": "declared", "health": "unknown", "freshness": "fresh", "signals": [] }
+    ]
+  },
+  "diagnostic_summary": {
+    "level": "candidate_cause",
+    "title": "请求在 PLACE 阶段失败",
+    "statements": [
+      "API 到 Orchestrator 的错误率与 P95 同时越过 critical 阈值。",
+      "宿主资源在同一窗口出现 HugePages 高使用率和 placement rejection。",
+      "ResourceExhausted 日志把该请求关联到宿主资源不足；当前仍按候选原因展示。"
+    ],
+    "evidence_ids": ["ev_fixture_log_001", "ev_fixture_trace_001"],
+    "missing_requirements": ["需要 Fault 工作区人工确认，才能升级为 confirmed cause"]
+  },
+  "evidence_refs": [
+    {
+      "schema_version": "1.0",
+      "evidence_id": "ev_fixture_log_001",
+      "source": "openobserve",
+      "kind": "log",
+      "locator": {
+        "provider": "openobserve",
+        "dataset": "e2b_logs",
+        "record_id": "log_fixture_001",
+        "deep_link": "/integrations/openobserve/evidence/ev_fixture_log_001"
+      },
+      "correlation": {
+        "service_id": "svc_e2b_fixture",
+        "focus": { "kind": "sandbox_id", "value": "sbx_hp16c3" },
+        "entity_ids": ["entity_e2b_orchestrator", "entity_e2b_host_fleet"],
+        "relation_ids": ["rel_api_orchestrator"],
+        "alert_ids": ["alert_fixture_hugepages_001"]
+      },
+      "observed_at": "2026-08-22T02:09:22Z",
+      "fetched_at": "2026-08-22T02:09:29Z",
+      "expires_at": "2026-09-21T02:09:22Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "summary": "Placement returned insufficient HugePages for the focused sandbox request.",
+      "integrity": { "algorithm": "sha256", "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+      "sensitivity": "internal",
+      "redactions": ["host.credentials", "request.headers.authorization"]
+    },
+    {
+      "schema_version": "1.0",
+      "evidence_id": "ev_fixture_trace_001",
+      "source": "openobserve",
+      "kind": "trace",
+      "locator": {
+        "provider": "openobserve",
+        "dataset": "default",
+        "record_id": "trace_fixture_001",
+        "deep_link": "/integrations/openobserve/evidence/ev_fixture_trace_001"
+      },
+      "correlation": {
+        "service_id": "svc_e2b_fixture",
+        "focus": { "kind": "sandbox_id", "value": "sbx_hp16c3" },
+        "entity_ids": ["entity_e2b_api", "entity_e2b_orchestrator"],
+        "relation_ids": ["rel_api_orchestrator"]
+      },
+      "observed_at": "2026-08-22T02:09:22Z",
+      "fetched_at": "2026-08-22T02:09:29Z",
+      "expires_at": "2026-09-21T02:09:22Z",
+      "freshness": "fresh",
+      "availability": "available",
+      "summary": "Focused trace confirms the API to Orchestrator span failed during PLACE.",
+      "integrity": { "algorithm": "sha256", "digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" },
+      "sensitivity": "internal",
+      "redactions": ["span.attributes.authorization"]
+    }
+  ],
+  "domain_state": {
+    "alerts": [{ "id": "alert_fixture_hugepages_001", "state": "firing", "updated_at": "2026-08-22T02:05:13Z" }],
+    "faults": [{ "id": "FLT-5F437252", "state": "active", "updated_at": "2026-08-22T02:09:28Z" }],
+    "impacts": [],
+    "incidents": []
+  },
+  "timeline": [
+    { "event_id": "evt_request_failure_fixture", "kind": "fault", "title": "sbx_hp16c3 在 PLACE 阶段失败", "source": "alert_system", "occurred_at": "2026-08-22T02:09:22Z", "entity_ids": ["entity_e2b_orchestrator"], "relation_ids": ["rel_api_orchestrator"], "domain_ref": "FLT-5F437252" },
+    { "event_id": "evt_saturation_alert_fixture", "kind": "alert", "title": "HugePages 使用率 91%", "source": "alertmanager", "occurred_at": "2026-08-22T02:05:13Z", "entity_ids": ["entity_e2b_host_fleet"] },
+    { "event_id": "evt_deploy_fixture", "kind": "deployment", "title": "部署发布 v2026.08.22-1", "source": "deployment_system", "occurred_at": "2026-08-22T01:55:14Z" }
+  ],
+  "capabilities": {
+    "view_metrics": true,
+    "view_logs": true,
+    "view_traces": true,
+    "view_domain": true,
+    "open_evidence_deep_links": true
+  },
+  "sections": [
+    { "section_key": "identity", "state": "available", "retryable": false },
+    { "section_key": "golden", "state": "available", "retryable": true },
+    { "section_key": "journey", "state": "available", "retryable": true },
+    { "section_key": "topology", "state": "available", "retryable": true },
+    { "section_key": "evidence", "state": "available", "retryable": true },
+    { "section_key": "domain", "state": "available", "retryable": true }
+  ]
+}

@@ -1,0 +1,311 @@
+{
+  "schema_version": "1.0",
+  "view_kind": "service_directory",
+  "request_id": "req_directory_fixture_001",
+  "assembled_at": "2026-08-22T02:09:30Z",
+  "summary": {
+    "managed": 24,
+    "critical": 2,
+    "partial": 3,
+    "unconfigured": 4
+  },
+  "items": [
+    {
+      "service": {
+        "service_id": "svc_e2b_fixture",
+        "entity_id": "entity_e2b_service",
+        "entity_key": "platform:e2b",
+        "name": "E2B",
+        "description": "安全、快速地创建和运行隔离 Sandbox 的平台能力。",
+        "layer": "platform",
+        "kind": "infrastructure_capability",
+        "environment": "production",
+        "owner_team_id": "team_platform_sre_fixture",
+        "owner_team_name": "Platform SRE",
+        "tier": "tier-1"
+      },
+      "profile": {
+        "profile_key": "e2b",
+        "profile_version": 1,
+        "status": "published"
+      },
+      "health": {
+        "status": "critical",
+        "reason_codes": ["red_api_orchestrator_errors_critical", "red_api_orchestrator_duration_critical"],
+        "evaluated_at": "2026-08-22T02:09:20Z"
+      },
+      "data_status": {
+        "state": "complete",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "prometheus_e2b_uat", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:20Z", "retryable": true },
+          { "source_key": "alert_system_domain", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": true }
+        ]
+      },
+      "golden_signals": [
+        {
+          "binding_key": "golden_create_latency",
+          "label": "创建延迟 P95",
+          "family": "golden",
+          "semantic": "latency",
+          "scope_kind": "service",
+          "scope_ref": "svc_e2b_fixture",
+          "value": 3820,
+          "display_value": "3.82s",
+          "unit": "ms",
+          "aggregation": "p95",
+          "window_seconds": 300,
+          "observed_at": "2026-08-22T02:09:20Z",
+          "freshness": "fresh",
+          "availability": "available",
+          "health": "degraded",
+          "source_key": "prometheus_e2b_uat",
+          "baseline_delta_percent": 37,
+          "threshold_source": "profile:e2b:v1:golden_create_latency"
+        },
+        {
+          "binding_key": "golden_create_traffic",
+          "label": "创建流量",
+          "family": "golden",
+          "semantic": "traffic",
+          "scope_kind": "service",
+          "scope_ref": "svc_e2b_fixture",
+          "value": 14.6,
+          "display_value": "14.6/min",
+          "unit": "creates/min",
+          "aggregation": "rate",
+          "window_seconds": 300,
+          "observed_at": "2026-08-22T02:09:20Z",
+          "freshness": "fresh",
+          "availability": "available",
+          "health": "neutral",
+          "source_key": "prometheus_e2b_uat",
+          "baseline_delta_percent": 12
+        },
+        {
+          "binding_key": "golden_create_errors",
+          "label": "创建错误率",
+          "family": "golden",
+          "semantic": "errors",
+          "scope_kind": "service",
+          "scope_ref": "svc_e2b_fixture",
+          "value": 6.4,
+          "display_value": "6.4%",
+          "unit": "percent",
+          "aggregation": "avg",
+          "window_seconds": 300,
+          "observed_at": "2026-08-22T02:09:20Z",
+          "freshness": "fresh",
+          "availability": "available",
+          "health": "degraded",
+          "source_key": "prometheus_e2b_uat",
+          "baseline_delta_percent": 6.1,
+          "threshold_source": "profile:e2b:v1:golden_create_errors"
+        },
+        {
+          "binding_key": "golden_capacity_saturation",
+          "label": "最坏资源饱和度",
+          "family": "golden",
+          "semantic": "saturation",
+          "scope_kind": "resource",
+          "scope_ref": "entity_e2b_host_fleet",
+          "value": 91,
+          "display_value": "91%",
+          "unit": "percent",
+          "aggregation": "max",
+          "window_seconds": 300,
+          "observed_at": "2026-08-22T02:09:20Z",
+          "freshness": "fresh",
+          "availability": "available",
+          "health": "degraded",
+          "source_key": "prometheus_e2b_uat",
+          "measurement_role": "proxy",
+          "proxy_reason": "Phase 1 使用最坏宿主 HugePages 使用率近似服务容量压力。",
+          "baseline_delta_percent": 15,
+          "threshold_source": "profile:e2b:v1:golden_capacity_saturation:hugepages_utilization_proxy"
+        }
+      ],
+      "domain_counts": {
+        "active_faults": 2,
+        "confirmed_impacts": 0,
+        "active_incidents": 0
+      },
+      "links": [
+        { "kind": "dashboard", "label": "Dashboard", "href": "/external/e2b/dashboard" },
+        { "kind": "runbook", "label": "Runbook", "href": "/runbooks/e2b-sandbox-placement" }
+      ],
+      "observed_at": "2026-08-22T02:09:20Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_api_fixture",
+        "entity_id": "entity_e2b_api",
+        "entity_key": "platform:e2b:api",
+        "name": "E2B API / Client Proxy",
+        "description": "接收 Sandbox 生命周期请求并转交编排层。",
+        "layer": "platform",
+        "kind": "infrastructure_capability",
+        "environment": "production",
+        "owner_team_id": "team_platform_sre_fixture",
+        "owner_team_name": "Platform SRE",
+        "tier": "tier-1"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["service_profile_not_published"], "evaluated_at": "2026-08-22T02:09:28Z" },
+      "data_status": {
+        "state": "unconfigured",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:28Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_orchestrator_fixture",
+        "entity_id": "entity_e2b_orchestrator",
+        "entity_key": "platform:e2b:orchestrator",
+        "name": "E2B Orchestrator",
+        "description": "负责 Sandbox placement、调度与资源选择。",
+        "layer": "platform",
+        "kind": "infrastructure_capability",
+        "environment": "production",
+        "owner_team_id": "team_platform_sre_fixture",
+        "owner_team_name": "Platform SRE",
+        "tier": "tier-1"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["required_signals_not_configured"], "evaluated_at": "2026-08-22T02:09:20Z" },
+      "data_status": {
+        "state": "partial",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "canonical_topology", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:10Z", "retryable": true },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:20Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_sandbox_pool_fixture",
+        "entity_id": "entity_e2b_sandbox_pool",
+        "entity_key": "infrastructure:e2b:sandbox-pool",
+        "name": "E2B Sandbox Pool",
+        "description": "承载 Firecracker Sandbox 实例与启动容量。",
+        "layer": "infrastructure",
+        "kind": "resource",
+        "environment": "production",
+        "owner_team_id": "team_platform_sre_fixture",
+        "owner_team_name": "Platform SRE",
+        "tier": "tier-1"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["service_profile_not_published"], "evaluated_at": "2026-08-22T02:09:10Z" },
+      "data_status": {
+        "state": "unconfigured",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:10Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_host_fleet_fixture",
+        "entity_id": "entity_e2b_host_fleet",
+        "entity_key": "infrastructure:e2b:host-fleet",
+        "name": "E2B Host Fleet",
+        "description": "为 Sandbox placement 提供 HugePages 与计算资源。",
+        "layer": "infrastructure",
+        "kind": "resource",
+        "environment": "production",
+        "owner_team_id": "team_platform_sre_fixture",
+        "owner_team_name": "Platform SRE",
+        "tier": "tier-1"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["service_level_required_signals_missing"], "evaluated_at": "2026-08-22T02:09:20Z" },
+      "data_status": {
+        "state": "partial",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "prometheus_e2b_uat", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:20Z", "retryable": true },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:20Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_postgresql_fixture",
+        "entity_id": "entity_e2b_postgresql",
+        "entity_key": "infrastructure:e2b:postgresql",
+        "name": "E2B PostgreSQL",
+        "description": "保存 Orchestrator 的持久化状态。",
+        "layer": "infrastructure",
+        "kind": "resource",
+        "environment": "production",
+        "owner_team_id": "team_data_platform_fixture",
+        "owner_team_name": "Data Platform",
+        "tier": "tier-1"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["service_profile_not_published"], "evaluated_at": "2026-08-22T02:09:10Z" },
+      "data_status": {
+        "state": "unconfigured",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:10Z"
+    },
+    {
+      "service": {
+        "service_id": "svc_e2b_openobserve_fixture",
+        "entity_id": "entity_e2b_openobserve",
+        "entity_key": "platform:e2b:openobserve",
+        "name": "E2B OpenObserve",
+        "description": "承载 E2B logs、traces 与访问证据。",
+        "layer": "platform",
+        "kind": "infrastructure_capability",
+        "environment": "production",
+        "owner_team_id": "team_observability_fixture",
+        "owner_team_name": "Observability",
+        "tier": "tier-2"
+      },
+      "profile": null,
+      "health": { "status": "unknown", "reason_codes": ["service_profile_not_published"], "evaluated_at": "2026-08-22T02:09:22Z" },
+      "data_status": {
+        "state": "unconfigured",
+        "sources": [
+          { "source_key": "service_registry", "state": "available", "freshness": "fresh", "observed_at": "2026-08-22T02:09:28Z", "retryable": false },
+          { "source_key": "profile_registry", "state": "unavailable", "freshness": "unknown", "reason_code": "service_profile_missing", "retryable": false }
+        ]
+      },
+      "golden_signals": [],
+      "domain_counts": { "active_faults": 0, "confirmed_impacts": 0, "active_incidents": 0 },
+      "links": [{ "kind": "service_registration", "label": "配置 Profile", "href": "/settings/services" }],
+      "observed_at": "2026-08-22T02:09:22Z"
+    }
+  ],
+  "next_cursor": null
+}
