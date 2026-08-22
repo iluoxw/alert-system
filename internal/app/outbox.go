@@ -311,17 +311,23 @@ func earliestStartsAt(alerts []domain.Alert) time.Time {
 	return earliest
 }
 
-// notifySendPayloadHandler 构造 "notify_send" 的 scheduler.Handler：解码 payload 为
-// notify.SendRequest，交给 notify.Sender.Send。tx 是 processOneDue 传入的、已经把这条
-// notify_send 定时器标记为 fired 的事务，本 handler 不使用它——Sender.Send 内部按
-// R6.1/R6.3 的既有设计自己开独立事务做占位写入/状态回写（notify.Sender 的 txRunner，
-// 与 scheduler 的 tx 完全无关），期间夹着同步的外部 IO（HTTP/短信）与指数退避重试。
-// 这意味着外层 processOneDue 事务（持有该 notify_send 定时器行锁）在 Sender.Send
-// 整个执行期间都保持打开——已由 team-lead 确认接受这一 MVP 权衡（发送慢只阻塞
-// "notify_send" 这一个 kind 的 worker 槽位，不阻塞其余五个 kind），留待后续任务视
-// 吞吐需求把发送异步化。
-func notifySendPayloadHandler(sender *notify.Sender) scheduler.Handler {
-	return func(ctx context.Context, _ pgx.Tx, refID string, payload []byte) error {
+// notifySendPayloadHandler 构造 "notify_send" 的 scheduler.DetachedHandler：解码
+// payload 为 notify.SendRequest，交给 notify.Sender.Send。
+//
+// 这是唯一一个注册成「事务外执行」模式的 kind（scheduler.RegisterDetachedHandler），
+// 因为它是唯一一个 handler 内部必然发生外部 IO 的 kind：Sender.Send 自己开独立小事务
+// 做占位写入/状态回写（notify.Sender 的 txRunner），中间夹着同步的 HTTP/SMTP 发送与
+// 指数退避重试。如果按默认模式在 scheduler 的 per-timer 事务内调用，那个事务会在整段
+// 外部 IO 期间保持打开、一直持有这条 notify_send 的 timers 行锁和一个连接池连接——
+// 慢渠道或超时渠道会把事务和行锁的持有时间拉到分钟级。
+//
+// 因此签名里没有 tx，也不需要：scheduler 先在短事务里把这条定时器 claim 下来（带租约）
+// 并提交、释放行锁，之后才调用本函数；执行结果由 scheduler 另开短事务回写。崩溃安全性
+// 由租约负责（claimed 不是终态，租约过期后重新领取），重复投递由 Sender 的
+// notification_log 幂等键（含随 payload 持久化的 Round）收敛——与改造前一致的
+// at-least-once 口径。
+func notifySendPayloadHandler(sender *notify.Sender) scheduler.DetachedHandler {
+	return func(ctx context.Context, _ string, payload []byte) error {
 		var req notify.SendRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return fmt.Errorf("app: 反序列化 notify_send payload 失败: %w", err)

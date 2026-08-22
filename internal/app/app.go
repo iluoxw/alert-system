@@ -177,7 +177,10 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
 	sched.RegisterHandler(groupTimerKind, groupStage.Handle)
 	sched.RegisterHandler(notify.TimerKindChannelEscalation, engine.Handle)
-	sched.RegisterHandler(notifySendTimerKind, notifySendPayloadHandler(sender))
+	// notify_send 是唯一注册成「事务外执行」模式的 kind：它内部必然做外部 IO
+	// （HTTP/SMTP + 退避重试），不能占着 scheduler 的事务与 timers 行锁执行。
+	// 语义见 notifySendPayloadHandler 与 scheduler.DetachedHandler 的文档。
+	sched.RegisterDetachedHandler(notifySendTimerKind, notifySendPayloadHandler(sender))
 	sched.RegisterHandler(ops.TimerKindDailyReport, opsHandlers.HandleDailyReport)
 	sched.RegisterHandler(ops.TimerKindStaleSweep, opsHandlers.HandleStaleSweep)
 	sched.RegisterHandler(ops.TimerKindOncallBroadcast, opsHandlers.HandleOncallBroadcast)
