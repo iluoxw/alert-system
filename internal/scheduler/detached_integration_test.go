@@ -26,6 +26,8 @@ import (
 //	⑤ 并发 worker     ConcurrentWorkers_ExecuteExactlyOnce
 //	⑥ 租约未过期      LiveClaim_IsNotStolen
 //	⑦ fencing token   SettleClaim_StaleTokenDoesNotOverwrite
+//	⑧ 轮询取消        CancelDuringHandler_LeavesClaimedThenReclaimFires
+//	⑨ 成功后取消      SuccessThenCancel_StillSettlesFired
 
 const detachedKind = "notify_send"
 
@@ -476,5 +478,112 @@ func TestScheduler_SettleClaim_StaleTokenDoesNotOverwriteReclaim(t *testing.T) {
 	final := readTimer(t, ctx, st, detachedKind, "alert-d7")
 	if final.status != "fired" || final.lease != nil {
 		t.Fatalf("最终 status=%q lease=%v, want fired/NULL", final.status, final.lease)
+	}
+}
+
+// ⑧ SIGTERM / signal.NotifyContext 取消发生在 detached handler 内部：claim 已经提交，
+// 不能把 timers 行写成 failed（那是这条路径相对 in-tx 的永久丢通知窗口）。行必须保持
+// claimed，租约过期后由新 worker 重领并收口 fired。
+func TestScheduler_DetachedHandler_CancelDuringHandler_LeavesClaimedThenReclaimFires(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	clock := newTestClock(now)
+
+	entered := make(chan struct{})
+	var calls int32
+	first := newDetachedWorker(t, st, clock, time.Minute, func(hctx context.Context, _ string, _ []byte) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(entered)
+			<-hctx.Done()
+			return hctx.Err()
+		}
+		return nil
+	})
+
+	scheduleDetached(t, ctx, first, "alert-d8", clock.Now().Add(10*time.Millisecond))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	go first.Run(runCtx)
+
+	clock.Set(clock.Now().Add(100 * time.Millisecond))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待事务外 handler 进入超时")
+	}
+	cancel()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec := readTimer(t, ctx, st, detachedKind, "alert-d8")
+		if rec.status == "failed" {
+			t.Fatalf("取消不得把已 claim 的 notify_send 写成 failed: %+v", rec)
+		}
+		if rec.status == "claimed" && rec.claimCount == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("取消后应保持 claimed: %+v", rec)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if rec := readTimer(t, ctx, st, detachedKind, "alert-d8"); rec.status != "claimed" {
+		t.Fatalf("短暂等待后 status=%q, want claimed", rec.status)
+	}
+
+	clock.Set(now.Add(2 * time.Minute))
+	second := newDetachedWorker(t, st, clock, time.Minute, func(_ context.Context, _ string, _ []byte) error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	})
+	runCtx2, cancel2 := context.WithCancel(ctx)
+	defer cancel2()
+	go second.Run(runCtx2)
+
+	waitForStatus(t, ctx, st, detachedKind, "alert-d8", "fired", 5*time.Second)
+	rec := readTimer(t, ctx, st, detachedKind, "alert-d8")
+	if rec.claimCount != 2 {
+		t.Fatalf("重领后 claim_count = %d, want 2", rec.claimCount)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("handler 被调用 %d 次, want 2（取消那次 + 重领成功）", got)
+	}
+}
+
+// ⑨ handler 已经成功返回后，即使轮询 ctx 随即被取消，也必须 WithoutCancel settle
+// fired，避免租约过期重领造成重复发送。
+func TestScheduler_DetachedHandler_SuccessThenCancel_StillSettlesFired(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	clock := newTestClock(time.Now())
+
+	entered := make(chan struct{})
+	var calls int32
+	sched := newDetachedWorker(t, st, clock, time.Minute, func(_ context.Context, _ string, _ []byte) error {
+		atomic.AddInt32(&calls, 1)
+		close(entered)
+		return nil
+	})
+
+	scheduleDetached(t, ctx, sched, "alert-d9", clock.Now().Add(10*time.Millisecond))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go sched.Run(runCtx)
+
+	clock.Set(clock.Now().Add(100 * time.Millisecond))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待事务外 handler 进入超时")
+	}
+	cancel()
+
+	waitForStatus(t, ctx, st, detachedKind, "alert-d9", "fired", 5*time.Second)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("handler 被调用 %d 次, want 1（成功后取消不得重领）", got)
 	}
 }

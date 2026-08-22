@@ -173,3 +173,28 @@ func TestScheduler_RegisterDetachedHandler_ConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestDetachedOutcome_SuccessSettlesFiredEvenIfCtxCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	status, settle := detachedOutcome(ctx, nil)
+	if !settle || status != "fired" {
+		t.Fatalf("成功结果必须 settle fired，即使 ctx 已取消: status=%q settle=%v", status, settle)
+	}
+}
+
+func TestDetachedOutcome_BusinessErrorSettlesFailed(t *testing.T) {
+	status, settle := detachedOutcome(context.Background(), errors.New("channel 500"))
+	if !settle || status != "failed" {
+		t.Fatalf("业务失败必须 settle failed: status=%q settle=%v", status, settle)
+	}
+}
+
+func TestDetachedOutcome_CancelDuringHandlerDoesNotSettle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	status, settle := detachedOutcome(ctx, context.Canceled)
+	if settle || status != "" {
+		t.Fatalf("轮询 ctx 取消不得 settle failed: status=%q settle=%v", status, settle)
+	}
+}

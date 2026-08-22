@@ -86,6 +86,10 @@ type Handler func(ctx context.Context, tx pgx.Tx, refID string, payload []byte) 
 // 返回 error 或 panic 的收口与 Handler 一致：记结构化日志 + 标记为 failed、不重试。
 // 区别是这里没有事务可以回滚——外部 IO 已经真的发生了，「回滚」本就不存在，
 // 幂等/重复的边界由 Sender 侧兜。
+//
+// 轮询 ctx 取消（生产里是 cmd/server 的 SIGTERM / signal.NotifyContext）不能走这条
+// failed 收口：claim 已经提交，再把行写成 failed 就会永久丢掉尚未发出的通知。
+// 见 detachedOutcome。
 type DetachedHandler func(ctx context.Context, refID string, payload []byte) error
 
 // dueTimer 是一条从数据库取出的到期定时器。
@@ -455,6 +459,27 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 	return true, nil
 }
 
+// detachedOutcome 决定事务外执行结束后要不要、以及如何回写终态。
+//
+// handler 成功：必须 settle fired。即使此刻轮询 ctx 已经被 SIGTERM 取消，也要用
+// WithoutCancel 把成功结果写进去，否则租约过期会重领、把已经发出的通知再发一次。
+//
+// handler 失败且 ctx 仍有效：settle failed，与事务内路径的业务失败收口一致。
+//
+// handler 失败且 ctx 已取消：不 settle。claim 已经提交，旧 in-tx 路径在同一取消下
+// 会回滚 markFired，随后用已取消 ctx 去 markFailed 也会失败，行仍是 pending。
+// detached 若用 WithoutCancel 把 failed 写进去，就会造出一个 in-tx 没有的永久丢
+// 通知窗口（发送可能还没发生；notification_log 也可能停在 pending）。留给租约过期重领。
+func detachedOutcome(ctx context.Context, handlerErr error) (status string, settle bool) {
+	if handlerErr == nil {
+		return "fired", true
+	}
+	if ctx.Err() != nil {
+		return "", false
+	}
+	return "failed", true
+}
+
 // runDetached 在**没有任何 scheduler 事务持有**的状态下执行一条已 claim 的定时器，
 // 然后另开一个短事务用 fencing token 回写终态。
 //
@@ -463,16 +488,22 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 // 渠道打爆，也让"发送到哪一步了"完全不可观测。慢发送阻塞的只是本 worker 的这一轮
 // 轮询，代价与改造前一致，区别是不再占着数据库事务和 timers 行锁。
 //
-// 失败收口对齐 processOneDue 的既有策略：结构化日志 + 标记 failed、不自动重试。
+// 真实业务失败收口对齐 processOneDue：结构化日志 + 标记 failed、不自动重试。
+// 轮询 ctx 取消不能这么收口——见 detachedOutcome。
 func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int, h DetachedHandler) {
-	status := "fired"
-	if handlerErr := invokeDetached(ctx, h, t); handlerErr != nil {
-		status = "failed"
+	handlerErr := invokeDetached(ctx, h, t)
+	status, settle := detachedOutcome(ctx, handlerErr)
+	if handlerErr != nil {
+		if !settle {
+			log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 事务外执行被取消，保持 claimed 待租约过期后重领: %v", t.id, t.kind, t.refID, handlerErr)
+			return
+		}
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 事务外执行失败: %v", t.id, t.kind, t.refID, handlerErr)
 	}
 
-	// 回写用脱离调用方 cancellation 的有界 context：外部 IO 已经真的发生了，若因为进程
-	// 正在优雅退出就放弃回写，这条 claim 只能等租约过期被重新领取，把同一条消息再发一次。
+	// 成功路径（以及非取消的业务失败）用脱离调用方 cancellation 的有界 context 回写：
+	// handler 已经返回 nil 时外部 IO 的结果已确定，若因为进程正在优雅退出就放弃
+	// settle fired，这条 claim 只能等租约过期被重新领取，把同一条消息再发一次。
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
 	defer cancel()
 
