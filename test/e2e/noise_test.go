@@ -8,7 +8,8 @@
 // 两场景都各自新建团队 + 专用路由（与既有场景同一手法，见 journey_test.go），
 // 避免与种子团队/其他场景互相干扰；断言复用 waitFor + repost 直到路由缓存
 // （routeCacheTTL≤10s）生效的既有手法，双锁定 mockLark 收到的 GroupKey/AlertIDs
-// 精确集合 + Target（=本场景团队 ID），防止误判成其他团队/场景的通知。
+// 精确集合 + ops-settings 中配置的真实 Target，防止误判成其他团队/场景的通知，
+// 同时回归 Team UUID 不能再被当作渠道地址。
 // 风暴熔断（storm_threshold_per_min）与 flapping 按设计裁剪不在本文件覆盖范围。
 package e2e
 
@@ -80,6 +81,10 @@ func TestScenarioNoise1_TemplateFingerprintMerge(t *testing.T) {
 	if teamID == "" {
 		t.Fatalf("e2e: 创建团队响应缺少 id: %+v", teamResp)
 	}
+	larkTarget := "e2e-noise-chat-1-" + suffix
+	if err := putTeamNotificationChannels(client, teamID, []map[string]string{{"kind": "lark", "target": larkTarget}}); err != nil {
+		t.Fatal(err)
+	}
 
 	alertname := "e2e-noise1-tmpl-" + suffix
 	adminCreate(t, client, "/api/v1/admin/routes", map[string]any{
@@ -126,7 +131,7 @@ func TestScenarioNoise1_TemplateFingerprintMerge(t *testing.T) {
 		}
 
 		for _, s := range mockLark.Sent() {
-			if s.Target == teamID && s.Msg.GroupKey == groupKey && sameIDSet(s.Msg.AlertIDs, ids) {
+			if s.Target == larkTarget && s.Target != teamID && s.Msg.GroupKey == groupKey && sameIDSet(s.Msg.AlertIDs, ids) {
 				return true
 			}
 		}
@@ -147,6 +152,10 @@ func TestScenarioNoise2_WindowModeMergesAllFingerprints(t *testing.T) {
 	teamID, _ := teamResp["id"].(string)
 	if teamID == "" {
 		t.Fatalf("e2e: 创建团队响应缺少 id: %+v", teamResp)
+	}
+	larkTarget := "e2e-noise-chat-2-" + suffix
+	if err := putTeamNotificationChannels(client, teamID, []map[string]string{{"kind": "lark", "target": larkTarget}}); err != nil {
+		t.Fatal(err)
 	}
 
 	// window 模式与 group_by 互斥（internal/api/config.go validateRoute），group_by
@@ -196,7 +205,7 @@ func TestScenarioNoise2_WindowModeMergesAllFingerprints(t *testing.T) {
 		ids := []string{a.ID, b.ID}
 
 		for _, s := range mockLark.Sent() {
-			if s.Target == teamID && s.Msg.GroupKey == groupKey && sameIDSet(s.Msg.AlertIDs, ids) {
+			if s.Target == larkTarget && s.Target != teamID && s.Msg.GroupKey == groupKey && sameIDSet(s.Msg.AlertIDs, ids) {
 				return true
 			}
 		}

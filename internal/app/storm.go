@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -66,14 +65,15 @@ type stormHandler struct {
 	routes stormRouteRepo
 	alerts stormAlertRepo
 	sched  stormScheduler
+	outbox *notifyOutbox
 
 	// now 默认 time.Now，测试替换为可控时钟。
 	now func() time.Time
 }
 
 // newStormHandler 构造 stormHandler。
-func newStormHandler(state stormStateRepo, routes stormRouteRepo, alerts stormAlertRepo, sched stormScheduler) *stormHandler {
-	return &stormHandler{state: state, routes: routes, alerts: alerts, sched: sched, now: time.Now}
+func newStormHandler(state stormStateRepo, routes stormRouteRepo, alerts stormAlertRepo, sched stormScheduler, outbox *notifyOutbox) *stormHandler {
+	return &stormHandler{state: state, routes: routes, alerts: alerts, sched: sched, outbox: outbox, now: time.Now}
 }
 
 // Handle 实现 scheduler.Handler，refID 是 routeID。
@@ -141,35 +141,29 @@ func (h *stormHandler) Handle(ctx context.Context, tx pgx.Tx, refID string, payl
 	return h.rescheduleGroups(ctx, tx, *route, active, now)
 }
 
-// sendSummary 把一条风暴摘要发送意图注册进既有 "notify_send" 定时器，做法与
-// notifyOutbox.scheduleSend 完全一致（同包内直接复用 notifySendTimerKind/
-// notifySendRefID，不另起一套调度逻辑）：GroupKey 用 stormGroupKey(routeID) 前缀
-// 区分于普通组通知，target 走团队固定渠道（与 NotifyGroup/NotifyRepeat 同一约定，
-// 摘要本身是团队维度提示，不针对具体个人）。
+// sendSummary 把一条风暴摘要交给 notifyOutbox 的团队渠道解析路径：GroupKey 用
+// stormGroupKey(routeID) 区分普通组通知，真实 target 来自 team_ops_settings，不能
+// 再把 route.TargetTeamID 当作飞书 chat ID。
 func (h *stormHandler) sendSummary(ctx context.Context, tx pgx.Tx, routeID string, route store.Route, state store.StormState, active []domain.Alert, now time.Time) error {
+	if h.outbox == nil {
+		return fmt.Errorf("app: 未配置风暴摘要通知 outbox")
+	}
 	sampleTitle := ""
 	if len(active) > 0 {
 		sampleTitle = active[0].Title
 	}
 
+	msg := buildStormSummaryMessage(routeID, state, sampleTitle, now)
+	msg.AlertIDs = alertIDs(active)
 	req := notify.SendRequest{
-		GroupKey:    stormGroupKey(routeID),
-		ChannelKind: teamNotifyChannel,
-		Target:      route.TargetTeamID,
-		Msg:         buildStormSummaryMessage(routeID, state, sampleTitle, now),
+		GroupKey: stormGroupKey(routeID),
+		Msg:      msg,
 		// round 在本次摘要发送意图产生的时刻（本次 storm_summary 定时器触发）一次性
 		// 捕获，随 payload 持久化——下一次摘要（下一个熔断周期）now 已推进，round
 		// 随之不同，notify.Sender 才不会把两次不同周期的摘要误判为同一次的重投。
 		Round: now.UnixNano(),
 	}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("app: 序列化风暴摘要发送请求失败: %w", err)
-	}
-	if err := h.sched.Schedule(ctx, tx, notifySendTimerKind, notifySendRefID(req), now, payload); err != nil {
-		return fmt.Errorf("app: 注册风暴摘要 notify_send 定时器失败: %w", err)
-	}
-	return nil
+	return h.outbox.scheduleTeamSends(ctx, tx, route.TargetTeamID, []string{teamNotifyChannel}, req, teamNotificationStormSummary)
 }
 
 // rescheduleGroups 对 active 里出现过的每个非空 distinct group_key 各补一轮
@@ -219,7 +213,8 @@ func buildStormSummaryMessage(routeID string, state store.StormState, sampleTitl
 	// Message.GroupKey 故意留空：飞书卡片渲染（channel_lark.go）对 GroupKey 非空的
 	// 消息会额外拼一行 "聚合组：{key}（共 len(AlertIDs) 条告警）"，风暴摘要不是真实
 	// 的组通知（没有单一 group_key，AlertIDs 也未填充），累计条数已经在 Body 里，
-	// 留空避免渲染出误导性的"共 0 条告警"。
+	// 留空避免渲染出误导性的"共 0 条告警"。AlertIDs 由 sendSummary 在拿到 active
+	// 后补入，仅用于发送结果/跳过审计按告警扇出，不改变卡片的摘要渲染分支。
 	return notify.Message{
 		Title:      fmt.Sprintf("风暴摘要：%d 条告警被抑制", state.SuppressedCount),
 		Body:       body,

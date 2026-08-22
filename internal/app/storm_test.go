@@ -10,6 +10,7 @@ import (
 
 	"alert-system/internal/domain"
 	"alert-system/internal/notify"
+	"alert-system/internal/ops"
 	"alert-system/internal/store"
 )
 
@@ -146,7 +147,10 @@ func (f *fakeStormScheduler) ScheduleIfAbsent(ctx context.Context, tx pgx.Tx, ki
 
 // newTestStormHandler 构造带固定时钟的 stormHandler，routeID 对应的 state/route 已就位。
 func newTestStormHandler(state *fakeStormStateRepo, routes *fakeStormRouteRepo, alerts *fakeStormAlertRepo, sched *fakeStormScheduler, now time.Time) *stormHandler {
-	h := newStormHandler(state, routes, alerts, sched)
+	outbox := newTestNotifyOutbox(sched, &fakeTeamChannelRepo{byTeam: map[string][]ops.ChannelTarget{
+		"team-x": {{Kind: teamNotifyChannel, Target: "chat-x"}},
+	}}, &fakeTeamTimeline{}, now)
+	h := newStormHandler(state, routes, alerts, sched, outbox)
 	h.now = func() time.Time { return now }
 	return h
 }
@@ -200,8 +204,11 @@ func TestStormHandler_StillOverThreshold_SendsSummaryAndRenews(t *testing.T) {
 	}
 
 	req := decodeSentRequest(t, sched)
-	if req.ChannelKind != teamNotifyChannel || req.Target != "team-x" {
+	if req.ChannelKind != teamNotifyChannel || req.Target != "chat-x" {
 		t.Fatalf("摘要发送目标不符: channel=%q target=%q", req.ChannelKind, req.Target)
+	}
+	if req.Target == "team-x" {
+		t.Fatal("团队 UUID 不得作为风暴摘要通知目标")
 	}
 	if req.Round != now.UnixNano() {
 		t.Fatalf("Round 应为本次触发时刻捕获，got %d want %d", req.Round, now.UnixNano())
@@ -225,6 +232,41 @@ func TestStormHandler_StillOverThreshold_SendsSummaryAndRenews(t *testing.T) {
 	}
 	if len(sched.scheduleIfAbsentCalls) != 0 {
 		t.Fatal("仍超阈值时不应补组 timer")
+	}
+}
+
+// 缺少团队 lark 配置时，摘要被显式记为 skipped，不伪造 TeamID target，也不阻塞
+// 风暴计数清零、摘要时刻记录与后续速率复查。
+func TestStormHandler_NoTeamChannel_AuditsSkipAndContinues(t *testing.T) {
+	now := time.Date(2026, 8, 23, 0, 3, 0, 0, time.UTC)
+	state := &fakeStormStateRepo{states: map[string]*store.StormState{
+		"r1": {RouteID: "r1", Active: true, ActivatedAt: now.Add(-5 * time.Minute), SuppressedCount: 3},
+	}}
+	routes := &fakeStormRouteRepo{routes: map[string]store.Route{"r1": testRoute("r1", 10, 300)}}
+	alerts := &fakeStormAlertRepo{count: 2, active: []domain.Alert{{ID: "a1", Title: "sample", GroupKey: "gk1"}}}
+	sched := &fakeStormScheduler{}
+	timeline := &fakeTeamTimeline{}
+	outbox := newTestNotifyOutbox(sched, &fakeTeamChannelRepo{byTeam: map[string][]ops.ChannelTarget{}}, timeline, now)
+	h := newStormHandler(state, routes, alerts, sched, outbox)
+	h.now = func() time.Time { return now }
+
+	if err := h.Handle(context.Background(), nil, "r1", nil); err != nil {
+		t.Fatalf("缺少团队渠道不应阻塞风暴状态推进: %v", err)
+	}
+	for _, call := range sched.scheduleCalls {
+		if call.kind == notifySendTimerKind {
+			t.Fatal("缺少真实 target 时不得注册 notify_send")
+		}
+	}
+	if state.states["r1"].SuppressedCount != 0 || state.states["r1"].LastSummaryAt == nil {
+		t.Fatalf("摘要跳过后仍应推进风暴状态: %+v", state.states["r1"])
+	}
+	if len(timeline.entries) != 1 {
+		t.Fatalf("跳过审计数量 = %d, want 1", len(timeline.entries))
+	}
+	entry := timeline.entries[0]
+	if entry.AlertID != "a1" || entry.Action != domain.TimelineActionNotifySkipped || entry.Detail["reason"] != "no_team_channel" || entry.Detail["notification_kind"] != teamNotificationStormSummary {
+		t.Fatalf("风暴摘要跳过审计不符: %+v", entry)
 	}
 }
 

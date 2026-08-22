@@ -20,6 +20,8 @@ const (
 	seedAdminPassword    = "e2e-admin-pass-000" //nolint:gosec // 测试固定密码，非生产凭据
 	seedApproverUsername = "e2e-approver"
 	seedApproverPassword = "e2e-approver-pass-000" //nolint:gosec // 测试固定密码，非生产凭据
+	seedTeamLarkTarget   = "e2e-lark-chat"
+	seedTeamEmailTarget  = "e2e-team-notifications@example.com"
 )
 
 // seedIdentities 是 bootstrapAdmin 的产出。
@@ -154,6 +156,12 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 	}
 
 	teamID := ids.Team.ID
+	if err := putTeamNotificationChannels(client, teamID, []map[string]string{
+		{"kind": "lark", "target": seedTeamLarkTarget},
+		{"kind": "email", "target": seedTeamEmailTarget},
+	}); err != nil {
+		return nil, err
+	}
 
 	// E2B 黄金回放一次会产生多条 firing Alert。它们的目标是验证 Alert→Fault，
 	// 不应在共享 TestMain 中启动真实的重复通知/人员升级链并污染后续场景。静默在
@@ -255,6 +263,29 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 		GrafanaWebhookPath: grafanaWebhookPath,
 		GenericWebhookPath: genericWebhookPath,
 	}, nil
+}
+
+// putTeamNotificationChannels 经真实 ops-settings 管理端点保存团队通知 target。三个
+// 周期任务开关都保持关闭：E2E 只需要 channels 作为团队通知的唯一配置源，不能让
+// 日报/悬置扫描/值班播报在共享测试进程里制造额外消息。
+func putTeamNotificationChannels(client *apiClient, teamID string, channels []map[string]string) error {
+	status, body, err := client.doJSON(http.MethodPut, "/api/v1/admin/teams/"+teamID+"/ops-settings", map[string]any{
+		"timezone":                     "UTC",
+		"daily_report_enabled":         false,
+		"daily_report_time":            "09:00",
+		"stale_sweep_enabled":          false,
+		"stale_sweep_interval_seconds": 1800,
+		"oncall_broadcast_enabled":     false,
+		"oncall_broadcast_time":        "09:30",
+		"channels":                     channels,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("e2e: 保存团队通知渠道失败(team_id=%s): %w", teamID, err)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("e2e: 保存团队通知渠道失败(team_id=%s) status=%d body=%s", teamID, status, body)
+	}
+	return nil
 }
 
 // createIntegration 经 POST /api/v1/admin/integrations 创建一个 integration，

@@ -17,7 +17,7 @@ import {
   Typography,
   message,
 } from 'antd'
-import { ArrowLeftOutlined, CheckCircleOutlined, CloseCircleOutlined, EditOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CheckCircleOutlined, CloseCircleOutlined, EditOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
 import type { AlertStats, TimelineAction } from '../api/client'
 import {
   ApiError,
@@ -44,6 +44,7 @@ const timelineActionLabel: Record<TimelineAction, string> = {
   silence: '静默',
   notify_sent: '通知成功',
   notify_failed: '通知失败',
+  notify_skipped: '通知跳过',
   note: '备注',
   source_unknown: '来源状态待确认',
   source_recovered: '来源同步恢复',
@@ -60,6 +61,7 @@ const timelineActionColor: Record<TimelineAction, string> = {
   silence: 'gray',
   notify_sent: 'green',
   notify_failed: 'red',
+  notify_skipped: 'orange',
   note: 'gray',
   source_unknown: 'orange',
   source_recovered: 'blue',
@@ -107,18 +109,19 @@ function extractAnnotations(signalContext: unknown): Record<string, string> {
   return {}
 }
 
-// notify_sent/notify_failed 的 detail 形状（后端 internal/notify 记账写入，
-// target 已由后端脱敏，前端直接展示）；字段均可能缺失，渲染需优雅降级。
+// notify_sent/notify_failed/notify_skipped 的 detail 形状（后端 internal/notify
+// 或 internal/app 写入；target 已由后端脱敏）；字段均可能缺失，渲染需优雅降级。
 interface NotifyDetail {
   channel?: string
   target?: string
   attempts?: number
   error?: string
+  reason?: string
 }
 
-// notify_sent/notify_failed 走定制文案而非通用 JSON.stringify（其余 action
-// 的 detail 形状不固定，仍走通用兜底渲染，保持兼容不回归）。
-function renderNotifyDetail(action: 'notify_sent' | 'notify_failed', detail: NotifyDetail) {
+// 三种通知结果走定制文案而非通用 JSON.stringify（其余 action 的 detail 形状不固
+// 定，仍走通用兜底渲染，保持兼容不回归）。
+function renderNotifyDetail(action: 'notify_sent' | 'notify_failed' | 'notify_skipped', detail: NotifyDetail) {
   const channel = detail.channel ?? '未知渠道'
   const target = detail.target ?? '未知对象'
 
@@ -129,6 +132,16 @@ function renderNotifyDetail(action: 'notify_sent' | 'notify_failed', detail: Not
         <Text>
           已通过 {channel} 通知 {target}
         </Text>
+      </Space>
+    )
+  }
+
+  if (action === 'notify_skipped') {
+    const reason = detail.reason === 'no_team_channel' ? '团队未配置该渠道的真实目标' : '缺少可用通知目标'
+    return (
+      <Space size={4}>
+        <ExclamationCircleOutlined style={{ color: '#faad14' }} />
+        <Text>已跳过 {channel} 通知：{reason}</Text>
       </Space>
     )
   }
@@ -457,7 +470,7 @@ export function AlertDetail() {
                     <Text strong>{entry.actor} · {timelineActionLabel[entry.action]}</Text>
                     <Text type="secondary">{new Date(entry.at).toLocaleString()}</Text>
                   </div>
-                  {entry.action === 'notify_sent' || entry.action === 'notify_failed' ? (
+                  {entry.action === 'notify_sent' || entry.action === 'notify_failed' || entry.action === 'notify_skipped' ? (
                     renderNotifyDetail(entry.action, (entry.detail ?? {}) as NotifyDetail)
                   ) : entry.action === 'handoff' ? (
                     renderHandoffDetail(entry.detail as { from?: string; to?: string } | undefined, userName)

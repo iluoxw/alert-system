@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -22,19 +23,32 @@ import (
 // 领域逻辑。
 const notifySendTimerKind = "notify_send"
 
-// teamNotifyChannel 是"组通知""重复提醒"两类团队维度通知意图使用的固定渠道字面量
-// （R6.2 约定飞书是主力渠道）。这两类意图的 target 是 alert.TeamID/组内共同 TeamID，
-// 不是具体的人，因此不走任务 9 新增的 ContactResolver 到人解析（team 还没有渠道
-// 联系方式表，是已知的后续缺口，不在本任务范围）；只有人员升级（NotifyEscalation）
-// 携带的是具体责任人的 UserID，才走 PersonnelChannel + TargetUserID 解析路径
-// （见 notifyOutbox.personnelChannel）。渠道升级（notify.Dispatcher）按通知策略
-// 配置的 channels 逐级切换，两者都不用这个字面量。
+// teamNotifyChannel 是组通知、重复提醒和风暴摘要请求的默认渠道种类。真实 target
+// 必须由 team_ops_settings.channels 解析，绝不能再把 TeamID 当作飞书 chat ID。
 const teamNotifyChannel = "lark"
+
+const (
+	teamNotificationGroup             = "group"
+	teamNotificationRepeat            = "repeat"
+	teamNotificationChannelEscalation = "channel_escalation"
+	teamNotificationStormSummary      = "storm_summary"
+)
 
 // notifyOutboxScheduler 是 notifyOutbox 依赖的定时器子集，由 *scheduler.Scheduler 实现。
 type notifyOutboxScheduler interface {
 	Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error
 	ScheduleIfAbsent(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) (bool, error)
+}
+
+// teamNotificationChannelRepo 把 team_ops_settings.channels 暴露为最小只读接口。
+// store.ErrNotFound 由 app 适配器转换为空切片；其他查询错误必须向上传播。
+type teamNotificationChannelRepo interface {
+	TeamChannels(ctx context.Context, tx pgx.Tx, teamID string) ([]ops.ChannelTarget, error)
+}
+
+// teamNotificationTimeline 是缺少真实团队渠道时的审计写入点。
+type teamNotificationTimeline interface {
+	Append(ctx context.Context, tx pgx.Tx, entry domain.TimelineEntry) (string, error)
 }
 
 // notifyOutboxChainStarter 抽象 oncall.Chain.Start，供 NotifyGroup 的"首次通知编排"
@@ -54,6 +68,8 @@ type notifyOutboxEngineStarter interface {
 // 的渠道升级 + 首个 repeat 定时器 + 人员升级链启动），见该方法注释。
 type notifyOutbox struct {
 	scheduler        notifyOutboxScheduler
+	teamChannels     teamNotificationChannelRepo
+	timeline         teamNotificationTimeline
 	engine           notifyOutboxEngineStarter
 	chain            notifyOutboxChainStarter
 	repeatInterval   time.Duration
@@ -73,6 +89,124 @@ func (o *notifyOutbox) scheduleSend(ctx context.Context, tx pgx.Tx, req notify.S
 	}
 	if err := o.scheduler.Schedule(ctx, tx, notifySendTimerKind, notifySendRefID(req), o.now(), payload); err != nil {
 		return fmt.Errorf("app: 注册 notify_send 定时器失败: %w", err)
+	}
+	return nil
+}
+
+// scheduleTeamSends 把团队维度的渠道 kind 解析成一个或多个真实 target，再逐一落
+// notify_send。解析发生在意图创建事务中，因此 payload、timer ref ID 与 Sender 幂等
+// 键都固化同一个真实 target；后续配置变更不会改写已经在途的意图。
+func (o *notifyOutbox) scheduleTeamSends(ctx context.Context, tx pgx.Tx, teamID string, requestedKinds []string, req notify.SendRequest, notificationKind string) error {
+	if o.teamChannels == nil {
+		return fmt.Errorf("app: 未配置团队通知渠道仓储")
+	}
+	channels, err := o.teamChannels.TeamChannels(ctx, tx, teamID)
+	if err != nil {
+		return fmt.Errorf("app: 查询团队通知渠道失败(team_id=%s): %w", teamID, err)
+	}
+
+	type channelPair struct {
+		kind   string
+		target string
+	}
+	byKind := make(map[string][]string)
+	configured := make(map[channelPair]struct{}, len(channels))
+	for _, channel := range channels {
+		kind := strings.TrimSpace(channel.Kind)
+		target := strings.TrimSpace(channel.Target)
+		if kind == "" || target == "" {
+			continue
+		}
+		pair := channelPair{kind: kind, target: target}
+		if _, exists := configured[pair]; exists {
+			continue
+		}
+		configured[pair] = struct{}{}
+		byKind[kind] = append(byKind[kind], target)
+	}
+
+	requested := make(map[string]struct{}, len(requestedKinds))
+	for _, rawKind := range requestedKinds {
+		kind := strings.TrimSpace(rawKind)
+		if kind == "" {
+			continue
+		}
+		if _, exists := requested[kind]; exists {
+			continue
+		}
+		requested[kind] = struct{}{}
+
+		targets := byKind[kind]
+		if len(targets) == 0 {
+			if err := o.appendTeamNotificationSkipped(ctx, tx, teamID, kind, notificationKind, req); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, target := range targets {
+			resolved := req
+			resolved.ChannelKind = kind
+			resolved.Target = target
+			if err := o.scheduleSend(ctx, tx, resolved); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// appendTeamNotificationSkipped 明确记录“没有真实团队渠道，所以未尝试发送”。它不
+// 使用 notify_failed：外部渠道一次都没有调用，attempts 必须保持 0。Group/Storm
+// 按 Message.AlertIDs 扇出；没有任何可关联告警的合成摘要只能落结构化日志。
+func (o *notifyOutbox) appendTeamNotificationSkipped(ctx context.Context, tx pgx.Tx, teamID, channelKind, notificationKind string, req notify.SendRequest) error {
+	alertIDs := req.Msg.AlertIDs
+	if req.AlertID != "" {
+		alertIDs = []string{req.AlertID}
+	}
+	if len(alertIDs) == 0 {
+		log.Printf("app: 团队通知已跳过 reason=no_team_channel team_id=%s channel=%s notification_kind=%s group_key=%s", teamID, channelKind, notificationKind, req.GroupKey)
+		return nil
+	}
+	if o.timeline == nil {
+		return fmt.Errorf("app: 未配置团队通知跳过审计仓储")
+	}
+
+	var step any
+	if req.Step != nil {
+		step = *req.Step
+	}
+	detail := map[string]any{
+		"channel":           channelKind,
+		"team_id":           teamID,
+		"step":              step,
+		"attempts":          0,
+		"status":            "skipped",
+		"reason":            "no_team_channel",
+		"notification_kind": notificationKind,
+	}
+	if req.GroupKey != "" {
+		detail["group_key"] = req.GroupKey
+	}
+
+	now := o.now()
+	seen := make(map[string]struct{}, len(alertIDs))
+	for _, alertID := range alertIDs {
+		if alertID == "" {
+			continue
+		}
+		if _, exists := seen[alertID]; exists {
+			continue
+		}
+		seen[alertID] = struct{}{}
+		if _, err := o.timeline.Append(ctx, tx, domain.TimelineEntry{
+			AlertID: alertID,
+			Actor:   "notify-outbox",
+			Action:  domain.TimelineActionNotifySkipped,
+			Detail:  detail,
+			At:      now,
+		}); err != nil {
+			return fmt.Errorf("app: 记录团队通知跳过失败(alert_id=%s): %w", alertID, err)
+		}
 	}
 	return nil
 }
@@ -150,17 +284,16 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 		return nil
 	}
 
+	round := o.now().UnixNano()
 	req := notify.SendRequest{
-		GroupKey:    groupKey,
-		ChannelKind: teamNotifyChannel,
-		Target:      active[0].TeamID,
-		Msg:         buildGroupMessage(groupKey, active),
+		GroupKey: groupKey,
+		Msg:      buildGroupMessage(groupKey, active),
 		// round 在本次组 flush 的时刻捕获（Bug C 修复）：静默过期后重复事件重新驱动
 		// 组 flush 会再次调用本方法，届时 o.now() 已经推进，round 随之不同，
 		// notify.Sender 才不会把"恢复后的组通知"误判为上一次组通知的崩溃重投。
-		Round: o.now().UnixNano(),
+		Round: round,
 	}
-	if err := o.scheduleSend(ctx, tx, req); err != nil {
+	if err := o.scheduleTeamSends(ctx, tx, active[0].TeamID, []string{teamNotifyChannel}, req, teamNotificationGroup); err != nil {
 		return err
 	}
 
@@ -191,8 +324,8 @@ func activeAlerts(alerts []domain.Alert) []domain.Alert {
 	return active
 }
 
-// NotifyRepeat 实现 notify.RepeatNotifier：repeat_interval 到期的重复提醒，固定走
-// teamNotifyChannel，target 用 alert.TeamID。
+// NotifyRepeat 实现 notify.RepeatNotifier：repeat_interval 到期的重复提醒，固定请求
+// teamNotifyChannel，再由 team_ops_settings.channels 解析一个或多个真实 target。
 //
 // 注：接口签名（notify.RepeatNotifier）只携带 domain.Alert，没有具体责任人信息，
 // 无法像 NotifyEscalation 那样解析到人——这与 design.md C3「升级链与 repeat 两处
@@ -201,39 +334,26 @@ func activeAlerts(alerts []domain.Alert) []domain.Alert {
 // 数据来源，属于设计层决策，不在本任务擅自展开）。
 func (o *notifyOutbox) NotifyRepeat(ctx context.Context, tx pgx.Tx, alert domain.Alert) error {
 	req := notify.SendRequest{
-		AlertID:     alert.ID,
-		ChannelKind: teamNotifyChannel,
-		Target:      alert.TeamID,
-		Msg:         buildAlertMessage(alert),
+		AlertID: alert.ID,
+		Msg:     buildAlertMessage(alert),
 		// round 在本次 repeat 定时器触发的时刻捕获：下一轮 repeat 触发时 o.now() 已经
 		// 推进 repeatInterval，round 随之不同，是 R6.5"重复提醒需要真正重发"的关键。
 		Round: o.now().UnixNano(),
 	}
-	return o.scheduleSend(ctx, tx, req)
+	return o.scheduleTeamSends(ctx, tx, alert.TeamID, []string{teamNotifyChannel}, req, teamNotificationRepeat)
 }
 
-// DispatchStep 实现 notify.Dispatcher：渠道升级推进到 step 级，对 channels 里的每个
-// 渠道各自注册一个发送意图，target 用 alert.TeamID（渠道升级是团队维度的触达强度
-// 提升，不针对具体个人——针对个人的升级是 oncall 包的人员升级链，二者正交）。
+// DispatchStep 实现 notify.Dispatcher：渠道升级推进到 step 级，把策略请求的 channel
+// kinds 与 team_ops_settings.channels 求交集并按真实 target 注册发送意图。渠道升级
+// 是团队维度的触达强度提升，不针对具体个人；针对个人的升级是 oncall 包的人员升级
+// 链，二者正交。
 func (o *notifyOutbox) DispatchStep(ctx context.Context, tx pgx.Tx, alert domain.Alert, step int, channels []string) error {
 	msg := buildAlertMessage(alert)
 	// round 在本次渠道升级推进的时刻一次性捕获，同一次推进里给多个渠道各发一条，
 	// 共享同一个 round（理由同 NotifyEscalation）。
 	round := o.now().UnixNano()
-	for _, ch := range channels {
-		req := notify.SendRequest{
-			AlertID:     alert.ID,
-			Step:        &step,
-			ChannelKind: ch,
-			Target:      alert.TeamID,
-			Msg:         msg,
-			Round:       round,
-		}
-		if err := o.scheduleSend(ctx, tx, req); err != nil {
-			return err
-		}
-	}
-	return nil
+	req := notify.SendRequest{AlertID: alert.ID, Step: &step, Msg: msg, Round: round}
+	return o.scheduleTeamSends(ctx, tx, alert.TeamID, channels, req, teamNotificationChannelEscalation)
 }
 
 // ScheduleOpsSend 实现 ops.OpsNotifier：把 ops 周期任务（日报/悬置扫描/值班播报）
