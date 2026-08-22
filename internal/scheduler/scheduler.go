@@ -78,7 +78,10 @@ type Handler func(ctx context.Context, tx pgx.Tx, refID string, payload []byte) 
 //
 // 因此 DetachedHandler 与 Handler 一样是 at-least-once、必须幂等：notify_send 的幂等
 // 由 notify.Sender 的 notification_log 幂等键负责（键含随 payload 持久化的 Round，
-// 重投时算出的键不变）。
+// 重投时算出的键不变）。这个幂等键只收敛「同一条意图被逻辑性重复调度」这类重复，
+// **消除不了**「外部 IO 已经发出、结果还没确认就崩溃」的重发窗口：那种情况下重投看到
+// 的记录是 pending 而不是 sent，于是消息会真的再发一次。at-least-once 是既定事实，
+// 不是幂等键能兜掉的（对齐 CLAUDE.md 不变量 4 的既有裁决）。
 //
 // 返回 error 或 panic 的收口与 Handler 一致：记结构化日志 + 标记为 failed、不重试。
 // 区别是这里没有事务可以回滚——外部 IO 已经真的发生了，「回滚」本就不存在，
@@ -252,15 +255,16 @@ func (s *Scheduler) HasFired(ctx context.Context, tx pgx.Tx, kind string, refID 
 	return exists, nil
 }
 
-// fetchOneDue 在 tx 内取出一条「可处理」的定时器并加行锁（FOR UPDATE SKIP LOCKED），
-// 跳过已被其他并发事务锁定的行，实现多 worker 并发轮询时同一条定时器只会被其中一个
-// 取到。found=false 表示当前没有（未被锁定的）可处理定时器了，本轮轮询可以结束。
+// fetchOneDue 在 tx 内取出一条可处理的定时器并加行锁（FOR UPDATE SKIP LOCKED），跳过
+// 已被其他并发事务锁定的行，因此多 worker 并发轮询时同一条定时器只会被其中一个取到。
+// found=false 表示当前没有（未被锁定的）可处理定时器，本轮轮询可以结束。
 //
-// 「可处理」有两个分支：
-//   - status='pending' 且已到期（fire_at <= now），正常路径；
-//   - status='claimed' 且租约已过期（lease_expires_at <= now），即某个 DetachedHandler
-//     的执行者在事务外执行途中死亡（进程崩溃 / 回写终态失败），这条定时器要被重新领取。
-//     租约未过期的 claimed 行不在结果集里，所以正在被别的 worker 执行的定时器不会被抢走。
+// 可处理只有两个分支：
+//   - 到期的 pending 行（fire_at <= now），正常路径；
+//   - 租约已过期的 claimed 行（lease_expires_at <= now），即某个 DetachedHandler 的
+//     执行者在事务外执行途中死亡（进程崩溃 / 回写终态失败），这条定时器要被重新领取。
+//
+// 租约未过期的 claimed 行不在结果集里，所以正在被别的 worker 执行的定时器不会被抢走。
 func (s *Scheduler) fetchOneDue(ctx context.Context, tx pgx.Tx, now time.Time) (t dueTimer, found bool, err error) {
 	err = tx.QueryRow(ctx, `
 		SELECT id, kind, ref_id, payload

@@ -4,7 +4,9 @@
 -- 提交「这条我领走了」，释放事务与行锁之后再执行发送。
 --
 -- 'claimed' 故意不是终态：租约到期后这条定时器可以被任意 worker 重新领取，所以进程在
--- 发送途中崩溃不会永久丢通知（at-least-once；重复发送由 notification_log 的幂等键收敛）。
+-- 发送途中崩溃不会永久丢通知。代价是 at-least-once：notification_log 的幂等键只收敛
+-- 逻辑性的重复调度，消除不了「HTTP 已发出、结果未确认就崩溃」的重发窗口，那种情况下
+-- 消息会真的再发一次。
 -- 反过来，租约未到期时它既不是 pending 也不是过期 claimed，并发 worker 的轮询查询看不到它，
 -- 同一条定时器不会被两个 worker 同时消费。
 ALTER TABLE timers DROP CONSTRAINT timers_status_check;

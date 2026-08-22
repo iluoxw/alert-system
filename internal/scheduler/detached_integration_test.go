@@ -300,8 +300,9 @@ func TestScheduler_DetachedHandler_HandlerPanic_MarksFailedAndWorkerSurvives(t *
 
 // ④ claim 之后崩溃的恢复：数据库里留下一条 claimed + 租约已过期的行，新 worker 必须
 // 重新领取（claim_count 递增）、再执行一次、并收口成终态。这就是"禁止发送前永久标
-// fired"的兑现——崩溃窗口里的通知不会永久丢失，代价是 at-least-once 重复投递
-// （由 notify.Sender 的幂等键收敛）。
+// fired"的兑现——崩溃窗口里的通知不会永久丢失，代价是 at-least-once：如果崩溃发生在
+// 「消息已经发出、结果还没确认」之后，这次重投会把它真的再发一次，notify.Sender 的
+// 幂等键收敛不了这个窗口（只收敛逻辑性的重复调度）。
 func TestScheduler_DetachedHandler_ExpiredClaim_IsReclaimedAndRetried(t *testing.T) {
 	st := setupTestStore(t)
 	ctx := context.Background()
