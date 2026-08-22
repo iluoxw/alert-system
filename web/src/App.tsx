@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -10,7 +10,7 @@ import {
   useLocation,
   useNavigate,
 } from 'react-router-dom'
-import { Avatar, Badge, Button, ConfigProvider, Drawer, Input, Layout, Menu, Spin, Tooltip } from 'antd'
+import { Avatar, Badge, Button, ConfigProvider, Drawer, Input, Layout, Menu, Skeleton, Spin, Tooltip } from 'antd'
 import {
   AlertOutlined,
   AppstoreOutlined,
@@ -49,11 +49,22 @@ import { IncidentList } from './pages/IncidentList'
 import { InfrastructureDetail } from './pages/InfrastructureDetail'
 import { FaultWorkspace } from './pages/FaultWorkspace'
 import { IncidentRoom } from './pages/IncidentRoom'
-import { ServiceDirectory } from './pages/ServiceDirectory'
+import { getDirectoryFixture } from './serviceObservability/fixtures'
+import './serviceObservability/serviceObservability.css'
+
+const ServiceDirectory = lazy(() => import('./pages/ServiceDirectory').then((module) => ({ default: module.ServiceDirectory })))
+const ServiceOverview = lazy(() => import('./pages/ServiceOverview').then((module) => ({ default: module.ServiceOverview })))
+const ServiceObservabilityWorkspace = lazy(() => import('./pages/ServiceObservabilityWorkspace').then((module) => ({ default: module.ServiceObservabilityWorkspace })))
 
 const { Header, Sider, Content } = Layout
 
 const sidebarStorageKey = 'firebreak.sidebar-collapsed'
+const fixtureServices = getDirectoryFixture().items
+
+function serviceNameForPath(pathname: string): string | undefined {
+  const serviceId = pathname.match(/^\/services\/([^/]+)/)?.[1]
+  return fixtureServices.find((item) => item.service.service_id === serviceId)?.service.name
+}
 
 function storedSidebarCollapsed() {
   if (typeof window === 'undefined') return false
@@ -68,6 +79,12 @@ function narrowViewport() {
   return typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches
 }
 
+function serviceObservabilityFixturePreview(pathname: string) {
+  return import.meta.env.DEV
+    && import.meta.env.VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE === 'true'
+    && pathname.startsWith('/services')
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -76,12 +93,30 @@ const queryClient = new QueryClient({
   },
 })
 
+function ServiceRouteFallback() {
+  return (
+    <main className="service-ops-page service-route-loading" aria-busy="true" aria-label="正在加载服务视图">
+      <section><Skeleton active title={{ width: '30%' }} paragraph={{ rows: 2 }} /></section>
+      <section className="service-route-loading__ledger" aria-hidden="true">
+        {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} active title paragraph={{ rows: 1 }} />)}
+      </section>
+      <section><Skeleton active title={{ width: '22%' }} paragraph={{ rows: 7 }} /></section>
+    </main>
+  )
+}
+
+function serviceRoute(element: ReactNode) {
+  return <Suspense fallback={<ServiceRouteFallback />}>{element}</Suspense>
+}
+
 // AuthGate 是登录态守卫：GET /me 探测登录态，未登录（401）跳转 /login；同时把
 // client.ts 的 401 统一处理钩子注册到这里——任意受保护请求触发的会话失效都会清空
 // React Query 缓存并跳转登录页，调用方（AlertList 等）不需要各自判断 401。
 function AuthGate({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
-  const { data, isLoading, isError } = useQuery({ queryKey: ['me'], queryFn: me })
+  const location = useLocation()
+  const fixturePreview = serviceObservabilityFixturePreview(location.pathname)
+  const { data, isLoading, isError } = useQuery({ queryKey: ['me'], queryFn: me, enabled: !fixturePreview })
   const navigateRef = useRef(navigate)
   navigateRef.current = navigate
 
@@ -93,6 +128,7 @@ function AuthGate({ children }: { children: ReactNode }) {
     return () => setUnauthorizedHandler(null)
   }, [])
 
+  if (fixturePreview) return <>{children}</>
   if (isLoading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', marginTop: 120 }}>
@@ -113,14 +149,19 @@ function AppLayout() {
   const location = useLocation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { data } = useQuery({ queryKey: ['me'], queryFn: me })
+  const fixturePreview = serviceObservabilityFixturePreview(location.pathname)
+  const meQuery = useQuery({ queryKey: ['me'], queryFn: me, enabled: !fixturePreview })
+  const data = meQuery.data ?? (fixturePreview
+    ? { user_id: 'fixture-user', username: 'fixture-sre', is_admin: false }
+    : undefined)
   const [searchText, setSearchText] = useState('')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(storedSidebarCollapsed)
   const [isNarrowViewport, setIsNarrowViewport] = useState(narrowViewport)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const effectiveSidebarCollapsed = sidebarCollapsed || isNarrowViewport
+  const currentServiceName = serviceNameForPath(location.pathname)
   // 全站只订阅一条 SSE 连接：AppLayout 是所有已登录页面的公共父组件。
-  useAlertEvents()
+  useAlertEvents(!fixturePreview)
 
   const handleLogout = async () => {
     await logout()
@@ -215,6 +256,12 @@ function AppLayout() {
       ? '告警详情'
       : location.pathname.startsWith('/alerts')
         ? '告警证据'
+      : location.pathname.includes('/observability')
+        ? currentServiceName ? `${currentServiceName} · 可观测性` : '服务可观测性'
+      : location.pathname === '/services'
+        ? '服务目录'
+      : location.pathname.startsWith('/services/')
+        ? currentServiceName ?? '服务总览'
       : location.pathname.startsWith('/silences')
         ? '静默策略'
         : location.pathname.startsWith('/settings')
@@ -389,7 +436,9 @@ function App() {
               <Route path="incidents" element={<IncidentList />} />
               <Route path="alerts" element={<AlertList />} />
               <Route path="alerts/:id" element={<AlertDetail />} />
-              <Route path="services" element={<ServiceDirectory />} />
+              <Route path="services" element={serviceRoute(<ServiceDirectory />)} />
+              <Route path="services/:serviceId" element={serviceRoute(<ServiceOverview />)} />
+              <Route path="services/:serviceId/observability" element={serviceRoute(<ServiceObservabilityWorkspace />)} />
               <Route path="infrastructure/:id" element={<InfrastructureDetail />} />
               <Route path="faults/:id" element={<FaultWorkspace />} />
               <Route path="incidents/:id" element={<IncidentRoom />} />

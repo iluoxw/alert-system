@@ -16,12 +16,13 @@ const invalidateThrottleMs = 2_000
 // EventSource 断线由浏览器原生自动重连，这里不写重连逻辑。推送是轮询之外的
 // 增强而非依赖——onerror 静默降级，不打印告警内容也不弹全局提示，坏了还有
 // AlertList/AlertDetail 的 15s 轮询兜底。
-export function useAlertEvents(): void {
+export function useAlertEvents(enabled = true): void {
   const queryClient = useQueryClient()
   const pendingRef = useRef(false)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
+    if (!enabled) return
     const es = new EventSource(apiV1Url('/events'), { withCredentials: true })
 
     const scheduleInvalidate = () => {
@@ -44,5 +45,5 @@ export function useAlertEvents(): void {
       if (timerRef.current !== null) clearTimeout(timerRef.current)
       es.close()
     }
-  }, [queryClient])
+  }, [enabled, queryClient])
 }
