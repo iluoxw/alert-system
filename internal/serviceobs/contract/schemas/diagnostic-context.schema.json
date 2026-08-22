@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-observability/v1/diagnostic-context.schema.json",
+  "title": "DiagnosticContext v1",
+  "description": "A server-assembled, read-only context shared by the Service Workspace, deterministic diagnostics and a future optional assistant provider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "context_version",
+    "request_id",
+    "assembled_at",
+    "actor",
+    "service",
+    "scope",
+    "focus",
+    "topology",
+    "signals",
+    "evidence_refs",
+    "domain_state",
+    "policy"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "context_version": { "type": "integer", "minimum": 1 },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "assembled_at": { "type": "string", "format": "date-time" },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "team_ids", "roles", "permission_snapshot_id"],
+      "properties": {
+        "user_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "team_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 50
+        },
+        "roles": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 50
+        },
+        "permission_snapshot_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_id", "entity_key", "name", "root_entity_ids", "profile_key", "profile_version"],
+      "properties": {
+        "service_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entity_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "root_entity_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "maxItems": 20
+        },
+        "profile_key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "profile_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant", "environment", "time_range", "timezone"],
+      "properties": {
+        "tenant": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "environment": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "time_range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to"],
+          "properties": {
+            "from": { "type": "string", "format": "date-time" },
+            "to": { "type": "string", "format": "date-time" }
+          }
+        },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "focus": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "value": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "journey": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "stage": { "type": "string", "minLength": 1, "maxLength": 64 }
+          }
+        }
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "observed_at", "freshness", "partial", "nodes", "relations"],
+      "properties": {
+        "snapshot_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "partial": { "type": "boolean" },
+        "nodes": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/node" }
+        },
+        "relations": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": { "$ref": "#/$defs/relation" }
+        }
+      }
+    },
+    "signals": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/signal" }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "evidence-ref.schema.json" }
+    },
+    "domain_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alerts", "faults", "impacts", "incidents"],
+      "properties": {
+        "alerts": { "$ref": "#/$defs/domainRefs" },
+        "faults": { "$ref": "#/$defs/domainRefs" },
+        "impacts": { "$ref": "#/$defs/domainRefs" },
+        "incidents": { "$ref": "#/$defs/domainRefs" }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_tool_keys", "max_window_seconds", "max_rows", "redacted_fields"],
+      "properties": {
+        "allowed_tool_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
+          },
+          "uniqueItems": true,
+          "maxItems": 50
+        },
+        "max_window_seconds": { "type": "integer", "minimum": 60, "maximum": 2592000 },
+        "max_rows": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "redacted_fields": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "uniqueItems": true,
+          "maxItems": 200
+        }
+      }
+    }
+  },
+  "$defs": {
+    "freshness": { "enum": ["fresh", "stale", "unknown"] },
+    "health": { "enum": ["healthy", "degraded", "critical", "unknown"] },
+    "signalHealth": { "enum": ["healthy", "degraded", "critical", "unknown", "neutral"] },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_id", "entity_key", "name", "layer", "kind", "health", "freshness"],
+      "properties": {
+        "entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entity_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "layer": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "health": { "$ref": "#/$defs/health" },
+        "freshness": { "$ref": "#/$defs/freshness" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relation_id", "source_entity_id", "target_entity_id", "kind", "provenance", "freshness"],
+      "properties": {
+        "relation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source_entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "target_entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "provenance": { "enum": ["declared", "observed", "declared_and_observed", "inferred"] },
+        "freshness": { "$ref": "#/$defs/freshness" }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding_key",
+        "family",
+        "semantic",
+        "scope_kind",
+        "scope_ref",
+        "value",
+        "unit",
+        "aggregation",
+        "window_seconds",
+        "observed_at",
+        "freshness",
+        "availability",
+        "health",
+        "source_key"
+      ],
+      "properties": {
+        "binding_key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "family": { "enum": ["golden", "red", "use"] },
+        "semantic": {
+          "enum": ["latency", "traffic", "errors", "saturation", "rate", "duration", "utilization"]
+        },
+        "scope_kind": { "enum": ["service", "entity", "relation", "resource"] },
+        "scope_ref": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value": { "type": ["number", "null"] },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "aggregation": { "enum": ["sum", "avg", "max", "min", "count", "rate", "p50", "p95", "p99"] },
+        "window_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "availability": { "enum": ["available", "unknown", "forbidden", "unavailable"] },
+        "health": { "$ref": "#/$defs/signalHealth" },
+        "source_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "measurement_role": { "enum": ["direct", "proxy"] },
+        "proxy_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "unknown_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "threshold_source": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "measurement_role": { "const": "proxy" } }, "required": ["measurement_role"] },
+          "then": { "required": ["proxy_reason"] }
+        },
+        {
+          "if": { "properties": { "availability": { "const": "available" } } },
+          "then": { "properties": { "value": { "type": "number" } } },
+          "else": {
+            "properties": {
+              "value": { "type": "null" },
+              "health": { "const": "unknown" }
+            },
+            "required": ["unknown_reason"]
+          }
+        }
+      ]
+    },
+    "domainRefs": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "state", "updated_at"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "state": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-observability/v1/service-observability-profile.schema.json",
+  "title": "ServiceObservabilityProfile v1",
+  "description": "A declarative service observability profile rendered by alert-system without service-specific executable code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_key",
+    "profile_version",
+    "status",
+    "service_ref",
+    "focus_kinds",
+    "journeys",
+    "views",
+    "signal_bindings",
+    "tool_refs",
+    "limits"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "profile_key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "profile_version": { "type": "integer", "minimum": 1 },
+    "status": { "enum": ["draft", "published", "deprecated"] },
+    "service_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_id", "root_entity_ids"],
+      "properties": {
+        "service_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "root_entity_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true
+        }
+      }
+    },
+    "focus_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/focusKind" }
+    },
+    "journeys": {
+      "type": "array",
+      "maxItems": 30,
+      "items": { "$ref": "#/$defs/journey" }
+    },
+    "views": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/view" }
+    },
+    "signal_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": { "$ref": "#/$defs/signalBinding" }
+    },
+    "tool_refs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_window_seconds",
+        "max_window_seconds",
+        "max_nodes",
+        "max_relations",
+        "max_rows",
+        "max_evidence_refs",
+        "freshness_ttl_seconds"
+      ],
+      "properties": {
+        "default_window_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 },
+        "max_window_seconds": { "type": "integer", "minimum": 60, "maximum": 2592000 },
+        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_relations": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_rows": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "max_evidence_refs": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "freshness_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "toolKey": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
+    },
+    "focusKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "value_pattern", "placeholder", "primary"],
+      "properties": {
+        "key": { "$ref": "#/$defs/identifier" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "value_pattern": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "placeholder": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "primary": { "type": "boolean" }
+      }
+    },
+    "journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "focus_kind", "stages"],
+      "properties": {
+        "key": { "$ref": "#/$defs/identifier" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "focus_kind": { "$ref": "#/$defs/identifier" },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "label"],
+            "properties": {
+              "key": { "$ref": "#/$defs/identifier" },
+              "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+              "entity_refs": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "uniqueItems": true,
+                "maxItems": 20
+              },
+              "relation_refs": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "uniqueItems": true,
+                "maxItems": 20
+              }
+            }
+          }
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "renderer", "title", "order"],
+      "properties": {
+        "key": { "$ref": "#/$defs/identifier" },
+        "renderer": {
+          "enum": [
+            "golden_overview",
+            "request_journey",
+            "dependency_topology",
+            "resource_fleet",
+            "evidence_list",
+            "domain_timeline"
+          ]
+        },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "order": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "journey_ref": { "$ref": "#/$defs/identifier" },
+        "signal_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/identifier" },
+          "uniqueItems": true,
+          "maxItems": 50
+        },
+        "tool_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/toolKey" },
+          "uniqueItems": true,
+          "maxItems": 20
+        }
+      }
+    },
+    "signalBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "family",
+        "semantic",
+        "scope",
+        "tool_key",
+        "output_field",
+        "unit",
+        "aggregation"
+      ],
+      "properties": {
+        "key": { "$ref": "#/$defs/identifier" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "family": { "enum": ["golden", "red", "use"] },
+        "semantic": {
+          "enum": ["latency", "traffic", "errors", "saturation", "rate", "duration", "utilization"]
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["service", "entity", "relation", "resource"] },
+            "refs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "uniqueItems": true,
+              "maxItems": 100
+            }
+          }
+        },
+        "tool_key": { "$ref": "#/$defs/toolKey" },
+        "output_field": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.\\[\\]-]{0,255}$"
+        },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "aggregation": { "enum": ["sum", "avg", "max", "min", "count", "rate", "p50", "p95", "p99"] },
+        "measurement_role": { "enum": ["direct", "proxy"] },
+        "proxy_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "baseline_ref": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "direction", "degraded", "critical"],
+          "properties": {
+            "mode": { "enum": ["absolute", "baseline_deviation"] },
+            "direction": { "enum": ["above", "below"] },
+            "degraded": { "type": "number" },
+            "critical": { "type": "number" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "measurement_role": { "const": "proxy" } }, "required": ["measurement_role"] },
+          "then": { "required": ["proxy_reason"] }
+        },
+        {
+          "if": { "properties": { "family": { "const": "golden" } } },
+          "then": { "properties": { "semantic": { "enum": ["latency", "traffic", "errors", "saturation"] } } }
+        },
+        {
+          "if": { "properties": { "family": { "const": "red" } } },
+          "then": { "properties": { "semantic": { "enum": ["rate", "errors", "duration"] } } }
+        },
+        {
+          "if": { "properties": { "family": { "const": "use" } } },
+          "then": { "properties": { "semantic": { "enum": ["utilization", "saturation", "errors"] } } }
+        }
+      ]
+    }
+  }
+}

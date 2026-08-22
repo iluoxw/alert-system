@@ -1,0 +1,451 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-observability/v1/service-observability-page-view.schema.json",
+  "title": "Service Observability Page View v1",
+  "description": "Route-specific, server-projected read models for the Service Directory, Service Overview and Observability Workspace. They are derived from Service Registration, ServiceObservabilityProfile and DiagnosticContext; browsers do not execute source queries.",
+  "oneOf": [
+    { "$ref": "#/$defs/directoryView" },
+    { "$ref": "#/$defs/overviewView" },
+    { "$ref": "#/$defs/workspaceView" }
+  ],
+  "$defs": {
+    "health": { "enum": ["healthy", "degraded", "critical", "unknown"] },
+    "signalHealth": { "enum": ["healthy", "degraded", "critical", "unknown", "neutral"] },
+    "freshness": { "enum": ["fresh", "stale", "unknown"] },
+    "availability": { "enum": ["available", "empty", "unknown", "forbidden", "unavailable"] },
+    "serviceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service_id", "entity_id", "entity_key", "name", "description", "layer", "kind", "environment", "owner_team_id", "owner_team_name", "tier"],
+      "properties": {
+        "service_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entity_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "layer": { "enum": ["infrastructure", "platform", "application"] },
+        "kind": { "enum": ["resource", "infrastructure_capability", "business_system"] },
+        "environment": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "owner_team_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "owner_team_name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "tier": { "enum": ["tier-0", "tier-1", "tier-2", "tier-3"] }
+      }
+    },
+    "profileRef": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["profile_key", "profile_version", "status"],
+      "properties": {
+        "profile_key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "profile_version": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["draft", "published", "deprecated"] }
+      }
+    },
+    "healthSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason_codes", "evaluated_at"],
+      "properties": {
+        "status": { "$ref": "#/$defs/health" },
+        "reason_codes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 20
+        },
+        "evaluated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "sourceStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_key", "state", "retryable"],
+      "properties": {
+        "source_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "state": { "$ref": "#/$defs/availability" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "dataStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "sources"],
+      "properties": {
+        "state": { "enum": ["complete", "partial", "stale", "unconfigured"] },
+        "sources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceStatus" },
+          "maxItems": 50
+        }
+      }
+    },
+    "signalValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding_key", "label", "family", "semantic", "scope_kind", "scope_ref", "value", "display_value", "unit", "aggregation", "window_seconds", "observed_at", "freshness", "availability", "health", "source_key"],
+      "properties": {
+        "binding_key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "family": { "enum": ["golden", "red", "use"] },
+        "semantic": { "enum": ["latency", "traffic", "errors", "saturation", "rate", "duration", "utilization"] },
+        "scope_kind": { "enum": ["service", "entity", "relation", "resource"] },
+        "scope_ref": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value": { "type": ["number", "null"] },
+        "display_value": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "aggregation": { "enum": ["sum", "avg", "max", "min", "count", "rate", "p50", "p95", "p99"] },
+        "window_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "availability": { "$ref": "#/$defs/availability" },
+        "health": { "$ref": "#/$defs/signalHealth" },
+        "source_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "measurement_role": { "enum": ["direct", "proxy"] },
+        "proxy_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "threshold_source": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "baseline_delta_percent": { "type": "number" },
+        "unknown_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "sparkline": {
+          "type": "array",
+          "items": { "type": "number" },
+          "maxItems": 120
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "measurement_role": { "const": "proxy" } }, "required": ["measurement_role"] },
+          "then": { "required": ["proxy_reason"] }
+        },
+        {
+          "if": { "properties": { "availability": { "const": "available" } } },
+          "then": { "properties": { "value": { "type": "number" } } },
+          "else": {
+            "properties": {
+              "value": { "type": "null" },
+              "health": { "const": "unknown" }
+            },
+            "required": ["unknown_reason"]
+          }
+        }
+      ]
+    },
+    "domainCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_faults", "confirmed_impacts", "active_incidents"],
+      "properties": {
+        "active_faults": { "type": "integer", "minimum": 0 },
+        "confirmed_impacts": { "type": "integer", "minimum": 0 },
+        "active_incidents": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sectionStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["section_key", "state", "retryable"],
+      "properties": {
+        "section_key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "state": { "$ref": "#/$defs/availability" },
+        "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "label", "href"],
+      "properties": {
+        "kind": { "enum": ["dashboard", "runbook", "service_registration", "entity", "fault", "incident"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "href": { "type": "string", "format": "uri-reference", "maxLength": 2048 }
+      }
+    },
+    "faultSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fault_id", "title", "state", "severity", "updated_at", "confirmed_impact_count", "potential_impact_count"],
+      "properties": {
+        "fault_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "state": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "severity": { "enum": ["info", "warning", "critical"] },
+        "owner_team_name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "duration_seconds": { "type": "integer", "minimum": 0 },
+        "confirmed_impact_count": { "type": "integer", "minimum": 0 },
+        "potential_impact_count": { "type": "integer", "minimum": 0 },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "dependencyRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_id", "name", "layer", "group_key", "group_label", "role", "provenance", "health", "freshness"],
+      "properties": {
+        "entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "layer": { "enum": ["infrastructure", "platform", "application"] },
+        "group_key": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+        "group_label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "role": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "provenance": { "enum": ["declared", "observed", "declared_and_observed", "inferred"] },
+        "health": { "$ref": "#/$defs/health" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "timelineEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "kind", "title", "source", "occurred_at"],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "enum": ["deployment", "alert", "fault", "impact", "incident", "human_decision", "telemetry_gap", "recovery"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "source": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "entity_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "maxItems": 100 },
+        "relation_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "maxItems": 200 },
+        "domain_ref": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "focusKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "placeholder", "value_pattern", "primary"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "placeholder": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value_pattern": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "primary": { "type": "boolean" }
+      }
+    },
+    "focus": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "value": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "journey": { "type": "string", "maxLength": 64 },
+        "stage": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant", "environment", "from", "to", "timezone"],
+      "properties": {
+        "tenant": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "environment": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "from": { "type": "string", "format": "date-time" },
+        "to": { "type": "string", "format": "date-time" },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "journeyStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "state", "entity_ids", "relation_ids", "evidence_ids"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "state": { "enum": ["ok", "failed", "pending", "skipped", "unknown"] },
+        "entity_ids": {
+          "type": "array",
+          "description": "Canonical stage entity refs. They may be outside the current bounded topology projection; UI filters against the current topology intersection.",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "maxItems": 20
+        },
+        "relation_ids": {
+          "type": "array",
+          "description": "Canonical stage relation refs. They may be outside the current bounded topology projection; UI must not synthesize missing relations.",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "maxItems": 20
+        },
+        "evidence_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "maxItems": 100 },
+        "reason_code": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "topologyNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_id", "name", "layer", "kind", "health", "freshness", "signals"],
+      "properties": {
+        "entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "layer": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "health": { "$ref": "#/$defs/health" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "signals": { "type": "array", "items": { "$ref": "#/$defs/signalValue" }, "maxItems": 30 }
+      }
+    },
+    "topologyRelation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relation_id", "source_entity_id", "target_entity_id", "kind", "provenance", "health", "freshness", "signals"],
+      "properties": {
+        "relation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source_entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "target_entity_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "provenance": { "enum": ["declared", "observed", "declared_and_observed", "inferred"] },
+        "health": { "$ref": "#/$defs/health" },
+        "freshness": { "$ref": "#/$defs/freshness" },
+        "signals": { "type": "array", "items": { "$ref": "#/$defs/signalValue" }, "maxItems": 30 }
+      }
+    },
+    "diagnosticSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "title", "statements", "evidence_ids", "missing_requirements"],
+      "properties": {
+        "level": { "enum": ["observation", "correlation", "candidate_cause", "confirmed_cause", "incomplete"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "statements": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 1000 }, "maxItems": 20 },
+        "evidence_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "maxItems": 100 },
+        "missing_requirements": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 300 }, "maxItems": 20 }
+      }
+    },
+    "domainRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state", "updated_at"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "state": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["view_metrics", "view_logs", "view_traces", "view_domain", "open_evidence_deep_links"],
+      "properties": {
+        "view_metrics": { "type": "boolean" },
+        "view_logs": { "type": "boolean" },
+        "view_traces": { "type": "boolean" },
+        "view_domain": { "type": "boolean" },
+        "open_evidence_deep_links": { "type": "boolean" }
+      }
+    },
+    "directoryView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "view_kind", "request_id", "assembled_at", "summary", "items", "next_cursor"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "view_kind": { "const": "service_directory" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "assembled_at": { "type": "string", "format": "date-time" },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["managed", "critical", "partial", "unconfigured"],
+          "properties": {
+            "managed": { "type": "integer", "minimum": 0 },
+            "critical": { "type": "integer", "minimum": 0 },
+            "partial": { "type": "integer", "minimum": 0 },
+            "unconfigured": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["service", "profile", "health", "data_status", "golden_signals", "domain_counts", "observed_at"],
+            "properties": {
+              "service": { "$ref": "#/$defs/serviceIdentity" },
+              "profile": { "$ref": "#/$defs/profileRef" },
+              "health": { "$ref": "#/$defs/healthSummary" },
+              "data_status": { "$ref": "#/$defs/dataStatus" },
+              "golden_signals": { "type": "array", "items": { "$ref": "#/$defs/signalValue" }, "maxItems": 4 },
+              "domain_counts": { "$ref": "#/$defs/domainCounts" },
+              "links": { "type": "array", "items": { "$ref": "#/$defs/link" }, "maxItems": 5 },
+              "observed_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "next_cursor": { "type": ["string", "null"], "maxLength": 512 }
+      }
+    },
+    "overviewView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "view_kind", "request_id", "assembled_at", "service", "profile", "health", "data_status", "golden_signals", "domain_counts", "faults", "dependencies", "recent_events", "focus_kinds", "links", "sections"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "view_kind": { "const": "service_overview" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "assembled_at": { "type": "string", "format": "date-time" },
+        "service": { "$ref": "#/$defs/serviceIdentity" },
+        "profile": { "$ref": "#/$defs/profileRef" },
+        "health": { "$ref": "#/$defs/healthSummary" },
+        "data_status": { "$ref": "#/$defs/dataStatus" },
+        "golden_signals": { "type": "array", "items": { "$ref": "#/$defs/signalValue" }, "maxItems": 4 },
+        "domain_counts": { "$ref": "#/$defs/domainCounts" },
+        "faults": { "type": "array", "items": { "$ref": "#/$defs/faultSummary" }, "maxItems": 50 },
+        "dependencies": { "type": "array", "items": { "$ref": "#/$defs/dependencyRow" }, "maxItems": 200 },
+        "recent_events": { "type": "array", "items": { "$ref": "#/$defs/timelineEvent" }, "maxItems": 100 },
+        "focus_kinds": { "type": "array", "items": { "$ref": "#/$defs/focusKind" }, "maxItems": 20 },
+        "links": { "type": "array", "items": { "$ref": "#/$defs/link" }, "maxItems": 20 },
+        "sections": { "type": "array", "items": { "$ref": "#/$defs/sectionStatus" }, "maxItems": 20 }
+      }
+    },
+    "workspaceView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "view_kind", "request_id", "context_version", "assembled_at", "service", "profile", "scope", "focus", "health", "data_status", "golden_signals", "journey", "topology", "diagnostic_summary", "evidence_refs", "domain_state", "timeline", "capabilities", "sections"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "view_kind": { "const": "observability_workspace" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "context_version": { "type": "integer", "minimum": 1 },
+        "assembled_at": { "type": "string", "format": "date-time" },
+        "service": { "$ref": "#/$defs/serviceIdentity" },
+        "profile": { "$ref": "#/$defs/profileRef" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "focus": { "$ref": "#/$defs/focus" },
+        "health": { "$ref": "#/$defs/healthSummary" },
+        "data_status": { "$ref": "#/$defs/dataStatus" },
+        "golden_signals": { "type": "array", "items": { "$ref": "#/$defs/signalValue" }, "maxItems": 4 },
+        "journey": { "type": "array", "items": { "$ref": "#/$defs/journeyStage" }, "maxItems": 50 },
+        "topology": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshot_id", "partial", "nodes", "relations"],
+          "properties": {
+            "snapshot_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "partial": { "type": "boolean" },
+            "nodes": { "type": "array", "items": { "$ref": "#/$defs/topologyNode" }, "maxItems": 1000 },
+            "relations": { "type": "array", "items": { "$ref": "#/$defs/topologyRelation" }, "maxItems": 5000 }
+          }
+        },
+        "diagnostic_summary": { "$ref": "#/$defs/diagnosticSummary" },
+        "evidence_refs": { "type": "array", "items": { "$ref": "evidence-ref.schema.json" }, "maxItems": 1000 },
+        "domain_state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["alerts", "faults", "impacts", "incidents"],
+          "properties": {
+            "alerts": { "type": "array", "items": { "$ref": "#/$defs/domainRef" }, "maxItems": 500 },
+            "faults": { "type": "array", "items": { "$ref": "#/$defs/domainRef" }, "maxItems": 500 },
+            "impacts": { "type": "array", "items": { "$ref": "#/$defs/domainRef" }, "maxItems": 500 },
+            "incidents": { "type": "array", "items": { "$ref": "#/$defs/domainRef" }, "maxItems": 500 }
+          }
+        },
+        "timeline": { "type": "array", "items": { "$ref": "#/$defs/timelineEvent" }, "maxItems": 500 },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "sections": { "type": "array", "items": { "$ref": "#/$defs/sectionStatus" }, "maxItems": 20 }
+      }
+    }
+  }
+}
