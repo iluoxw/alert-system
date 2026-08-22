@@ -123,7 +123,7 @@ else -> complete
 - key：`service_id + environment + profile_version + default_window_seconds`；
 - value 只能包含目录摘要：Health、Data、四大 Golden compact values、domain counts、observed_at；
 - 默认 fresh TTL 45s，max stale 5m，可配置；
-- fresh：直接返回；stale：返回旧摘要并显式 Stale，同时入 bounded refresh queue；miss：立即返回 Unknown/Unconfigured 占位并入队，不在目录请求内对每行同步扇出所有 source；
+- fresh：直接返回；stale：返回旧摘要并显式 Stale，同时入 bounded refresh queue；miss：立即返回 Unknown/Unconfigured 占位并入队，不在目录请求内对每行同步扇出所有 source；占位的 `observed_at` 取 registration/domain 中最新的真实时间，绝不能用当前时间伪装成观测时间；
 - 固定 worker 数、bounded queue、per-key singleflight；队列满时保留 Unknown/Stale，不额外起 goroutine；
 - refresh 失败不覆盖最后成功快照；超过 max stale 后不得继续显示旧绿值；
 - cache 不保存 logs、traces、原始 evidence 或凭据；
@@ -248,7 +248,7 @@ Registry 构造时注入：profile filesystem、contract validator、Tool catalo
 
 校验顺序：
 
-1. 文件必须是普通 `.json`，大小有上限，拒绝 symlink/目录穿越；
+1. 文件必须是普通 `.json`，单文件上限 1 MiB、目录最多 1000 个候选文件，拒绝 symlink/目录穿越；
 2. JSON decode 使用 unknown-field/schema 双重拒绝；
 3. schema validation；
 4. 递归拒绝 forbidden key：`query/promql/sql/logql/shell/secret/token/headers/prompt/html/executable`；只检查 key，不对合法说明文字做 substring 猜测；
@@ -473,11 +473,13 @@ GET /api/v1/service-observability/:service_id/workspace
 
 **目录参数**
 
-- `environment/team_id/tier/health/data_status/q/sort/cursor/limit`
-- limit 默认 50、硬上限 200；enum 与 CSV 值严格白名单；
-- stable sort tuple + service ID 作为 opaque base64url cursor；解码/版本/sort 不匹配返回 422，不传入 SQL；
+- `environment/team_id/tier/health/data_status/q/sort/direction/cursor/limit`
+- `sort` 仅允许现有 UI 的 `service/owner/tier/health/fault/data/observed`，`direction` 仅允许 `asc/desc`；未传 sort 时使用 triage 默认排序；
+- limit 默认 50、硬上限 200；enum 与 CSV 值严格白名单；`q`、cursor 与各 ID 参数有长度上限；
+- stable sort tuple + service ID 作为 opaque base64url cursor；cursor 最大 512 字符，并绑定版本、全部 filter、sort 与 direction 的 fingerprint；解码/版本/query fingerprint 不匹配返回 422，不传入 SQL；
 - 默认排序：Health severity、confirmed Impact、active Fault、tier、name、service ID；
 - directory 只读 cache；cache miss 不做 N×source 同步 fan-out。
+- `summary` 统计 metadata filter 后的完整候选集合，不只统计当前分页；Health/Data 统计只读相同 cache snapshot，不触发额外 refresh。
 
 **总览参数**
 
