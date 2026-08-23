@@ -208,9 +208,13 @@ func (c *Coordinator) ReadObservations(
 		return serviceobs.ObservationFacts{}, err
 	}
 
-	// 完全没有配置任何 provider：逐字保留 Phase 2 语义。
+	// 完全没有配置任何 provider：source 与 signal 逐字保留 Phase 2 语义。
 	if !c.readers.AnyConfigured() {
-		return c.notConnectedFacts(c.requestedBindingKeys(req)), nil
+		// focus 是这里唯一的例外，而且必须是 Unknown：NotRequested 的含义是"你没问"，
+		// 但用户确实问了"这个 sandbox_id 有没有被观测到"，真实答案是"我们不知道"。
+		// 把后者说成前者等于替用户撤回了问题，也违反"缺数据至少降级为 Unknown"。
+		focusUnknown := req.Purpose.NeedsFocusEvidence() && req.Focus != nil
+		return c.notConnectedFacts(c.requestedBindingKeys(req), focusUnknown), nil
 	}
 
 	permissions, err := c.resolvePermissions(ctx, req)
@@ -252,11 +256,17 @@ func (c *Coordinator) resolvePermissions(
 }
 
 // notConnectedFacts 构造 Phase 2 的"遥测完全未接入"事实。
-func (c *Coordinator) notConnectedFacts(bindingKeys []string) serviceobs.ObservationFacts {
+//
+// focusUnknown 由调用方判定"本次是否真的问过 focus"，理由见 ReadObservations 里的注释。
+func (c *Coordinator) notConnectedFacts(bindingKeys []string, focusUnknown bool) serviceobs.ObservationFacts {
+	focus := serviceobs.FocusNotRequested
+	if focusUnknown {
+		focus = serviceobs.FocusUnknown
+	}
 	facts := serviceobs.ObservationFacts{
 		Signals:      make([]health.SignalObservation, 0, len(bindingKeys)),
 		EvidenceRefs: []model.EvidenceRef{},
-		Focus:        serviceobs.FocusNotRequested,
+		Focus:        focus,
 	}
 	for _, key := range bindingKeys {
 		facts.Signals = append(facts.Signals, health.SignalObservation{
@@ -585,7 +595,8 @@ func withFocusPlaceholder(outcome sourceOutcome, focusRequested bool) sourceOutc
 //   - signal 只保留本次真的被请求的 binding，重复 binding 以第一个为准（adapter 不该重复
 //     返回，但重复时不能让后面的覆盖前面的，否则结果依赖 map 遍历顺序）；
 //   - 缺失的 binding 补一条显式 Unknown，绝不静默消失；
-//   - focus 结论取"最坏"：任一来源 unknown 就是 unknown，否则任一 matched 就是 matched。
+//   - focus 结论按 matched > unknown > empty 取，而不是取"最坏"：已确认命中是正事实，
+//     另一个来源失败不能把它抹掉。
 func mergeOutcomes(bindingKeys []string, outcomes []sourceOutcome) serviceobs.ObservationFacts {
 	facts := serviceobs.ObservationFacts{
 		Signals:      []health.SignalObservation{},

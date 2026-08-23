@@ -359,6 +359,76 @@ func TestFullyUnconfiguredKeepsPhase2Semantics(t *testing.T) {
 	}
 }
 
+// 完全未配置且本次真的问了 focus 时必须是 Unknown。
+//
+// NotRequested 的含义是"你没问"，而用户确实问了"这个 sandbox_id 有没有被观测到"；
+// 一个 provider 都没有时的诚实答案是"我们不知道"。source 与 signal 侧仍逐字保留 Phase 2。
+func TestFullyUnconfiguredWithRequestedFocusIsUnknown(t *testing.T) {
+	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
+	coordinator := New(Options{Permissions: allPermissions()})
+	req := workspaceRequest()
+	req.Focus = &focusValue
+	facts, err := coordinator.ReadObservations(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if facts.Focus != serviceobs.FocusUnknown {
+		t.Fatalf("Focus=%q，问过 focus 却无任何 provider 时应是 unknown", facts.Focus)
+	}
+	if len(facts.Sources) != 1 {
+		t.Fatalf("完全未配置时应只有一条 source，得到 %d", len(facts.Sources))
+	}
+	source := facts.Sources[0]
+	if source.SourceKey != serviceobs.SourceKeyPrometheus ||
+		source.ReasonCode != serviceobs.ReasonTelemetryNotConnected {
+		t.Fatalf("focus 降级不得改动 Phase 2 的 source 语义，得到 %+v", source)
+	}
+	if len(facts.Signals) != 5 {
+		t.Fatalf("每个 binding 都要有显式 Unknown，得到 %d 条", len(facts.Signals))
+	}
+	for _, signal := range facts.Signals {
+		if signal.UnknownReason != serviceobs.ReasonTelemetryNotConnected {
+			t.Fatalf("binding %s 的 reason=%q", signal.BindingKey, signal.UnknownReason)
+		}
+	}
+}
+
+// 只有聚焦工作区会扇出 focus 证据，因此目录/总览即使畸形地带了 focus 值也仍是 NotRequested。
+func TestFullyUnconfiguredIgnoresFocusForNonEvidencePurposes(t *testing.T) {
+	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
+	for _, purpose := range []serviceobs.Purpose{
+		serviceobs.PurposeDirectorySummary, serviceobs.PurposeOverview,
+	} {
+		t.Run(string(purpose), func(t *testing.T) {
+			coordinator := New(Options{Permissions: allPermissions()})
+			req := workspaceRequest()
+			req.Purpose = purpose
+			req.Focus = &focusValue
+			facts, err := coordinator.ReadObservations(context.Background(), req)
+			if err != nil {
+				t.Fatalf("ReadObservations 失败: %v", err)
+			}
+			if facts.Focus != serviceobs.FocusNotRequested {
+				t.Fatalf("Focus=%q，该用途不查 focus 证据时应是 not_requested", facts.Focus)
+			}
+		})
+	}
+}
+
+// 聚焦工作区但没带 focus 值：没问过就是 not_requested，不能凭空报 unknown。
+func TestFullyUnconfiguredWithoutFocusStaysNotRequested(t *testing.T) {
+	coordinator := New(Options{Permissions: allPermissions()})
+	req := workspaceRequest()
+	req.Focus = nil
+	facts, err := coordinator.ReadObservations(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if facts.Focus != serviceobs.FocusNotRequested {
+		t.Fatalf("Focus=%q，没问过 focus 时应是 not_requested", facts.Focus)
+	}
+}
+
 // 部分配置：当前 purpose 选中但未连接的来源必须显式出现，不能省略。
 func TestPartialConfigurationReportsNotConnectedExplicitly(t *testing.T) {
 	t.Run("只有 Prometheus", func(t *testing.T) {

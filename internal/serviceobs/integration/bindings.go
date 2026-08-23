@@ -91,18 +91,24 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 	ctx := newBindingContext(pkg)
 
 	seenKeys := map[string]struct{}{}
-	// 多重性账本。focusProviders / evidenceProviders 同时统计显式 binding 与 side output，
-	// 因此"journey 已经顺带给出 focus"再加一条 focus binding 会被判成重复。
+	// 多重性账本。口径按 kind 分层，刻意不一致：
+	//
+	//   - signal / journey：每个 target 恰好一条 **primary** binding。它们是"这个信号/旅程
+	//     的值从哪来"的唯一答案，两条就意味着页面上同一个格子有两个互相矛盾的来源。
+	//   - focus：每个 focus kind 至多一条**显式** binding。
+	//   - evidence：只有 (target, class, source) 三者全同才算重复。
+	//
+	// side output **不计入** primary 多重性。多个独立来源各自报告同一个 focus 是正常输入，
+	// 由 coordinator 按 matched > unknown > empty 合并：traces 命中而 logs 不知道，结论必须
+	// 是 matched。同理，journey 顺带带回 trace 证据，并不妨碍 package 再声明一条参数不同的
+	// trace evidence binding（比如换一个时间窗或不同的过滤维度）。
+	//
+	// 反过来，"两条 binding 的 tool/template/params 逐字节相同"本身**不是**错误：E2B 就用
+	// 同一条 HugePages 利用率查询同时喂 golden saturation 与 USE saturation 两个格子。一次
+	// 读取投影到多个展示位是有意的，adapter 侧去重是执行层的事，不是配置层的错。
 	signalProviders := map[string]string{}
 	journeyProviders := map[string]string{}
-	// explicitFocus 与 sideFocus 分开记账。
-	//
-	// 多个来源各自报告 focus 结论是**正常**的：coordinator 按 matched > unknown > empty 合并
-	// 它们，"traces 命中而 logs 不知道"必须是 matched。所以 side output 之间不冲突。
-	// 真正的死配置是：某个来源已经顺带给出这个 focus 的判定，package 还为它单独建一条
-	// kind=focus binding——那是第三次查询，且结论重复。
 	explicitFocus := map[string]string{}
-	sideFocus := map[string]string{}
 	evidenceProviders := map[string]string{}
 
 	resolved := make([]resolvedBinding, 0, len(pkg.Bindings))
@@ -137,7 +143,6 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 		}
 
 		// target 解析 + 多重性。
-		focusForBinding := ""
 		switch binding.Kind {
 		case KindSignal:
 			signal, ok := ctx.signalKeys[binding.TargetRef]
@@ -165,8 +170,7 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 			}
 			signalProviders[binding.TargetRef] = binding.Key
 		case KindJourney:
-			journey, ok := ctx.journeys[binding.TargetRef]
-			if !ok {
+			if _, ok := ctx.journeys[binding.TargetRef]; !ok {
 				return nil, failf(ReasonDanglingRef,
 					"provider_bindings[%s].target_ref=%s 不是已声明的 journey",
 					binding.Key, binding.TargetRef)
@@ -177,16 +181,19 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 					binding.TargetRef, previous, binding.Key)
 			}
 			journeyProviders[binding.TargetRef] = binding.Key
-			// journey 的 focus 语义来自它声明的 focus_kind：trace 读取顺带给出的 focus
-			// 结论属于那个 focus kind。
-			focusForBinding = journey.FocusKind
 		case KindFocus:
 			if _, ok := ctx.focusKeys[binding.TargetRef]; !ok {
 				return nil, failf(ReasonDanglingRef,
 					"provider_bindings[%s].target_ref=%s 不是已声明的 focus kind",
 					binding.Key, binding.TargetRef)
 			}
-			focusForBinding = binding.TargetRef
+			// 显式 focus binding 每个 focus kind 至多一条。
+			if previous, exists := explicitFocus[binding.TargetRef]; exists {
+				return nil, failf(ReasonDuplicateBindingTarget,
+					"focus %s 同时被 %s 与 %s 显式绑定，至多一条",
+					binding.TargetRef, previous, binding.Key)
+			}
+			explicitFocus[binding.TargetRef] = binding.Key
 		case KindEvidence:
 			if _, ok := ctx.focusKeys[binding.TargetRef]; !ok {
 				return nil, failf(ReasonDanglingRef,
@@ -198,37 +205,15 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 					"provider_bindings[%s] template %s 没有声明 evidence class",
 					binding.Key, template.Ref)
 			}
-			// 同一 focus 的不同 class 可以共存（logs + traces + access），
-			// 只有相同 (target, class/source) 才算重复。
+			// 同一 focus 的不同 class 可以共存（logs + traces + access）；同一 class 来自
+			// 不同 source 也可以共存（比如 traces 既有 OpenObserve 也有别的后端）。
+			// 只有 (target, class, source) 三者全同才是重复。
 			slot := evidenceSlot(binding.TargetRef, template)
 			if previous, exists := evidenceProviders[slot]; exists {
 				return nil, failf(ReasonDuplicateBindingTarget,
-					"focus %s 的 %s 证据同时被 %s 与 %s 绑定",
-					binding.TargetRef, template.EvidenceClass, previous, binding.Key)
-			}
-			evidenceProviders[slot] = binding.Key
-			focusForBinding = binding.TargetRef
-		}
-
-		// focus 记账：显式 binding 至多一条，且不能与任何 side output 提供者共存。
-		if binding.Kind == KindFocus {
-			if previous, exists := explicitFocus[focusForBinding]; exists {
-				return nil, failf(ReasonDuplicateBindingTarget,
-					"focus %s 同时被 %s 与 %s 显式绑定，至多一条",
-					focusForBinding, previous, binding.Key)
-			}
-			explicitFocus[focusForBinding] = binding.Key
-		} else if focusForBinding != "" && template.ProvidesSideOutput(SideOutputFocus) {
-			sideFocus[focusForBinding] = binding.Key
-		}
-		// trace EvidenceRef 是 side output 时，同一 focus 不能再显式绑 traces class。
-		if focusForBinding != "" && template.ProvidesSideOutput(SideOutputTraceEvidence) &&
-			binding.Kind != KindEvidence {
-			slot := focusForBinding + "\x1e" + string(EvidenceClassTraces)
-			if previous, exists := evidenceProviders[slot]; exists {
-				return nil, failf(ReasonDuplicateBindingTarget,
-					"focus %s 的 traces 证据同时来自 %s 与 %s",
-					focusForBinding, previous, binding.Key)
+					"focus %s 的 %s 证据在 %s 上同时被 %s 与 %s 绑定",
+					binding.TargetRef, template.EvidenceClass, template.SourceKey,
+					previous, binding.Key)
 			}
 			evidenceProviders[slot] = binding.Key
 		}
@@ -259,21 +244,16 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 		return nil, failf(ReasonBindingNotBound,
 			"journeys %v 没有 provider binding，阶段会永久缺失", missing)
 	}
-	// 显式 focus binding 与已有 side output 冲突：那是第三次查询，结论还重复。
-	for focusKind, explicit := range explicitFocus {
-		if side, exists := sideFocus[focusKind]; exists {
-			return nil, failf(ReasonDuplicateBindingTarget,
-				"focus %s 的判定已由 %s 的 side output 提供，%s 这条显式 binding 是重复查询",
-				focusKind, side, explicit)
-		}
-	}
-
 	sort.SliceStable(resolved, func(i, j int) bool { return resolved[i].Key < resolved[j].Key })
 	return resolved, nil
 }
 
+// evidenceSlot 的重复口径是 (target, class, source) 三元组。
+//
+// 只用 (target, class) 会把"同一类证据来自两个不同后端"误判成重复配置——那其实是合法的
+// 多来源冗余，coordinator 会分别读取并各自降级。
 func evidenceSlot(target string, template Template) string {
-	return target + "\x1e" + string(template.EvidenceClass)
+	return target + "\x1e" + string(template.EvidenceClass) + "\x1e" + string(template.SourceKey)
 }
 
 func missingTargets(declared map[string]SignalBinding, bound map[string]string) []string {

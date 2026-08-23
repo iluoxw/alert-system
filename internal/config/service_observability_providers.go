@@ -20,8 +20,9 @@ import (
 //     alert-system 基础能力，再接遥测。
 //  2. 显式配置但非法（scheme、userinfo、query、fragment、生产用 http、数值不合法）
 //     一律让启动失败。静默兜底成默认值会让"配置写错"看起来像"配置生效了"。
-//  3. 凭据只从服务端 env/file provider 读取，绝不进 YAML 示例明文、日志或 stats。
-//     它们用 provider.Secret 承载，String/JSON/slog 全部输出掩码。
+//  3. 配置里只存**引用**（env 变量名或文件路径），值始终留在被引用的 env 或文件里——
+//     所以真正需要保护的是引用目标，配置本身不含凭据，绝不进 YAML 示例明文、日志或 stats。
+//     解析出的值用 provider.Secret 承载，String/JSON/slog 全部输出掩码。
 
 // ServiceObservabilityProvidersConfig 是两个 provider 的连接与限额配置。
 type ServiceObservabilityProvidersConfig struct {
@@ -71,8 +72,8 @@ func (p ProviderEndpointConfig) GoString() string { return "config." + p.String(
 
 // MarshalJSON 让 JSON 序列化也只输出安全表示。
 //
-// 这一条是必须的：Password/Token 各自有掩码，但 Username 与 Organization 是普通字符串，
-// 一次 json.Marshal(整个配置) 就会把上游账号与 org 名写进去。实测正是这样漏的。
+// 这一条是必须的：Organization 是普通字符串，一次 json.Marshal(整个配置) 就会把 org 名
+// 写进去。实测正是这样漏的（当时 Username 也还是普通字符串，现在它已收敛成 Secret）。
 func (p ProviderEndpointConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(p.String())
 }

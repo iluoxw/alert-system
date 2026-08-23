@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"alert-system/internal/serviceobs/provider"
+	"syscall"
 )
 
 func validFileProviders() fileServiceObservabilityProvidersConfig {
@@ -178,30 +181,51 @@ func TestBearerTokenComesFromEnvRefAndNeverLeaks(t *testing.T) {
 	assertNoLeak(t, config, secret, "PROM_TOKEN_ENV")
 }
 
-// Basic 是实测的 OpenObserve 凭据形态：username 与 password 必须分离。
+// Basic 是实测的 OpenObserve 凭据形态：username 与 password 必须分离，且两者都只来自引用。
 func TestBasicAuthUsernamePasswordSeparation(t *testing.T) {
+	const username = "sre@example.com"
 	const password = "oo-password-plaintext"
+	t.Setenv("OO_USERNAME_ENV", username)
 	t.Setenv("OO_PASSWORD_ENV", password)
 
 	fc := validFileProviders()
 	fc.OpenObserve.Endpoint = "https://logs.internal"
 	fc.OpenObserve.Organization = "secret-org"
 	fc.OpenObserve.Auth = fileProviderAuthConfig{
-		Mode: "basic", Username: "sre@example.com", PasswordEnv: "OO_PASSWORD_ENV",
+		Mode: "basic", UsernameEnv: "OO_USERNAME_ENV", PasswordEnv: "OO_PASSWORD_ENV",
 	}
 	config, err := normalizeServiceObservabilityProviders(fc, provider.ModeProduction)
 	if err != nil {
 		t.Fatalf("失败: %v", err)
 	}
-	if config.OpenObserve.Auth.Username != "sre@example.com" {
-		t.Fatalf("username=%q", config.OpenObserve.Auth.Username)
+	if config.OpenObserve.Auth.Username.Reveal() != username {
+		t.Fatal("username 应从被引用的环境变量读到")
 	}
 	name, value, ok := config.OpenObserve.Auth.Header()
-	if !ok || name != "Authorization" || !strings.HasPrefix(value, "Basic ") {
-		t.Fatalf("header=(%q,%q,%t)", name, value, ok)
+	if !ok || name != "Authorization" {
+		t.Fatalf("header=(%q,%t)", name, ok)
 	}
-	// username 与 organization 都不该出现在任何渲染里。
-	assertNoLeak(t, config, password, "sre@example.com", "secret-org", value)
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+	if value != want {
+		t.Fatal("Basic 凭据应是 base64(user:password)")
+	}
+	// username、organization 与拼好的 header 都不该出现在任何渲染里。
+	assertNoLeak(t, config, password, username, "secret-org", value)
+}
+
+// username 必须是 provider.Secret 而不是 string。
+//
+// 退回 string 时"不泄露"就完全依赖外层 String/GoString/MarshalJSON/LogValue 四条路径都记得
+// 掩码它——新增一条输出路径、或者有人直接 slog.String("user", auth.Username)，掩码就没了。
+// 类型自带掩码后想要明文必须显式 Reveal()，调用点因此少且显眼。
+func TestAuthUsernameIsSecretTyped(t *testing.T) {
+	field, ok := reflect.TypeOf(ProviderAuthConfig{}).FieldByName("Username")
+	if !ok {
+		t.Fatal("ProviderAuthConfig 缺少 Username 字段")
+	}
+	if field.Type != reflect.TypeOf(provider.Secret{}) {
+		t.Fatalf("Username 类型是 %s，必须是 provider.Secret", field.Type)
+	}
 }
 
 // 文件引用：必须是常规文件、有界、trim，且错误不回显路径。
@@ -224,7 +248,7 @@ func TestFileSecretRefBounds(t *testing.T) {
 	}
 
 	oversize := filepath.Join(dir, "oversize")
-	if err := os.WriteFile(oversize, make([]byte, maxSecretFileBytes+1), 0o600); err != nil {
+	if err := os.WriteFile(oversize, bytes.Repeat([]byte("a"), maxSecretFileBytes+1), 0o600); err != nil {
 		t.Fatalf("写文件失败: %v", err)
 	}
 	empty := filepath.Join(dir, "empty")
@@ -253,26 +277,140 @@ func TestFileSecretRefBounds(t *testing.T) {
 	}
 }
 
+// 字节上界必须是严格的：恰好等于上界被接受，多一个字节被拒绝。
+//
+// 这一条单独立测是因为它区分了两种实现：靠 Stat().Size() 预判会在 /proc 这类报 0 的文件上
+// 失效，只有按 fd 读 max+1 字节才真的有界。
+func TestFileSecretRefSizeBoundaryIsExact(t *testing.T) {
+	dir := t.TempDir()
+	// 内容全是非空白字符：trim 之后长度不变，测到的才是上界本身。
+	atLimit := filepath.Join(dir, "at-limit")
+	if err := os.WriteFile(atLimit, bytes.Repeat([]byte("a"), maxSecretFileBytes), 0o600); err != nil {
+		t.Fatalf("写文件失败: %v", err)
+	}
+
+	fc := validFileProviders()
+	fc.Prometheus.Endpoint = "https://metrics.internal"
+	fc.Prometheus.Auth = fileProviderAuthConfig{Mode: "bearer", TokenFile: atLimit}
+	config, err := normalizeServiceObservabilityProviders(fc, provider.ModeProduction)
+	if err != nil {
+		t.Fatalf("恰好等于上界必须被接受: %v", err)
+	}
+	if got := len(config.Prometheus.Auth.Token.Reveal()); got != maxSecretFileBytes {
+		t.Fatalf("读到 %d 字节，want %d", got, maxSecretFileBytes)
+	}
+
+	overLimit := filepath.Join(dir, "over-limit")
+	if err := os.WriteFile(overLimit, bytes.Repeat([]byte("a"), maxSecretFileBytes+1), 0o600); err != nil {
+		t.Fatalf("写文件失败: %v", err)
+	}
+	fc.Prometheus.Auth = fileProviderAuthConfig{Mode: "bearer", TokenFile: overLimit}
+	if _, err := normalizeServiceObservabilityProviders(fc, provider.ModeProduction); err == nil {
+		t.Fatal("超过上界一个字节就必须被拒绝")
+	}
+}
+
+// 无法安全注入 header 的凭据必须在启动时就被拒绝。
+//
+// 等到构造请求时才发现已经太晚：CR/LF 那时已经是一次可被拆分的出站请求，username 里的冒号
+// 已经把 user:password 的边界挪走了。
+func TestHostileCredentialRejectedAtStartup(t *testing.T) {
+	cases := []struct {
+		name     string
+		username string
+		password string
+		token    string
+		// viaFile 走文件引用而不是 env 引用。NUL 只能这样注入：POSIX 的 environ 以 NUL
+		// 分隔，setenv 会直接拒绝含 NUL 的值——但挂载进来的 secret 文件没有这个限制，
+		// 所以这条路径反而是真实的攻击面。
+		viaFile bool
+	}{
+		{name: "username 带冒号", username: "sre:admin", password: "ok-password"},
+		{name: "username 带 LF", username: "sre\nadmin", password: "ok-password"},
+		{name: "username 带 NUL", username: "sre\x00admin", password: "ok-password", viaFile: true},
+		{name: "password 带 CRLF", username: "sre", password: "pa\r\nss"},
+		{name: "token 带 LF", token: "to\nken"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := validFileProviders()
+			fc.OpenObserve.Endpoint = "https://logs.internal"
+			switch {
+			case tc.token != "":
+				t.Setenv("HOSTILE_TOKEN_ENV", tc.token)
+				fc.OpenObserve.Auth = fileProviderAuthConfig{
+					Mode: "bearer", TokenEnv: "HOSTILE_TOKEN_ENV"}
+			case tc.viaFile:
+				path := filepath.Join(t.TempDir(), "username")
+				if err := os.WriteFile(path, []byte(tc.username), 0o600); err != nil {
+					t.Fatalf("写文件失败: %v", err)
+				}
+				t.Setenv("HOSTILE_PASSWORD_ENV", tc.password)
+				fc.OpenObserve.Auth = fileProviderAuthConfig{
+					Mode:         "basic",
+					UsernameFile: path,
+					PasswordEnv:  "HOSTILE_PASSWORD_ENV",
+				}
+			default:
+				t.Setenv("HOSTILE_USERNAME_ENV", tc.username)
+				t.Setenv("HOSTILE_PASSWORD_ENV", tc.password)
+				fc.OpenObserve.Auth = fileProviderAuthConfig{
+					Mode:        "basic",
+					UsernameEnv: "HOSTILE_USERNAME_ENV",
+					PasswordEnv: "HOSTILE_PASSWORD_ENV",
+				}
+			}
+			_, err := normalizeServiceObservabilityProviders(fc, provider.ModeProduction)
+			if err == nil {
+				t.Fatal("恶意凭据必须让启动失败")
+			}
+			for _, value := range []string{tc.username, tc.password, tc.token} {
+				if value != "" && strings.Contains(err.Error(), value) {
+					t.Fatalf("错误信息回显了凭据值: %q", err.Error())
+				}
+			}
+			if !strings.Contains(err.Error(), "openobserve") {
+				t.Fatalf("错误信息应指出是哪一项配置: %v", err)
+			}
+		})
+	}
+}
+
 // 认证模式的必填与冲突组合必须全部 fail closed。
 func TestAuthModeCombinations(t *testing.T) {
 	t.Setenv("SOME_TOKEN", "value")
 	t.Setenv("SOME_PASSWORD", "value")
+	t.Setenv("SOME_USERNAME", "value")
 
 	cases := []struct {
 		name string
 		auth fileProviderAuthConfig
 	}{
 		{"未知模式", fileProviderAuthConfig{Mode: "mtls"}},
-		{"basic 缺 username", fileProviderAuthConfig{Mode: "basic", PasswordEnv: "SOME_PASSWORD"}},
-		{"basic 缺 password 引用", fileProviderAuthConfig{Mode: "basic", Username: "u"}},
+		{"basic 缺 username 引用", fileProviderAuthConfig{
+			Mode: "basic", PasswordEnv: "SOME_PASSWORD"}},
+		{"basic 缺 password 引用", fileProviderAuthConfig{
+			Mode: "basic", UsernameEnv: "SOME_USERNAME"}},
 		{"basic 带 token 引用", fileProviderAuthConfig{
-			Mode: "basic", Username: "u", PasswordEnv: "SOME_PASSWORD", TokenEnv: "SOME_TOKEN"}},
+			Mode: "basic", UsernameEnv: "SOME_USERNAME", PasswordEnv: "SOME_PASSWORD",
+			TokenEnv: "SOME_TOKEN"}},
+		{"username 的 env 与 file 引用互斥", fileProviderAuthConfig{
+			Mode: "basic", UsernameEnv: "SOME_USERNAME", UsernameFile: "/tmp/whatever",
+			PasswordEnv: "SOME_PASSWORD"}},
+		{"引用的 username env 为空", fileProviderAuthConfig{
+			Mode: "basic", UsernameEnv: "DEFINITELY_UNSET_ENV", PasswordEnv: "SOME_PASSWORD"}},
 		{"bearer 缺 token 引用", fileProviderAuthConfig{Mode: "bearer"}},
-		{"bearer 带 username", fileProviderAuthConfig{
-			Mode: "bearer", Username: "u", TokenEnv: "SOME_TOKEN"}},
+		{"bearer 带 username 引用", fileProviderAuthConfig{
+			Mode: "bearer", UsernameEnv: "SOME_USERNAME", TokenEnv: "SOME_TOKEN"}},
+		{"bearer 带 username file 引用", fileProviderAuthConfig{
+			Mode: "bearer", UsernameFile: "/tmp/whatever", TokenEnv: "SOME_TOKEN"}},
 		{"bearer 带 password 引用", fileProviderAuthConfig{
 			Mode: "bearer", TokenEnv: "SOME_TOKEN", PasswordEnv: "SOME_PASSWORD"}},
 		{"none 却带凭据", fileProviderAuthConfig{Mode: "none", TokenEnv: "SOME_TOKEN"}},
+		{"none 带 username 引用", fileProviderAuthConfig{
+			Mode: "none", UsernameEnv: "SOME_USERNAME"}},
+		{"none 带 password 引用", fileProviderAuthConfig{
+			Mode: "none", PasswordEnv: "SOME_PASSWORD"}},
 		{"env 与 file 引用互斥", fileProviderAuthConfig{
 			Mode: "bearer", TokenEnv: "SOME_TOKEN", TokenFile: "/tmp/whatever"}},
 		{"引用的 env 为空", fileProviderAuthConfig{Mode: "bearer", TokenEnv: "DEFINITELY_UNSET_ENV"}},
@@ -320,25 +458,41 @@ func assertNoLeak(t *testing.T, config ServiceObservabilityProvidersConfig, secr
 	t.Helper()
 	renderings := []string{
 		config.String(),
+		config.GoString(),
 		config.Prometheus.String(),
+		config.Prometheus.GoString(),
 		config.OpenObserve.String(),
+		config.OpenObserve.GoString(),
+		config.Prometheus.Auth.String(),
+		config.Prometheus.Auth.GoString(),
+		config.OpenObserve.Auth.String(),
+		config.OpenObserve.Auth.GoString(),
 		fmt.Sprintf("%v", config),
 		fmt.Sprintf("%+v", config),
 		fmt.Sprintf("%#v", config),
+		fmt.Sprintf("%v", config.OpenObserve.Auth),
+		fmt.Sprintf("%+v", config.OpenObserve.Auth),
+		fmt.Sprintf("%#v", config.OpenObserve.Auth),
 		fmt.Sprintf("%q", config.String()),
 	}
-	encoded, err := json.Marshal(config)
-	if err != nil {
-		t.Fatalf("序列化失败: %v", err)
+	for _, value := range []any{config, config.OpenObserve, config.OpenObserve.Auth} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("序列化失败: %v", err)
+		}
+		renderings = append(renderings, string(encoded))
 	}
-	renderings = append(renderings, string(encoded))
 
+	// 两种 handler 都要试：TextHandler 会走 TextMarshaler，JSONHandler 不一定，
+	// 只测一种曾让"掩码其实靠 MarshalText 侥幸成立"这个 bug 溜过去。
 	for _, newHandler := range []func(*strings.Builder) slog.Handler{
 		func(b *strings.Builder) slog.Handler { return slog.NewTextHandler(b, nil) },
 		func(b *strings.Builder) slog.Handler { return slog.NewJSONHandler(b, nil) },
 	} {
 		var builder strings.Builder
-		slog.New(newHandler(&builder)).Info("providers", "config", config)
+		slog.New(newHandler(&builder)).Info("providers",
+			"config", config, "auth", config.OpenObserve.Auth,
+			"username", config.OpenObserve.Auth.Username)
 		renderings = append(renderings, builder.String())
 	}
 
@@ -358,11 +512,13 @@ func assertNoLeak(t *testing.T, config ServiceObservabilityProvidersConfig, secr
 //
 // 检查的是字段名本身：`TokenEnv`/`TokenFile`/`PasswordEnv`/`PasswordFile` 是引用（env 名或
 // 文件路径），是设计的一部分；而一个恰好叫 Token/Password/Secret 的字段会把明文引到 YAML 里，
-// 示例文件一旦被复制成部署配置就会带着凭据进版本库。
+// 示例文件一旦被复制成部署配置就会带着凭据进版本库。Username 同在禁列：上游账号名也不该有
+// 直填形式。
 func TestYAMLHasNoCredentialValueField(t *testing.T) {
 	authType := reflect.TypeOf(fileProviderAuthConfig{})
 	forbidden := map[string]struct{}{
 		"Token": {}, "Password": {}, "Secret": {}, "Authorization": {}, "APIKey": {},
+		"Username": {},
 	}
 	for i := 0; i < authType.NumField(); i++ {
 		name := authType.Field(i).Name
@@ -371,7 +527,9 @@ func TestYAMLHasNoCredentialValueField(t *testing.T) {
 		}
 	}
 	// 引用字段必须以 Env 或 File 结尾，形状上就无法承载明文。
-	for _, name := range []string{"PasswordEnv", "PasswordFile", "TokenEnv", "TokenFile"} {
+	for _, name := range []string{
+		"UsernameEnv", "UsernameFile", "PasswordEnv", "PasswordFile", "TokenEnv", "TokenFile",
+	} {
 		field, ok := authType.FieldByName(name)
 		if !ok {
 			t.Fatalf("缺少引用字段 %s", name)
@@ -417,6 +575,69 @@ func TestProviderEnvOverrides(t *testing.T) {
 	}
 }
 
+// auth 的环境变量只覆盖**引用**：只有 `..._ENV` / `..._FILE` 两种后缀。
+//
+// 反向断言同样重要：一个直填的 `..._AUTH_USERNAME`、或任何 `OBS_*` 简写别名，都必须无效。
+// 它们会把值本身搬进进程环境，而进程环境是最容易被误导出的地方；一旦有人"顺手加个兼容"，
+// 这里就会红。
+func TestProviderAuthRefEnvOverrides(t *testing.T) {
+	const username = "env-ref-user"
+	const password = "env-ref-password"
+	t.Setenv("OO_USERNAME_SOURCE", username)
+	t.Setenv("OO_PASSWORD_SOURCE", password)
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_MODE", "basic")
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_USERNAME_ENV", "OO_USERNAME_SOURCE")
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_PASSWORD_ENV", "OO_PASSWORD_SOURCE")
+	// 直填与简写别名都不该被认；配上它们不会改变任何结果。
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_USERNAME", "direct-value-user")
+	t.Setenv("OBS_AUTH", "direct-value-token")
+	t.Setenv("OBS_ENDPOINT", "https://sneaky.internal")
+
+	fc := fileConfig{ServiceObservability: fileServiceObservabilityConfig{Providers: validFileProviders()}}
+	fc.ServiceObservability.Providers.OpenObserve.Endpoint = "https://logs.internal"
+	applyServiceObservabilityProviderEnvOverrides(&fc)
+	if fc.ServiceObservability.Providers.OpenObserve.Auth.UsernameEnv != "OO_USERNAME_SOURCE" {
+		t.Fatal("USERNAME_ENV 应覆盖 username 引用")
+	}
+	config, err := normalizeServiceObservabilityProviders(
+		fc.ServiceObservability.Providers, provider.ModeProduction)
+	if err != nil {
+		t.Fatalf("失败: %v", err)
+	}
+	if config.OpenObserve.Auth.Username.Reveal() != username {
+		t.Fatal("username 应来自 USERNAME_ENV 指向的环境变量，而不是任何直填值")
+	}
+	if config.OpenObserve.Endpoint.Host() != "logs.internal" {
+		t.Fatalf("Host=%q，OBS_ENDPOINT 这类别名不该生效", config.OpenObserve.Endpoint.Host())
+	}
+	assertNoLeak(t, config, username, password, "direct-value-user", "direct-value-token")
+}
+
+func TestUsernameFileEnvOverride(t *testing.T) {
+	const username = "file-ref-user"
+	path := filepath.Join(t.TempDir(), "username")
+	if err := os.WriteFile(path, []byte(username+"\n"), 0o600); err != nil {
+		t.Fatalf("写文件失败: %v", err)
+	}
+	t.Setenv("OO_PASSWORD_SOURCE", "file-ref-password")
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_MODE", "basic")
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_USERNAME_FILE", path)
+	t.Setenv("SERVICE_OBSERVABILITY_OPENOBSERVE_AUTH_PASSWORD_ENV", "OO_PASSWORD_SOURCE")
+
+	fc := fileConfig{ServiceObservability: fileServiceObservabilityConfig{Providers: validFileProviders()}}
+	fc.ServiceObservability.Providers.OpenObserve.Endpoint = "https://logs.internal"
+	applyServiceObservabilityProviderEnvOverrides(&fc)
+	config, err := normalizeServiceObservabilityProviders(
+		fc.ServiceObservability.Providers, provider.ModeProduction)
+	if err != nil {
+		t.Fatalf("失败: %v", err)
+	}
+	if config.OpenObserve.Auth.Username.Reveal() != username {
+		t.Fatal("username 应从被引用的文件读到并 trim")
+	}
+	assertNoLeak(t, config, username, "file-ref-password")
+}
+
 func TestNonIntegerProviderEnvFailsStartup(t *testing.T) {
 	t.Setenv("SERVICE_OBSERVABILITY_PROMETHEUS_MAX_ROWS", "many")
 	fc := fileConfig{ServiceObservability: fileServiceObservabilityConfig{Providers: validFileProviders()}}
@@ -447,4 +668,36 @@ func TestDefaultsAreSelfConsistent(t *testing.T) {
 		t.Fatalf("默认 timeout=%s 不在允许范围内", config.Prometheus.Timeout)
 	}
 	_ = time.Second
+}
+
+// FIFO 路径必须立刻被拒绝，而不是把启动挂死。
+//
+// 只读打开一个没有写入端的 FIFO 会永久阻塞，"不是常规文件"这条校验于是永远执行不到，
+// 进程卡在启动里且没有任何错误可看——比拒绝更难排查。这条测试用 2 秒超时把它钉住。
+func TestFIFOSecretFileIsRejectedWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fifo-secret")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("当前环境无法创建 FIFO: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := readSecretFile(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO 必须被拒绝")
+		}
+		if !strings.Contains(err.Error(), "不是常规文件") {
+			t.Fatalf("应因非常规文件被拒，实际 %v", err)
+		}
+		if strings.Contains(err.Error(), path) || strings.Contains(err.Error(), dir) {
+			t.Fatalf("错误泄露了路径: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readSecretFile 在 FIFO 上阻塞，启动会被挂死")
+	}
 }

@@ -121,7 +121,15 @@ journey/evidence/topology 就重复查询。Package 不能自行增加 side outp
 
 运行时以 manifest 为激活/回滚单位：Profile Registry 加载 Profile，受信 adapter 只从配对的
 CompiledIntegration 读取运行时 binding；缺任一半、摘要错配或单独激活均 quarantine 整对，不能
-静默混用旧版本。SIP 不参与请求路径、不绕过现有 Registry，也不让 v1 字段产生 entity-key
+静默混用旧版本。摘要链只能证明字节完整，证明不了内容没被换掉——能改产物的人同样能重算摘要——
+所以激活校验必须**严格解析两份产物**（拒绝未知字段与尾随 JSON），并在 manifest、
+CompiledIntegration 与**实际 Profile 文档**三者之间逐项核对重复记录的激活身份字段：
+compiler version、profile key/version/digest、package key/version/status、environment、
+service id、service entity id、root entity ids、integration digest。这份三处冗余唯一的用处就是
+让"只改了其中一处"暴露出来：把 manifest 的 `package_status` 从 draft 改成 published 能绕过编译期
+的 publish 授权门，但改不动已签摘要的 Profile 文档里的 status，交叉核对因此 fail closed。
+回滚引用（previous profile digest 与 previous integration digest）必须同时为空或同时存在，
+只回退一半就等于混版。SIP 不参与请求路径、不绕过现有 Registry，也不让 v1 字段产生 entity-key
 fallback。Phase 3 先提供离线/启动前编译与验证能力，不修改 Kubernetes 发布配置。
 
 ### 5. 遥测 adapter 由平台受信实现，SIP 只配置能力

@@ -232,8 +232,9 @@ func TestMixedVersionPairIsRejected(t *testing.T) {
 		Integration: first.IntegrationJSON,
 	}
 	mixed.Manifest.IntegrationDigest = first.Manifest.IntegrationDigest
-	if err := ValidateBundle(mixed); !errors.Is(err, ErrBundlePairBroken) {
-		t.Fatalf("err=%v，want ErrBundlePairBroken", err)
+	// 身份交叉核对比单纯的摘要锚点更早发现问题：两半的 package_version 就不一致。
+	if err := ValidateBundle(mixed); !errors.Is(err, ErrBundleIdentityMismatch) {
+		t.Fatalf("err=%v，want ErrBundleIdentityMismatch", err)
 	}
 }
 
@@ -509,11 +510,16 @@ func TestDuplicateExplicitFocusBindingIsRejected(t *testing.T) {
 	}
 }
 
-// 显式 focus binding 与 side output 提供者共存必须被拒绝：那是同一判定的第三次查询。
+// 显式 focus binding 与 journey 的 focus side output 共存是**合法**的。
 //
-// E2B 的 journey binding 已经用一次 trace 读取顺带给出 focus，因此再加一条显式 focus binding
-// 就是重复。这条同时守住"E2B 不需要显式 focus binding"这个设计意图。
-func TestExplicitFocusConflictsWithJourneySideOutput(t *testing.T) {
+// 这条曾经被反向断言过——当时的规则是"side output 已经给出这个 focus，再加显式 binding 就是
+// 重复查询"。那条规则过宽：多个独立来源各自报告同一个 focus 是正常输入，coordinator 本来就
+// 按 matched > unknown > empty 合并它们。把它判成配置错误会强迫用户在"traces 顺带的判定"和
+// "专门的 focus 查询"之间二选一，而后者往往覆盖面更广（比如 journey 只看某个 span，显式
+// binding 扫全量记录）。
+//
+// primary 多重性只约束 signal 与 journey；focus 只约束"显式 binding 至多一条"。
+func TestExplicitFocusCoexistsWithJourneySideOutput(t *testing.T) {
 	raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
 		doc["provider_bindings"] = append(doc["provider_bindings"].([]any), map[string]any{
 			"key":          "focus_sandbox_records",
@@ -526,6 +532,53 @@ func TestExplicitFocusConflictsWithJourneySideOutput(t *testing.T) {
 				"select_fields": []any{"sandbox_id"}, "row_limit": float64(100),
 			},
 		})
+	})
+	compiled, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: raw})
+	if err != nil {
+		t.Fatalf("显式 focus 与 journey side output 应可共存: %v", err)
+	}
+
+	// 两个 focus 提供者都必须真的进入运行时产物，否则"合并"无从发生。
+	var integration CompiledIntegration
+	if err := json.Unmarshal(compiled.IntegrationJSON, &integration); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	var explicit, journey bool
+	for _, binding := range integration.Bindings {
+		switch binding.Key {
+		case "focus_sandbox_records":
+			explicit = true
+		case "journey_sandbox_create":
+			journey = true
+		}
+	}
+	if !explicit || !journey {
+		t.Fatalf("两个 focus 提供者都应保留，explicit=%t journey=%t", explicit, journey)
+	}
+}
+
+// 但同一个 focus kind 上两条**显式** focus binding 仍必须拒绝：至多一条。
+func TestSecondExplicitFocusBindingIsStillRejected(t *testing.T) {
+	raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
+		bindings := doc["provider_bindings"].([]any)
+		for _, key := range []string{"focus_a", "focus_b"} {
+			bindings = append(bindings, map[string]any{
+				"key":          key,
+				"kind":         "focus",
+				"target_ref":   "sandbox_id",
+				"tool_key":     "evidence.search_traces.v1",
+				"template_ref": "focus_records.v1",
+				"params": map[string]any{
+					"stream": "default", "focus_field": "sandbox_id",
+					// 参数刻意不同，证明拒绝的理由是"显式 binding 至多一条"，
+					// 而不是"参数重复"。
+					"select_fields": []any{"sandbox_id"},
+					"row_limit":     float64(100 + len(key)),
+				},
+			})
+		}
+		doc["provider_bindings"] = bindings
 	})
 	_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: raw})
 	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {

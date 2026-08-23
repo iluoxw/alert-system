@@ -96,22 +96,29 @@ E2B package 刻意**不声明** USE Saturation 与 USE Errors：placement admiss
 typed params；`kind` 仅允许：
 
 - `signal`：target 指向 `signal_bindings[].key`，每个 signal 恰好一个 provider binding；
-- `focus`：target 指向 `focus_kinds[].key`，同一 focus kind 至多一个；
+- `focus`：target 指向 `focus_kinds[].key`，同一 focus kind 至多一个**显式** binding；
 - `journey`：target 指向 `journeys[].key`，每个 journey 恰好一个；
 - `evidence`：target 指向用于参数化查询的 `focus_kinds[].key`，logs/traces/access class 由受信
-  template registry 推导；同一 focus 可以各有一条 logs、traces、access binding，只有相同
-  `(target_ref, derived evidence class/source key)` 的重复项才拒绝。
+  template registry 推导；同一 focus 可以各有一条 logs、traces、access binding，同一 class 来自
+  不同 source 也可以共存，只有 `(target_ref, derived evidence class, source_key)` 三者全同的
+  重复项才拒绝。
 
 Observed topology hints 是 trace template 的声明输出，由 `topology_policy` 约束，不另设会重复同一
 trace 查询的 `topology` binding。请求 purpose 不属于 SIP；它只能由服务端路由选择。registry
 还声明 source capability、required permission、允许的 kind、参数槽位、主输出与固定 side outputs。
 
 多个来源各自报告 focus 结论是**正常**的：coordinator 按 `matched > unknown > empty` 合并它们，
-因此 logs 与 traces 都带 focus side output 不冲突。真正被拒绝的是**显式** `kind=focus` binding
-与任何 side output 提供者共存——那是同一判定的第三次查询。同理，如果 journey 已经用一次 trace
-读取顺带产出 trace EvidenceRef，再显式绑一条同 focus 的 traces evidence 也会被拒绝。
+因此 logs 与 traces 都带 focus side output 不冲突。**side output 不计入 primary 多重性**：显式
+`kind=focus` binding 与 journey 的 focus side output 可以共存，journey 顺带产出的 trace EvidenceRef
+也不妨碍另一条参数不同的 traces evidence binding——后者往往覆盖面更广（journey 只看它自己的
+stage span，显式 binding 可以换时间窗或扫全量），把它判成配置错误会逼用户放弃更完整的证据面。
+多重性约束因此只有三条：`signal` 与 `journey` 每个 target 恰好一条 primary binding；`focus` 每个
+target 至多一条**显式** binding；`evidence` 仅拒绝 `(target_ref, class, source_key)` 三者全同的重复。
+反之，两条 binding 的 `tool_key`/`template_ref`/`params` 逐字节相同本身不是错误——一次读取投影到
+多个展示位是有意的（E2B 用同一条 HugePages 利用率查询同时喂 golden saturation 与 USE saturation），
+执行层去重是 adapter 的事。
 Binding kind 只标识主要 target；focus、trace EvidenceRef、topology hints 等 side outputs 必须由
-adapter 在同一次有界读取中投影，package 不能自行增加，也不能为同一 trace 重复发起查询。compiler 必须
+adapter 在同一次有界读取中投影，package 不能自行增加。compiler 必须
 验证 `tool_key` 已发布且属于 package `tool_refs`、template capability 等于 ToolDescriptor 的
 `source_adapter`、template permission 被 descriptor 覆盖；`signal_bindings[].output_field` 必须是
 对应模板声明的输出字段。

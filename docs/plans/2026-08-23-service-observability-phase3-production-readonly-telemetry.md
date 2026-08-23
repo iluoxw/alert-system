@@ -145,10 +145,16 @@ CompiledIntegration 继续禁止 raw query、endpoint、header、secret，不得
 `provider_bindings[].kind` 仅允许：
 
 - `signal`：target_ref 命中 signal binding，每个 signal 恰好一个；
-- `focus`：target_ref 命中 focus kind，同一 focus kind 至多一个；
+- `focus`：target_ref 命中 focus kind，同一 focus kind 至多一个**显式** binding；
 - `journey`：target_ref 命中 journey，每个 journey 恰好一个；
 - `evidence`：target_ref 命中查询所依赖的 focus kind，logs/traces/access class 由 template 推导；
-  同一 focus 可各有一条不同 class，只有相同 `(target_ref, derived class/source key)` 才算重复。
+  同一 focus 可各有一条不同 class，同一 class 来自不同 source 也可共存，只有
+  `(target_ref, derived class, source_key)` 三者全同才算重复。
+
+side output 不计入 primary 多重性：多个独立来源报告同一 focus 是合法输入，由 coordinator 按
+`matched > unknown > empty` 合并；journey 的 trace side output 也不阻止另一条参数不同的 traces
+evidence binding。两条 binding 的 tool/template/params 逐字节相同同样不是错误——一次读取投影到
+多个展示位是有意的，执行层去重属于 adapter。
 
 Observed topology hints 是 trace template 的声明输出，由 topology policy 约束，不新增会重复 trace
 查询的 `topology` kind。请求 purpose 继续由服务端路由选择，绝不成为 package 编译事实；source

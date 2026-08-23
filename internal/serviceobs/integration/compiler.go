@@ -145,6 +145,15 @@ func (c *Compiler) Compile(ctx context.Context, req CompileRequest) (CompiledPac
 		return CompiledPackage{}, ErrProfileResolverRequired
 	}
 
+	// 回滚引用必须成对：只记住上一份 Profile 的摘要，回滚时就会把新的 CompiledIntegration
+	// 与旧的 Profile 拼在一起——那正是配对校验要防的混版形状。
+	if err := assertPreviousDigestsPaired(CompileManifest{
+		PreviousProfileDigest:     req.PreviousProfileDigest,
+		PreviousIntegrationDigest: req.PreviousIntegrationDigest,
+	}); err != nil {
+		return CompiledPackage{}, err
+	}
+
 	pkg, err := c.Validator.Decode(req.Raw)
 	if err != nil {
 		return CompiledPackage{}, err

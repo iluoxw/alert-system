@@ -345,16 +345,49 @@ func TestCompileStructurallyDifferentSecondPackage(t *testing.T) {
 // 回滚引用：上一版本摘要原样进清单，compiler 不改 Profile ID 语义。
 func TestCompileCarriesPreviousDigestForRollback(t *testing.T) {
 	compiler := newCompiler(t, e2bResolver())
-	previous := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	previousProfile := "sha256:" + strings.Repeat("0", 64)
+	previousIntegration := "sha256:" + strings.Repeat("1", 64)
 	compiled, err := compiler.Compile(context.Background(), CompileRequest{
-		Raw:                   readPackage(t, "e2b.package.json"),
-		PreviousProfileDigest: previous,
+		Raw:                       readPackage(t, "e2b.package.json"),
+		PreviousProfileDigest:     previousProfile,
+		PreviousIntegrationDigest: previousIntegration,
 	})
 	if err != nil {
 		t.Fatalf("编译失败: %v", err)
 	}
-	if compiled.Manifest.PreviousProfileDigest != previous {
-		t.Fatalf("PreviousProfileDigest=%q，应原样保留", compiled.Manifest.PreviousProfileDigest)
+	if compiled.Manifest.PreviousProfileDigest != previousProfile ||
+		compiled.Manifest.PreviousIntegrationDigest != previousIntegration {
+		t.Fatalf("回滚引用应原样成对保留: %+v", compiled.Manifest)
+	}
+}
+
+// 回滚引用只给一半必须在编译期就失败。
+//
+// 只记住上一份 Profile 的摘要，回滚时就会把新的 CompiledIntegration 与旧的 Profile 拼在
+// 一起——那正是混版形状，而且两份产物各自的摘要都还对得上，事后极难发现。
+func TestCompileRejectsHalfPairedPreviousDigests(t *testing.T) {
+	raw := readPackage(t, "e2b.package.json")
+	cases := map[string]CompileRequest{
+		"只给 Profile 摘要": {
+			Raw: raw, PreviousProfileDigest: "sha256:" + strings.Repeat("0", 64),
+		},
+		"只给 Integration 摘要": {
+			Raw: raw, PreviousIntegrationDigest: "sha256:" + strings.Repeat("1", 64),
+		},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), req)
+			if !errors.Is(err, ErrBundlePreviousDigestUnpaired) {
+				t.Fatalf("err=%v，want ErrBundlePreviousDigestUnpaired", err)
+			}
+		})
+	}
+
+	// 反向控制：两个都为空是首个版本的正常形态。
+	if _, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: raw}); err != nil {
+		t.Fatalf("首个版本（两个引用都为空）应正常编译: %v", err)
 	}
 }
 
@@ -789,15 +822,95 @@ func TestTemplateAndParamFailures(t *testing.T) {
 	}
 }
 
-// 同一 focus 的 logs 与 traces 证据必须能共存：只有相同 (target, class) 才算重复。
-// 这条曾经被简单的 kind+target 去重错误地阻断过。
-func TestDistinctEvidenceClassesCoexist(t *testing.T) {
-	raw := readPackage(t, "e2b.package.json")
-	// E2B 的 journey binding 已经用 trace 读取顺带提供 traces 证据，因此再显式加一条
-	// traces evidence 必须被判成重复；换成 access class 则应通过（若有可用 tool）。
-	mutated := mutate(t, raw, func(doc map[string]any) {
+// ratio 的三组 label 槽位必须真的参与"template 是否接受这个参数"的判断。
+//
+// presentSlots 漏掉它们时后果是静默的：把 common_labels 塞给一个不接受它的模板不会报错，
+// 参数被丢掉，查询照样发出去——用户以为加了过滤条件，实际查的是全量。这类"配了但没生效"
+// 比直接失败危险得多。
+func TestRatioLabelSlotsAreRejectedByNonRatioTemplates(t *testing.T) {
+	for _, slot := range []string{"common_labels", "numerator_labels", "denominator_labels"} {
+		t.Run(slot, func(t *testing.T) {
+			raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
+				for _, item := range doc["provider_bindings"].([]any) {
+					binding := item.(map[string]any)
+					// counter_rate.v1 只接受 metric / labels / range_seconds。
+					if binding["template_ref"] == "counter_rate.v1" {
+						binding["params"].(map[string]any)[slot] = []any{
+							map[string]any{"name": "job", "value": "node-exporter"},
+						}
+						break
+					}
+				}
+			})
+			_, err := newCompiler(t, e2bResolver()).Compile(
+				context.Background(), CompileRequest{Raw: raw})
+			if code := ReasonCodeOf(err); code != ReasonTemplateParamInvalid {
+				t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonTemplateParamInvalid)
+			}
+		})
+	}
+}
+
+// evidence 的重复口径是 (target, class, source) 三元组，一条一条证明。
+//
+// 曾经用过两个更粗的口径，都被证伪：
+//   - kind+target：把同一 focus 的 logs 与 traces 误判成重复；
+//   - target+class：把"同一类证据来自两个不同后端"误判成重复，而那是合法的多来源冗余。
+func TestEvidenceDuplicateKeyIncludesSource(t *testing.T) {
+	tracesA := Template{EvidenceClass: EvidenceClassTraces, SourceKey: SourceKeyOpenObserveTraces}
+	tracesB := Template{EvidenceClass: EvidenceClassTraces, SourceKey: SourceKeyPrometheus}
+	logs := Template{EvidenceClass: EvidenceClassLogs, SourceKey: SourceKeyOpenObserveLogs}
+
+	if evidenceSlot("sandbox_id", tracesA) != evidenceSlot("sandbox_id", tracesA) {
+		t.Fatal("同 target/class/source 必须得到同一个槽位")
+	}
+	// 同 class 不同 source：必须是**不同**槽位，否则合法的多来源冗余会被判成重复。
+	if evidenceSlot("sandbox_id", tracesA) == evidenceSlot("sandbox_id", tracesB) {
+		t.Fatal("同 class 不同 source 必须落到不同槽位")
+	}
+	if evidenceSlot("sandbox_id", tracesA) == evidenceSlot("sandbox_id", logs) {
+		t.Fatal("不同 class 必须落到不同槽位")
+	}
+	if evidenceSlot("sandbox_id", tracesA) == evidenceSlot("other_id", tracesA) {
+		t.Fatal("不同 target 必须落到不同槽位")
+	}
+}
+
+// 同一 (target, class, source) 上两条 evidence binding 必须被拒绝。
+func TestSameSourceEvidenceDuplicateIsRejected(t *testing.T) {
+	raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
 		bindings := doc["provider_bindings"].([]any)
-		doc["provider_bindings"] = append(bindings, map[string]any{
+		for i, key := range []string{"evidence_traces_a", "evidence_traces_b"} {
+			bindings = append(bindings, map[string]any{
+				"key":          key,
+				"kind":         "evidence",
+				"target_ref":   "sandbox_id",
+				"tool_key":     "evidence.search_traces.v1",
+				"template_ref": "trace_by_focus.v1",
+				// 参数刻意不同：拒绝的理由必须是 (target, class, source) 重复，
+				// 而不是"两条 binding 的 params 一样"。
+				"params": map[string]any{
+					"stream": "default", "focus_field": "sandbox_id",
+					"row_limit": float64(100 + i),
+				},
+			})
+		}
+		doc["provider_bindings"] = bindings
+	})
+	_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: raw})
+	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {
+		t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonDuplicateBindingTarget)
+	}
+}
+
+// journey 的 trace side output 与显式 traces evidence 共存是**合法**的。
+//
+// 这条同样是被撤回的过宽规则：journey 顺带带回的 trace 证据与一条参数不同的显式 trace
+// evidence binding 不是同一次查询——journey 只看它自己那些 stage span，显式 binding 可以
+// 换时间窗、换 row_limit、扫全量。把它判成配置错误会逼用户放弃更完整的证据面。
+func TestJourneySideOutputCoexistsWithExplicitTraceEvidence(t *testing.T) {
+	raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
+		doc["provider_bindings"] = append(doc["provider_bindings"].([]any), map[string]any{
 			"key":          "evidence_sandbox_traces",
 			"kind":         "evidence",
 			"target_ref":   "sandbox_id",
@@ -808,13 +921,16 @@ func TestDistinctEvidenceClassesCoexist(t *testing.T) {
 			},
 		})
 	})
-	_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: mutated})
-	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {
-		t.Fatalf("reason=%q err=%v，journey 的 trace side output 已提供 traces 证据，重复绑定应被拒绝", code, err)
+	if _, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: raw}); err != nil {
+		t.Fatalf("journey side output 与显式 trace evidence 应可共存: %v", err)
 	}
+}
 
-	// 反向控制：把 journey binding 去掉之后，显式 traces evidence 应该合法（journey 也随之
-	// 不再声明，因此不会触发 journey 缺绑定）。
+// 同一 focus 的 logs 与 traces 证据必须能共存。
+func TestDistinctEvidenceClassesCoexist(t *testing.T) {
+	raw := readPackage(t, "e2b.package.json")
+	// 去掉 journey binding 与 request_journey 视图，只留 logs + 显式 traces 两条证据。
 	rebuilt := mutate(t, raw, func(doc map[string]any) {
 		template := profileTemplate(doc)
 		template["journeys"] = []any{}
@@ -845,7 +961,8 @@ func TestDistinctEvidenceClassesCoexist(t *testing.T) {
 			},
 		})
 	})
-	if _, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: rebuilt}); err != nil {
+	if _, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: rebuilt}); err != nil {
 		t.Fatalf("logs + traces 两个不同 class 应能共存: %v", err)
 	}
 }

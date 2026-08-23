@@ -1,10 +1,14 @@
 package integration
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+
+	"alert-system/internal/serviceobs/model"
 )
 
 // 本文件是 server-only 运行时产物 CompiledIntegration。
@@ -98,12 +102,36 @@ var (
 	ErrBundlePairBroken = errors.New("integration: 两份产物未配成同一激活单元")
 	// ErrBundleForbiddenContent 表示 CompiledIntegration 里出现了禁止内容。
 	ErrBundleForbiddenContent = errors.New("integration: CompiledIntegration 含禁止内容")
+	// ErrBundleInvalidArtifact 表示某一份产物无法按契约严格解析：未知字段、尾随 JSON、
+	// 或根本不是合法文档。它与"摘要不匹配"是两件事——摘要对得上但结构非法说明生成侧
+	// 与加载侧对同一份字节的理解不同。
+	ErrBundleInvalidArtifact = errors.New("integration: 激活单元内的产物无法严格解析")
+	// ErrBundleIdentityMismatch 表示 manifest、CompiledIntegration 与实际 Profile 三者
+	// 之间的激活身份字段不一致。
+	//
+	// 这些字段在三处重复出现是刻意的冗余：单看任何一处都无法发现"有人只改了 manifest"。
+	// 最典型的攻击面是把 manifest 的 package_status 从 draft 改成 published——它绕过了
+	// compiler 的 AllowPublished 门，但实际 Profile 产物仍然是 draft，交叉核对因此能抓住。
+	ErrBundleIdentityMismatch = errors.New("integration: 激活身份字段不一致")
+	// ErrBundlePreviousDigestUnpaired 表示回滚引用只给了一半。
+	//
+	// 回滚的单位是**一对**产物：只记住上一份 Profile 的摘要，回滚时就会把新的
+	// CompiledIntegration 与旧的 Profile 拼在一起。
+	ErrBundlePreviousDigestUnpaired = errors.New("integration: 回滚引用必须成对出现或同时为空")
 )
 
 // ValidateBundle 是加载/激活前的唯一入口。
 //
 // 它必须在任何一半被使用之前调用：Profile Registry 与 adapter 各自只看自己那一半，
 // 谁都发现不了"两半来自不同版本"，所以配对校验只能在这里做一次。
+//
+// 校验分四层，顺序是刻意的：
+//
+//  1. 两份产物都在场，且字节摘要与 manifest 记录一致（先挡篡改，后面的解析才有意义）；
+//  2. 运行时产物里没有禁止内容（对原始字节的内容策略，不依赖 Go 结构形状）；
+//  3. 两份产物都能按契约**严格**解析——未知字段与尾随 JSON 都拒绝；
+//  4. manifest、CompiledIntegration 与**实际 Profile** 三者的激活身份字段逐项一致；
+//  5. 回滚引用成对出现或同时为空。
 func ValidateBundle(bundle Bundle) error {
 	if len(bundle.Profile) == 0 {
 		return ErrBundleProfileMissing
@@ -111,40 +139,155 @@ func ValidateBundle(bundle Bundle) error {
 	if len(bundle.Integration) == 0 {
 		return ErrBundleIntegrationMissing
 	}
-	if digest(bundle.Profile) != bundle.Manifest.ProfileDigest {
+	profileDigest := digest(bundle.Profile)
+	if profileDigest != bundle.Manifest.ProfileDigest {
 		return ErrBundleProfileDigestMismatch
 	}
 	if digest(bundle.Integration) != bundle.Manifest.IntegrationDigest {
 		return ErrBundleIntegrationDigestMismatch
 	}
 
-	var compiled CompiledIntegration
-	if err := json.Unmarshal(bundle.Integration, &compiled); err != nil {
-		return fmt.Errorf("%w: 无法解析", ErrBundleIntegrationMissing)
-	}
-	if compiled.SchemaVersion != CompiledIntegrationSchemaVersion {
-		return fmt.Errorf("%w: schema_version=%q", ErrBundlePairBroken, compiled.SchemaVersion)
-	}
-	// 交叉锚点：CompiledIntegration 自己记的 ProfileDigest 必须指向同一份 Profile。
-	if compiled.ProfileDigest != bundle.Manifest.ProfileDigest {
-		return ErrBundlePairBroken
-	}
-	if compiled.PackageKey != bundle.Manifest.PackageKey ||
-		compiled.PackageVersion != bundle.Manifest.PackageVersion ||
-		compiled.ProfileVersion != bundle.Manifest.ProfileVersion ||
-		compiled.Environment != bundle.Manifest.Environment {
-		return ErrBundlePairBroken
-	}
-
-	// 纵深防御：即使编译路径将来被改动，禁止内容也不能进入运行时产物。
+	// 禁止键扫描放在严格解码**之前**：它是对原始字节的内容策略，与 Go 结构当前长什么样
+	// 无关。放在后面的话，将来某天有人给 CompiledIntegration 加了一个装 endpoint 的字段，
+	// 严格解码会先放行，这道闸门的语义就被稀释成"只挡未知字段"。
 	var generic any
 	if err := json.Unmarshal(bundle.Integration, &generic); err != nil {
-		return fmt.Errorf("%w: 无法解析", ErrBundleIntegrationMissing)
+		return fmt.Errorf("%w: CompiledIntegration 无法解析为通用结构", ErrBundleInvalidArtifact)
 	}
 	if path, found := scanForbiddenKeys(generic, ""); found {
 		return fmt.Errorf("%w: 禁止的键 %s", ErrBundleForbiddenContent, path)
 	}
+
+	var compiled CompiledIntegration
+	if err := strictDecodeJSON(bundle.Integration, &compiled); err != nil {
+		return fmt.Errorf("%w: CompiledIntegration %s", ErrBundleInvalidArtifact, err)
+	}
+	// 实际 Profile 产物必须被真的解析出来，而不是只算一个摘要就放过去。摘要只能证明
+	// "字节没被改"，证明不了"这份 Profile 描述的是同一个服务"。
+	var profileDoc model.Profile
+	if err := strictDecodeJSON(bundle.Profile, &profileDoc); err != nil {
+		return fmt.Errorf("%w: Profile %s", ErrBundleInvalidArtifact, err)
+	}
+
+	if compiled.SchemaVersion != CompiledIntegrationSchemaVersion {
+		return fmt.Errorf("%w: CompiledIntegration schema_version", ErrBundleIdentityMismatch)
+	}
+	if err := assertActivationIdentity(bundle.Manifest, compiled, profileDoc, profileDigest); err != nil {
+		return err
+	}
+	return assertPreviousDigestsPaired(bundle.Manifest)
+}
+
+// assertActivationIdentity 逐项核对三处重复的激活身份字段。
+//
+// 错误只报**字段名**，不回显值：这些字段里有 service/entity ID 与环境名，属于部署拓扑，
+// 而校验失败会进启动日志与 quarantine 记录。
+func assertActivationIdentity(
+	manifest CompileManifest, compiled CompiledIntegration,
+	profileDoc model.Profile, profileDigest string,
+) error {
+	mismatch := func(field string) error {
+		return fmt.Errorf("%w: %s", ErrBundleIdentityMismatch, field)
+	}
+
+	// manifest <-> CompiledIntegration。
+	if manifest.CompilerVersion != compiled.CompilerVersion {
+		return mismatch("compiler_version")
+	}
+	if manifest.PackageKey != compiled.PackageKey {
+		return mismatch("package_key")
+	}
+	if manifest.PackageVersion != compiled.PackageVersion {
+		return mismatch("package_version")
+	}
+	if manifest.PackageStatus != compiled.PackageStatus {
+		return mismatch("package_status")
+	}
+	if manifest.Environment != compiled.Environment {
+		return mismatch("environment")
+	}
+	if manifest.ServiceID != compiled.ServiceID {
+		return mismatch("service_id")
+	}
+	if manifest.ServiceEntityID != compiled.ServiceEntityID {
+		return mismatch("service_entity_id")
+	}
+	if !equalStrings(manifest.RootEntityIDs, compiled.RootEntityIDs) {
+		return mismatch("root_entity_ids")
+	}
+	if manifest.ProfileKey != compiled.ProfileKey {
+		return mismatch("profile_key")
+	}
+	if manifest.ProfileVersion != compiled.ProfileVersion {
+		return mismatch("profile_version")
+	}
+	// 摘要要与 manifest 记录**和**实际字节三方一致。
+	if manifest.ProfileDigest != compiled.ProfileDigest || compiled.ProfileDigest != profileDigest {
+		return mismatch("profile_digest")
+	}
+
+	// 实际 Profile 产物是最强的锚点：它就是 Registry 会加载的那份文档。
+	if profileDoc.ProfileKey != manifest.ProfileKey {
+		return mismatch("profile.profile_key")
+	}
+	if profileDoc.ProfileVersion != manifest.ProfileVersion {
+		return mismatch("profile.profile_version")
+	}
+	if profileDoc.ServiceRef.ServiceID != manifest.ServiceID {
+		return mismatch("profile.service_ref.service_id")
+	}
+	if !equalStrings(profileDoc.ServiceRef.RootEntityIDs, manifest.RootEntityIDs) {
+		return mismatch("profile.service_ref.root_entity_ids")
+	}
+	// package status 与实际 Profile status 必须满足编译时的同一映射。
+	//
+	// 这一条专门堵"只改 manifest"的提权：把 manifest 的 package_status 改成 published 能
+	// 绕过 compiler 的 AllowPublished 门，但它改不了已经签好摘要的 Profile 产物——那份
+	// 文档里的 status 仍然是 draft，于是在这里失败。
+	if profileStatus(manifest.PackageStatus) != profileDoc.Status {
+		return mismatch("profile.status")
+	}
 	return nil
+}
+
+// assertPreviousDigestsPaired 要求回滚引用同时为空或同时存在。
+func assertPreviousDigestsPaired(manifest CompileManifest) error {
+	hasProfile := manifest.PreviousProfileDigest != ""
+	hasIntegration := manifest.PreviousIntegrationDigest != ""
+	if hasProfile != hasIntegration {
+		return ErrBundlePreviousDigestUnpaired
+	}
+	return nil
+}
+
+// strictDecodeJSON 按契约严格解码：拒绝未知字段，也拒绝合法文档之后的尾随 JSON。
+//
+// 尾随内容必须拒绝的理由与游标解码一致：`{...}{...}` 里第一个对象能解析成功，于是不同
+// 实现可能各自读到不同的一半；摘要还照样对得上，因为字节没被改，只是被"多写了一份"。
+func strictDecodeJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("解码失败")
+	}
+	// 第二次 Decode 必须恰好是 io.EOF：任何剩余 token 都说明文档不止一个 JSON 值。
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("存在尾随内容")
+	}
+	return nil
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildCompiledIntegration 生成 server-only 产物。
