@@ -48,6 +48,7 @@ export const queryReasonCodes = {
  * UTF-16 长度算会让 43 个中文字符在 fixture 下通过、在 live 下 422。
  */
 export const queryLimits = {
+  maxEnvironmentBytes: 64,
   maxQueryBytes: 128,
   maxCursorLength: 512,
   maxPageLimit: 200,
@@ -94,6 +95,7 @@ function reject(reasonCode: string, message: string): never {
 }
 
 export interface DirectoryQueryInput {
+  environment?: string
   tier?: string
   health?: string[]
   dataStatus?: string[]
@@ -105,6 +107,7 @@ export interface DirectoryQueryInput {
 }
 
 export interface OverviewQueryInput {
+  environment?: string
   windowSeconds?: number | string
 }
 
@@ -114,11 +117,31 @@ export interface FocusKindContract {
 }
 
 export interface WorkspaceQueryInput {
+  environment?: string
   focusKind?: string
   focusValue?: string
   from?: string
   to?: string
   timezone?: string
+}
+
+// environmentPattern 与后端 internal/api/service_observability.go 完全一致。
+// 三条路由都校验 environment，因此 fixture 侧缺了它就会出现"fixture 通过、live 422"。
+const environmentPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/**
+ * validateEnvironment 校验 environment 形状并返回 trim 后的值。
+ *
+ * 空值（trim 后为空）表示"未传"：后端据此沿用 registration 环境，fixture 据此返回
+ * 自身环境的 Page View。形状非法一律 422 invalid_filter。
+ */
+export function validateEnvironment(environment: string | undefined): string {
+  const value = scalar(environment)
+  if (value === '') return ''
+  if (byteLength(value) > queryLimits.maxEnvironmentBytes || !environmentPattern.test(value)) {
+    reject(queryReasonCodes.invalidFilter, 'environment 格式非法')
+  }
+  return value
 }
 
 /**
@@ -201,8 +224,9 @@ function assertAllowlist(
   }
 }
 
-/** validateDirectoryQuery 校验目录查询参数。 */
+/** validateDirectoryQuery 校验目录查询参数。顺序与 live handler 一致：environment 最先。 */
 export function validateDirectoryQuery(query: DirectoryQueryInput): void {
+  validateEnvironment(query.environment)
   const sort = scalar(query.sort)
   if (sort !== '' && !isDirectorySortKey(sort)) {
     reject(queryReasonCodes.invalidFilter, `sort 只支持 ${directorySortKeys.join('/')}`)
@@ -243,8 +267,9 @@ export function validateDirectoryQuery(query: DirectoryQueryInput): void {
   }
 }
 
-/** validateOverviewQuery 校验总览查询参数。 */
+/** validateOverviewQuery 校验总览查询参数。顺序与 live handler 一致：environment 先于窗口。 */
 export function validateOverviewQuery(query: OverviewQueryInput): void {
+  validateEnvironment(query.environment)
   const windowSeconds = parseIntegerParameter(
     query.windowSeconds,
     queryReasonCodes.invalidWindow,
@@ -255,12 +280,51 @@ export function validateOverviewQuery(query: OverviewQueryInput): void {
   }
 }
 
-// RFC3339 必须带 Z 或 ±hh:mm 偏移量：Date.parse 会接受 `2026-08-22`（日期）和
-// `2026-08-22T02:04:22`（无时区，按本地时区解释），而后端的 time.Parse(RFC3339) 两者都拒绝。
-const rfc3339Pattern = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/
+// 严格 RFC3339，逐条对齐 Go 的 time.Parse(time.RFC3339, ...)（已在 go1.25 上实测）：
+//
+//   - 分隔符与 UTC 标记必须**大写**：`2026-08-22t02:04:22z` 被 Go 拒绝；
+//   - 日期必须真实存在：`2026-02-30` 与 `2026-02-29`（非闰年）被拒绝，`2024-02-29` 接受；
+//   - 时钟上界 23:59:59；`24:00:00`、`23:60:00`、`23:59:60` 全部拒绝；
+//   - 小数秒可选但必须至少一位数字：`.123` 接受，`.` 拒绝；
+//   - 偏移量必须是 `Z` 或 `±HH:MM`（带冒号）；`+0800` 拒绝。
+//
+// 刻意与 Go 一致的两个"意外接受"：`+25:00` 与 `+08:60` 只做数字形状校验，Go 也接受它们。
+// 因此这里不能用 Date.parse 兜底——Date.parse 会拒绝这两个，同时又会把 `2026-02-30`
+// 规范化成 3 月 2 日而错误通过。
+const rfc3339Pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
+
+function isLeapYear(year: number): boolean {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+}
+
+function daysInMonth(year: number, month: number): number {
+  const lengths = [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return lengths[month - 1]
+}
+
+/**
+ * isStrictRFC3339 判断一个字符串是否是 Go 的 RFC3339 会接受的绝对时间。
+ *
+ * 它是自洽的解析器，不调用 Date.parse：JS 的日期解析既过宽（`2026-02-30` 被规范化成
+ * 3 月 2 日）又过窄（拒绝 `+25:00`），两个方向都会让 fixture 与 live 判定不一致。
+ */
+export function isStrictRFC3339(raw: string): boolean {
+  const match = rfc3339Pattern.exec(raw)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const hour = Number(match[4])
+  const minute = Number(match[5])
+  const second = Number(match[6])
+  if (month < 1 || month > 12) return false
+  if (day < 1 || day > daysInMonth(year, month)) return false
+  if (hour > 23 || minute > 59 || second > 59) return false
+  return true
+}
 
 function assertAbsoluteRFC3339(raw: string): void {
-  if (!rfc3339Pattern.test(raw) || Number.isNaN(Date.parse(raw))) {
+  if (!isStrictRFC3339(raw)) {
     reject(queryReasonCodes.invalidTimeRange, 'from/to 必须是带时区的绝对 RFC3339 时间')
   }
 }
@@ -273,8 +337,12 @@ function assertAbsoluteRFC3339(raw: string): void {
  *
  * 时间窗上界依赖已发布 Profile 的 limits，属服务端职责，fixture 不假装拥有那份配置。
  * timezone 这里只校验形状/长度；"能否真的加载这个时区"属于 R2 的 C4，不在本模块放宽。
+ *
+ * environment 也属于非 focus 字段：显式 QA 场景可以忽略过期 focus，但不能连 environment
+ * 形状一起放过。
  */
 export function validateWorkspaceScope(query: WorkspaceQueryInput): void {
+  validateEnvironment(query.environment)
   const from = scalar(query.from)
   const to = scalar(query.to)
   if ((from === '') !== (to === '')) {
@@ -318,11 +386,17 @@ export function validateWorkspaceFocus(
   }
 }
 
-/** validateWorkspaceQuery 校验完整工作区查询（focus + 非 focus 字段）。 */
+/**
+ * validateWorkspaceQuery 校验完整工作区查询。
+ *
+ * 顺序刻意与 live handler 一致（environment -> focus -> 时间窗 -> timezone）：同一个
+ * URL 上有多个非法参数时，两种模式必须报出同一个 reason code。
+ */
 export function validateWorkspaceQuery(
   focusKinds: FocusKindContract[],
   query: WorkspaceQueryInput,
 ): void {
+  validateEnvironment(query.environment)
   validateWorkspaceFocus(focusKinds, query)
   validateWorkspaceScope(query)
 }

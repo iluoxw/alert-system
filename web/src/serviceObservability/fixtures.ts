@@ -11,6 +11,7 @@ import type {
 import {
   QueryValidationError,
   alignFocusIdentity,
+  validateEnvironment,
   validateDirectoryQuery,
   validateOverviewQuery,
   validateWorkspaceFocus,
@@ -156,17 +157,63 @@ function guardWorkspaceFocus(query: ServiceWorkspaceQuery): void {
   }
 }
 
+function guardEnvironment(environment: string | undefined): string {
+  try {
+    return validateEnvironment(environment)
+  } catch (error) {
+    asApiError(error)
+  }
+}
+
+// maxServiceIDBytes 与后端 parseServiceID 的上界一致：形状都不满足的 ID 一律按"服务不
+// 存在"处理，并且**先于**任何 query 校验——live 就是这么做的。
+const maxServiceIDBytes = 64
+
+function isUsableServiceID(serviceId: string): boolean {
+  const trimmed = serviceId.trim()
+  return trimmed !== '' && new TextEncoder().encode(trimmed).length <= maxServiceIDBytes
+}
+
+// fixture 的契约文件是**一个环境作用域**的 Page View。环境从 Page View 数据派生，
+// 没有任何服务专属 ID 分支。
+function directoryEnvironments(): Set<string> {
+  return new Set(directoryFixture.items.map((item) => item.service.environment))
+}
+
+// emptyDirectoryView 返回一个有界的空目录：没有条目、没有下一页、摘要全零。
+//
+// 请求另一个环境时必须是这个形状，而不是把当前环境的事实端出去——那就是跨环境泄露
+// 生产事实，也会让"这个环境有多少受管服务"变成一个假数字。
+function emptyDirectoryView(view: ServiceDirectoryView): ServiceDirectoryView {
+  return {
+    ...view,
+    summary: { managed: 0, critical: 0, partial: 0, unconfigured: 0 },
+    items: [],
+    next_cursor: null,
+  }
+}
+
 export function getDirectoryFixture(query: ServiceDirectoryQuery = {}): ServiceDirectoryView {
   guardDirectoryQuery(query)
-  return structuredClone(directoryFixture)
+  const environment = guardEnvironment(query.environment)
+  const view = structuredClone(directoryFixture)
+  // 未传 environment 或命中 fixture 自身环境 -> 返回完整 Page View（包含它自己撰写的
+  // summary 分母）；显式请求另一个环境 -> 有界空视图。
+  if (environment === '' || directoryEnvironments().has(environment)) return view
+  return emptyDirectoryView(view)
 }
 
 export function getOverviewFixture(
   serviceId: string,
   query: ServiceOverviewQuery = {},
 ): ServiceOverviewView | null {
+  // 与 live 同序：service ID 形状 -> environment -> window -> 服务存在性。
+  if (!isUsableServiceID(serviceId)) return null
   guardOverviewQuery(query)
+  const environment = guardEnvironment(query.environment)
   if (overviewFixture.service.service_id !== serviceId) return null
+  // 显式环境与该服务登记环境不符统一按"服务不存在"处理，不泄露其它环境是否存在。
+  if (environment !== '' && environment !== overviewFixture.service.environment) return null
   return structuredClone(overviewFixture)
 }
 
@@ -196,10 +243,17 @@ export function resolveWorkspaceScenario(value: string | null): WorkspaceScenari
  *      于是 URL、输入框、Journey 与诊断结论互相一致；
  *   4. focus 非法 -> 抛 422 invalid_focus（与 live 同一 reason code）。
  *
- * 顺序很关键：**先解析 service 与 scenario，再校验 focus**。反过来会让"带着上一次的旧
- * focus 打开 `scenario=partial`"变成 422，于是确定性 QA 状态不可达；而未知 service 也
- * 应该是 404（view=null）而不是被一个非法 focus 抢先判成 422。非 focus 字段（时间窗、
- * 时区形状）两条路径都要校验。
+ * 顺序对齐 live handler，只有一个**刻意的 fixture-only 例外**：
+ *
+ *   - live 的 parseServiceID 只看形状（非空、<=64 字节），形状不合法直接 404，因此这里
+ *     也先判形状；
+ *   - 之后 live 依次校验 environment -> focus -> 时间窗 -> timezone，**再**由 facade 判
+ *     "服务不存在"。所以一个语法合法但不存在的 service 配上非法 focus 在 live 是 422，
+ *     不是 404；正常路径必须照此排序，否则 fixture 会把 422 说成 404；
+ *   - 唯一例外：**已知**服务 + 显式 QA `scenario=` 时，场景视图自带权威 focus，URL 上
+ *     可能还留着上一次的旧 focus。用它把场景判成 422 会让确定性五态 QA 不可达，因此
+ *     这条分支跳过 focus 校验并把 focus 规范化到场景视图。它只对已知服务成立——不存在
+ *     的服务不能靠加一个 scenario 参数绕过 query 校验。
  */
 export function getWorkspaceFixture(
   serviceId: string,
@@ -209,19 +263,26 @@ export function getWorkspaceFixture(
   view: ObservabilityWorkspaceView | null
   scenario: WorkspaceScenarioFixture | null
 } {
-  const base = getBaseWorkspaceFixture(serviceId)
-  if (!base) return { view: null, scenario: null }
+  if (!isUsableServiceID(serviceId)) return { view: null, scenario: null }
 
+  const base = getBaseWorkspaceFixture(serviceId)
   const scenario = resolveWorkspaceScenario(scenarioValue)
-  if (scenario) {
+  if (base && scenario) {
+    // fixture-only 例外：非 focus 字段（environment、时间窗、timezone）仍然校验。
     guardWorkspaceScope(query)
-    // focus 以场景视图为准：调用方（页面）据此把 URL 规范化，旧 focus 不会被保留，
-    // 也不会因为它非法而挡住这个 QA 状态。
     return { view: applyJsonPatch(base, scenario.patch), scenario }
   }
 
-  guardWorkspaceScope(query)
+  // 正常路径与 live 同序：先把 query 判完，再判服务存在性。
   guardWorkspaceFocus(query)
+  guardWorkspaceScope(query)
+  if (!base) return { view: null, scenario: null }
+
+  // 显式环境与该服务登记环境不符统一按"服务不存在"处理。
+  const environment = guardEnvironment(query.environment)
+  if (environment !== '' && environment !== base.scope.environment) {
+    return { view: null, scenario: null }
+  }
 
   const requested = query.focusValue?.trim() ?? ''
   const baseFocusValue = base.focus?.value ?? ''

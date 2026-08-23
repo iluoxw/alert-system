@@ -152,12 +152,9 @@ async function main(): Promise<void> {
     fixtures.getWorkspaceFixture(serviceId, 'partial', { from: base.scope.from }))
   await expectApiError('显式场景仍校验绝对时间', 'invalid_time_range', () =>
     fixtures.getWorkspaceFixture(serviceId, 'partial', { from: '2026-08-22', to: '2026-08-23' }))
-  // 未知 service 是 404，不该被非法 focus 抢先判成 422。
-  equal(
-    '未知服务优先于非法 focus',
-    fixtures.getWorkspaceFixture('svc_unknown', null, staleInvalidFocus).view,
-    null,
-  )
+  // 注意：R1 曾断言"未知 service 优先于非法 focus"，那与 live 相反——live 的 parseFocus
+  // 在 facade 之前跑，所以缺失服务 + 非法 focus 是 422。正确口径在下方"缺失服务与非法
+  // focus 的先后顺序"一节。
 
   // ---- 与 Go HTTP 边界的口径对齐（Codex R1 复审缺口 3）----
 
@@ -192,6 +189,111 @@ async function main(): Promise<void> {
   // timezone 形状上界不放宽（真正的 IANA 加载属于 R2 C4）。
   await expectApiError('超长 timezone', 'invalid_timezone', () =>
     fixtures.getWorkspaceFixture(serviceId, null, { timezone: 'z'.repeat(65) }))
+
+  // ---- RFC3339 与 Go 边界逐例对齐（复审缺口 1）----
+  //
+  // 期望值来自在 go1.25 上实测 time.Parse(time.RFC3339, ...) 的结果，包括两个 Go 也接受
+  // 的"意外"偏移量（+25:00 / +08:60）——用 Date.parse 兜底会在这两例上判反，同时又会把
+  // 2026-02-30 规范化成 3 月 2 日而错误通过。
+  const rfc3339Table: Array<[string, boolean]> = [
+    ['2026-08-22T02:04:22Z', true],
+    ['2026-08-22t02:04:22z', false],
+    ['2026-08-22T02:04:22z', false],
+    ['2026-08-22t02:04:22Z', false],
+    ['2026-02-30T02:04:22Z', false],
+    ['2026-02-29T02:04:22Z', false],
+    ['2024-02-29T02:04:22Z', true],
+    ['2026-13-01T02:04:22Z', false],
+    ['2026-00-10T02:04:22Z', false],
+    ['2026-08-00T02:04:22Z', false],
+    ['2026-08-32T02:04:22Z', false],
+    ['2026-04-31T02:04:22Z', false],
+    ['2026-08-22T24:00:00Z', false],
+    ['2026-08-22T23:60:00Z', false],
+    ['2026-08-22T23:59:60Z', false],
+    ['2026-08-22T23:59:59.123Z', true],
+    ['2026-08-22T23:59:59.Z', false],
+    ['2026-08-22T23:59:59+08:00', true],
+    ['2026-08-22T23:59:59-08:00', true],
+    ['2026-08-22T23:59:59+25:00', true],
+    ['2026-08-22T23:59:59+08:60', true],
+    ['2026-08-22T23:59:59+0800', false],
+    ['2026-08-22T23:59:59', false],
+    ['2026-08-22', false],
+    ['2026-8-22T02:04:22Z', false],
+    ['2026-08-22T02:04:22.000000001Z', true],
+    ['2026-08-22T02:04:22ZZ', false],
+  ]
+  for (const [candidate, accepted] of rfc3339Table) {
+    const to = accepted ? candidate : base.scope.to
+    if (accepted) {
+      check(`RFC3339 接受 ${candidate}`, Boolean(fixtures.getWorkspaceFixture(serviceId, null, {
+        from: candidate, to: candidate,
+      }).view))
+    } else {
+      await expectApiError(`RFC3339 拒绝 ${candidate}`, 'invalid_time_range', () =>
+        fixtures.getWorkspaceFixture(serviceId, null, { from: candidate, to }))
+    }
+  }
+
+  // ---- 缺失服务与非法 focus 的先后顺序必须与 live 一致（复审缺口 2）----
+
+  // live 的 parseFocus 在 facade 之前跑，所以"语法合法但不存在的 service + 非法 focus"
+  // 是 422，不是 404。
+  await expectApiError('缺失服务 + 非法 focus 仍是 422', 'invalid_focus', () =>
+    fixtures.getWorkspaceFixture('svc_missing_fixture', null, {
+      focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+    }))
+  await expectApiError('缺失服务 + 非法时间窗仍是 422', 'invalid_time_range', () =>
+    fixtures.getWorkspaceFixture('svc_missing_fixture', null, { from: base.scope.from }))
+  // 只有 query 合法时才走到"服务不存在"。
+  equal('缺失服务 + 合法 query 是 404', fixtures.getWorkspaceFixture('svc_missing_fixture', null, {
+    focusKind: base.focus.kind, focusValue: baseFocusValue,
+  }).view, null)
+  // 场景例外只对已知服务成立：不存在的服务不能靠加 scenario 绕过 query 校验。
+  await expectApiError('缺失服务加 scenario 仍不能绕过 focus 校验', 'invalid_focus', () =>
+    fixtures.getWorkspaceFixture('svc_missing_fixture', 'partial', {
+      focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+    }))
+  equal('缺失服务加 scenario 仍是 404', fixtures.getWorkspaceFixture('svc_missing_fixture', 'partial', {}).view, null)
+  // 形状都不合法的 service ID 先于 query 校验被判 404（对齐 live parseServiceID）。
+  equal('超长 service ID 优先 404', fixtures.getWorkspaceFixture('s'.repeat(65), null, {
+    focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+  }).view, null)
+
+  // ---- environment 契约（复审缺口 3）----
+
+  const fixtureEnvironment = base.scope.environment
+  await expectApiError('目录非法 environment', 'invalid_filter', () =>
+    fixtures.getDirectoryFixture({ environment: '-bad env' }))
+  await expectApiError('总览非法 environment', 'invalid_filter', () =>
+    fixtures.getOverviewFixture(serviceId, { environment: 'prod uction' }))
+  await expectApiError('工作区非法 environment', 'invalid_filter', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, { environment: 'x'.repeat(65) }))
+  // 匹配或缺省：完整 Page View。
+  check('目录缺省 environment 返回完整视图', fixtures.getDirectoryFixture({}).items.length > 0)
+  check('目录匹配 environment 返回完整视图',
+    fixtures.getDirectoryFixture({ environment: fixtureEnvironment }).items.length > 0)
+  equal('总览匹配 environment 可用',
+    fixtures.getOverviewFixture(serviceId, { environment: fixtureEnvironment })?.service.service_id, serviceId)
+  check('工作区匹配 environment 可用', Boolean(fixtures.getWorkspaceFixture(serviceId, null, {
+    environment: fixtureEnvironment, focusKind: base.focus.kind, focusValue: baseFocusValue,
+  }).view))
+  // 另一个合法环境：目录是有界空视图，总览/工作区是 404。
+  const otherEnvironment = `${fixtureEnvironment}-other`
+  const otherDirectory = fixtures.getDirectoryFixture({ environment: otherEnvironment })
+  equal('另一环境的目录没有条目', otherDirectory.items.length, 0)
+  equal('另一环境的目录没有下一页', otherDirectory.next_cursor, null)
+  equal('另一环境的目录摘要 managed 归零', otherDirectory.summary.managed, 0)
+  equal('另一环境的目录摘要 critical 归零', otherDirectory.summary.critical, 0)
+  equal('另一环境的目录摘要 partial 归零', otherDirectory.summary.partial, 0)
+  equal('另一环境的目录摘要 unconfigured 归零', otherDirectory.summary.unconfigured, 0)
+  check('另一环境的目录不泄露服务事实', !JSON.stringify(otherDirectory).includes(serviceId))
+  equal('另一环境的总览是 404',
+    fixtures.getOverviewFixture(serviceId, { environment: otherEnvironment }), null)
+  equal('另一环境的工作区是 404', fixtures.getWorkspaceFixture(serviceId, null, {
+    environment: otherEnvironment, focusKind: base.focus.kind, focusValue: baseFocusValue,
+  }).view, null)
 
   // 未知服务返回 null，让页面走统一 404 状态。
   equal('未知服务的工作区为 null', fixtures.getWorkspaceFixture('svc_unknown', null, {}).view, null)

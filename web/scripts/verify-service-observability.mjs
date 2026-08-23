@@ -668,19 +668,119 @@ assert.equal(typeof queryContract.validateWorkspaceScope, 'function')
 const workspaceProviderBody = stripComments(
   fixtureProviderSource.slice(fixtureProviderSource.indexOf('export function getWorkspaceFixture(')),
 )
+const serviceShapeAt = workspaceProviderBody.indexOf('isUsableServiceID(serviceId)')
 const scenarioAt = workspaceProviderBody.indexOf('resolveWorkspaceScenario(scenarioValue)')
 const focusGuardAt = workspaceProviderBody.indexOf('guardWorkspaceFocus(query)')
-const baseLookupAt = workspaceProviderBody.indexOf('getBaseWorkspaceFixture(serviceId)')
-assert.ok(scenarioAt !== -1 && focusGuardAt !== -1 && baseLookupAt !== -1, 'provider body markers missing')
+const missingServiceAt = workspaceProviderBody.indexOf('if (!base) return')
 assert.ok(
-  baseLookupAt < scenarioAt && scenarioAt < focusGuardAt,
-  'the fixture provider must resolve service and scenario before validating focus',
+  serviceShapeAt !== -1 && scenarioAt !== -1 && focusGuardAt !== -1 && missingServiceAt !== -1,
+  'provider body markers missing',
+)
+// live 的 parseServiceID 只看形状且先于一切 query 校验。
+assert.ok(serviceShapeAt < focusGuardAt, 'service ID shape must be checked before query validation')
+// 显式 QA 场景的例外分支必须在 focus 校验之前，并且以"已知服务"为前提。
+assert.ok(scenarioAt < focusGuardAt, 'the explicit scenario branch must precede focus validation')
+assert.ok(
+  /if \(base && scenario\)/.test(workspaceProviderBody),
+  'the scenario exception must require a known service; a missing service cannot bypass validation',
+)
+// 正常路径必须与 live 同序：先把 query 判完，再判"服务不存在"。
+assert.ok(
+  focusGuardAt < missingServiceAt,
+  'the normal fixture path must validate the query before answering 404, matching the live handler',
 )
 // 显式场景分支仍要校验非 focus 字段。
 const scenarioBranch = workspaceProviderBody.slice(scenarioAt, focusGuardAt)
 assert.ok(
   scenarioBranch.includes('guardWorkspaceScope(query)'),
   'the explicit scenario branch must still validate the non-focus query fields',
+)
+
+// ---- 复审缺口 1：RFC3339 必须是自洽严格解析，不依赖 Date.parse ----
+
+assert.ok(
+  queryContractSource.includes('export function isStrictRFC3339'),
+  'the query contract must expose a strict RFC3339 validator',
+)
+assert.ok(
+  queryContractSource.includes('daysInMonth') && queryContractSource.includes('isLeapYear'),
+  'strict RFC3339 must validate the calendar, not just the shape',
+)
+assert.ok(
+  !/Date\.parse/.test(stripComments(queryContractSource)),
+  'strict RFC3339 must not rely on Date.parse, which both over- and under-accepts vs Go',
+)
+// 期望表来自在 go1.25 上实测 time.Parse(time.RFC3339, ...)。
+for (const [candidate, accepted] of [
+  ['2026-08-22T02:04:22Z', true],
+  ['2026-08-22t02:04:22z', false],
+  ['2026-08-22T02:04:22z', false],
+  ['2026-08-22t02:04:22Z', false],
+  ['2026-02-30T02:04:22Z', false],
+  ['2026-02-29T02:04:22Z', false],
+  ['2024-02-29T02:04:22Z', true],
+  ['2026-13-01T02:04:22Z', false],
+  ['2026-08-32T02:04:22Z', false],
+  ['2026-04-31T02:04:22Z', false],
+  ['2026-08-22T24:00:00Z', false],
+  ['2026-08-22T23:60:00Z', false],
+  ['2026-08-22T23:59:60Z', false],
+  ['2026-08-22T23:59:59.123Z', true],
+  ['2026-08-22T23:59:59.Z', false],
+  ['2026-08-22T23:59:59+08:00', true],
+  ['2026-08-22T23:59:59+25:00', true],
+  ['2026-08-22T23:59:59+08:60', true],
+  ['2026-08-22T23:59:59+0800', false],
+  ['2026-08-22T23:59:59', false],
+  ['2026-08-22', false],
+  ['2026-8-22T02:04:22Z', false],
+  ['2026-08-22T02:04:22.000000001Z', true],
+]) {
+  assert.equal(
+    queryContract.isStrictRFC3339(candidate), accepted,
+    `strict RFC3339 must ${accepted ? 'accept' : 'reject'} ${candidate} exactly like Go`,
+  )
+}
+
+// ---- 复审缺口 3：environment 必须进入 TS 查询契约 ----
+
+assert.ok(
+  queryContractSource.includes('export function validateEnvironment'),
+  'the query contract must validate environment like all three API routes do',
+)
+// 形状与后端同一条正则。
+const goEnvironmentPattern = /environmentPattern = regexp\.MustCompile\(`([^`]+)`\)/.exec(goAPISource)
+assert.ok(goEnvironmentPattern, 'cannot read the Go environment pattern')
+assert.ok(
+  queryContractSource.includes(goEnvironmentPattern[1]),
+  `TS environment pattern must match Go ${goEnvironmentPattern[1]}`,
+)
+queryContract.validateEnvironment('production')
+queryContract.validateEnvironment(' production ')
+queryContract.validateEnvironment(undefined)
+for (const environment of ['-bad', 'prod uction', 'x'.repeat(65), '_prod']) {
+  expectReason(
+    () => queryContract.validateEnvironment(environment),
+    'invalid_filter', `environment=${environment}`,
+  )
+}
+// 三个入口都要校验 environment。
+expectReason(() => queryContract.validateDirectoryQuery({ environment: '-bad' }), 'invalid_filter', 'directory environment')
+expectReason(() => queryContract.validateOverviewQuery({ environment: '-bad' }), 'invalid_filter', 'overview environment')
+expectReason(
+  () => queryContract.validateWorkspaceQuery([], { environment: '-bad' }),
+  'invalid_filter', 'workspace environment',
+)
+// fixture 的环境作用域必须从 Page View 数据派生，不能写死服务 ID。
+assert.ok(
+  fixtureProviderSource.includes('directoryEnvironments()')
+    && fixtureProviderSource.includes('emptyDirectoryView('),
+  'the directory fixture must scope itself by the environment carried in its own page view',
+)
+assert.ok(
+  fixtureProviderSource.includes('base.scope.environment')
+    && fixtureProviderSource.includes('overviewFixture.service.environment'),
+  'overview/workspace fixtures must compare the requested environment with their own page view',
 )
 
 // ---- C6：团队筛选来自团队目录，而不是已加载分页 ----
