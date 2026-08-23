@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { Button, Drawer, Input, Result, Select } from 'antd'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Button, Drawer, Input, Result, Select, Skeleton } from 'antd'
 import {
   ClockCircleOutlined,
   ProfileOutlined,
   QuestionCircleOutlined,
   ReloadOutlined,
+  SettingOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import {
@@ -17,7 +18,11 @@ import { JourneyRail } from '../components/serviceObservability/JourneyRail'
 import { TopologyExplorer } from '../components/serviceObservability/TopologyExplorer'
 import { WorkspaceContext } from '../components/serviceObservability/WorkspaceContext'
 import { DomainTimeline } from '../components/serviceObservability/DomainTimeline'
-import { getBaseWorkspaceFixture, getWorkspaceFixture } from '../serviceObservability/fixtures'
+import {
+  serviceObservabilityFixtureMode,
+  usePublishServiceLabel,
+  useServiceWorkspace,
+} from '../serviceObservability/data'
 import { formatClock, formatDateTime, formatWindow, humanizeIdentifier } from '../serviceObservability/format'
 import {
   selectionForEvent,
@@ -31,29 +36,77 @@ import {
   readWorkspaceViewState,
   sameSearchParams,
 } from '../serviceObservability/workspaceState'
-import type { ContextTab, TopologyMode, TopologyScope, WorkspaceQueryPatch, WorkspaceViewState } from '../serviceObservability/workspaceState'
-import type { JourneyStage, TimelineEvent } from '../serviceObservability/types'
+import type { ContextTab, TopologyMode, TopologyScope, WorkspaceQueryPatch } from '../serviceObservability/workspaceState'
+import type { JourneyStage, ObservabilityWorkspaceView, TimelineEvent, WorkspaceScenarioFixture } from '../serviceObservability/types'
 import { useMediaQuery } from '../serviceObservability/useMediaQuery'
+import { ApiError } from '../api/client'
 
 const workspaceViewQueryKeys = ['stage', 'selected', 'tab', 'topology', 'scope', 'cursor'] as const
-
-const emptyViewState: WorkspaceViewState = {
-  activeTab: 'summary',
-  topologyMode: 'canvas',
-  topologyScope: 'focus',
-}
 
 export function ServiceObservabilityWorkspace() {
   const { serviceId = '' } = useParams()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+
+  // 服务端查询参数全部来自 URL：focus、时间窗与时区因此是可分享的事实源，
+  // 页面不自己发明它们，也不在 live 模式下用 fixture 兜底。
+  const serverQuery = useMemo(() => ({
+    environment: searchParams.get('environment') ?? undefined,
+    focusKind: searchParams.get('focus_kind') ?? undefined,
+    focusValue: searchParams.get('focus_value') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
+    timezone: searchParams.get('timezone') ?? undefined,
+  }), [searchParams])
+  // scenario 只在显式 fixture 模式有效：它是 demo/视觉 QA 的状态选择器，不是 live 概念。
+  const scenarioValue = serviceObservabilityFixtureMode ? searchParams.get('scenario') : null
+
+  const workspaceQuery = useServiceWorkspace(serviceId, serverQuery, scenarioValue)
+  const view = workspaceQuery.data?.view
+  usePublishServiceLabel(view?.service.name)
+
+  if (workspaceQuery.isPending) {
+    return (
+      <main className="service-workspace-page" aria-busy="true" aria-label="正在加载可观测性工作区">
+        <Skeleton active title={{ width: '28%' }} paragraph={{ rows: 2 }} />
+        <Skeleton active title paragraph={{ rows: 10 }} />
+      </main>
+    )
+  }
+  if (workspaceQuery.isError || !view) {
+    return (
+      <WorkspaceErrorState
+        serviceId={serviceId}
+        error={workspaceQuery.error}
+        onRetry={() => workspaceQuery.refetch()}
+        onBack={() => navigate('/services')}
+      />
+    )
+  }
+  return (
+    <WorkspaceContent
+      view={view}
+      scenario={workspaceQuery.data?.scenario ?? null}
+      isRefetching={workspaceQuery.isFetching}
+      onRetry={() => workspaceQuery.refetch()}
+    />
+  )
+}
+
+function WorkspaceContent({
+  view,
+  scenario,
+  isRefetching,
+  onRetry,
+}: {
+  view: ObservabilityWorkspaceView
+  scenario: WorkspaceScenarioFixture | null
+  isRefetching: boolean
+  onRetry: () => void
+}) {
   const [searchParams, setSearchParams] = useSearchParams()
-  const scenarioValue = searchParams.get('scenario')
-  const fixture = useMemo(() => getWorkspaceFixture(serviceId, scenarioValue), [serviceId, scenarioValue])
-  const base = useMemo(() => getBaseWorkspaceFixture(serviceId), [serviceId])
-  const viewState = useMemo(() => (
-    fixture.view ? readWorkspaceViewState(searchParams, fixture.view) : emptyViewState
-  ), [fixture.view, searchParams])
-  const [focusValue, setFocusValue] = useState(searchParams.get('focus_value') ?? fixture.view?.focus.value ?? '')
+  const viewState = useMemo(() => readWorkspaceViewState(searchParams, view), [searchParams, view])
+  const [focusValue, setFocusValue] = useState(searchParams.get('focus_value') ?? view.focus?.value ?? '')
   const [contextDrawerOpen, setContextDrawerOpen] = useState(false)
   const [journeyExpanded, setJourneyExpanded] = useState(false)
   const contextInDrawer = useMediaQuery('(max-width: 1439px)')
@@ -61,28 +114,22 @@ export function ServiceObservabilityWorkspace() {
   const mobileWorkspace = useMediaQuery('(max-width: 900px)')
 
   useEffect(() => {
-    if (!fixture.view) return
-    const canonical = canonicalWorkspaceSearchParams(searchParams, fixture.view, viewState)
+    const canonical = canonicalWorkspaceSearchParams(searchParams, view, viewState)
     if (!sameSearchParams(searchParams, canonical)) setSearchParams(canonical, { replace: true })
-  }, [fixture.view, searchParams, setSearchParams, viewState])
+  }, [searchParams, setSearchParams, view, viewState])
 
   useEffect(() => {
-    if (!fixture.view) return
-    setFocusValue(searchParams.get('focus_value') ?? fixture.view.focus.value)
-  }, [fixture.view, searchParams])
+    setFocusValue(searchParams.get('focus_value') ?? view.focus?.value ?? '')
+  }, [searchParams, view])
 
   useEffect(() => {
     if (!contextInDrawer) setContextDrawerOpen(false)
   }, [contextInDrawer])
 
-  if (!fixture.view || !base) {
-    return <Result status="404" title="服务工作区不存在" subTitle="当前 Phase 1 fixture 中没有该服务。" extra={<Button onClick={() => navigate('/services')}>返回服务目录</Button>} />
-  }
-
-  const view = fixture.view
   const emptyFocus = view.sections.find((section) => section.section_key === 'journey')?.state === 'empty'
   const retryableFailure = view.data_status.sources.some((source) => source.state === 'unavailable' && source.retryable)
-  const focusLabel = humanizeIdentifier(view.focus.kind)
+  const focusKind = view.focus?.kind ?? searchParams.get('focus_kind') ?? ''
+  const focusLabel = focusKind ? humanizeIdentifier(focusKind) : '请求定位'
   const windowSeconds = Math.max(1, Math.round((Date.parse(view.scope.to) - Date.parse(view.scope.from)) / 1000))
 
   const updateQuery = (patch: WorkspaceQueryPatch, replace = false) => {
@@ -91,35 +138,27 @@ export function ServiceObservabilityWorkspace() {
 
   const runDiagnosis = () => {
     const value = focusValue.trim()
-    if (!value) return
+    if (!value || !focusKind) return
+    // 只改 URL：新的 focus 由服务端重新装配一次，前端不猜结果也不改 scenario。
     updateQuery({
-      focus_kind: view.focus.kind,
+      focus_kind: focusKind,
       focus_value: value,
-      from: view.scope.from,
-      to: view.scope.to,
-      scenario: value !== base.focus.value ? 'empty' : emptyFocus ? null : undefined,
       stage: null,
-      selected: null,
-      cursor: null,
-      tab: 'summary',
-      scope: value !== base.focus.value ? 'all' : 'focus',
-    })
-  }
-
-  const retryFailed = () => {
-    setFocusValue(base.focus.value)
-    updateQuery({
-      scenario: null,
-      focus_kind: base.focus.kind,
-      focus_value: base.focus.value,
-      from: base.scope.from,
-      to: base.scope.to,
-      stage: base.focus.stage ?? null,
       selected: null,
       cursor: null,
       tab: 'summary',
       scope: 'focus',
     })
+  }
+
+  // 重试失败数据在 live 模式就是 refetch：它绝不修改 scenario（scenario 只是 fixture
+  // 模式的状态选择器，用它"修复"一次真实故障等于把故障藏起来）。
+  const retryFailed = () => {
+    if (serviceObservabilityFixtureMode) {
+      updateQuery({ scenario: null, stage: null, selected: null, cursor: null, tab: 'summary', scope: 'focus' })
+      return
+    }
+    onRetry()
   }
 
   const selectStage = (stage: JourneyStage) => {
@@ -179,9 +218,9 @@ export function ServiceObservabilityWorkspace() {
         <span className="workspace-owner"><ProfileOutlined /> 负责人 {view.service.owner_team_name}</span>
         <span>层级 <b>{view.service.tier.replace('tier-', 'T')}</b></span>
         <Select className="workspace-time-range" value={String(windowSeconds)} options={[{ value: String(windowSeconds), label: `最近 ${formatWindow(windowSeconds)}` }]} aria-label="时间范围" />
-        <Select className="workspace-focus-kind" value={view.focus.kind} options={[{ value: view.focus.kind, label: focusLabel }]} aria-label="Focus 类型" />
+        <Select className="workspace-focus-kind" value={focusKind || undefined} placeholder="选择定位字段" options={focusKind ? [{ value: focusKind, label: focusLabel }] : []} aria-label="Focus 类型" />
         <Input className="workspace-focus-input" value={focusValue} onChange={(event) => setFocusValue(event.target.value)} onPressEnter={runDiagnosis} aria-label="Focus 值" />
-        <Button className="workspace-run-diagnosis" type="primary" onClick={runDiagnosis} disabled={!focusValue.trim()}>执行只读诊断</Button>
+        <Button className="workspace-run-diagnosis" type="primary" onClick={runDiagnosis} disabled={!focusValue.trim() || !focusKind}>执行只读诊断</Button>
         <span className="workspace-data-state">
           <DataStatusBadge state={view.data_status.state} compact />
           <time dateTime={view.assembled_at} title={formatDateTime(view.assembled_at, view.scope.timezone)}>
@@ -197,7 +236,9 @@ export function ServiceObservabilityWorkspace() {
             <strong>{emptyFocus ? `查询成功，但没有匹配该 ${focusLabel} 的请求` : retryableFailure ? '部分数据不可用' : 'Observed path 已过新鲜度 TTL'}</strong>
             {emptyFocus ? '保留 declared topology；不会发明 journey 或请求路径。' : view.diagnostic_summary.title}
           </span>
-          <Button icon={<ReloadOutlined />} onClick={retryFailed}>{emptyFocus ? '恢复主 fixture' : retryableFailure ? '重试失败数据' : '刷新 Trace'}</Button>
+          <Button icon={<ReloadOutlined />} loading={isRefetching} onClick={retryFailed}>
+            {emptyFocus ? '重新查询' : retryableFailure ? '重试失败数据' : '刷新观测'}
+          </Button>
         </section>
       )}
 
@@ -241,8 +282,79 @@ export function ServiceObservabilityWorkspace() {
       </Drawer>
 
       <span className="workspace-live-region" aria-live="polite">
-        {fixture.scenario ? `已加载场景：${fixture.scenario.label}` : '已加载完整 fixture'}；当前选择 {viewState.selectedObject ?? '无'}；拓扑范围 {viewState.topologyScope}；当前页签 {viewState.activeTab}
+        {scenario ? `已加载场景：${scenario.label}` : '已加载服务端聚合视图'}；当前选择 {viewState.selectedObject ?? '无'}；拓扑范围 {viewState.topologyScope}；当前页签 {viewState.activeTab}
       </span>
     </main>
+  )
+}
+
+// WorkspaceErrorState 把 404 / 409 / 422 / 503 分别渲染成可操作的页面状态。
+//
+// 409 是最需要区分的一种：服务存在、责任与领域状态都在，只是没有已发布 Profile——
+// 工作区不猜指标也不猜布局，而是把人送去服务登记。
+function WorkspaceErrorState({
+  serviceId,
+  error,
+  onRetry,
+  onBack,
+}: {
+  serviceId: string
+  error: unknown
+  onRetry: () => void
+  onBack: () => void
+}) {
+  const apiError = error instanceof ApiError ? error : undefined
+  const status = apiError?.status ?? (error as { status?: number } | undefined)?.status
+  if (status === 409) {
+    return (
+      <Result
+        icon={<SettingOutlined />}
+        title="该服务尚未配置 Service Profile"
+        subTitle="工作区需要已发布 Profile 才能确定 focus、journey 与信号绑定；服务总览、责任与领域状态仍然可用。"
+        extra={[
+          <Link key="overview" className="ant-btn ant-btn-primary" to={`/services/${serviceId}`}>返回服务总览</Link>,
+          <Link key="registration" className="ant-btn ant-btn-default" to={`/settings/services/${serviceId}`}>前往服务登记</Link>,
+        ]}
+      />
+    )
+  }
+  if (status === 404) {
+    return (
+      <Result
+        status="404"
+        title="服务工作区不存在"
+        subTitle={serviceObservabilityFixtureMode
+          ? '当前 fixture 集合中没有该服务。'
+          : '该服务没有登记，或不在当前环境内。'}
+        extra={<Button onClick={onBack}>返回服务目录</Button>}
+      />
+    )
+  }
+  if (status === 422) {
+    const scopeTooBroad = apiError?.reasonCode === 'scope_too_broad'
+    return (
+      <Result
+        status="warning"
+        title={scopeTooBroad ? '查询范围超出限制' : '定位参数非法'}
+        subTitle={apiError?.message ?? (scopeTooBroad
+          ? '请收窄时间窗后重试；服务端不会静默截断成一个你没请求过的范围。'
+          : 'focus 或时间窗不满足该服务已发布 Profile 的定义。')}
+        extra={[
+          <Link key="overview" className="ant-btn ant-btn-primary" to={`/services/${serviceId}`}>返回服务总览</Link>,
+          <Button key="back" onClick={onBack}>返回服务目录</Button>,
+        ]}
+      />
+    )
+  }
+  return (
+    <Result
+      status="500"
+      title="可观测性工作区暂时不可用"
+      subTitle={apiError?.message ?? '聚合视图请求失败；页面不会用历史数据或 fixture 掩盖这次故障。'}
+      extra={[
+        <Button key="retry" type="primary" icon={<ReloadOutlined />} onClick={onRetry}>重试</Button>,
+        <Button key="back" onClick={onBack}>返回服务目录</Button>,
+      ]}
+    />
   )
 }

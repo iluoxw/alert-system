@@ -297,6 +297,10 @@
 
 .service-directory-empty { min-height: 330px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; }
 
+/* 目录分页：next_cursor 存在时显式提供"继续加载"，不做无限滚动（无限滚动会让
+   "当前看到的是完整候选集合"这件事变得不可判断）。 */
+.service-directory-more { display: flex; justify-content: center; padding: 12px 0 4px; }
+
 .service-signal-legend {
   min-height: 42px;
   display: flex;
@@ -466,6 +470,11 @@
 .workspace-state-banner span { display: flex; gap: 7px; }
 .workspace-state-banner.is-empty { color: #536176; background: #f7f9fb; border-color: #cfd7e2; }
 .workspace-state-banner.is-empty > .anticon { color: #718096; }
+.workspace-state-banner.is-unconfigured { color: #4a5568; background: #f7f9fb; border-color: #cfd7e2; }
+.workspace-state-banner.is-unconfigured > .anticon { color: #718096; }
+
+/* 空态说明：一次成功查询但没有事实，与"查不到"必须看起来不同。 */
+.service-empty-note { margin: 0; padding: 10px 2px; color: #66748a; font-size: 11px; }
 
 .service-workspace-page:has(.workspace-state-banner) .workspace-state-banner { min-height: 36px; padding-block: 3px; }
 .service-workspace-page:has(.workspace-state-banner) .golden-ledger { min-height: 104px; }

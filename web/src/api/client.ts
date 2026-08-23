@@ -9,6 +9,12 @@
 // （见 setUnauthorizedHandler），调用方不需要每处自行判断 401。
 
 import { apiV1Url } from '../config/runtime'
+// Page View 类型集中在 serviceObservability/types.ts（对齐契约 v1），不在这里重复声明。
+import type {
+  ObservabilityWorkspaceView,
+  ServiceDirectoryView,
+  ServiceOverviewView,
+} from '../serviceObservability/types'
 
 export type Severity = 'critical' | 'warning' | 'info'
 export type Status = 'firing' | 'acknowledged' | 'resolved'
@@ -91,14 +97,18 @@ export interface LoginResponse {
 // ApiError 携带 HTTP 状态码与后端 {"error": "..."} 里的文案，供调用方展示。
 // details 对应少数端点（如 internal/api/shifts.go 的时段冲突）额外返回的
 // {"details": [...]} 数组，多数端点不带该字段，调用方按需断言其形状。
+// reasonCode 对应后端的稳定机器码（如 profile_unconfigured / invalid_focus /
+// scope_too_broad）：调用方按 code 分支，文案只用于展示，不参与判断。
 export class ApiError extends Error {
   status: number
   details?: unknown
+  reasonCode?: string
 
-  constructor(status: number, message: string, details?: unknown) {
+  constructor(status: number, message: string, details?: unknown, reasonCode?: string) {
     super(message)
     this.status = status
     this.details = details
+    this.reasonCode = reasonCode
   }
 }
 
@@ -127,14 +137,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let message = `请求失败（${res.status}）`
     let details: unknown
+    let reasonCode: string | undefined
     try {
-      const body = (await res.json()) as { error?: string; details?: unknown }
+      const body = (await res.json()) as { error?: string; details?: unknown; reason_code?: string }
       if (body.error) message = body.error
       details = body.details
+      reasonCode = body.reason_code
     } catch {
       // 响应体不是 JSON（如 204 或网络层错误页）时保留默认文案
     }
-    throw new ApiError(res.status, message, details)
+    throw new ApiError(res.status, message, details, reasonCode)
   }
 
   if (res.status === 204) {
@@ -1483,4 +1495,89 @@ export function applyRunbook(incidentId: string, planRunId: string, confirmPlanS
     method: 'POST',
     body: JSON.stringify({ plan_run_id: planRunId, confirm_plan_sha256: confirmPlanSHA256, retries_stopped: true }),
   })
+}
+
+// ============================================================
+// Service Observability 三层 Page View（internal/api/service_observability.go）
+// ============================================================
+//
+// 三个只读聚合端点返回服务端投影好的 Page View：浏览器只展示与交互，不重算 Health、
+// 不拼 PromQL/SQL，也拿不到任何数据源凭据或查询模板。
+//
+// 类型集中在 serviceObservability/types.ts（与契约 v1 的 Page View schema 对齐），
+// 这里不重复声明形状。局部失败是 200 + Partial/Forbidden/Empty/Stale 的 view 状态；
+// 404/409/422/503 通过 ApiError.status 与 ApiError.reasonCode 分支。
+
+// ServiceDirectoryQuery 对应目录端点的全部服务端查询参数。
+//
+// health/dataStatus 是 CSV 枚举；cursor 是 opaque 游标（前端既不解析也不构造它，
+// 只把上一页返回的 next_cursor 原样回传）。
+export interface ServiceDirectoryQuery {
+  environment?: string
+  teamId?: string
+  tier?: string
+  health?: string[]
+  dataStatus?: string[]
+  q?: string
+  sort?: string
+  direction?: 'asc' | 'desc'
+  cursor?: string
+  limit?: number
+}
+
+export interface ServiceOverviewQuery {
+  environment?: string
+  windowSeconds?: number
+}
+
+export interface ServiceWorkspaceQuery {
+  environment?: string
+  focusKind?: string
+  focusValue?: string
+  from?: string
+  to?: string
+  timezone?: string
+}
+
+export function getServiceDirectory(query: ServiceDirectoryQuery = {}): Promise<ServiceDirectoryView> {
+  return request<ServiceDirectoryView>(`/service-observability${withQuery({
+    environment: query.environment,
+    team_id: query.teamId,
+    tier: query.tier,
+    health: query.health?.join(','),
+    data_status: query.dataStatus?.join(','),
+    q: query.q,
+    sort: query.sort,
+    direction: query.direction,
+    cursor: query.cursor,
+    limit: query.limit,
+  })}`)
+}
+
+export function getServiceOverview(
+  serviceId: string,
+  query: ServiceOverviewQuery = {},
+): Promise<ServiceOverviewView> {
+  return request<ServiceOverviewView>(
+    `/service-observability/${encodeURIComponent(serviceId)}${withQuery({
+      environment: query.environment,
+      window_seconds: query.windowSeconds,
+    })}`,
+  )
+}
+
+export function getServiceWorkspace(
+  serviceId: string,
+  query: ServiceWorkspaceQuery = {},
+): Promise<ObservabilityWorkspaceView> {
+  return request<ObservabilityWorkspaceView>(
+    `/service-observability/${encodeURIComponent(serviceId)}/workspace${withQuery({
+      environment: query.environment,
+      focus_kind: query.focusKind,
+      focus_value: query.focusValue,
+      from: query.from,
+      to: query.to,
+      timezone: query.timezone,
+    })}`,
+  )
 }

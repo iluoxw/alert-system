@@ -38,15 +38,16 @@ export function JourneyRail({
   expanded: boolean
   onToggle: () => void
 }) {
-  const journeyLabel = humanizeIdentifier(view.focus.journey)
-  const focusLabel = humanizeIdentifier(view.focus.kind)
+  // 无 focus 时不发明 journey：标题退回中性文案，阶段列表本身就是空的。
+  const journeyLabel = view.focus ? humanizeIdentifier(view.focus.journey) : '请求阶段'
+  const focusLabel = view.focus ? humanizeIdentifier(view.focus.kind) : '定位字段'
   const windowSeconds = Math.max(1, Math.round((Date.parse(view.scope.to) - Date.parse(view.scope.from)) / 1000))
   return (
     <section className={`workspace-journey-panel${compact ? ' is-compact' : ''}${expanded ? ' is-expanded' : ''}`}>
       <header>
         <div>
           <h3>{journeyLabel} 阶段</h3>
-          <small>{view.focus.value}</small>
+          <small>{view.focus?.value ?? '未聚焦：仅显示服务级声明拓扑'}</small>
         </div>
         {compact && (
           <button type="button" className="journey-expand-button" onClick={onToggle} aria-expanded={expanded}>
@@ -73,7 +74,7 @@ export function JourneyRail({
       </div>
       {(!compact || expanded) && (
         <dl className="workspace-focus-facts">
-          <div><dt>{focusLabel}</dt><dd>{view.focus.value}</dd></div>
+          <div><dt>{focusLabel}</dt><dd>{view.focus?.value ?? '未聚焦'}</dd></div>
           <div><dt>Tenant</dt><dd>{view.scope.tenant}</dd></div>
           <div><dt>Environment</dt><dd>{view.scope.environment}</dd></div>
           <div>

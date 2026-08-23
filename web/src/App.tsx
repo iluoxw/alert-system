@@ -49,7 +49,7 @@ import { IncidentList } from './pages/IncidentList'
 import { InfrastructureDetail } from './pages/InfrastructureDetail'
 import { FaultWorkspace } from './pages/FaultWorkspace'
 import { IncidentRoom } from './pages/IncidentRoom'
-import { getDirectoryFixture } from './serviceObservability/fixtures'
+import { serviceObservabilityFixtureMode, useServiceLabel } from './serviceObservability/data'
 import './serviceObservability/serviceObservability.css'
 
 const ServiceDirectory = lazy(() => import('./pages/ServiceDirectory').then((module) => ({ default: module.ServiceDirectory })))
@@ -59,12 +59,6 @@ const ServiceObservabilityWorkspace = lazy(() => import('./pages/ServiceObservab
 const { Header, Sider, Content } = Layout
 
 const sidebarStorageKey = 'firebreak.sidebar-collapsed'
-const fixtureServices = getDirectoryFixture().items
-
-function serviceNameForPath(pathname: string): string | undefined {
-  const serviceId = pathname.match(/^\/services\/([^/]+)/)?.[1]
-  return fixtureServices.find((item) => item.service.service_id === serviceId)?.service.name
-}
 
 function storedSidebarCollapsed() {
   if (typeof window === 'undefined') return false
@@ -79,10 +73,11 @@ function narrowViewport() {
   return typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches
 }
 
+// serviceObservabilityFixturePreview 只在显式开发 fixture 模式下放行 /services 预览：
+// 判定本身来自 serviceObservability/data.ts 这个唯一数据源选择点（它自带
+// import.meta.env.DEV 双重门控），production build 因此无法绕过 AuthGate。
 function serviceObservabilityFixturePreview(pathname: string) {
-  return import.meta.env.DEV
-    && import.meta.env.VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE === 'true'
-    && pathname.startsWith('/services')
+  return serviceObservabilityFixtureMode && pathname.startsWith('/services')
 }
 
 const queryClient = new QueryClient({
@@ -159,7 +154,9 @@ function AppLayout() {
   const [isNarrowViewport, setIsNarrowViewport] = useState(narrowViewport)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const effectiveSidebarCollapsed = sidebarCollapsed || isNarrowViewport
-  const currentServiceName = serviceNameForPath(location.pathname)
+  // 服务名来自页面已经拿到的 Page View（fixture 与 live 走同一条路径）：shell 绝不
+  // import fixture 去猜真实 identity。
+  const currentServiceName = useServiceLabel() ?? undefined
   // 全站只订阅一条 SSE 连接：AppLayout 是所有已登录页面的公共父组件。
   useAlertEvents(!fixturePreview)
 

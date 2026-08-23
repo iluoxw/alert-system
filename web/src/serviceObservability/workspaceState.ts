@@ -51,8 +51,8 @@ export function readWorkspaceViewState(searchParams: URLSearchParams, view: Obse
   const cursorParam = searchParams.get('cursor')
   const selectedStageKey = view.journey.some((stage) => stage.key === stageParam)
     ? stageParam ?? undefined
-    : view.journey.some((stage) => stage.key === view.focus.stage)
-      ? view.focus.stage
+    : view.journey.some((stage) => stage.key === view.focus?.stage)
+      ? view.focus?.stage
       : undefined
   const selectedParam = searchParams.get('selected')
   const focusEmpty = view.sections.some((section) => section.section_key === 'journey' && section.state === 'empty')
@@ -85,8 +85,8 @@ export function canonicalWorkspaceSearchParams(
   state: WorkspaceViewState,
 ): URLSearchParams {
   return patchWorkspaceSearchParams(current, {
-    focus_kind: current.get('focus_kind') ?? view.focus.kind,
-    focus_value: current.get('focus_value') ?? view.focus.value,
+    focus_kind: current.get('focus_kind') ?? view.focus?.kind ?? null,
+    focus_value: current.get('focus_value') ?? view.focus?.value ?? null,
     from: current.get('from') ?? view.scope.from,
     to: current.get('to') ?? view.scope.to,
     tab: state.activeTab,

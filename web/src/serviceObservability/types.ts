@@ -84,18 +84,23 @@ export interface DirectoryItem {
   observed_at: string
 }
 
+// DirectorySummary 统计的是 metadata 筛选（environment/team/tier/q）之后的完整候选
+// 集合，不是当前分页；health/data_status 只筛结果，不改这里的分母。
+export interface DirectorySummary {
+  managed: number
+  critical: number
+  partial: number
+  unconfigured: number
+}
+
 export interface ServiceDirectoryView {
   schema_version: string
   view_kind: 'service_directory'
   request_id: string
   assembled_at: string
-  summary: {
-    managed: number
-    critical: number
-    partial: number
-    unconfigured: number
-  }
+  summary: DirectorySummary
   items: DirectoryItem[]
+  // next_cursor 是 opaque 游标：前端只把它原样回传，既不解析也不构造。
   next_cursor: string | null
 }
 
@@ -281,7 +286,9 @@ export interface ObservabilityWorkspaceView {
   service: ServiceIdentity
   profile: ProfileSummary
   scope: WorkspaceScope
-  focus: WorkspaceFocus
+  // focus 为 null 表示"没有聚焦"：此时只返回服务级 declared topology，不发明
+  // observed request path，journey 也是空的。
+  focus: WorkspaceFocus | null
   health: HealthSummary
   data_status: DataStatus
   golden_signals: SignalValue[]

@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { Button, Empty, Input, Select } from 'antd'
+import { Button, Empty, Input, Result, Select, Skeleton } from 'antd'
 import {
   AppstoreOutlined,
   ArrowDownOutlined,
@@ -10,12 +10,17 @@ import {
   DashboardOutlined,
   FilterOutlined,
   ReadOutlined,
+  ReloadOutlined,
   SettingOutlined,
   SwapOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import { DataStatusBadge, HealthBadge } from '../components/ServiceObservability'
-import { getDirectoryFixture } from '../serviceObservability/fixtures'
+import {
+  serviceObservabilityFixtureMode,
+  useServiceDirectoryPages,
+  usePublishServiceLabel,
+} from '../serviceObservability/data'
 import { formatClock } from '../serviceObservability/format'
 import {
   directorySearchStorageKey,
@@ -25,10 +30,10 @@ import {
   sortDirectoryItems,
 } from '../serviceObservability/directory'
 import type { DirectorySortKey, SortDirection } from '../serviceObservability/directory'
-import type { DirectoryItem, SignalValue } from '../serviceObservability/types'
+import type { DirectoryItem, DirectorySummary, SignalValue } from '../serviceObservability/types'
+import { ApiError } from '../api/client'
 import '../serviceObservability/serviceObservability.css'
 
-const directory = getDirectoryFixture()
 const scrollStorageKey = 'firebreak.service-directory.scroll-y'
 
 function compactSignal(signal: SignalValue): string {
@@ -46,6 +51,8 @@ function signalLabel(signal: SignalValue): string {
   return '容量'
 }
 
+// itemMatches 只在显式 fixture 模式使用：live 模式的筛选、排序与分页全部由服务端负责，
+// 前端不再重算一遍（否则摘要分母与当前页会互相矛盾）。
 function itemMatches(item: DirectoryItem, searchParams: URLSearchParams): boolean {
   const query = searchParams.get('q')?.trim().toLowerCase() ?? ''
   const team = searchParams.get('team')
@@ -100,17 +107,46 @@ function isRowSecondaryTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest('a, button, input, [role="button"]'))
 }
 
+const emptySummary: DirectorySummary = { managed: 0, critical: 0, partial: 0, unconfigured: 0 }
+
 export function ServiceDirectory() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const sortParam = searchParams.get('sort')
   const activeSort = isDirectorySortKey(sortParam) ? sortParam : undefined
   const direction: SortDirection = searchParams.get('direction') === 'desc' ? 'desc' : 'asc'
-  const items = useMemo(() => {
-    const filtered = directory.items.filter((item) => itemMatches(item, searchParams))
-    return sortDirectoryItems(filtered, activeSort, direction)
-  }, [activeSort, direction, searchParams])
   const q = searchParams.get('q') ?? ''
+
+  // 服务端查询参数完全来自 URL：URL 因此仍是可分享的筛选事实源。React Query key 包含
+  // 这个对象的每一项，换筛选不会命中上一次的缓存。
+  const serverQuery = useMemo(() => ({
+    environment: searchParams.get('environment') ?? undefined,
+    teamId: searchParams.get('team') ?? undefined,
+    tier: searchParams.get('tier') ?? undefined,
+    health: searchParams.get('health') ? [searchParams.get('health') as string] : undefined,
+    dataStatus: searchParams.get('data') ? [searchParams.get('data') as string] : undefined,
+    q: q.trim() || undefined,
+    sort: activeSort,
+    direction: activeSort ? direction : undefined,
+  }), [activeSort, direction, q, searchParams])
+
+  const directoryQuery = useServiceDirectoryPages(serverQuery)
+  // 目录不是单个服务，顶栏不显示服务名。
+  usePublishServiceLabel(null)
+
+  const pages = directoryQuery.data?.pages
+  const latestPage = pages && pages.length > 0 ? pages[pages.length - 1] : undefined
+  const summary = latestPage?.summary ?? emptySummary
+  const loadedItems = useMemo(() => (pages ?? []).flatMap((page) => page.items), [pages])
+  const items = useMemo(() => {
+    if (!serviceObservabilityFixtureMode) {
+      // live 模式：服务端已按选定口径排序并分页，原样渲染。
+      return loadedItems
+    }
+    const filtered = loadedItems.filter((item) => itemMatches(item, searchParams))
+    return sortDirectoryItems(filtered, activeSort, direction)
+  }, [activeSort, direction, loadedItems, searchParams])
+  const assembledAt = latestPage?.assembled_at
 
   useEffect(() => {
     const saved = window.sessionStorage.getItem(scrollStorageKey)
@@ -137,7 +173,7 @@ export function ServiceDirectory() {
 
   const clearFilters = () => {
     const next = new URLSearchParams(searchParams)
-    for (const key of ['q', 'team', 'tier', 'health', 'data', 'layer', 'profile']) next.delete(key)
+    for (const key of ['q', 'team', 'tier', 'health', 'data', 'layer', 'profile', 'environment']) next.delete(key)
     setSearchParams(next, { replace: true })
   }
 
@@ -150,10 +186,31 @@ export function ServiceDirectory() {
     setSearchParams(next)
   }
 
-  const teamOptions = Array.from(new Map(directory.items.map((item) => [
+  const teamOptions = Array.from(new Map(loadedItems.map((item) => [
     item.service.owner_team_id,
     { value: item.service.owner_team_id, label: item.service.owner_team_name },
   ])).values())
+
+  if (directoryQuery.isPending) {
+    return (
+      <main className="service-ops-page service-directory-v2" aria-busy="true" aria-label="正在加载服务目录">
+        <Skeleton active title={{ width: '24%' }} paragraph={{ rows: 2 }} />
+        <Skeleton active title paragraph={{ rows: 8 }} />
+      </main>
+    )
+  }
+
+  if (directoryQuery.isError) {
+    return (
+      <main className="service-ops-page service-directory-v2">
+        <DirectoryErrorState
+          error={directoryQuery.error}
+          onRetry={() => directoryQuery.refetch()}
+          onClearFilters={clearFilters}
+        />
+      </main>
+    )
+  }
 
   return (
     <main className="service-ops-page service-directory-v2">
@@ -163,27 +220,29 @@ export function ServiceDirectory() {
           <h2>服务目录</h2>
           <p>从服务责任边界进入健康、Fault、依赖与诊断。</p>
         </div>
-        <time className="service-last-updated" dateTime={directory.assembled_at} title={`${directory.assembled_at} · UTC`} tabIndex={0}>
-          目录更新于 {formatClock(directory.assembled_at)}
-        </time>
+        {assembledAt && (
+          <time className="service-last-updated" dateTime={assembledAt} title={`${assembledAt} · UTC`} tabIndex={0}>
+            目录更新于 {formatClock(assembledAt)}
+          </time>
+        )}
       </header>
 
       <section className="service-summary-ledger" aria-label="服务目录摘要">
         <article>
           <AppstoreOutlined />
-          <div><span>受管服务</span><strong>{directory.summary.managed}</strong><small>平台与应用服务</small></div>
+          <div><span>受管服务</span><strong>{summary.managed}</strong><small>平台与应用服务</small></div>
         </article>
         <article>
           <CloseCircleOutlined />
-          <div><span>Critical</span><strong>{directory.summary.critical}</strong><small>需要立即判断</small></div>
+          <div><span>Critical</span><strong>{summary.critical}</strong><small>需要立即判断</small></div>
         </article>
         <article>
           <WarningOutlined />
-          <div><span>Partial</span><strong>{directory.summary.partial}</strong><small>数据不完整</small></div>
+          <div><span>Partial</span><strong>{summary.partial}</strong><small>数据不完整</small></div>
         </article>
         <article>
           <SettingOutlined />
-          <div><span>待配置</span><strong>{directory.summary.unconfigured}</strong><small>缺少 Profile 或 owner</small></div>
+          <div><span>待配置</span><strong>{summary.unconfigured}</strong><small>缺少 Profile 或 owner</small></div>
         </article>
       </section>
 
@@ -228,31 +287,36 @@ export function ServiceDirectory() {
             options={['complete', 'partial', 'stale', 'unconfigured'].map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))}
             aria-label="按数据状态筛选"
           />
-          <Select
-            allowClear
-            value={searchParams.get('layer') || undefined}
-            onChange={(value) => updateFilter('layer', value)}
-            placeholder="全部分层"
-            options={[
-              { value: 'platform', label: '平台层' },
-              { value: 'infrastructure', label: '基础设施层' },
-              { value: 'application', label: '应用层' },
-            ]}
-            aria-label="按服务分层筛选"
-          />
-          <Select
-            allowClear
-            value={searchParams.get('profile') || undefined}
-            onChange={(value) => updateFilter('profile', value)}
-            placeholder="全部 Profile"
-            options={[
-              { value: 'published', label: 'Profile 已发布' },
-              { value: 'missing', label: 'Profile 未配置' },
-            ]}
-            aria-label="按 Profile 状态筛选"
-          />
+          {serviceObservabilityFixtureMode && (
+            <>
+              <Select
+                allowClear
+                value={searchParams.get('layer') || undefined}
+                onChange={(value) => updateFilter('layer', value)}
+                placeholder="全部分层"
+                options={[
+                  { value: 'platform', label: '平台层' },
+                  { value: 'infrastructure', label: '基础设施层' },
+                  { value: 'application', label: '应用层' },
+                ]}
+                aria-label="按服务分层筛选"
+              />
+              <Select
+                allowClear
+                value={searchParams.get('profile') || undefined}
+                onChange={(value) => updateFilter('profile', value)}
+                placeholder="全部 Profile"
+                options={[
+                  { value: 'published', label: 'Profile 已发布' },
+                  { value: 'missing', label: 'Profile 未配置' },
+                ]}
+                aria-label="按 Profile 状态筛选"
+              />
+            </>
+          )}
           <span className="service-directory-count">
-            <b>E2B fixture set</b>{items.length} 条当前结果 / {directory.summary.managed} 个受管服务
+            {serviceObservabilityFixtureMode && <b>E2B fixture set</b>}
+            {items.length} 条当前结果 / {summary.managed} 个受管服务
           </span>
         </div>
 
@@ -350,7 +414,7 @@ export function ServiceDirectory() {
                         <DataStatusBadge state={item.data_status.state} />
                         <small>
                           <time dateTime={item.observed_at} title={`${item.observed_at} · UTC`} tabIndex={0}>
-                            {formatRelativeObservedAt(item.observed_at, directory.assembled_at)}
+                            {formatRelativeObservedAt(item.observed_at, assembledAt ?? item.observed_at)}
                           </time>
                           {' · '}{item.data_status.sources.length} 个来源
                         </small>
@@ -374,6 +438,18 @@ export function ServiceDirectory() {
             </table>
           </div>
         )}
+
+        {directoryQuery.hasNextPage && (
+          <div className="service-directory-more">
+            <Button
+              onClick={() => directoryQuery.fetchNextPage()}
+              loading={directoryQuery.isFetchingNextPage}
+              aria-label="加载更多服务"
+            >
+              加载更多（共 {summary.managed} 个受管服务）
+            </Button>
+          </div>
+        )}
       </section>
 
       <footer className="service-signal-legend">
@@ -385,5 +461,38 @@ export function ServiceDirectory() {
         <span>Traffic/Rate 只显示值或基线变化，不单独判断好坏。</span>
       </footer>
     </main>
+  )
+}
+
+// DirectoryErrorState 把后端的稳定 reason code 映射成可操作的页面状态。
+//
+// 它绝不回落到 fixture：网络或后端故障必须看得见，否则页面会展示与生产无关的数字。
+function DirectoryErrorState({
+  error,
+  onRetry,
+  onClearFilters,
+}: {
+  error: unknown
+  onRetry: () => void
+  onClearFilters: () => void
+}) {
+  const apiError = error instanceof ApiError ? error : undefined
+  if (apiError?.status === 422) {
+    return (
+      <Result
+        status="warning"
+        title={apiError.reasonCode === 'scope_too_broad' ? '筛选范围过大' : '筛选条件非法'}
+        subTitle={apiError.message}
+        extra={<Button type="primary" onClick={onClearFilters}>清除筛选</Button>}
+      />
+    )
+  }
+  return (
+    <Result
+      status="500"
+      title="服务目录暂时不可用"
+      subTitle={apiError?.message ?? '聚合视图请求失败；页面不会用历史数据或 fixture 掩盖这次故障。'}
+      extra={<Button type="primary" icon={<ReloadOutlined />} onClick={onRetry}>重试</Button>}
+    />
   )
 }

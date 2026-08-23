@@ -40,6 +40,12 @@ function applyPatch(source, operations) {
   return document
 }
 
+// stripComments 去掉行注释与块注释，让"代码里不得出现查询模板/凭据"这类断言不会被
+// 解释性文档误伤。
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
 function valueAtPath(document, pointer) {
   return pointerSegments(pointer).reduce((value, segment) => Array.isArray(value) ? value[Number(segment)] : value[segment], document)
 }
@@ -127,10 +133,112 @@ for (const route of ['services/:serviceId', 'services/:serviceId/observability']
 for (const token of ['lazy(', '<Suspense', 'ServiceRouteFallback', 'aria-busy="true"']) {
   assert.ok(appSource.includes(token), `service route loading boundary is missing ${token}`)
 }
+// live 模式下 App shell 不得 import fixture 去猜服务 identity：真实服务名只能来自
+// Page View（fixture 模式走同一条发布路径）。
+assert.ok(
+  !appSource.includes("serviceObservability/fixtures"),
+  'App shell must not import contract fixtures to guess service identity',
+)
+assert.ok(
+  appSource.includes('useServiceLabel'),
+  'App shell must read the service label published by the page view',
+)
 
 const fixtureSource = await readFile(path.join(repoRoot, 'web/src/serviceObservability/fixtures.ts'), 'utf8')
 for (const filename of ['e2b.directory-view.json?raw', 'e2b.overview-view.json?raw', 'e2b.workspace-view.json?raw', 'e2b.workspace-scenarios.json?raw']) {
   assert.ok(fixtureSource.includes(filename), `UI is not driven by ${filename}`)
+}
+
+// ---- 数据源选择点：唯一、双重门控、失败不回落 ----
+
+const dataSource = await readFile(path.join(repoRoot, 'web/src/serviceObservability/data.ts'), 'utf8')
+assert.ok(
+  dataSource.includes('import.meta.env.DEV')
+    && dataSource.includes("import.meta.env.VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE === 'true'"),
+  'fixture mode must stay double-gated on import.meta.env.DEV and the explicit env flag',
+)
+assert.ok(
+  /await fixtureModule\(\)/.test(dataSource) && /import\('\.\/fixtures'\)/.test(dataSource),
+  'fixtures must be reachable only through the dynamic fixture-mode branch',
+)
+for (const api of ['getServiceDirectory', 'getServiceOverview', 'getServiceWorkspace']) {
+  assert.ok(dataSource.includes(api), `data source selector must call ${api}`)
+}
+// API 失败绝不回落 fixture：选择点里不允许出现任何 catch。
+assert.ok(!/catch\s*[({]/.test(dataSource), 'the data source selector must not swallow API errors')
+
+const pageSources = Object.fromEntries(await Promise.all([
+  'web/src/pages/ServiceDirectory.tsx',
+  'web/src/pages/ServiceOverview.tsx',
+  'web/src/pages/ServiceObservabilityWorkspace.tsx',
+].map(async (filename) => [filename, await readFile(path.join(repoRoot, filename), 'utf8')])))
+
+// 三个页面都只经过唯一选择点，不自己 import fixture、也不自己判断环境变量。
+for (const [filename, source] of Object.entries(pageSources)) {
+  assert.ok(
+    !source.includes("serviceObservability/fixtures"),
+    `${filename} must not import contract fixtures directly`,
+  )
+  assert.ok(
+    !source.includes('import.meta.env.VITE_SERVICE_OBSERVABILITY_FIXTURE_MODE'),
+    `${filename} must not re-implement the fixture-mode decision`,
+  )
+  assert.ok(
+    source.includes("from '../serviceObservability/data'"),
+    `${filename} must consume the single data source selector`,
+  )
+}
+
+// 每个页面都消费对应的聚合 API hook，并有显式的失败状态与重试。
+assert.ok(pageSources['web/src/pages/ServiceDirectory.tsx'].includes('useServiceDirectoryPages'))
+assert.ok(pageSources['web/src/pages/ServiceOverview.tsx'].includes('useServiceOverview'))
+assert.ok(pageSources['web/src/pages/ServiceObservabilityWorkspace.tsx'].includes('useServiceWorkspace'))
+// 目录必须显式消费 next_cursor（服务端分页），不自己构造游标。
+const directoryPage = pageSources['web/src/pages/ServiceDirectory.tsx']
+for (const token of ['hasNextPage', 'fetchNextPage', 'isFetchingNextPage']) {
+  assert.ok(directoryPage.includes(token), `service directory must consume server pagination via ${token}`)
+}
+// 工作区的"重试失败数据"在 live 模式必须是 refetch，而不是改 scenario。
+const workspacePage = pageSources['web/src/pages/ServiceObservabilityWorkspace.tsx']
+assert.ok(workspacePage.includes('onRetry'), 'workspace retry must call the query refetch')
+assert.ok(
+  /if \(serviceObservabilityFixtureMode\) \{[\s\S]{0,320}?scenario: null/.test(workspacePage),
+  'scenario may only be reset inside the fixture-mode branch',
+)
+for (const status of ['409', '404', '422']) {
+  assert.ok(workspacePage.includes(status), `workspace must render an explicit ${status} state`)
+}
+assert.ok(
+  workspacePage.includes('profile_unconfigured') || workspacePage.includes('Service Profile'),
+  'workspace must explain the 409 unconfigured state instead of showing an empty page',
+)
+
+// 客户端只声明三条 typed API，且不在浏览器里出现查询模板或凭据。
+const clientSource = await readFile(path.join(repoRoot, 'web/src/api/client.ts'), 'utf8')
+for (const token of [
+  '/service-observability',
+  'ServiceDirectoryQuery',
+  'ServiceOverviewQuery',
+  'ServiceWorkspaceQuery',
+  'reasonCode',
+]) {
+  assert.ok(clientSource.includes(token), `api client is missing ${token}`)
+}
+// 只检查 Service Observability 这一段的真实代码：注释里的"不拼 PromQL/SQL"是正确的
+// 文档，而查询模板、凭据 header 或数据源语法出现在代码里才是缺陷。范围限定也避免误伤
+// client.ts 里与本 Phase 无关的既有类型（例如 webhook 的 bearer_token_env 字段名）。
+const observabilityClientSection = clientSource.slice(
+  clientSource.indexOf('Service Observability 三层 Page View'),
+)
+assert.ok(observabilityClientSection.length > 0, 'api client must keep the page view section marker')
+const observabilityClientCode = stripComments(observabilityClientSection).toLowerCase()
+for (const forbidden of [
+  'histogram_quantile', 'rate(', 'select ', 'promql', 'logql', 'authorization', 'api_key', 'token',
+]) {
+  assert.ok(
+    !observabilityClientCode.includes(forbidden),
+    `service observability api client must not carry ${forbidden}`,
+  )
 }
 
 const workspaceSources = await Promise.all([
@@ -154,7 +262,9 @@ for (const token of ['aria-sort', "searchParams.get('sort')", "searchParams.get(
 }
 
 const overviewSource = await readFile(path.join(repoRoot, 'web/src/pages/ServiceOverview.tsx'), 'utf8')
-for (const token of ['aria-invalid', 'service-focus-validation', 'workspaceWindowSeconds']) {
+// windowSeconds 取代了 Phase 1 的 workspaceWindowSeconds：总览不再从 workspace fixture
+// 借时间窗，而是用 URL 参数或服务端兜底窗口渲染诊断启动器。
+for (const token of ['aria-invalid', 'service-focus-validation', 'windowSeconds']) {
   assert.ok(overviewSource.includes(token), `service overview diagnosis launcher is missing ${token}`)
 }
 

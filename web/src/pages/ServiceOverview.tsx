@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import { Button, Input, Result, Select } from 'antd'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Button, Input, Result, Select, Skeleton } from 'antd'
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -10,6 +10,7 @@ import {
   DashboardOutlined,
   DatabaseOutlined,
   ReadOutlined,
+  ReloadOutlined,
   SafetyCertificateOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
@@ -20,7 +21,7 @@ import {
   SectionHeading,
   ServiceBreadcrumb,
 } from '../components/ServiceObservability'
-import { getBaseWorkspaceFixture, getOverviewFixture } from '../serviceObservability/fixtures'
+import { serviceObservabilityFixtureMode, useServiceOverview, usePublishServiceLabel } from '../serviceObservability/data'
 import {
   formatClock,
   formatDateTime,
@@ -29,44 +30,92 @@ import {
   formatSourceName,
   formatWindow,
 } from '../serviceObservability/format'
+import type { ServiceOverviewView } from '../serviceObservability/types'
+import { ApiError } from '../api/client'
 
 const dependencyIcon = (layer: string) => layer === 'infrastructure' ? <DatabaseOutlined /> : <ApiOutlined />
 const serviceIcon = (kind: string) => kind === 'infrastructure_capability' ? <CodeSandboxOutlined /> : <AppstoreOutlined />
 
+// defaultWindowSeconds 与服务端的兜底窗口一致：显式 Profile 默认窗口由服务端决定，
+// 前端只在需要构造工作区链接时使用这个显示值，绝不用它覆盖服务端的时间窗。
+const defaultWindowSeconds = 300
+
 export function ServiceOverview() {
   const { serviceId = '' } = useParams()
   const navigate = useNavigate()
-  const view = useMemo(() => getOverviewFixture(serviceId), [serviceId])
-  const workspace = useMemo(() => getBaseWorkspaceFixture(serviceId), [serviceId])
-  const primaryFocus = view?.focus_kinds.find((focus) => focus.primary) ?? view?.focus_kinds[0]
-  const [focusKind, setFocusKind] = useState(primaryFocus?.key ?? '')
-  const [focusValue, setFocusValue] = useState(workspace?.focus.value ?? primaryFocus?.placeholder ?? '')
+  const [searchParams] = useSearchParams()
+  const environment = searchParams.get('environment') ?? undefined
+  const windowParam = Number(searchParams.get('window_seconds'))
+  const windowSeconds = Number.isInteger(windowParam) && windowParam > 0 ? windowParam : undefined
 
-  if (!view || !workspace) {
-    return <Result status="404" title="服务不存在" subTitle="当前 Phase 1 fixture 中没有该服务。" extra={<Button onClick={() => navigate('/services')}>返回服务目录</Button>} />
+  const overviewQuery = useServiceOverview(serviceId, { environment, windowSeconds })
+  const view = overviewQuery.data
+  usePublishServiceLabel(view?.service.name)
+
+  if (overviewQuery.isPending) {
+    return (
+      <main className="service-ops-page service-overview-page" aria-busy="true" aria-label="正在加载服务总览">
+        <Skeleton active title={{ width: '30%' }} paragraph={{ rows: 3 }} />
+        <Skeleton active title paragraph={{ rows: 6 }} />
+      </main>
+    )
   }
+  if (overviewQuery.isError || !view) {
+    return (
+      <OverviewErrorState
+        error={overviewQuery.error}
+        onRetry={() => overviewQuery.refetch()}
+        onBack={() => navigate('/services')}
+      />
+    )
+  }
+  return (
+    <OverviewContent
+      view={view}
+      environment={environment}
+      windowSeconds={windowSeconds ?? defaultWindowSeconds}
+    />
+  )
+}
+
+function OverviewContent({
+  view,
+  environment,
+  windowSeconds,
+}: {
+  view: ServiceOverviewView
+  environment?: string
+  windowSeconds: number
+}) {
+  const navigate = useNavigate()
+  const primaryFocus = view.focus_kinds.find((focus) => focus.primary) ?? view.focus_kinds[0]
+  const [focusKind, setFocusKind] = useState(primaryFocus?.key ?? '')
+  const [focusValue, setFocusValue] = useState(primaryFocus?.placeholder ?? '')
+  // 时区只影响显示。总览没有自己的 scope，因此统一用 UTC 渲染服务端返回的绝对时间。
+  const timezone = 'UTC'
 
   const focusDefinition = view.focus_kinds.find((focus) => focus.key === focusKind)
   const focusValid = Boolean(focusDefinition && new RegExp(focusDefinition.value_pattern).test(focusValue.trim()))
-  const dependencyGroups = Array.from(view.dependencies.reduce((groups, dependency) => {
+  const dependencyGroups = useMemo(() => Array.from(view.dependencies.reduce((groups, dependency) => {
     const group = groups.get(dependency.group_key) ?? { key: dependency.group_key, label: dependency.group_label, items: [] }
     group.items.push(dependency)
     groups.set(dependency.group_key, group)
     return groups
-  }, new Map<string, { key: string; label: string; items: typeof view.dependencies }>()).values())
-  const workspaceWindowSeconds = Math.max(0, Math.round((Date.parse(workspace.scope.to) - Date.parse(workspace.scope.from)) / 1000))
-  const workspaceWindowLabel = `${formatWindow(workspaceWindowSeconds)} · ${formatClock(workspace.scope.from, workspace.scope.timezone)}–${formatClock(workspace.scope.to, workspace.scope.timezone)}`
+  }, new Map<string, { key: string; label: string; items: typeof view.dependencies }>()).values()), [view.dependencies])
+  const workspaceWindowLabel = `最近 ${formatWindow(windowSeconds)}`
+  const unconfigured = view.profile === null
+
+  const workspaceHref = (params?: URLSearchParams) => {
+    const search = params ?? new URLSearchParams()
+    if (environment) search.set('environment', environment)
+    const query = search.toString()
+    return `/services/${view.service.service_id}/observability${query ? `?${query}` : ''}`
+  }
 
   const openWorkspace = () => {
     if (!focusValid) return
-    const params = new URLSearchParams({
-      focus_kind: focusKind,
-      focus_value: focusValue.trim(),
-      from: workspace.scope.from,
-      to: workspace.scope.to,
-    })
-    if (focusValue.trim() !== workspace.focus.value) params.set('scenario', 'empty')
-    navigate(`/services/${view.service.service_id}/observability?${params}`)
+    const params = new URLSearchParams({ focus_kind: focusKind, focus_value: focusValue.trim() })
+    navigate(workspaceHref(params))
   }
 
   return (
@@ -87,20 +136,33 @@ export function ServiceOverview() {
               <code>{view.service.entity_key}</code>
               <span>负责人 <b>{view.service.owner_team_name}</b></span>
               <span>层级 <b>{view.service.tier.replace('tier-', 'T')}</b></span>
-              <span>Profile <b>v{view.profile?.profile_version ?? '—'}</b></span>
+              <span>Profile <b>{view.profile ? `v${view.profile.profile_version}` : '未配置'}</b></span>
             </div>
           </div>
         </div>
         <div className="service-overview-actions">
-          <time dateTime={view.assembled_at} title={formatDateTime(view.assembled_at, workspace.scope.timezone)}>
-            服务上下文更新于 {formatClock(view.assembled_at, workspace.scope.timezone)}
+          <time dateTime={view.assembled_at} title={formatDateTime(view.assembled_at, timezone)}>
+            服务上下文更新于 {formatClock(view.assembled_at, timezone)}
           </time>
-          <Button type="primary" onClick={() => navigate(`/services/${view.service.service_id}/observability`)}>
+          <Button type="primary" disabled={unconfigured} onClick={() => navigate(workspaceHref())}>
             进入可观测性工作区
           </Button>
           {view.links.map((link) => <a key={link.kind} href={link.href}>{link.label}</a>)}
         </div>
       </header>
+
+      {unconfigured && (
+        <section className="workspace-state-banner is-unconfigured" role="status">
+          <WarningOutlined />
+          <span>
+            <strong>该服务尚未配置 Service Profile</strong>
+            责任、declared 依赖与已提交的领域状态仍然可用；黄金信号与聚焦工作区需要先发布 Profile。
+          </span>
+          <Link className="ant-btn ant-btn-default" to={`/settings/services/${view.service.service_id}`}>
+            前往服务登记
+          </Link>
+        </section>
+      )}
 
       <GoldenLedger signals={view.golden_signals} />
 
@@ -109,6 +171,7 @@ export function ServiceOverview() {
           <section className="service-panel">
             <SectionHeading title="当前需要判断" action={<Link to="/faults">查看全部 Fault <ArrowRightOutlined /></Link>} />
             <div className="service-fault-list">
+              {view.faults.length === 0 && <p className="service-empty-note">当前没有未关闭的 Fault。</p>}
               {view.faults.map((fault) => (
                 <Link key={fault.fault_id} to={`/faults/${fault.fault_id}`} className={`service-fault-row is-${fault.severity}`}>
                   <span className="service-fault-mark">{fault.severity === 'critical' ? <CloseCircleOutlined /> : <WarningOutlined />}</span>
@@ -141,19 +204,24 @@ export function ServiceOverview() {
                           <td>{formatProvenance(dependency.provenance)}</td>
                           <td><HealthBadge state={dependency.health} compact /></td>
                           <td>
-                            <time
-                              dateTime={dependency.observed_at}
-                              title={formatDateTime(dependency.observed_at, workspace.scope.timezone)}
-                              tabIndex={0}
-                            >
-                              {formatClock(dependency.observed_at, workspace.scope.timezone)}
-                            </time>
+                            {dependency.observed_at ? (
+                              <time
+                                dateTime={dependency.observed_at}
+                                title={formatDateTime(dependency.observed_at, timezone)}
+                                tabIndex={0}
+                              >
+                                {formatClock(dependency.observed_at, timezone)}
+                              </time>
+                            ) : <span className="is-unknown">未观测</span>}
                           </td>
                           <td><Link aria-label={`打开 ${dependency.name}`} to={`/infrastructure/${dependency.entity_id}`}><ArrowRightOutlined /></Link></td>
                         </tr>
                       ))}
                     </Fragment>
                   ))}
+                  {view.dependencies.length === 0 && (
+                    <tr><td colSpan={7} className="service-empty-note">没有可显示的 declared 依赖。</td></tr>
+                  )}
                 </tbody>
               </table>
             </div>
@@ -161,14 +229,15 @@ export function ServiceOverview() {
 
           <section className="service-panel service-recent-events">
             <SectionHeading title="最近事件" />
+            {view.recent_events.length === 0 && <p className="service-empty-note">当前边界内没有已提交的事件。</p>}
             {view.recent_events.map((event) => (
               <div key={event.event_id} className={`service-event-row is-${event.kind}`}>
                 <time
                   dateTime={event.occurred_at}
-                  title={formatDateTime(event.occurred_at, workspace.scope.timezone)}
+                  title={formatDateTime(event.occurred_at, timezone)}
                   tabIndex={0}
                 >
-                  {formatClock(event.occurred_at, workspace.scope.timezone)}
+                  {formatClock(event.occurred_at, timezone)}
                 </time>
                 <span>{event.title}</span>
                 <small>{formatSourceName(event.source)}</small>
@@ -191,45 +260,53 @@ export function ServiceOverview() {
 
           <section className="service-panel service-diagnosis-launcher">
             <SectionHeading title="开始诊断" />
-            <label>
-              <span>定位字段</span>
-              <Select
-                value={focusKind}
-                onChange={(value) => {
-                  setFocusKind(value)
-                  const definition = view.focus_kinds.find((focus) => focus.key === value)
-                  setFocusValue(definition?.placeholder ?? '')
-                }}
-                options={view.focus_kinds.map((focus) => ({ value: focus.key, label: focus.label }))}
-              />
-            </label>
-            <label>
-              <span>{focusDefinition?.label ?? 'Focus'}</span>
-              <Input
-                value={focusValue}
-                status={focusValue && !focusValid ? 'error' : undefined}
-                aria-invalid={Boolean(focusValue && !focusValid)}
-                aria-describedby={focusValue && !focusValid ? 'service-focus-validation' : 'service-focus-validation-note'}
-                onChange={(event) => setFocusValue(event.target.value)}
-                onPressEnter={openWorkspace}
-                placeholder={focusDefinition?.placeholder}
-              />
-            </label>
-            {focusValue && !focusValid ? (
-              <small id="service-focus-validation" className="service-focus-error" role="alert">
-                输入格式不符合当前定位字段。
-              </small>
-            ) : null}
-            <label>
-              <span>时间范围</span>
-              <Select
-                value={String(workspaceWindowSeconds)}
-                aria-label="诊断时间范围"
-                options={[{ value: String(workspaceWindowSeconds), label: workspaceWindowLabel }]}
-              />
-            </label>
-            <Button type="primary" block disabled={!focusValid} onClick={openWorkspace}>定位请求</Button>
-            <small id="service-focus-validation-note">将在可观测性工作区打开该请求；URL 不包含凭据或原始查询。</small>
+            {view.focus_kinds.length === 0 ? (
+              <p className="service-empty-note">
+                该服务尚未声明 focus 维度；发布 Service Profile 后才能按请求定位。
+              </p>
+            ) : (
+              <>
+                <label>
+                  <span>定位字段</span>
+                  <Select
+                    value={focusKind}
+                    onChange={(value) => {
+                      setFocusKind(value)
+                      const definition = view.focus_kinds.find((focus) => focus.key === value)
+                      setFocusValue(definition?.placeholder ?? '')
+                    }}
+                    options={view.focus_kinds.map((focus) => ({ value: focus.key, label: focus.label }))}
+                  />
+                </label>
+                <label>
+                  <span>{focusDefinition?.label ?? 'Focus'}</span>
+                  <Input
+                    value={focusValue}
+                    status={focusValue && !focusValid ? 'error' : undefined}
+                    aria-invalid={Boolean(focusValue && !focusValid)}
+                    aria-describedby={focusValue && !focusValid ? 'service-focus-validation' : 'service-focus-validation-note'}
+                    onChange={(event) => setFocusValue(event.target.value)}
+                    onPressEnter={openWorkspace}
+                    placeholder={focusDefinition?.placeholder}
+                  />
+                </label>
+                {focusValue && !focusValid ? (
+                  <small id="service-focus-validation" className="service-focus-error" role="alert">
+                    输入格式不符合当前定位字段。
+                  </small>
+                ) : null}
+                <label>
+                  <span>时间范围</span>
+                  <Select
+                    value={String(windowSeconds)}
+                    aria-label="诊断时间范围"
+                    options={[{ value: String(windowSeconds), label: workspaceWindowLabel }]}
+                  />
+                </label>
+                <Button type="primary" block disabled={!focusValid} onClick={openWorkspace}>定位请求</Button>
+                <small id="service-focus-validation-note">将在可观测性工作区打开该请求；URL 不包含凭据或原始查询。</small>
+              </>
+            )}
           </section>
 
           <section className="service-panel service-responsibility">
@@ -250,5 +327,53 @@ export function ServiceOverview() {
         </aside>
       </div>
     </main>
+  )
+}
+
+// OverviewErrorState 按后端稳定 reason code 分支。API 失败绝不回落 fixture：
+// 网络错误被 demo 数据掩盖，比页面报错危险得多。
+function OverviewErrorState({
+  error,
+  onRetry,
+  onBack,
+}: {
+  error: unknown
+  onRetry: () => void
+  onBack: () => void
+}) {
+  const apiError = error instanceof ApiError ? error : undefined
+  const status = apiError?.status ?? (error as { status?: number } | undefined)?.status
+  if (status === 404) {
+    return (
+      <Result
+        status="404"
+        title="服务不存在"
+        subTitle={serviceObservabilityFixtureMode
+          ? '当前 fixture 集合中没有该服务。'
+          : '该服务没有登记，或不在当前环境内。'}
+        extra={<Button onClick={onBack}>返回服务目录</Button>}
+      />
+    )
+  }
+  if (status === 422) {
+    return (
+      <Result
+        status="warning"
+        title="请求参数非法"
+        subTitle={apiError?.message ?? '时间窗或环境参数不满足服务端约束。'}
+        extra={<Button onClick={onBack}>返回服务目录</Button>}
+      />
+    )
+  }
+  return (
+    <Result
+      status="500"
+      title="服务总览暂时不可用"
+      subTitle={apiError?.message ?? '聚合视图请求失败；页面不会用历史数据或 fixture 掩盖这次故障。'}
+      extra={[
+        <Button key="retry" type="primary" icon={<ReloadOutlined />} onClick={onRetry}>重试</Button>,
+        <Button key="back" onClick={onBack}>返回服务目录</Button>,
+      ]}
+    />
   )
 }
