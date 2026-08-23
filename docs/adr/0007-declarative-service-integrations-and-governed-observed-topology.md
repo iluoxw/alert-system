@@ -90,8 +90,10 @@ Package 禁止包含：
 - 未经 allowlist 的字段名、URL 或 adapter key。
 
 原始查询模板仍属于 alert-system 内部的**受信 provider template registry**。SIP 只能选择模板
-并传递 schema 允许的参数，例如已发现并固定的 metric name、label matcher、stream key、
-focus field 和 stage mapping。PromQL/SQL 由 adapter 从类型化模板构造，服务方不能提交自由文本。
+并传递 schema 允许的参数，例如已发现并固定的 metric name、label 等值对、stream key、
+focus field 和 stage mapping。label 名必须来自 identifier allowlist，值只能是被严格编码的
+字面值；SIP 禁止 regex、否定、集合选择器和任何自由 matcher 表达式。PromQL/SQL 由 adapter
+从类型化模板构造，服务方不能提交自由文本。
 
 ### 4. SIP 发布前编译为现有 v1 Profile，不改变 ID 语义
 
