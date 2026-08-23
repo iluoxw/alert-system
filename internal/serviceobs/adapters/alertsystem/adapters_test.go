@@ -58,12 +58,12 @@ type fakeReader struct {
 	boundaryTruncated bool
 	boundaryArgs      boundaryCall
 	boundaryErr       error
-	reachable     map[string]struct{}
-	reachableErr  error
-	serviceResRow store.ServiceResolutionRow
-	serviceResErr error
-	entityResRow  store.EntityResolutionRow
-	entityResErr  error
+	reachable         map[string]struct{}
+	reachableErr      error
+	serviceResRow     store.ServiceResolutionRow
+	serviceResErr     error
+	entityResRow      store.EntityResolutionRow
+	entityResErr      error
 
 	domainRows  store.DomainFactsRows
 	domainQuery store.DomainFactsQuery

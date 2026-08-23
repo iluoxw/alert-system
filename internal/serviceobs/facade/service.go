@@ -459,7 +459,7 @@ func (s *Service) windowFor(published *model.Profile) int {
 }
 
 const (
-	minFacadeWindowSeconds      = 60
+	minFacadeWindowSeconds        = 60
 	defaultFacadeMaxWindowSeconds = 86400
 )
 
