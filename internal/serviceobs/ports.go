@@ -457,6 +457,11 @@ type DomainReader interface {
 
 // ObservationRequest 是语义信号读取请求。它只携带语义 key 与范围，绝不携带 PromQL、
 // SQL、LogQL 或凭据。
+//
+// Subject 与 Purpose 是 Phase 3 新增的**兼容扩展**：两者都必须由装配层从 session 与路由
+// 决定，URL、query 与 SIP 都不能自报。Phase 2 的 UnavailableObservationReader 不看这两个
+// 字段，因此既有调用方不受影响；ObservationCoordinator 则对它们 fail closed——一个没有
+// 用途的读取请求无法判断"该不该扇出证据查询"，只能拒绝而不是猜。
 type ObservationRequest struct {
 	Profile       model.Profile
 	ServiceID     string
@@ -465,16 +470,36 @@ type ObservationRequest struct {
 	From          time.Time
 	To            time.Time
 	Focus         *model.Focus
+	// Subject 是服务端从 session 计算出的身份。
+	Subject Subject
+	// Purpose 是服务端按路由选择的读取用途。零值不是合法用途。
+	Purpose Purpose
+	// BindingKeys 为空表示"读 Profile 声明的全部 binding"；目录摘要只传摘要需要的那几个，
+	// 避免一次列表刷新把整份 Profile 的 binding 全查一遍。
+	BindingKeys []string
 }
 
 // ObservationFacts 是遥测 adapter 的返回：规范化观测 + 自己的 source 状态。
 //
 // 它复用 health 包的观测类型，避免再定义一套平行结构后与 evaluator 漂移。
+//
+// Phase 3 的新增字段全部是**追加**：既有调用方（Phase 2 的 assembler 与
+// UnavailableObservationReader）不读它们，编译与行为都不变。新增字段表达的是 Phase 2 无法
+// 表达的四件事——focus 是否命中、journey 每个阶段的观测状态、observed topology hint、
+// 以及身份/边界的可审计缺口。
 type ObservationFacts struct {
 	Signals      []health.SignalObservation
 	Sources      []health.SourceObservation
 	EvidenceRefs []model.EvidenceRef
 	ReadAt       time.Time
+	// Focus 表达"没请求过 / 命中 / 查成功但没有匹配 / 不知道"。零值是 not_requested。
+	Focus FocusResult
+	// JourneyStages 只使用 Page View v1 的 stage 枚举，且本阶段不凭缺失事实生成 skipped。
+	JourneyStages []JourneyStageObservation
+	// TopologyHints 是候选 observed 边。它们必须先经 alias 唯一解析才可能进 overlay。
+	TopologyHints []ObservedTopologyHint
+	// Issues 是身份解析与边界缺口的可审计摘要，不含未脱敏原文。
+	Issues []ReconciliationIssue
 }
 
 // ObservationReader 是 Golden/RED/USE 与 Evidence 的读取端口。Phase 3 用
@@ -505,6 +530,9 @@ func (UnavailableObservationReader) ReadObservations(
 	facts := ObservationFacts{
 		Signals:      make([]health.SignalObservation, 0, len(req.Profile.SignalBindings)),
 		EvidenceRefs: []model.EvidenceRef{},
+		// 遥测未接入时没有任何 focus 语义：显式 not_requested，而不是让零值被误读成
+		// "查过但没匹配"。
+		Focus: FocusNotRequested,
 	}
 	for _, binding := range req.Profile.SignalBindings {
 		facts.Signals = append(facts.Signals, health.SignalObservation{

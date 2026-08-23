@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"alert-system/internal/serviceobs/provider"
 )
 
 const (
@@ -114,6 +116,9 @@ type ServiceObservabilityConfig struct {
 	// MaxWindowSeconds 是全局时间窗上界。每次请求的有效上界取它与 Profile limits
 	// 的最小值。
 	MaxWindowSeconds int
+	// Providers 是 Phase 3 只读遥测 provider 的连接与限额配置。endpoint 为空表示
+	// 未连接：启动成功、页面显式 Unknown。
+	Providers ServiceObservabilityProvidersConfig
 }
 
 // SMTPConfig 是 email 通知渠道（R3）所需的 SMTP 凭据配置。Host 为空表示未配置，
@@ -193,13 +198,14 @@ type fileConfig struct {
 }
 
 type fileServiceObservabilityConfig struct {
-	ProfileDir       string `yaml:"profile_dir"`
-	CacheTTL         string `yaml:"cache_ttl"`
-	CacheMaxStale    string `yaml:"cache_max_stale"`
-	CacheMaxEntries  int    `yaml:"cache_max_entries"`
-	RefreshWorkers   int    `yaml:"refresh_workers"`
-	RefreshQueue     int    `yaml:"refresh_queue"`
-	MaxWindowSeconds int    `yaml:"max_window_seconds"`
+	ProfileDir       string                                  `yaml:"profile_dir"`
+	CacheTTL         string                                  `yaml:"cache_ttl"`
+	CacheMaxStale    string                                  `yaml:"cache_max_stale"`
+	CacheMaxEntries  int                                     `yaml:"cache_max_entries"`
+	RefreshWorkers   int                                     `yaml:"refresh_workers"`
+	RefreshQueue     int                                     `yaml:"refresh_queue"`
+	MaxWindowSeconds int                                     `yaml:"max_window_seconds"`
+	Providers        fileServiceObservabilityProvidersConfig `yaml:"providers"`
 }
 
 type fileSMTPConfig struct {
@@ -255,6 +261,7 @@ func Load(path string) (Config, error) {
 			RefreshWorkers:   defaultServiceObservabilityRefreshWorkers,
 			RefreshQueue:     defaultServiceObservabilityRefreshQueue,
 			MaxWindowSeconds: defaultServiceObservabilityMaxWindowSeconds,
+			Providers:        defaultFileProviders(),
 		},
 	}
 
@@ -381,6 +388,11 @@ func normalizeServiceObservability(fc fileServiceObservabilityConfig) (ServiceOb
 			"invalid service_observability.max_window_seconds %d: must be at least %d",
 			fc.MaxWindowSeconds, minServiceObservabilityMaxWindowSeconds)
 	}
+	// 生产装配一律 ModeProduction：没有任何请求参数或 YAML 项能把它切成测试模式。
+	providers, err := normalizeServiceObservabilityProviders(fc.Providers, provider.ModeProduction)
+	if err != nil {
+		return ServiceObservabilityConfig{}, err
+	}
 	return ServiceObservabilityConfig{
 		ProfileDir:       strings.TrimSpace(fc.ProfileDir),
 		CacheTTL:         cacheTTL,
@@ -389,6 +401,7 @@ func normalizeServiceObservability(fc fileServiceObservabilityConfig) (ServiceOb
 		RefreshWorkers:   fc.RefreshWorkers,
 		RefreshQueue:     fc.RefreshQueue,
 		MaxWindowSeconds: fc.MaxWindowSeconds,
+		Providers:        providers,
 	}, nil
 }
 
@@ -517,6 +530,7 @@ func applyServiceObservabilityEnvOverrides(fc *fileConfig) {
 	if v := os.Getenv("SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS"); v != "" {
 		fc.ServiceObservability.MaxWindowSeconds = invalidIfNotInteger(v)
 	}
+	applyServiceObservabilityProviderEnvOverrides(fc)
 }
 
 // invalidIfNotInteger 把非整数环境变量映射成一个必然被校验拒绝的值（0），从而让启动

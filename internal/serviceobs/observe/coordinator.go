@@ -1,0 +1,664 @@
+// Package observe 是 provider-neutral 的 ObservationCoordinator。
+//
+// 它实现 serviceobs.ObservationReader，因此 facade、API 路由与前端 Page View 不出现任何
+// provider 分支：换 Prometheus 后端或换证据存储只改这里注册了哪些 reader。
+//
+// 六条行为口径在本文件固化，每一条都有对应测试：
+//
+//  1. Subject 与 Purpose 必须由装配层给出。缺任何一个都 fail closed——一个没有用途的读取
+//     请求无法判断"该不该对每一行服务扇出证据查询"，猜错的代价是把一次目录列表放大成
+//     上千次上游查询。
+//  2. purpose 决定调用哪些来源。directory_summary 只读 signal，**绝不**碰
+//     logs/traces/access。
+//  3. 每个来源有自己的 deadline 与 limits。单来源超时/失败/panic 只把它自己降级为
+//     Unknown/Unavailable，其它来源与 declared topology、domain 事实全部保留。
+//  4. 父 context 取消或超时一律向上返回 context 错误，不把已断开的请求伪装成一个可返回的
+//     Partial；同时所有子 context 被取消，在途 HTTP 请求随之终止，不遗留 goroutine。
+//  5. 完全没有配置任何 provider 时，逐字保留 Phase 2 的 telemetry_not_connected 语义。
+//     部分配置时，当前 purpose 已选中但未连接的来源必须显式 *_not_connected，不能省略。
+//  6. 当前用户缺少某来源所需权限时，该来源的上游调用次数为 0，只在最小范围 Forbidden。
+package observe
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"alert-system/internal/serviceobs"
+	"alert-system/internal/serviceobs/health"
+	"alert-system/internal/serviceobs/model"
+)
+
+// Readers 是已注册的来源实现。任一字段为 nil 表示该 provider 未连接。
+//
+// 用 nil 而不是布尔开关：装配层要么注册了一个真的能查的实现，要么什么都没注册，
+// 不存在"注册了但其实不可用"的中间态。
+type Readers struct {
+	Signals serviceobs.SemanticSignalReader
+	Traces  serviceobs.TraceReader
+	Logs    serviceobs.LogReader
+	Access  serviceobs.AccessReader
+}
+
+// AnyConfigured 表示是否至少注册了一个 provider。
+func (r Readers) AnyConfigured() bool {
+	return r.Signals != nil || r.Traces != nil || r.Logs != nil || r.Access != nil
+}
+
+// Limits 是各来源的全局上界。每次请求的有效值取它与 Profile limits 的最小值。
+type Limits struct {
+	Signals serviceobs.SourceLimits
+	Traces  serviceobs.SourceLimits
+	Logs    serviceobs.SourceLimits
+	Access  serviceobs.SourceLimits
+}
+
+const (
+	defaultSourceTimeout    = 5 * time.Second
+	defaultMaxRows          = 200
+	defaultMaxSeries        = 500
+	defaultMaxResponseBytes = int64(8 << 20)
+)
+
+func withLimitDefaults(limits serviceobs.SourceLimits) serviceobs.SourceLimits {
+	if limits.Timeout <= 0 {
+		limits.Timeout = defaultSourceTimeout
+	}
+	if limits.MaxRows <= 0 {
+		limits.MaxRows = defaultMaxRows
+	}
+	if limits.MaxSeries <= 0 {
+		limits.MaxSeries = defaultMaxSeries
+	}
+	if limits.MaxResponseBytes <= 0 {
+		limits.MaxResponseBytes = defaultMaxResponseBytes
+	}
+	return limits
+}
+
+// clampToProfile 把全局上界与 Profile limits 取最小值。
+//
+// 只收紧不放宽：Profile 声明的 max_rows 比全局大时仍然用全局值，否则一个服务可以通过
+// 自己的 Profile 把系统级保护抬高。
+func clampToProfile(limits serviceobs.SourceLimits, profile model.Profile) serviceobs.SourceLimits {
+	if profile.Limits.MaxRows > 0 && profile.Limits.MaxRows < limits.MaxRows {
+		limits.MaxRows = profile.Limits.MaxRows
+	}
+	return limits
+}
+
+// Options 是 Coordinator 的构造依赖。
+type Options struct {
+	Readers Readers
+	Limits  Limits
+	// Permissions 为 nil 时一切需要权限的来源都被视为未授权：默认从严。
+	Permissions serviceobs.PermissionResolver
+	// SummaryBindingKeys 决定目录摘要读哪些 binding。为 nil 时回退到"全部 golden binding"，
+	// 因为目录摘要展示的就是四大黄金信号。
+	SummaryBindingKeys func(model.Profile) []string
+}
+
+// Coordinator 并行读取已授权且当前 purpose 真正需要的来源。
+type Coordinator struct {
+	readers     Readers
+	limits      Limits
+	permissions serviceobs.PermissionResolver
+	summaryKeys func(model.Profile) []string
+}
+
+// 编译期断言：Coordinator 必须满足 Phase 2 就固定下来的 ObservationReader 端口。
+var _ serviceobs.ObservationReader = (*Coordinator)(nil)
+
+var (
+	// ErrSubjectRequired 表示装配层没有传服务端身份。
+	ErrSubjectRequired = errors.New("observe: ObservationRequest 缺少服务端 Subject")
+	// ErrPurposeRequired 表示装配层没有选择读取用途。
+	ErrPurposeRequired = errors.New("observe: ObservationRequest 缺少合法 Purpose")
+)
+
+// New 构造 Coordinator。它不校验 readers 是否齐全：完全未配置是合法状态。
+func New(opts Options) *Coordinator {
+	summaryKeys := opts.SummaryBindingKeys
+	if summaryKeys == nil {
+		summaryKeys = defaultSummaryBindingKeys
+	}
+	return &Coordinator{
+		readers:     opts.Readers,
+		limits:      opts.Limits,
+		permissions: opts.Permissions,
+		summaryKeys: summaryKeys,
+	}
+}
+
+// defaultSummaryBindingKeys 返回四大黄金信号的 binding key。
+//
+// 目录摘要展示的就是它们；把全部 binding 都查一遍会让一次列表刷新的成本随 Profile 大小
+// 线性增长，而多出来的值一个也不会显示。
+func defaultSummaryBindingKeys(profile model.Profile) []string {
+	bindings := profile.GoldenBindings()
+	keys := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		keys = append(keys, binding.Key)
+	}
+	return keys
+}
+
+// sourcePlan 是一次请求要读的来源清单。
+type sourcePlan struct {
+	signals bool
+	traces  bool
+	logs    bool
+	access  bool
+}
+
+// planSources 按 purpose 与 Profile 决定读哪些来源。
+//
+// 它只回答"该不该读"，不回答"能不能读"：provider 未连接与权限不足分别在后面产生显式的
+// not_connected 与 Forbidden 状态。这个分工很重要——"没被请求"必须与"请求了但拿不到"
+// 可区分，否则页面无法解释自己为什么是空的。
+func planSources(purpose serviceobs.Purpose, profile model.Profile) sourcePlan {
+	plan := sourcePlan{signals: len(profile.SignalBindings) > 0}
+	if !purpose.NeedsFocusEvidence() {
+		return plan
+	}
+	// 聚焦工作区按 Profile 声明的 renderer 决定要不要证据来源：没有 evidence/journey
+	// renderer 的 Profile 不该被强行查一遍日志。
+	for _, view := range profile.Views {
+		switch view.Renderer {
+		case model.RendererRequestJourney, model.RendererDependencyTopology:
+			plan.traces = true
+		case model.RendererEvidenceList:
+			plan.traces = true
+			plan.logs = true
+			plan.access = true
+		}
+	}
+	return plan
+}
+
+// sourceOutcome 是单个来源的归一化结果。
+type sourceOutcome struct {
+	source        health.SourceObservation
+	signals       []health.SignalObservation
+	evidence      []model.EvidenceRef
+	journeyStages []serviceobs.JourneyStageObservation
+	hints         []serviceobs.ObservedTopologyHint
+	issues        []serviceobs.ReconciliationIssue
+	focus         serviceobs.FocusResult
+	// focusReported 表示该来源是否真的表达了 focus 结论。只有表达过的来源才参与合并，
+	// 否则一个不读 focus 的来源会把结论拉回 not_requested。
+	focusReported bool
+}
+
+// ReadObservations 并行读取来源并按稳定 source key 合并。
+func (c *Coordinator) ReadObservations(
+	ctx context.Context, req serviceobs.ObservationRequest,
+) (serviceobs.ObservationFacts, error) {
+	if req.Subject.UserID == "" {
+		return serviceobs.ObservationFacts{}, ErrSubjectRequired
+	}
+	if !req.Purpose.IsValid() {
+		return serviceobs.ObservationFacts{}, fmt.Errorf("%w: %q", ErrPurposeRequired, req.Purpose)
+	}
+	// 父 context 已经断开时立刻返回：不发起任何上游调用，也不构造一个看起来完整的结果。
+	if err := ctx.Err(); err != nil {
+		return serviceobs.ObservationFacts{}, err
+	}
+
+	// 完全没有配置任何 provider：逐字保留 Phase 2 语义。
+	if !c.readers.AnyConfigured() {
+		return c.notConnectedFacts(req), nil
+	}
+
+	permissions, err := c.resolvePermissions(ctx, req)
+	if err != nil {
+		return serviceobs.ObservationFacts{}, err
+	}
+
+	plan := planSources(req.Purpose, req.Profile)
+	outcomes := c.runSources(ctx, req, plan, permissions)
+
+	// 父 context 取消/超时必须向上返回，而不是把一堆"因为断开所以 Unknown"的来源当成
+	// 一个可展示的 Partial 返回给用户。
+	if err := ctx.Err(); err != nil {
+		return serviceobs.ObservationFacts{}, err
+	}
+	return mergeOutcomes(req, outcomes), nil
+}
+
+// resolvePermissions 现算权限。resolver 为 nil 时返回空集合（拒绝一切），而不是放行。
+func (c *Coordinator) resolvePermissions(
+	ctx context.Context, req serviceobs.ObservationRequest,
+) (serviceobs.Permissions, error) {
+	if c.permissions == nil {
+		return serviceobs.NewPermissions(), nil
+	}
+	permissions, err := c.permissions.ResolvePermissions(ctx, req.Subject, req.ServiceID)
+	if err != nil {
+		// 权限算不出来时不能"当作有权限"继续：整请求失败，由上层决定页面级错误。
+		return serviceobs.Permissions{}, fmt.Errorf("observe: 解析权限失败: %w", err)
+	}
+	return permissions, nil
+}
+
+// notConnectedFacts 构造 Phase 2 的"遥测完全未接入"事实。
+func (c *Coordinator) notConnectedFacts(req serviceobs.ObservationRequest) serviceobs.ObservationFacts {
+	facts := serviceobs.ObservationFacts{
+		Signals:      make([]health.SignalObservation, 0, len(req.Profile.SignalBindings)),
+		EvidenceRefs: []model.EvidenceRef{},
+		Focus:        serviceobs.FocusNotRequested,
+	}
+	for _, key := range c.requestedBindingKeys(req) {
+		facts.Signals = append(facts.Signals, health.SignalObservation{
+			BindingKey:    key,
+			Availability:  model.SignalAvailabilityUnavailable,
+			SourceKey:     serviceobs.SourceKeyPrometheus,
+			UnknownReason: serviceobs.ReasonTelemetryNotConnected,
+		})
+	}
+	facts.Sources = []health.SourceObservation{{
+		SourceKey:  serviceobs.SourceKeyPrometheus,
+		State:      model.AvailabilityUnavailable,
+		Freshness:  model.FreshnessUnknown,
+		ReasonCode: serviceobs.ReasonTelemetryNotConnected,
+		Retryable:  false,
+	}}
+	return facts
+}
+
+// requestedBindingKeys 决定本次真正要读的 binding。
+func (c *Coordinator) requestedBindingKeys(req serviceobs.ObservationRequest) []string {
+	if len(req.BindingKeys) > 0 {
+		return req.BindingKeys
+	}
+	if req.Purpose == serviceobs.PurposeDirectorySummary {
+		return c.summaryKeys(req.Profile)
+	}
+	keys := make([]string, 0, len(req.Profile.SignalBindings))
+	for _, binding := range req.Profile.SignalBindings {
+		keys = append(keys, binding.Key)
+	}
+	return keys
+}
+
+// runSources 并行执行来源。
+//
+// 每个来源拿到的是自己的 child context：它自己的 deadline 到了只影响自己，而父 context
+// 取消会同时终止全部在途请求。WaitGroup 保证函数返回前所有 goroutine 都已退出，
+// 因此不会有 goroutine 泄漏。
+func (c *Coordinator) runSources(
+	ctx context.Context,
+	req serviceobs.ObservationRequest,
+	plan sourcePlan,
+	permissions serviceobs.Permissions,
+) []sourceOutcome {
+	type task struct {
+		sourceKey  string
+		permission serviceobs.Permission
+		limits     serviceobs.SourceLimits
+		run        func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error)
+		configured bool
+		notConnect string
+	}
+
+	tasks := make([]task, 0, 4)
+	if plan.signals {
+		tasks = append(tasks, task{
+			sourceKey:  serviceobs.SourceKeyPrometheus,
+			permission: serviceobs.PermissionMetricsRead,
+			limits:     clampToProfile(withLimitDefaults(c.limits.Signals), req.Profile),
+			configured: c.readers.Signals != nil,
+			notConnect: serviceobs.ReasonPrometheusNotConnected,
+			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
+				facts, err := c.readers.Signals.ReadSignals(ctx, serviceobs.SignalRequest{
+					Subject:       req.Subject,
+					Purpose:       req.Purpose,
+					Profile:       req.Profile,
+					ServiceID:     req.ServiceID,
+					Environment:   req.Environment,
+					BindingKeys:   c.requestedBindingKeys(req),
+					WindowSeconds: req.WindowSeconds,
+					From:          req.From,
+					To:            req.To,
+					Limits:        limits,
+				})
+				if err != nil {
+					return sourceOutcome{}, err
+				}
+				return sourceOutcome{source: facts.Source, signals: facts.Signals}, nil
+			},
+		})
+	}
+	focusRequest := func(limits serviceobs.SourceLimits) serviceobs.FocusRequest {
+		return serviceobs.FocusRequest{
+			Subject:     req.Subject,
+			Purpose:     req.Purpose,
+			Profile:     req.Profile,
+			ServiceID:   req.ServiceID,
+			Environment: req.Environment,
+			From:        req.From,
+			To:          req.To,
+			Focus:       req.Focus,
+			Limits:      limits,
+		}
+	}
+	if plan.traces {
+		tasks = append(tasks, task{
+			sourceKey:  serviceobs.SourceKeyOpenObserveTraces,
+			permission: serviceobs.PermissionTracesRead,
+			limits:     clampToProfile(withLimitDefaults(c.limits.Traces), req.Profile),
+			configured: c.readers.Traces != nil,
+			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
+				facts, err := c.readers.Traces.ReadTraces(ctx, focusRequest(limits))
+				if err != nil {
+					return sourceOutcome{}, err
+				}
+				return sourceOutcome{
+					source: facts.Source, evidence: facts.EvidenceRefs,
+					journeyStages: facts.JourneyStages, hints: facts.TopologyHints,
+					issues: facts.Issues, focus: facts.Focus, focusReported: true,
+				}, nil
+			},
+		})
+	}
+	if plan.logs {
+		tasks = append(tasks, task{
+			sourceKey:  serviceobs.SourceKeyOpenObserveLogs,
+			permission: serviceobs.PermissionLogsRead,
+			limits:     clampToProfile(withLimitDefaults(c.limits.Logs), req.Profile),
+			configured: c.readers.Logs != nil,
+			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
+				facts, err := c.readers.Logs.ReadLogs(ctx, focusRequest(limits))
+				if err != nil {
+					return sourceOutcome{}, err
+				}
+				return sourceOutcome{
+					source: facts.Source, evidence: facts.EvidenceRefs,
+					focus: facts.Focus, focusReported: true,
+				}, nil
+			},
+		})
+	}
+	if plan.access {
+		tasks = append(tasks, task{
+			sourceKey: serviceobs.SourceKeyOpenObserveAccess,
+			// access 记录可能带 request/response 片段，因此按 logs.read 从严要求，
+			// 不借 traces.read 放行。
+			permission: serviceobs.PermissionLogsRead,
+			limits:     clampToProfile(withLimitDefaults(c.limits.Access), req.Profile),
+			configured: c.readers.Access != nil,
+			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
+				facts, err := c.readers.Access.ReadAccess(ctx, focusRequest(limits))
+				if err != nil {
+					return sourceOutcome{}, err
+				}
+				return sourceOutcome{
+					source: facts.Source, evidence: facts.EvidenceRefs,
+					focus: facts.Focus, focusReported: true,
+				}, nil
+			},
+		})
+	}
+
+	outcomes := make([]sourceOutcome, len(tasks))
+	var wg sync.WaitGroup
+	for i := range tasks {
+		current := tasks[i]
+		index := i
+		// 未连接与未授权都不启 goroutine：前者没有实现可调，后者必须保证上游调用次数为 0。
+		if !current.configured {
+			outcomes[index] = notConnectedOutcome(current.sourceKey, current.notConnect)
+			continue
+		}
+		if !permissions.Allows(current.permission) {
+			outcomes[index] = forbiddenOutcome(current.sourceKey)
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outcomes[index] = runOne(ctx, current.sourceKey, current.limits, current.run)
+		}()
+	}
+	wg.Wait()
+	return outcomes
+}
+
+// runOne 执行一个来源，并把 panic、超时与错误映射成稳定的 source 状态。
+func runOne(
+	parent context.Context,
+	sourceKey string,
+	limits serviceobs.SourceLimits,
+	run func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error),
+) (outcome sourceOutcome) {
+	// panic 隔离：一个 adapter 崩溃不能带走整个请求，也不能让别的来源丢结果。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			outcome = failedOutcome(sourceKey, serviceobs.ReasonSourceInternalError, false)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(parent, limits.Timeout)
+	defer cancel()
+
+	result, err := run(ctx, limits)
+	if err == nil {
+		if result.source.SourceKey == "" {
+			result.source.SourceKey = sourceKey
+		}
+		return result
+	}
+
+	// 父 context 断开：这不是"这个来源坏了"，而是整个请求没了。仍然给一个 Unknown 占位，
+	// 由 ReadObservations 统一改成向上返回 context 错误。
+	if parent.Err() != nil {
+		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true)
+	}
+	return failedOutcome(sourceKey, reasonForError(err), retryableForError(err))
+}
+
+// reasonForError 把 adapter 的 typed 错误映射成稳定 reason code。
+//
+// 这里只识别本包定义的 sentinel：provider 特有的错误分类属于 Task 4/5 的 adapter，
+// 它们应该在返回前自行映射成这些 code，而不是让 coordinator 猜供应商语义。
+func reasonForError(err error) string {
+	switch {
+	case errors.Is(err, ErrUpstreamAuthFailed):
+		return serviceobs.ReasonUpstreamAuthFailed
+	case errors.Is(err, ErrUpstreamRateLimited):
+		return serviceobs.ReasonUpstreamRateLimited
+	case errors.Is(err, ErrResponseTooLarge):
+		return serviceobs.ReasonResponseTooLarge
+	case errors.Is(err, ErrCardinalityExceeded):
+		return serviceobs.ReasonCardinalityExceeded
+	case errors.Is(err, ErrAuditUnavailable):
+		return serviceobs.ReasonAuditUnavailable
+	default:
+		return serviceobs.ReasonSourceReadFailed
+	}
+}
+
+func retryableForError(err error) bool {
+	switch {
+	case errors.Is(err, ErrUpstreamAuthFailed):
+		// 凭据失效重试也不会好：它需要平台去换凭据。
+		return false
+	case errors.Is(err, ErrResponseTooLarge), errors.Is(err, ErrCardinalityExceeded):
+		// 需要用户收窄范围，重试同一个请求没有意义。
+		return false
+	default:
+		return true
+	}
+}
+
+// adapter 应当返回的 sentinel 错误。它们让"上游凭据失效"与"当前用户没权限"在类型上就分开。
+var (
+	ErrUpstreamAuthFailed  = errors.New("observe: 上游服务账号鉴权失败")
+	ErrUpstreamRateLimited = errors.New("observe: 上游限流")
+	ErrResponseTooLarge    = errors.New("observe: 响应超过字节或行数上界")
+	ErrCardinalityExceeded = errors.New("observe: series 基数超限")
+	ErrAuditUnavailable    = errors.New("observe: 审计不可写，结果不得返回")
+)
+
+func notConnectedOutcome(sourceKey, reason string) sourceOutcome {
+	return sourceOutcome{source: health.SourceObservation{
+		SourceKey:  sourceKey,
+		State:      model.AvailabilityUnavailable,
+		Freshness:  model.FreshnessUnknown,
+		ReasonCode: reason,
+		Retryable:  false,
+	}}
+}
+
+func forbiddenOutcome(sourceKey string) sourceOutcome {
+	return sourceOutcome{source: health.SourceObservation{
+		SourceKey:  sourceKey,
+		State:      model.AvailabilityForbidden,
+		Freshness:  model.FreshnessUnknown,
+		ReasonCode: serviceobs.ReasonPermissionDenied,
+		// 重试不会给用户补上权限。
+		Retryable: false,
+	}}
+}
+
+func failedOutcome(sourceKey, reason string, retryable bool) sourceOutcome {
+	return sourceOutcome{
+		source: health.SourceObservation{
+			SourceKey:  sourceKey,
+			State:      model.AvailabilityUnavailable,
+			Freshness:  model.FreshnessUnknown,
+			ReasonCode: reason,
+			Retryable:  retryable,
+		},
+		focus:         serviceobs.FocusUnknown,
+		focusReported: true,
+	}
+}
+
+// mergeOutcomes 按稳定 source key 合并结果。
+//
+// 合并规则刻意保守：
+//   - signal 只保留本次真的被请求的 binding，重复 binding 以第一个为准（adapter 不该重复
+//     返回，但重复时不能让后面的覆盖前面的，否则结果依赖 map 遍历顺序）；
+//   - 缺失的 binding 补一条显式 Unknown，绝不静默消失；
+//   - focus 结论取"最坏"：任一来源 unknown 就是 unknown，否则任一 matched 就是 matched。
+func mergeOutcomes(req serviceobs.ObservationRequest, outcomes []sourceOutcome) serviceobs.ObservationFacts {
+	facts := serviceobs.ObservationFacts{
+		Signals:      []health.SignalObservation{},
+		Sources:      []health.SourceObservation{},
+		EvidenceRefs: []model.EvidenceRef{},
+		Focus:        serviceobs.FocusNotRequested,
+	}
+
+	seenBinding := map[string]struct{}{}
+	for _, outcome := range outcomes {
+		if outcome.source.SourceKey != "" {
+			facts.Sources = append(facts.Sources, outcome.source)
+		}
+		for _, signal := range outcome.signals {
+			if _, exists := seenBinding[signal.BindingKey]; exists {
+				continue
+			}
+			seenBinding[signal.BindingKey] = struct{}{}
+			facts.Signals = append(facts.Signals, signal)
+		}
+		facts.EvidenceRefs = append(facts.EvidenceRefs, outcome.evidence...)
+		facts.JourneyStages = append(facts.JourneyStages, outcome.journeyStages...)
+		facts.TopologyHints = append(facts.TopologyHints, outcome.hints...)
+		facts.Issues = append(facts.Issues, outcome.issues...)
+	}
+
+	// 被请求但没有回值的 binding 必须显式 Unknown。
+	signalReason := signalUnknownReason(outcomes)
+	for _, key := range requestedKeys(req, outcomes) {
+		if _, exists := seenBinding[key]; exists {
+			continue
+		}
+		seenBinding[key] = struct{}{}
+		facts.Signals = append(facts.Signals, health.SignalObservation{
+			BindingKey:    key,
+			Availability:  model.SignalAvailabilityUnavailable,
+			SourceKey:     serviceobs.SourceKeyPrometheus,
+			UnknownReason: signalReason,
+		})
+	}
+
+	facts.Focus = mergeFocus(outcomes)
+	sort.SliceStable(facts.Sources, func(i, j int) bool {
+		return facts.Sources[i].SourceKey < facts.Sources[j].SourceKey
+	})
+	sort.SliceStable(facts.Signals, func(i, j int) bool {
+		return facts.Signals[i].BindingKey < facts.Signals[j].BindingKey
+	})
+	serviceobs.SortIssues(facts.Issues)
+	return facts
+}
+
+// requestedKeys 从 request 与已返回结果推断本次被请求的 binding 集合。
+func requestedKeys(req serviceobs.ObservationRequest, outcomes []sourceOutcome) []string {
+	if len(req.BindingKeys) > 0 {
+		return req.BindingKeys
+	}
+	if req.Purpose == serviceobs.PurposeDirectorySummary {
+		bindings := req.Profile.GoldenBindings()
+		keys := make([]string, 0, len(bindings))
+		for _, binding := range bindings {
+			keys = append(keys, binding.Key)
+		}
+		return keys
+	}
+	keys := make([]string, 0, len(req.Profile.SignalBindings))
+	for _, binding := range req.Profile.SignalBindings {
+		keys = append(keys, binding.Key)
+	}
+	return keys
+}
+
+// signalUnknownReason 为补齐的 Unknown binding 选一个稳定 reason。
+//
+// 它取 signal 来源自己的 reason code，因此"Prometheus 超时"与"Prometheus 未连接"在
+// binding 层面也能被区分，而不是笼统的一句 unknown。
+func signalUnknownReason(outcomes []sourceOutcome) string {
+	for _, outcome := range outcomes {
+		if outcome.source.SourceKey != serviceobs.SourceKeyPrometheus {
+			continue
+		}
+		if outcome.source.ReasonCode != "" {
+			return outcome.source.ReasonCode
+		}
+	}
+	return serviceobs.ReasonSourceReadFailed
+}
+
+// mergeFocus 取最坏 focus 结论。
+//
+// unknown 优先于 matched，matched 优先于 empty：如果 traces 说命中、logs 说不知道，
+// 整体结论必须是"不知道"，否则页面会用一个不完整的证据集去解释一次请求。
+func mergeFocus(outcomes []sourceOutcome) serviceobs.FocusResult {
+	result := serviceobs.FocusNotRequested
+	for _, outcome := range outcomes {
+		if !outcome.focusReported {
+			continue
+		}
+		switch outcome.focus {
+		case serviceobs.FocusUnknown:
+			return serviceobs.FocusUnknown
+		case serviceobs.FocusMatched:
+			result = serviceobs.FocusMatched
+		case serviceobs.FocusEmpty:
+			if result != serviceobs.FocusMatched {
+				result = serviceobs.FocusEmpty
+			}
+		}
+	}
+	return result
+}
