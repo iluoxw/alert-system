@@ -701,13 +701,16 @@ adapter 回填 per-source ReadAt、coordinator 只透传的后续项。Correctio
 
 Correction implementation `6f3cfbb3745b5f435c9cea3921d4462acc79dc0a` 已通过 Codex 本地
 gofmt/diff-check、contract verifier、build、普通与 integration vet、focused race、全量 unit + Docker
-e2e，以及全量 integration-race。Grok 仍需对包含本节事实同步的最终候选 SHA 做集中 review；review
-完成前不启动 Batch B。
+e2e，以及全量 integration-race。包含事实同步的最终候选
+`096174c2c2136a9113c0393de5e52c774b2352a7` 又通过 Grok exact-SHA review，结论为
+`PASS / no P0-P2 / no PR`；该 SHA 是 Batch B 唯一基线。
 
 ### Opus 5 High Batch B：Task 4–6
 
 Prometheus/OpenObserve/alias-overlay。完成后一次 push，Codex 跑 provider `httptest`、projection、
-store integration 与 security negative tests。
+store integration 与 security negative tests。细粒度 TDD、冲突域所有权、并发规则与验收命令见
+`docs/plans/2026-08-23-service-observability-phase3-batch-b-adapters-topology.md`；先由同一固定 Cursor
+Cloud 会话使用 Fable 5 High 做纯计划 review，通过后再切换 Opus 5 High 编码。
 
 ### Opus 5 High Batch C：Task 7–8
 
