@@ -15,7 +15,8 @@
 // 本模块保持纯净：不 import fixture、不 import API client、不碰 `window`，因此可以被
 // Node 直接编译执行，回归测试跑的是真实实现而不是它的副本。
 
-const httpSchemes = ['http://', 'https://'] as const
+// WHATWG URL 的 protocol 带尾随冒号。
+const httpProtocols = ['http:', 'https:'] as const
 
 /** normalizeHref 只去掉外层空白：内部空白与控制字符不是格式问题，而是非法输入。 */
 export function normalizeHref(raw: string | undefined | null): string {
@@ -32,19 +33,40 @@ function containsControlCharacters(value: string): boolean {
   return false
 }
 
+// isAbsoluteHTTP 判断是否是 **host 非空**的绝对 http/https URL。
+//
+// 判定必须真正解析 URL，不能只看"scheme 前缀之后还有字符"：那种前缀检查会放过一整类
+// 没有主机名或根本无法解析的值（`https://user@/path`、`https://:443/path`、
+// `https://[::1`、`https://exa mple.com`、`https://evil.example:bad/path`），而浏览器
+// 自己的 URL 解析全都拒绝它们——于是 UI 会渲染出一个点开后行为未定义的链接。
+//
+// 这里直接用 WHATWG `URL`（浏览器与 Node 同一套语义），并要求 protocol 是 http/https、
+// hostname 非空。hostname 是关键：它剥掉 userinfo 与端口，因此"authority 文本非空但没有
+// 主机名"的值不会被误判成合法。后端 internal/safelink 用 net/url 做同一件事，两侧共用
+// testdata/link_policy_cases.json 这张表来机械证明口径一致。
+// emptyAuthorityPattern 匹配 `scheme://` 之后直接是 `/`、`?`、`#` 或字符串结尾的形态，
+// 也就是"authority 为空"。
+//
+// 这一条前置检查是为了消除一个真实的解析器分歧：WHATWG URL 会把 `http:///runbooks`
+// **规范化**成 `http://runbooks/`（把路径的第一段当成主机名！），而 Go 的 net/url 认为
+// 它没有 host。也就是说同一个字符串在浏览器里会跳到外站 `runbooks`，在服务端校验里却
+// 是"无主机"。一个目标取决于"问哪个解析器"的值绝不能变成可点击链接，因此两侧都显式
+// 拒绝它，而不是各自跟随自己的解析器。
+const emptyAuthorityPattern = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[/?#]|$)/
+
 function isAbsoluteHTTP(value: string): boolean {
-  const lowered = value.toLowerCase()
-  for (const scheme of httpSchemes) {
-    if (!lowered.startsWith(scheme)) continue
-    const authority = value.slice(scheme.length)
-    if (authority === '') return false
-    // host 必须非空：`http:///path` 的 authority 以 `/` 开头，等于没有 host。
-    if (authority.startsWith('/') || authority.startsWith('?') || authority.startsWith('#')) {
-      return false
-    }
-    return true
+  if (emptyAuthorityPattern.test(value)) return false
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    // 无法解析（含裸主机与 malformed authority）一律不合法。
+    return false
   }
-  return false
+  if (!httpProtocols.includes(parsed.protocol.toLowerCase() as (typeof httpProtocols)[number])) {
+    return false
+  }
+  return parsed.hostname !== ''
 }
 
 /**

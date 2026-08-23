@@ -547,7 +547,10 @@ func TestWorkspaceTimezoneRequiresLoadableIANAZone(t *testing.T) {
 		{name: "Asia/Shanghai", timezone: "Asia/Shanghai", accepted: true},
 		{name: "America/New_York", timezone: "America/New_York", accepted: true},
 		{name: "Europe/Berlin", timezone: "Europe/Berlin", accepted: true},
-		{name: "Local 是 Go 的特殊值但不是 IANA 区名", timezone: "Local", accepted: true},
+		// Local 是 Go 的进程级特殊值：LoadLocation 接受它，但它不是确定的 IANA 显示时区，
+		// 浏览器 Intl 也直接拒绝。接受它会造成 live/fixture/渲染三方不一致。
+		{name: "Local 必须被拒绝", timezone: "Local"},
+		{name: "local 小写同样被拒绝", timezone: "local"},
 		{name: "形状合法但不存在", timezone: "Mars/Olympus"},
 		{name: "形状合法但不存在的深层路径", timezone: "Asia/Atlantis"},
 		{name: "大小写不匹配的真实区名", timezone: "asia/shanghai"},

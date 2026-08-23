@@ -1,0 +1,64 @@
+{
+  "description": "运营页面可点击入口的链接安全策略共享用例表。Go 的 internal/safelink 与前端 web/src/serviceObservability/safeHref.ts 读取同一份表，因此两侧口径不一致会被测试直接抓住，而不是靠人工对照两份实现。拒绝 mailto、自定义 scheme、裸主机与 scheme-relative 是对 V1 写入口径的有意安全收紧。",
+  "cases": [
+    { "name": "内部根路径", "href": "/", "safe": true },
+    { "name": "内部路径", "href": "/settings/services/svc-1", "safe": true },
+    { "name": "内部路径带查询", "href": "/alerts?service_id=svc-1", "safe": true },
+    { "name": "内部路径带片段", "href": "/faults/FLT-1#timeline", "safe": true },
+    { "name": "内部路径两端空白被 trim", "href": "  /runbooks/e2b  ", "safe": true },
+    { "name": "内部路径含编码字符", "href": "/runbooks/%E4%B8%AD%E6%96%87", "safe": true },
+
+    { "name": "https URL", "href": "https://grafana.example.com/d/abc", "safe": true },
+    { "name": "http URL", "href": "http://grafana.example.com/d/abc", "safe": true },
+    { "name": "混合大小写 scheme", "href": "HtTpS://grafana.example.com/d/abc", "safe": true },
+    { "name": "带端口", "href": "https://grafana.example.com:3000/d/abc", "safe": true },
+    { "name": "带 userinfo 且 host 真实", "href": "https://user@grafana.example.com/d", "safe": true },
+    { "name": "带 userinfo 与密码且 host 真实", "href": "https://user:pass@grafana.example.com/d", "safe": true },
+    { "name": "括号 IPv6", "href": "https://[::1]/d", "safe": true },
+    { "name": "括号 IPv6 带端口", "href": "https://[::1]:8080/d", "safe": true },
+    { "name": "IPv4 主机", "href": "http://10.60.199.160:9090/graph", "safe": true },
+    { "name": "只有 host 没有路径", "href": "https://grafana.example.com", "safe": true },
+
+    { "name": "hostless：userinfo 后无 host", "href": "https://user@/path", "safe": false },
+    { "name": "hostless：只有端口", "href": "https://:443/path", "safe": false },
+    { "name": "hostless：userinfo 后直接查询串", "href": "https://user@?x", "safe": false },
+    { "name": "hostless：三斜杠", "href": "http:///runbooks", "safe": false },
+    { "name": "hostless：三斜杠会被浏览器规范化成外站主机，两侧都必须拒绝", "href": "http:///evil.example.com", "safe": false },
+    { "name": "hostless：只有 scheme", "href": "http://", "safe": false },
+    { "name": "hostless：只有查询串", "href": "https://?x=1", "safe": false },
+    { "name": "hostless：只有片段", "href": "https://#x", "safe": false },
+    { "name": "malformed：IPv6 括号未闭合", "href": "https://[::1", "safe": false },
+    { "name": "malformed：host 含空格", "href": "https://exa mple.com", "safe": false },
+    { "name": "malformed：端口不是数字", "href": "https://evil.example:bad/path", "safe": false },
+
+    { "name": "javascript", "href": "javascript:alert(1)", "safe": false },
+    { "name": "javascript 大写", "href": "JavaScript:alert(1)", "safe": false },
+    { "name": "javascript 前置空白", "href": "  javascript:alert(1)", "safe": false },
+    { "name": "data", "href": "data:text/html;base64,PHNjcmlwdD4=", "safe": false },
+    { "name": "vbscript", "href": "vbscript:msgbox(1)", "safe": false },
+    { "name": "mailto 是有意收紧", "href": "mailto:sre@example.com", "safe": false },
+    { "name": "tel 是有意收紧", "href": "tel:+8613800000000", "safe": false },
+    { "name": "file", "href": "file:///etc/passwd", "safe": false },
+    { "name": "自定义 scheme", "href": "firebreak://open/service", "safe": false },
+
+    { "name": "scheme-relative", "href": "//evil.example.com/path", "safe": false },
+    { "name": "scheme-relative 带空白", "href": "  //evil.example.com", "safe": false },
+    { "name": "裸主机", "href": "grafana.example.com/d/abc", "safe": false },
+    { "name": "裸主机带端口", "href": "grafana.example.com:3000", "safe": false },
+    { "name": "相对路径无前导斜杠", "href": "runbooks/e2b", "safe": false },
+
+    { "name": "反斜杠 authority", "href": "/\\evil.example.com", "safe": false },
+    { "name": "双反斜杠", "href": "\\\\evil.example.com", "safe": false },
+    { "name": "http URL 内含反斜杠", "href": "https://grafana.example.com\\@evil.example.com", "safe": false },
+
+    { "name": "换行注入", "href": "/runbooks\nevil", "safe": false },
+    { "name": "回车注入", "href": "/runbooks\revil", "safe": false },
+    { "name": "制表符", "href": "/runbooks\tevil", "safe": false },
+    { "name": "NUL", "href": "/runbooks\u0000evil", "safe": false },
+    { "name": "DEL", "href": "/runbooks\u007fevil", "safe": false },
+    { "name": "javascript 中夹控制字符", "href": "java\u0001script:alert(1)", "safe": false },
+
+    { "name": "空字符串", "href": "", "safe": false },
+    { "name": "只有空白", "href": "   ", "safe": false }
+  ]
+}

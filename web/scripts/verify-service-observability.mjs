@@ -913,12 +913,29 @@ assert.equal(queryContract.validateTimezone(undefined), '', 'blank timezone stay
 // `+08:00` / `-05:00` 是形状规则的行为判别用例：Intl 接受它们（ES2024 的偏移量时区），
 // 但后端形状正则要求以字母开头，Go 的 LoadLocation 也不接受。少了形状校验就会出现
 // "fixture 通过、live 422"。
+// `Local` 是 Go 的进程级特殊值：LoadLocation 接受它，但它不是确定的 IANA 显示时区，
+// 浏览器 Intl 也拒绝它。两侧都必须显式拒绝，否则同一个值 live 接受、fixture 422，
+// 而带 Local 的 Page View 在前端无法如实渲染。
 for (const zone of [
   'Mars/Olympus', 'Asia/Atlantis', 'Asia Shanghai', 'z'.repeat(65),
-  '+08:00', '-05:00', '_bad', '9Bad',
+  '+08:00', '-05:00', '_bad', '9Bad', 'Local', 'local', 'LOCAL',
 ]) {
   expectReason(() => queryContract.validateTimezone(zone), 'invalid_timezone', `timezone=${zone}`)
 }
+// 断言必须落在**用法**上：只检查常量名存在，会被"删掉比较、留下声明"的改动绕过。
+assert.ok(
+  /=== localTimezoneSentinel\.toLowerCase\(\)/.test(queryContractSource),
+  'the fixture timezone contract must compare against the process-local sentinel, not just declare it',
+)
+assert.ok(
+  /strings\.EqualFold\(timezone, localTimezoneSentinel\)/.test(goAPISource),
+  'the API timezone boundary must compare against the process-local sentinel, not just declare it',
+)
+// 过期注释不得再声称"真实时区加载不在本模块"。
+assert.ok(
+  !/属于 R2 的 C4，不在本模块放宽/.test(queryContractSource),
+  'the stale comment about timezone loading being out of scope must be gone',
+)
 // fixture provider 必须把有效时区反映到返回视图。
 assert.ok(
   fixtureProviderSource.includes('applyRequestedTimezone('),
@@ -1041,49 +1058,54 @@ assert.ok(
   'the trace action must be omitted when the locator is unsafe',
 )
 
-// 可执行：TS 策略与 Go 表逐例一致。
+// 可执行：TS 策略与 Go 读**同一张**共享用例表。
+//
+// 两侧各写一份清单只能证明"各自自洽"；读同一个文件才能机械证明口径一致。Go 侧在
+// internal/safelink/safelink_test.go 读同一份 JSON。
 const safeHrefModulePath = path.join(tmpDir, 'safeHref.js')
 execFileSync('npx', [
   'tsc', '--ignoreConfig', 'src/serviceObservability/safeHref.ts',
   '--outDir', tmpDir, '--module', 'commonjs', '--target', 'es2022', '--skipLibCheck',
 ], { cwd: webRoot, stdio: 'pipe' })
 const safeHrefModule = require(safeHrefModulePath)
-for (const [href, safe] of [
-  ['/', true],
-  ['/settings/services/svc-1', true],
-  ['/alerts?service_id=svc-1', true],
-  ['  /runbooks/e2b  ', true],
-  ['https://grafana.example.com/d/abc', true],
-  ['http://grafana.example.com:3000/d', true],
-  ['HtTpS://grafana.example.com/d', true],
-  ['javascript:alert(1)', false],
-  ['JavaScript:alert(1)', false],
-  ['  javascript:alert(1)', false],
-  ['data:text/html;base64,PHNjcmlwdD4=', false],
-  ['vbscript:msgbox(1)', false],
-  ['mailto:sre@example.com', false],
-  ['firebreak://open/service', false],
-  ['//evil.example.com/path', false],
-  ['grafana.example.com/d/abc', false],
-  ['runbooks/e2b', false],
-  ['/\\evil.example.com', false],
-  ['\\\\evil.example.com', false],
-  ['/runbooks\nevil', false],
-  ['/runbooks\x00evil', false],
-  ['http://', false],
-  ['http:///runbooks', false],
-  ['', false],
-  ['   ', false],
-]) {
+const linkPolicyTable = JSON.parse(await readFile(
+  path.join(repoRoot, 'internal/safelink/testdata/link_policy_cases.json'), 'utf8',
+))
+assert.ok(linkPolicyTable.cases.length >= 50, 'the shared link policy table must stay comprehensive')
+let hostBearingPositives = 0
+let hostlessNegatives = 0
+for (const { name, href, safe } of linkPolicyTable.cases) {
   assert.equal(
     safeHrefModule.isSafeHref(href), safe,
-    `TS link policy must ${safe ? 'accept' : 'reject'} ${JSON.stringify(href)}`,
+    `TS link policy must ${safe ? 'accept' : 'reject'} ${JSON.stringify(href)} (${name})`,
   )
   assert.equal(
     safeHrefModule.safeHref(href), safe ? href.trim() : undefined,
     `safeHref must ${safe ? 'return the trimmed value' : 'return undefined'} for ${JSON.stringify(href)}`,
   )
+  if (safe && /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(href.trim())) hostBearingPositives += 1
+  if (!safe && /^https?:\/\//i.test(href.trim())) hostlessNegatives += 1
 }
+// 表里必须同时有"带真实主机的正例"和"hostless/malformed 的反例"，否则这条断言会退化成
+// 只覆盖内部路径。
+assert.ok(hostBearingPositives >= 8, `expected host-bearing positives, got ${hostBearingPositives}`)
+assert.ok(hostlessNegatives >= 8, `expected hostless/malformed negatives, got ${hostlessNegatives}`)
+
+// 绝对 URL 分支必须真的解析 URL 并要求 hostname 非空，不能只看 scheme 前缀。
+assert.ok(
+  /new URL\(value\)/.test(tsSafeHrefSource) && /parsed\.hostname !== ''/.test(tsSafeHrefSource),
+  'the TS absolute branch must parse the URL and require a non-empty hostname',
+)
+assert.ok(
+  /url\.Parse\(value\)/.test(goSafeLinkSource) && /parsed\.Hostname\(\) != ""/.test(goSafeLinkSource),
+  'the Go absolute branch must parse the URL and require a non-empty hostname',
+)
+// 空 authority 必须显式拒绝：WHATWG 会把 `http:///x` 规范化成外站主机 `x`，而 Go 认为
+// 它没有 host。目标取决于解析器的值不能变成可点击链接。
+assert.ok(
+  tsSafeHrefSource.includes('emptyAuthorityPattern'),
+  'the TS policy must explicitly reject an empty authority to stay aligned with Go',
+)
 
 // 契约 fixture 里现有的链接必须全部仍然安全（不得因为收紧而破坏既有 demo）。
 for (const item of directory.items) {

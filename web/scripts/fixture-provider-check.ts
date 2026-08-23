@@ -352,8 +352,10 @@ async function main(): Promise<void> {
 
   // 形状合法但不存在的时区必须 422（与后端 time.LoadLocation 同口径；生产权威在后端）。
   // `+08:00` 被 Intl 接受但形状规则必须拒绝（Go 的正则要求以字母开头）。
+  // `Local` 是 Go 的进程级特殊值：后端也显式拒绝它，因此 fixture 与 live 一致。
   for (const timezone of [
     'Mars/Olympus', 'Asia/Atlantis', 'Asia Shanghai', 'z'.repeat(65), '+08:00', '_bad',
+    'Local', 'local',
   ]) {
     await expectApiError(`时区 ${timezone} 应被拒绝`, 'invalid_timezone', () =>
       fixtures.getWorkspaceFixture(serviceId, null, { timezone }))

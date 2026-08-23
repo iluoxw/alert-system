@@ -28,10 +28,13 @@
 // 只在投影时最小范围 fail closed（那一个链接不输出）。
 package safelink
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // httpSchemes 是唯一允许的绝对 scheme（大小写不敏感比较）。
-var httpSchemes = []string{"http://", "https://"}
+var httpSchemes = []string{"http", "https"}
 
 // Normalize 去掉两端空白并返回可用于比较的值。
 //
@@ -79,27 +82,46 @@ func SafeOrEmpty(raw string) string {
 	return Normalize(raw)
 }
 
-// isAbsoluteHTTP 判断是否是 host 非空的绝对 http/https URL。
+// isAbsoluteHTTP 判断是否是 **host 非空**的绝对 http/https URL。
 //
-// 刻意不用 net/url.Parse 做唯一判据：Parse 对 `javascript:alert(1)` 这类输入同样"成功"
-// （scheme=javascript），真正的判定还是 scheme allowlist，因此这里直接按前缀白名单判断，
-// 语义更直白也更难被绕过。
+// 判定必须真正解析 URL，不能只看"scheme 前缀之后还有字符"：那种前缀检查会放过一整类
+// 没有主机名或根本无法解析的值，而浏览器（WHATWG URL）全都拒绝它们——
+//
+//	https://user@/path            userinfo 之后没有 host
+//	https://:443/path             只有端口
+//	https://user@?x               userinfo 之后直接是查询串
+//	https://[::1                  IPv6 括号未闭合
+//	https://exa mple.com          host 里有空格
+//	https://evil.example:bad/path 端口不是数字
+//
+// 于是 UI 会渲染出一个点开后行为未定义的链接。这里用 net/url.Parse 之后**同时**要求：
+// 解析成功、绝对 URL、scheme 是 http/https（大小写不敏感）、并且 Hostname() 非空。
+// Hostname() 是关键：它剥掉 userinfo 与端口，因此 `user@`、`:443` 这类"authority 文本
+// 非空但没有主机名"的值不会被误判成合法。
+//
+// scheme allowlist 依然是安全边界：`javascript:alert(1)`、`mailto:x` 解析同样"成功"
+// （scheme 分别是 javascript / mailto），只是被 scheme 检查挡下。
 func isAbsoluteHTTP(value string) bool {
-	lowered := strings.ToLower(value)
-	for _, scheme := range httpSchemes {
-		if !strings.HasPrefix(lowered, scheme) {
-			continue
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	if !parsed.IsAbs() {
+		// 相对形态（含裸主机 `example.com/x`）在这里一律不合法：内部路径必须以 / 开头，
+		// 已经在调用方判过。
+		return false
+	}
+	if !isHTTPScheme(parsed.Scheme) {
+		return false
+	}
+	return parsed.Hostname() != ""
+}
+
+func isHTTPScheme(scheme string) bool {
+	for _, allowed := range httpSchemes {
+		if strings.EqualFold(scheme, allowed) {
+			return true
 		}
-		authority := value[len(scheme):]
-		if authority == "" {
-			return false
-		}
-		// host 必须非空：`http:///path` 的 authority 以 `/` 开头，等于没有 host。
-		if strings.HasPrefix(authority, "/") || strings.HasPrefix(authority, "?") ||
-			strings.HasPrefix(authority, "#") {
-			return false
-		}
-		return true
 	}
 	return false
 }

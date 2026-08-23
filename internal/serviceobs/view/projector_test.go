@@ -1350,6 +1350,11 @@ func TestLinksForIdentityFailsClosedOnUnsafeLegacyURLs(t *testing.T) {
 		"//evil.example.com/path", "grafana.example.com/d/abc", "runbooks/e2b",
 		`/\evil.example.com`, `\\evil.example.com`,
 		"/runbooks\nevil", "/runbooks\x00evil", "http://", "http:///runbooks",
+		// hostless 与 malformed 的绝对 URL：写入校验只管住新写入，这些值可能早于它
+		// 落库，投影必须一并 fail closed。
+		"https://user@/path", "https://:443/path", "https://user@?x",
+		"http:///evil.example.com", "https://?x=1", "https://#x",
+		"https://[::1", "https://exa mple.com", "https://evil.example:bad/path",
 	} {
 		unsafeIdentity := identity
 		unsafeIdentity.DashboardURL = unsafe
@@ -1366,6 +1371,25 @@ func TestLinksForIdentityFailsClosedOnUnsafeLegacyURLs(t *testing.T) {
 		// 其它入口必须保留：一个坏链接不能让整个服务不可查看。
 		if len(links) != len(baseline) {
 			t.Fatalf("不安全链接 %q 影响了其它入口: %+v", unsafe, links)
+		}
+	}
+
+	// 反向控制：带 userinfo / 端口 / 括号 IPv6 的真实主机必须继续被投影出来。
+	for _, safe := range []string{
+		"https://user@grafana.example.com/d", "https://user:pass@grafana.example.com/d",
+		"https://grafana.example.com:3000/d", "https://[::1]:8080/d",
+		"http://10.60.199.160:9090/graph", "HtTpS://grafana.example.com/d",
+	} {
+		hostBearing := identity
+		hostBearing.DashboardURL = safe
+		found := false
+		for _, link := range LinksForIdentity(hostBearing) {
+			if link.Kind == model.LinkKindDashboard && link.Href == safe {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("有真实主机名的链接 %q 必须被投影出来", safe)
 		}
 	}
 

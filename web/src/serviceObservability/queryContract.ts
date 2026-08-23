@@ -337,7 +337,7 @@ function assertAbsoluteRFC3339(raw: string): void {
  * 加载：场景视图自带权威 focus，用旧 focus 把它判成 422 等于让 QA 状态不可达。
  *
  * 时间窗上界依赖已发布 Profile 的 limits，属服务端职责，fixture 不假装拥有那份配置。
- * timezone 这里只校验形状/长度；"能否真的加载这个时区"属于 R2 的 C4，不在本模块放宽。
+ * timezone 由 validateTimezone 完整校验：形状、长度，以及"这个时区在运行时真的可用"。
  *
  * environment 也属于非 focus 字段：显式 QA 场景可以忽略过期 focus，但不能连 environment
  * 形状一起放过。
@@ -362,6 +362,9 @@ export function validateWorkspaceScope(query: WorkspaceQueryInput): void {
 // 通过、在 live 下 422。
 const timezonePattern = /^[A-Za-z][A-Za-z0-9_+/-]{0,63}$/
 
+// localTimezoneSentinel 与后端同名常量一致：Go 的进程级时区特殊值，不是确定的显示时区。
+const localTimezoneSentinel = 'Local'
+
 /**
  * validateTimezone 校验时区并返回 trim 后的值。
  *
@@ -378,6 +381,11 @@ export function validateTimezone(timezone: string | undefined): string {
   if (value === '') return ''
   if (byteLength(value) > queryLimits.maxTimezoneBytes || !timezonePattern.test(value)) {
     reject(queryReasonCodes.invalidTimezone, 'timezone 格式非法')
+  }
+  // "Local" 是 Go 的进程级特殊值（LoadLocation 接受它），不是确定的 IANA 显示时区。
+  // 后端已显式拒绝它；这里同样显式拒绝，而不是依赖"Intl 恰好也不认识它"这个巧合。
+  if (value.toLowerCase() === localTimezoneSentinel.toLowerCase()) {
+    reject(queryReasonCodes.invalidTimezone, 'timezone 必须是确定的 IANA 时区')
   }
   if (!isLoadableTimezone(value)) {
     reject(queryReasonCodes.invalidTimezone, 'timezone 不是可用的 IANA 时区')

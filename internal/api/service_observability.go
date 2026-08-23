@@ -499,11 +499,23 @@ func parseTimezone(c *gin.Context) (string, error) {
 	if len(timezone) > maxTimezoneLength || !timezonePattern.MatchString(timezone) {
 		return "", &reasonCodedError{code: reasonInvalidTimezone, message: "timezone 格式非法"}
 	}
+	// "Local" 是 Go 的进程级特殊值，不是 IANA 区名：LoadLocation 会接受它，但它的含义是
+	// "运行服务端进程的那台机器的时区"。这对一个**显示**时区来说是不可用的——浏览器的
+	// Intl 直接拒绝它，于是同一个值 live 接受、fixture 422，而一个带着 Local 的 Page View
+	// 在前端根本无法如实渲染。这里显式拒绝，也不去发明"客户端本地时区"的映射。
+	if strings.EqualFold(timezone, localTimezoneSentinel) {
+		return "", &reasonCodedError{
+			code: reasonInvalidTimezone, message: "timezone 必须是确定的 IANA 时区",
+		}
+	}
 	if _, err := time.LoadLocation(timezone); err != nil {
 		return "", &reasonCodedError{code: reasonInvalidTimezone, message: "timezone 不是可用的 IANA 时区"}
 	}
 	return timezone, nil
 }
+
+// localTimezoneSentinel 是 Go 的进程级时区特殊值。它不是一个确定的 IANA 显示时区。
+const localTimezoneSentinel = "Local"
 
 func containsControlCharacters(value string) bool {
 	for _, r := range value {

@@ -11,6 +11,9 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"alert-system/internal/domain"
@@ -175,39 +178,92 @@ func TestServiceRequest_ValidClassificationRoundTrips(t *testing.T) {
 // 写入口径的**有意安全收紧**。这些值此前可以写进登记并被渲染成运营页面的可点击链接，而
 // 值班人会在事故中直接点开它们。空值继续合法（未配置 Dashboard/Runbook 是正常状态）。
 func TestServiceRequest_RejectsUnsafeDashboardAndRunbookLinks(t *testing.T) {
-	unsafe := []string{
-		"javascript:alert(1)",
-		"JavaScript:alert(1)",
-		"  javascript:alert(1)",
-		"data:text/html;base64,PHNjcmlwdD4=",
-		"vbscript:msgbox(1)",
-		"mailto:sre@example.com",
-		"firebreak://open/service",
-		"//evil.example.com/path",
-		"grafana.example.com/d/abc",
-		"runbooks/e2b",
-		`/\evil.example.com`,
-		`\\evil.example.com`,
-		"/runbooks\nevil",
-		"/runbooks\x00evil",
-		"http://",
-		"http:///runbooks",
+	// 用例来自与 safelink/前端共用的策略表，避免三处各写一份清单后互相漂移。
+	raw, err := os.ReadFile(filepath.Join("..", "safelink", "testdata", "link_policy_cases.json"))
+	if err != nil {
+		t.Fatalf("读取共享链接策略用例表失败: %v", err)
 	}
-	for _, href := range unsafe {
+	var table struct {
+		Cases []struct {
+			Name string `json:"name"`
+			Href string `json:"href"`
+			Safe bool   `json:"safe"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &table); err != nil {
+		t.Fatalf("解析共享链接策略用例表失败: %v", err)
+	}
+
+	rejected, accepted := 0, 0
+	for _, tc := range table.Cases {
+		// 空值/纯空白在写入侧是合法的"未配置"，不属于本用例。
+		if strings.TrimSpace(tc.Href) == "" {
+			continue
+		}
 		for _, field := range []string{"dashboard_url", "runbook_url"} {
 			request := decodeServiceRequest(t, validServiceBody)
 			if field == "dashboard_url" {
-				request.DashboardURL = href
+				request.DashboardURL = tc.Href
 			} else {
-				request.RunbookURL = href
+				request.RunbookURL = tc.Href
 			}
-			_, err := request.domain()
+			service, err := request.domain()
+			if tc.Safe {
+				if err != nil {
+					t.Fatalf("%s: %s=%q 应被接受: %v", tc.Name, field, tc.Href, err)
+				}
+				stored := service.DashboardURL
+				if field == "runbook_url" {
+					stored = service.RunbookURL
+				}
+				if stored != strings.TrimSpace(tc.Href) {
+					t.Fatalf("%s: %s 被改写为 %q", tc.Name, field, stored)
+				}
+				accepted++
+				continue
+			}
 			if err == nil {
-				t.Fatalf("%s=%q 应被拒绝", field, href)
+				t.Fatalf("%s: %s=%q 应被拒绝", tc.Name, field, tc.Href)
 			}
 			if code := reasonCodeOf(err); code != reasonServiceLinkInvalid {
-				t.Fatalf("%s=%q reason_code=%q, want %q", field, href, code, reasonServiceLinkInvalid)
+				t.Fatalf("%s: %s=%q reason_code=%q, want %q",
+					tc.Name, field, tc.Href, code, reasonServiceLinkInvalid)
 			}
+			rejected++
+		}
+	}
+	// 防止用例表被清空后测试变成空跑。
+	if rejected < 40 || accepted < 20 {
+		t.Fatalf("共享用例表覆盖不足: rejected=%d accepted=%d", rejected, accepted)
+	}
+}
+
+// hostless 与 malformed 的绝对 URL 必须在写入侧就被拒绝：只检查"scheme 之后还有字符"
+// 会让这些值落库，之后被渲染成一个点开后行为未定义的链接。
+func TestServiceRequest_RejectsHostlessAndMalformedAbsoluteLinks(t *testing.T) {
+	for _, href := range []string{
+		"https://user@/path", "https://:443/path", "https://user@?x",
+		"http:///runbooks", "http:///evil.example.com", "https://?x=1", "https://#x",
+		"https://[::1", "https://exa mple.com", "https://evil.example:bad/path",
+	} {
+		request := decodeServiceRequest(t, validServiceBody)
+		request.DashboardURL = href
+		if _, err := request.domain(); err == nil {
+			t.Fatalf("%q 没有可用主机名或无法解析，应被拒绝", href)
+		} else if code := reasonCodeOf(err); code != reasonServiceLinkInvalid {
+			t.Fatalf("%q reason_code=%q, want %q", href, code, reasonServiceLinkInvalid)
+		}
+	}
+	// 反向控制：带 userinfo / 端口 / 括号 IPv6 的真实主机必须继续写得进去。
+	for _, href := range []string{
+		"https://user@grafana.example.com/d", "https://user:pass@grafana.example.com/d",
+		"https://grafana.example.com:3000/d", "https://[::1]:8080/d",
+		"http://10.60.199.160:9090/graph", "HtTpS://grafana.example.com/d",
+	} {
+		request := decodeServiceRequest(t, validServiceBody)
+		request.DashboardURL = href
+		if _, err := request.domain(); err != nil {
+			t.Fatalf("%q 有真实主机名，应被接受: %v", href, err)
 		}
 	}
 }
