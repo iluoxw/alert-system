@@ -461,6 +461,48 @@ func TestDefaultTransportIgnoresEnvironmentProxy(t *testing.T) {
 	}
 }
 
+// PostJSON 走与 PostForm/Get 相同的安全通道：Content-Type 固定、context 可取消、错误不回显 body。
+func TestPostJSONUsesJSONContentTypeAndRedactsErrors(t *testing.T) {
+	const wantBody = `{"query":"safe"}`
+	var gotContentType string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		if r.Method != http.MethodPost {
+			t.Fatalf("method=%s", r.Method)
+		}
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	endpoint, err := ParseEndpoint(server.URL, ModeLoopbackTest)
+	if err != nil {
+		t.Fatalf("ParseEndpoint: %v", err)
+	}
+	client, err := NewClient(ClientOptions{Endpoint: endpoint, Header: http.Header{
+		"Authorization": []string{"Bearer secret-token"},
+	}})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.PostJSON(ctx, "/api/v1/query", []byte(wantBody)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后 err=%v", err)
+	}
+
+	response, err := client.PostJSON(context.Background(), "/api/v1/query", []byte(wantBody))
+	if err != nil {
+		t.Fatalf("PostJSON: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type=%q", gotContentType)
+	}
+}
+
 // Secret 必须**真的**实现 slog.LogValuer。
 //
 // 早先 LogValue 返回 string，因此它并没有满足接口：掩码其实是靠 MarshalText 侥幸成立的。

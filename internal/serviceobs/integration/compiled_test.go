@@ -86,8 +86,20 @@ func TestCompileProducesBothArtifacts(t *testing.T) {
 			journey = binding
 		}
 	}
-	if len(journey.ResolvedTargetIDs) == 0 {
-		t.Fatal("journey binding 应带上 stage 的真实 canonical ID")
+	if len(journey.ResolvedTargetIDs) != 0 {
+		t.Fatalf("journey binding 的 ResolvedTargetIDs 必须为空: %v", journey.ResolvedTargetIDs)
+	}
+	if len(journey.ResolvedJourneyStages) == 0 {
+		t.Fatal("journey binding 应带上按 stage 分组的 canonical ID")
+	}
+	hasEntity := false
+	for _, stage := range journey.ResolvedJourneyStages {
+		if len(stage.EntityIDs) > 0 || len(stage.RelationIDs) > 0 {
+			hasEntity = true
+		}
+	}
+	if !hasEntity {
+		t.Fatalf("journey stages 缺少 canonical refs: %+v", journey.ResolvedJourneyStages)
 	}
 	hasTopology := false
 	for _, side := range journey.SideOutputs {
@@ -633,5 +645,46 @@ func TestExampleFixtureShapesAreIntentional(t *testing.T) {
 	}
 	if len(postgres.Profile.Journeys) != 0 {
 		t.Fatalf("PostgreSQL fixture 的 journeys 应为空，得到 %d", len(postgres.Profile.Journeys))
+	}
+}
+
+// CompiledIntegration schema 1.0 artifact 必须被 strict loader 明确拒绝。
+func TestValidateBundleRejectsCompiledIntegrationSchemaVersion10(t *testing.T) {
+	compiled, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: readPackage(t, "e2b.package.json")})
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	bundle := compiled.Bundle()
+	var integrationDoc map[string]any
+	if err := json.Unmarshal(bundle.Integration, &integrationDoc); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	integrationDoc["schema_version"] = "1.0"
+	tampered, err := json.Marshal(integrationDoc)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	bundle.Integration = tampered
+	bundle.Manifest.IntegrationDigest = digest(tampered)
+	if err := ValidateBundle(bundle); !errors.Is(err, ErrBundleIdentityMismatch) {
+		t.Fatalf("err=%v，want ErrBundleIdentityMismatch", err)
+	}
+}
+
+// 第二服务 compiled integration 只含 Prometheus signal bindings，无 E2B 分支。
+func TestBatchBSecondServiceUsesSamePrometheusRuntime(t *testing.T) {
+	postgres, err := newCompiler(t, postgresResolver()).Compile(
+		context.Background(), CompileRequest{Raw: readPackage(t, "postgresql.package.json")})
+	if err != nil {
+		t.Fatalf("编译 PostgreSQL 失败: %v", err)
+	}
+	for _, binding := range postgres.Integration.Bindings {
+		if binding.SourceKey != SourceKeyPrometheus {
+			t.Fatalf("binding %s source=%q want prometheus", binding.Key, binding.SourceKey)
+		}
+		if binding.Kind != KindSignal {
+			t.Fatalf("postgresql fixture 应是 signals-only，出现 kind=%s", binding.Kind)
+		}
 	}
 }

@@ -50,6 +50,9 @@ const (
 	SlotStatusField       ParamSlot = "status_field"
 	SlotSelectFields      ParamSlot = "select_fields"
 	SlotRowLimit          ParamSlot = "row_limit"
+	SlotStageMappings     ParamSlot = "stage_mappings"
+	SlotStatusMappings    ParamSlot = "status_mappings"
+	SlotIdentityMappings  ParamSlot = "identity_mappings"
 )
 
 // EvidenceClass 是 evidence binding 的证据类别。它由受信 registry 推导，package 不能自报。
@@ -205,8 +208,11 @@ var registry = func() map[string]Template {
 			SideOutputs: []SideOutput{
 				SideOutputFocus, SideOutputTraceEvidence, SideOutputTopologyHints,
 			},
-			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
-			Optional:           []ParamSlot{SlotSelectFields, SlotStageField},
+			Required: []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
+			Optional: []ParamSlot{
+				SlotSelectFields, SlotStageField, SlotStatusField,
+				SlotStageMappings, SlotStatusMappings, SlotIdentityMappings,
+			},
 			Outputs:            []string{"traces.count", "traces.last_observed_at"},
 			RequiredPermission: PermissionTracesRead,
 			Summary:            "按 focus 取 trace 与 span",
@@ -219,7 +225,7 @@ var registry = func() map[string]Template {
 			EvidenceClass:      EvidenceClassLogs,
 			SideOutputs:        []SideOutput{SideOutputFocus},
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
-			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField},
+			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField, SlotStatusMappings},
 			Outputs:            []string{"logs.count", "logs.last_observed_at"},
 			RequiredPermission: PermissionLogsRead,
 			Summary:            "按 focus 取日志摘要",
@@ -234,7 +240,7 @@ var registry = func() map[string]Template {
 			EvidenceClass:      EvidenceClassAccess,
 			SideOutputs:        []SideOutput{SideOutputFocus},
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
-			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField},
+			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField, SlotStatusMappings},
 			Outputs:            []string{"access.count", "access.last_observed_at"},
 			RequiredPermission: PermissionLogsRead,
 			Summary:            "按 focus 取 access 记录摘要",
@@ -324,6 +330,9 @@ func presentSlots(params TemplateParams) map[ParamSlot]struct{} {
 	mark(SlotStatusField, params.StatusField != "")
 	mark(SlotSelectFields, len(params.SelectFields) > 0)
 	mark(SlotRowLimit, params.RowLimit != nil)
+	mark(SlotStageMappings, len(params.StageMappings) > 0)
+	mark(SlotStatusMappings, len(params.StatusMappings) > 0)
+	mark(SlotIdentityMappings, len(params.IdentityMappings) > 0)
 	return present
 }
 

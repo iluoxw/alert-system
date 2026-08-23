@@ -29,6 +29,7 @@ import (
 
 	"alert-system/internal/serviceobs"
 	"alert-system/internal/serviceobs/health"
+	"alert-system/internal/serviceobs/integration"
 	"alert-system/internal/serviceobs/model"
 )
 
@@ -96,6 +97,8 @@ type Options struct {
 	Limits  Limits
 	// Permissions 为 nil 时一切需要权限的来源都被视为未授权：默认从严。
 	Permissions serviceobs.PermissionResolver
+	// BindingSource 在 provider 已配置时必须提供：执行计划来自 CompiledIntegration。
+	BindingSource integration.RuntimeBindingSource
 	// SummaryBindingKeys 决定目录摘要读哪些 binding。为 nil 时回退到"全部 golden binding"，
 	// 因为目录摘要展示的就是四大黄金信号。
 	SummaryBindingKeys func(model.Profile) []string
@@ -103,10 +106,11 @@ type Options struct {
 
 // Coordinator 并行读取已授权且当前 purpose 真正需要的来源。
 type Coordinator struct {
-	readers     Readers
-	limits      Limits
-	permissions serviceobs.PermissionResolver
-	summaryKeys func(model.Profile) []string
+	readers       Readers
+	limits        Limits
+	permissions   serviceobs.PermissionResolver
+	bindingSource integration.RuntimeBindingSource
+	summaryKeys   func(model.Profile) []string
 }
 
 // 编译期断言：Coordinator 必须满足 Phase 2 就固定下来的 ObservationReader 端口。
@@ -117,6 +121,8 @@ var (
 	ErrSubjectRequired = errors.New("observe: ObservationRequest 缺少服务端 Subject")
 	// ErrPurposeRequired 表示装配层没有选择读取用途。
 	ErrPurposeRequired = errors.New("observe: ObservationRequest 缺少合法 Purpose")
+	// ErrRuntimeBindingRequired 表示 provider 已配置但缺少 RuntimeBindingSource。
+	ErrRuntimeBindingRequired = errors.New("observe: provider 已配置但缺少 RuntimeBindingSource")
 )
 
 // New 构造 Coordinator。它不校验 readers 是否齐全：完全未配置是合法状态。
@@ -126,10 +132,11 @@ func New(opts Options) *Coordinator {
 		summaryKeys = defaultSummaryBindingKeys
 	}
 	return &Coordinator{
-		readers:     opts.Readers,
-		limits:      opts.Limits,
-		permissions: opts.Permissions,
-		summaryKeys: summaryKeys,
+		readers:       opts.Readers,
+		limits:        opts.Limits,
+		permissions:   opts.Permissions,
+		bindingSource: opts.BindingSource,
+		summaryKeys:   summaryKeys,
 	}
 }
 
@@ -146,7 +153,7 @@ func defaultSummaryBindingKeys(profile model.Profile) []string {
 	return keys
 }
 
-// sourcePlan 是一次请求要读的来源清单。
+// sourcePlan 是一次请求要读的来源清单（legacy renderer 规划，仅无 binding source 时保留）。
 type sourcePlan struct {
 	signals bool
 	traces  bool
@@ -154,18 +161,12 @@ type sourcePlan struct {
 	access  bool
 }
 
-// planSources 按 purpose 与 Profile 决定读哪些来源。
-//
-// 它只回答"该不该读"，不回答"能不能读"：provider 未连接与权限不足分别在后面产生显式的
-// not_connected 与 Forbidden 状态。这个分工很重要——"没被请求"必须与"请求了但拿不到"
-// 可区分，否则页面无法解释自己为什么是空的。
+// planSources 按 purpose 与 Profile renderer 决定读哪些来源（Phase 2 兼容路径）。
 func planSources(purpose serviceobs.Purpose, profile model.Profile) sourcePlan {
 	plan := sourcePlan{signals: len(profile.SignalBindings) > 0}
 	if !purpose.NeedsFocusEvidence() {
 		return plan
 	}
-	// 聚焦工作区按 Profile 声明的 renderer 决定要不要证据来源：没有 evidence/journey
-	// renderer 的 Profile 不该被强行查一遍日志。
 	for _, view := range profile.Views {
 		switch view.Renderer {
 		case model.RendererRequestJourney, model.RendererDependencyTopology:
@@ -229,15 +230,33 @@ func (c *Coordinator) ReadObservations(
 	// binding 补 Unknown"就会不一致——页面于是缺几条本该显式 Unknown 的信号。
 	bindingKeys := c.requestedBindingKeys(req)
 
-	plan := planSources(req.Purpose, req.Profile)
-	outcomes := c.runSources(ctx, req, plan, permissions, bindingKeys)
+	var runtimePlan runtimeSourcePlan
+	var compiled integration.CompiledIntegration
+	if c.bindingSource != nil {
+		resolved, resolveErr := c.bindingSource.ResolveCompiled(
+			ctx, req.ServiceID, req.Environment, req.Profile,
+		)
+		if resolveErr != nil {
+			return serviceobs.ObservationFacts{}, fmt.Errorf("observe: 解析 CompiledIntegration 失败: %w", resolveErr)
+		}
+		compiled = resolved
+		runtimePlan = planRuntimeSources(req.Purpose, req.Focus, bindingKeys, compiled)
+	} else if c.readers.AnyConfigured() {
+		return serviceobs.ObservationFacts{}, ErrRuntimeBindingRequired
+	}
+
+	outcomes := c.runSources(ctx, req, runtimePlan, permissions, bindingKeys)
 
 	// 父 context 取消/超时必须向上返回，而不是把一堆"因为断开所以 Unknown"的来源当成
 	// 一个可展示的 Partial 返回给用户。
 	if err := ctx.Err(); err != nil {
 		return serviceobs.ObservationFacts{}, err
 	}
-	return mergeOutcomes(bindingKeys, outcomes), nil
+	facts := mergeOutcomes(bindingKeys, outcomes)
+	if runtimePlan.FocusUnknown {
+		facts.Focus = serviceobs.FocusUnknown
+	}
+	return facts, nil
 }
 
 // resolvePermissions 现算权限。resolver 为 nil 时返回空集合（拒绝一切），而不是放行。
@@ -309,32 +328,28 @@ func (c *Coordinator) requestedBindingKeys(req serviceobs.ObservationRequest) []
 func (c *Coordinator) runSources(
 	ctx context.Context,
 	req serviceobs.ObservationRequest,
-	plan sourcePlan,
+	plan runtimeSourcePlan,
 	permissions serviceobs.Permissions,
 	bindingKeys []string,
 ) []sourceOutcome {
 	type task struct {
-		sourceKey  string
-		permission serviceobs.Permission
-		limits     serviceobs.SourceLimits
-		run        func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error)
-		configured bool
-		notConnect string
-		// affectsFocus 表示该来源是否参与 focus 判定。
-		//
-		// signals 是 false：Prometheus 超时说明"指标不知道"，与"这个 sandbox_id 有没有被
-		// 观测到"完全无关。修复前所有失败来源都无条件报 FocusUnknown，于是一次 Prometheus
-		// 超时就能把 traces 已经确认命中的 focus 降级成 Unknown——那正是"最小范围 Unknown"
-		// 要防的越界降级。
+		sourceKey    string
+		permission   serviceobs.Permission
+		limits       serviceobs.SourceLimits
+		bindings     []integration.CompiledBinding
+		run          func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error)
+		configured   bool
+		notConnect   string
 		affectsFocus bool
 	}
 
 	tasks := make([]task, 0, 4)
-	if plan.signals {
+	if len(plan.Signals) > 0 {
 		tasks = append(tasks, task{
 			sourceKey:    serviceobs.SourceKeyPrometheus,
 			permission:   serviceobs.PermissionMetricsRead,
 			limits:       clampToProfile(withLimitDefaults(c.limits.Signals), req.Profile),
+			bindings:     plan.Signals,
 			configured:   c.readers.Signals != nil,
 			notConnect:   serviceobs.ReasonPrometheusNotConnected,
 			affectsFocus: false,
@@ -346,6 +361,7 @@ func (c *Coordinator) runSources(
 					ServiceID:     req.ServiceID,
 					Environment:   req.Environment,
 					BindingKeys:   bindingKeys,
+					Bindings:      plan.Signals,
 					WindowSeconds: req.WindowSeconds,
 					From:          req.From,
 					To:            req.To,
@@ -358,7 +374,7 @@ func (c *Coordinator) runSources(
 			},
 		})
 	}
-	focusRequest := func(limits serviceobs.SourceLimits) serviceobs.FocusRequest {
+	focusRequest := func(bindings []integration.CompiledBinding, limits serviceobs.SourceLimits) serviceobs.FocusRequest {
 		return serviceobs.FocusRequest{
 			Subject:     req.Subject,
 			Purpose:     req.Purpose,
@@ -368,19 +384,21 @@ func (c *Coordinator) runSources(
 			From:        req.From,
 			To:          req.To,
 			Focus:       req.Focus,
+			Bindings:    bindings,
 			Limits:      limits,
 		}
 	}
-	if plan.traces {
+	if len(plan.Traces) > 0 {
 		tasks = append(tasks, task{
 			sourceKey:    serviceobs.SourceKeyOpenObserveTraces,
 			permission:   serviceobs.PermissionTracesRead,
 			limits:       clampToProfile(withLimitDefaults(c.limits.Traces), req.Profile),
+			bindings:     plan.Traces,
 			configured:   c.readers.Traces != nil,
 			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
 			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
-				facts, err := c.readers.Traces.ReadTraces(ctx, focusRequest(limits))
+				facts, err := c.readers.Traces.ReadTraces(ctx, focusRequest(plan.Traces, limits))
 				if err != nil {
 					return sourceOutcome{}, err
 				}
@@ -392,16 +410,17 @@ func (c *Coordinator) runSources(
 			},
 		})
 	}
-	if plan.logs {
+	if len(plan.Logs) > 0 {
 		tasks = append(tasks, task{
 			sourceKey:    serviceobs.SourceKeyOpenObserveLogs,
 			permission:   serviceobs.PermissionLogsRead,
 			limits:       clampToProfile(withLimitDefaults(c.limits.Logs), req.Profile),
+			bindings:     plan.Logs,
 			configured:   c.readers.Logs != nil,
 			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
 			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
-				facts, err := c.readers.Logs.ReadLogs(ctx, focusRequest(limits))
+				facts, err := c.readers.Logs.ReadLogs(ctx, focusRequest(plan.Logs, limits))
 				if err != nil {
 					return sourceOutcome{}, err
 				}
@@ -412,18 +431,17 @@ func (c *Coordinator) runSources(
 			},
 		})
 	}
-	if plan.access {
+	if len(plan.Access) > 0 {
 		tasks = append(tasks, task{
-			sourceKey: serviceobs.SourceKeyOpenObserveAccess,
-			// access 记录可能带 request/response 片段，因此按 logs.read 从严要求，
-			// 不借 traces.read 放行。
+			sourceKey:    serviceobs.SourceKeyOpenObserveAccess,
 			permission:   serviceobs.PermissionLogsRead,
 			limits:       clampToProfile(withLimitDefaults(c.limits.Access), req.Profile),
+			bindings:     plan.Access,
 			configured:   c.readers.Access != nil,
 			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
 			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
-				facts, err := c.readers.Access.ReadAccess(ctx, focusRequest(limits))
+				facts, err := c.readers.Access.ReadAccess(ctx, focusRequest(plan.Access, limits))
 				if err != nil {
 					return sourceOutcome{}, err
 				}

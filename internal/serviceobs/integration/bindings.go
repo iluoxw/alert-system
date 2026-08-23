@@ -53,6 +53,7 @@ type resolvedBinding struct {
 	RequiredPermission string
 	EvidenceClass      EvidenceClass
 	SideOutputs        []SideOutput
+	IdentityMappings   []IdentityMapping
 }
 
 // bindingContext 收集 Profile 模板里可被引用的目标集合。
@@ -135,6 +136,12 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 			return nil, err
 		}
 		if err := validateRatioSelectors(binding, template); err != nil {
+			return nil, err
+		}
+		if err := validateStageStatusMappings(binding, template, ctx); err != nil {
+			return nil, err
+		}
+		if err := validateIdentityMappings(binding, template, pkg.TopologyPolicy); err != nil {
 			return nil, err
 		}
 		if err := validateToolBinding(binding, template, ctx, tools); err != nil {
@@ -229,6 +236,7 @@ func validateProviderBindings(pkg Package, tools ToolDescriptorSource) ([]resolv
 			RequiredPermission: template.RequiredPermission,
 			EvidenceClass:      template.EvidenceClass,
 			SideOutputs:        append([]SideOutput(nil), template.SideOutputs...),
+			IdentityMappings:   append([]IdentityMapping(nil), binding.Params.IdentityMappings...),
 		})
 	}
 

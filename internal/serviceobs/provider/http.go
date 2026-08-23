@@ -298,6 +298,20 @@ type Response struct {
 	Header     http.Header
 }
 
+// PostJSON 以 JSON body 发起 POST。body 必须来自 json.Marshal 后的 bytes。
+func (c *Client) PostJSON(ctx context.Context, path string, body []byte) (Response, error) {
+	target, err := c.endpoint.resolve(path)
+	if err != nil {
+		return Response{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), strings.NewReader(string(body)))
+	if err != nil {
+		return Response{}, fmt.Errorf("provider: 构造请求失败: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	return c.do(ctx, request)
+}
+
 // PostForm 以 form 编码发起 POST。
 //
 // 用 encoder 而不是字符串拼 URL：拼接会让参数值里的 & 与 = 改变请求语义，

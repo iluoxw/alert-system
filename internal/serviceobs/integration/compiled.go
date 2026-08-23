@@ -28,7 +28,7 @@ import (
 // CompiledIntegrationSchemaVersion 是 server-only 产物自身的版本线。
 //
 // 它与 SIP 的 schema_version 分开：运行时产物的形状可以在不改 package 契约的情况下演进。
-const CompiledIntegrationSchemaVersion = "1.0"
+const CompiledIntegrationSchemaVersion = "1.1"
 
 // CompiledIntegration 是受信 adapter 唯一的运行时 binding 来源。
 type CompiledIntegration struct {
@@ -52,34 +52,45 @@ type CompiledIntegration struct {
 	TopologyPolicy CompiledTopologyPolicy `json:"topology_policy"`
 }
 
+// CompiledJourneyStageTarget 保留 journey stage 与 entity/relation ID 的分组。
+type CompiledJourneyStageTarget struct {
+	StageKey    string   `json:"stage_key"`
+	EntityIDs   []string `json:"entity_ids"`
+	RelationIDs []string `json:"relation_ids"`
+}
+
 // CompiledBinding 是一条可执行的 binding：已解析目标 + typed params + registry 推导事实。
 type CompiledBinding struct {
 	Key       string      `json:"key"`
 	Kind      BindingKind `json:"kind"`
 	TargetRef string      `json:"target_ref"`
-	// ResolvedTargetIDs 是 target 在 canonical graph 里的真实 ID。
+	// FocusKind 只在 journey binding 上填充，用于 focus kind 过滤。
+	FocusKind string `json:"focus_kind,omitempty"`
+	// ResolvedTargetIDs 是 signal scope 等在 canonical graph 里的真实 ID。
 	//
-	// signal 的 scope refs、journey 的 stage refs 都在这里落成真实 ID，adapter 因此不需要
-	// 回头查 Profile 或 SIP。focus/evidence 的 target 是 focus kind，没有 canonical ID，
-	// 此时为空数组而不是 null。
-	ResolvedTargetIDs  []string       `json:"resolved_target_ids"`
-	ToolKey            string         `json:"tool_key"`
-	TemplateRef        string         `json:"template_ref"`
-	SourceKey          string         `json:"source_key"`
-	Capability         Capability     `json:"capability"`
-	RequiredPermission string         `json:"required_permission"`
-	EvidenceClass      EvidenceClass  `json:"evidence_class,omitempty"`
-	SideOutputs        []SideOutput   `json:"side_outputs"`
-	Params             TemplateParams `json:"params"`
+	// journey binding 必须为空，改用 ResolvedJourneyStages；focus/evidence 的 target 是
+	// focus kind，没有 canonical ID，此时也为空数组而不是 null。
+	ResolvedTargetIDs []string `json:"resolved_target_ids"`
+	// ResolvedJourneyStages 只在 journey binding 上非空，按 Profile stage 顺序输出。
+	ResolvedJourneyStages []CompiledJourneyStageTarget `json:"resolved_journey_stages,omitempty"`
+	ToolKey               string                       `json:"tool_key"`
+	TemplateRef           string                       `json:"template_ref"`
+	SourceKey             string                       `json:"source_key"`
+	Capability            Capability                   `json:"capability"`
+	RequiredPermission    string                       `json:"required_permission"`
+	EvidenceClass         EvidenceClass                `json:"evidence_class,omitempty"`
+	SideOutputs           []SideOutput                 `json:"side_outputs"`
+	Params                TemplateParams               `json:"params"`
+	// IdentityMappings 是 trace/journey 模板编译后的 topology identity 快照。
+	IdentityMappings []IdentityMapping `json:"identity_mappings,omitempty"`
 }
 
 // CompiledTopologyPolicy 是 topology policy 的编译快照。
 type CompiledTopologyPolicy struct {
-	AliasNamespaces   []string `json:"alias_namespaces"`
-	IdentityFields    []string `json:"identity_fields"`
-	InstanceRole      string   `json:"instance_role,omitempty"`
-	StaleAfterSeconds int      `json:"stale_after_seconds"`
-	MaxHints          int      `json:"max_hints,omitempty"`
+	AliasNamespaces   []string          `json:"alias_namespaces"`
+	IdentityMappings  []IdentityMapping `json:"identity_mappings"`
+	StaleAfterSeconds int               `json:"stale_after_seconds"`
+	MaxHints          int               `json:"max_hints,omitempty"`
 }
 
 // Bundle 是"一次激活"的完整单元。加载器只接受 Bundle，不接受单独的一半。
@@ -315,48 +326,66 @@ func buildCompiledIntegration(
 	for _, signal := range pkg.ProfileTemplate.SignalBindings {
 		signalScopes[signal.Key] = resolvedScopeIDs(signal.Scope, resolved)
 	}
-	journeyRefs := map[string][]string{}
+	journeyStages := map[string][]CompiledJourneyStageTarget{}
 	for _, journey := range pkg.ProfileTemplate.Journeys {
-		refs := make([]string, 0)
+		stages := make([]CompiledJourneyStageTarget, 0, len(journey.Stages))
 		for _, stage := range journey.Stages {
+			entityIDs := make([]string, 0, len(stage.EntitySelectors))
 			for _, selector := range stage.EntitySelectors {
-				refs = append(refs, resolved.entityID(selector.EntityKey))
+				entityIDs = append(entityIDs, resolved.entityID(selector.EntityKey))
 			}
+			relationIDs := make([]string, 0, len(stage.RelationSelectors))
 			for _, selector := range stage.RelationSelectors {
-				refs = append(refs, resolved.relationID(relationKey(selector)))
+				relationIDs = append(relationIDs, resolved.relationID(relationKey(selector)))
 			}
+			stages = append(stages, CompiledJourneyStageTarget{
+				StageKey:    stage.Key,
+				EntityIDs:   entityIDs,
+				RelationIDs: relationIDs,
+			})
 		}
-		journeyRefs[journey.Key] = refs
+		journeyStages[journey.Key] = stages
 	}
 
 	for _, binding := range bindings {
 		targets := []string{}
+		journeyStageTargets := []CompiledJourneyStageTarget{}
 		switch binding.Kind {
 		case KindSignal:
 			targets = signalScopes[binding.TargetRef]
 		case KindJourney:
-			targets = journeyRefs[binding.TargetRef]
+			journeyStageTargets = journeyStages[binding.TargetRef]
 		}
 		if targets == nil {
 			targets = []string{}
+		}
+		if journeyStageTargets == nil {
+			journeyStageTargets = []CompiledJourneyStageTarget{}
 		}
 		sideOutputs := binding.SideOutputs
 		if sideOutputs == nil {
 			sideOutputs = []SideOutput{}
 		}
+		identityMappings := binding.IdentityMappings
+		if identityMappings == nil {
+			identityMappings = []IdentityMapping{}
+		}
 		compiled.Bindings = append(compiled.Bindings, CompiledBinding{
-			Key:                binding.Key,
-			Kind:               binding.Kind,
-			TargetRef:          binding.TargetRef,
-			ResolvedTargetIDs:  targets,
-			ToolKey:            binding.ToolKey,
-			TemplateRef:        binding.TemplateRef,
-			SourceKey:          binding.SourceKey,
-			Capability:         binding.Capability,
-			RequiredPermission: binding.RequiredPermission,
-			EvidenceClass:      binding.EvidenceClass,
-			SideOutputs:        sideOutputs,
-			Params:             binding.Params,
+			Key:                   binding.Key,
+			Kind:                  binding.Kind,
+			TargetRef:             binding.TargetRef,
+			FocusKind:             journeyFocusKind(binding, pkg),
+			ResolvedTargetIDs:     targets,
+			ResolvedJourneyStages: journeyStageTargets,
+			ToolKey:               binding.ToolKey,
+			TemplateRef:           binding.TemplateRef,
+			SourceKey:             binding.SourceKey,
+			Capability:            binding.Capability,
+			RequiredPermission:    binding.RequiredPermission,
+			EvidenceClass:         binding.EvidenceClass,
+			SideOutputs:           sideOutputs,
+			Params:                binding.Params,
+			IdentityMappings:      identityMappings,
 		})
 	}
 	sort.SliceStable(compiled.Bindings, func(i, j int) bool {
@@ -376,18 +405,26 @@ func resolvedScopeIDs(scope SignalScope, resolved resolution) []string {
 	return out
 }
 
+func journeyFocusKind(binding resolvedBinding, pkg Package) string {
+	if binding.Kind != KindJourney {
+		return ""
+	}
+	for _, journey := range pkg.ProfileTemplate.Journeys {
+		if journey.Key == binding.TargetRef {
+			return journey.FocusKind
+		}
+	}
+	return ""
+}
+
 func compileTopologyPolicy(policy TopologyPolicy) CompiledTopologyPolicy {
 	compiled := CompiledTopologyPolicy{
 		AliasNamespaces:   append([]string(nil), policy.AliasNamespaces...),
-		IdentityFields:    []string{},
+		IdentityMappings:  append([]IdentityMapping(nil), policy.IdentityMappings...),
 		StaleAfterSeconds: policy.Overlay.StaleAfterSeconds,
 	}
-	if policy.Discovery != nil {
-		compiled.IdentityFields = append([]string(nil), policy.Discovery.IdentityFields...)
-		compiled.InstanceRole = policy.Discovery.InstanceRole
-	}
-	if compiled.IdentityFields == nil {
-		compiled.IdentityFields = []string{}
+	if compiled.IdentityMappings == nil {
+		compiled.IdentityMappings = []IdentityMapping{}
 	}
 	if policy.Overlay.MaxHints != nil {
 		compiled.MaxHints = *policy.Overlay.MaxHints

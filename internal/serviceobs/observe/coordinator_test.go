@@ -3,6 +3,7 @@ package observe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"alert-system/internal/serviceobs"
 	"alert-system/internal/serviceobs/health"
+	"alert-system/internal/serviceobs/integration"
 	"alert-system/internal/serviceobs/model"
 )
 
@@ -165,6 +167,94 @@ func allPermissions() *fakePermissions {
 	}}
 }
 
+func testBindingSource(profile model.Profile) integration.RuntimeBindingSource {
+	compiled := buildTestCompiledIntegration(profile)
+	digest, err := integration.ProfileDigest(profile)
+	if err != nil {
+		panic(err)
+	}
+	compiled.SchemaVersion = integration.CompiledIntegrationSchemaVersion
+	compiled.ProfileKey = profile.ProfileKey
+	compiled.ProfileVersion = profile.ProfileVersion
+	compiled.ProfileDigest = digest
+	compiled.ServiceID = "svc-1"
+	compiled.Environment = "production"
+	compiled.TopologyPolicy = integration.CompiledTopologyPolicy{
+		AliasNamespaces:  []string{},
+		IdentityMappings: []integration.IdentityMapping{},
+	}
+	return integration.NewStaticRuntimeBindingSource(map[string]integration.CompiledIntegration{
+		compiled.ServiceID + "\x1e" + compiled.Environment + "\x1e" +
+			profile.ProfileKey + "\x1e" + itoa(profile.ProfileVersion): compiled,
+	})
+}
+
+func itoa(v int) string {
+	return fmt.Sprintf("%d", v)
+}
+
+func buildTestCompiledIntegration(profile model.Profile) integration.CompiledIntegration {
+	bindings := make([]integration.CompiledBinding, 0, len(profile.SignalBindings)+3)
+	for _, signal := range profile.SignalBindings {
+		bindings = append(bindings, integration.CompiledBinding{
+			Key: signal.Key, Kind: integration.KindSignal, TargetRef: signal.Key,
+			SourceKey: serviceobs.SourceKeyPrometheus, ResolvedTargetIDs: []string{},
+		})
+	}
+	focusKind := "sandbox_id"
+	for _, focus := range profile.FocusKinds {
+		if focus.Primary {
+			focusKind = focus.Key
+		}
+	}
+	hasEvidence, hasJourney := false, false
+	for _, view := range profile.Views {
+		switch view.Renderer {
+		case model.RendererEvidenceList:
+			hasEvidence = true
+		case model.RendererRequestJourney, model.RendererDependencyTopology:
+			hasJourney = true
+		}
+	}
+	if hasJourney {
+		bindings = append(bindings, integration.CompiledBinding{
+			Key: "journey_test", Kind: integration.KindJourney,
+			TargetRef: "sandbox_create", FocusKind: focusKind,
+			SourceKey: serviceobs.SourceKeyOpenObserveTraces,
+			SideOutputs: []integration.SideOutput{
+				integration.SideOutputFocus, integration.SideOutputTraceEvidence, integration.SideOutputTopologyHints,
+			},
+			ResolvedJourneyStages: []integration.CompiledJourneyStageTarget{},
+		})
+	}
+	if hasEvidence {
+		bindings = append(bindings,
+			integration.CompiledBinding{
+				Key: "logs_test", Kind: integration.KindEvidence, TargetRef: focusKind,
+				SourceKey:   serviceobs.SourceKeyOpenObserveLogs,
+				SideOutputs: []integration.SideOutput{integration.SideOutputFocus},
+			},
+			integration.CompiledBinding{
+				Key: "access_test", Kind: integration.KindEvidence, TargetRef: focusKind,
+				SourceKey:   serviceobs.SourceKeyOpenObserveAccess,
+				SideOutputs: []integration.SideOutput{integration.SideOutputFocus},
+			},
+		)
+	}
+	return integration.CompiledIntegration{Bindings: bindings}
+}
+
+func optsWithCompiled(opts Options, profile model.Profile) Options {
+	if opts.Readers.AnyConfigured() && opts.BindingSource == nil {
+		opts.BindingSource = testBindingSource(profile)
+	}
+	return opts
+}
+
+func newCoordinator(opts Options) *Coordinator {
+	return New(optsWithCompiled(opts, testProfile()))
+}
+
 // testProfile 构造一份带 evidence renderer 的 Profile，因此聚焦工作区会选中三个证据来源。
 func testProfile() model.Profile {
 	profile := model.Profile{
@@ -179,6 +269,9 @@ func testProfile() model.Profile {
 			{Key: "golden_saturation", Family: model.SignalFamilyGolden, Semantic: model.SemanticSaturation},
 			{Key: "red_rate", Family: model.SignalFamilyRED, Semantic: model.SemanticRate},
 		},
+		FocusKinds: []model.FocusKind{{
+			Key: "sandbox_id", Label: "Sandbox", ValuePattern: "^sbx_[A-Za-z0-9]+$", Primary: true,
+		}},
 		Views: []model.ProfileView{
 			{Key: "overview", Renderer: model.RendererGoldenOverview, Order: 10},
 			{Key: "evidence", Renderer: model.RendererEvidenceList, Order: 20},
@@ -190,6 +283,7 @@ func testProfile() model.Profile {
 }
 
 func workspaceRequest() serviceobs.ObservationRequest {
+	focus := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
 	return serviceobs.ObservationRequest{
 		Profile:       testProfile(),
 		ServiceID:     "svc-1",
@@ -199,6 +293,7 @@ func workspaceRequest() serviceobs.ObservationRequest {
 		To:            time.Date(2026, 8, 23, 2, 9, 22, 0, time.UTC),
 		Subject:       serviceobs.Subject{UserID: "user-1", Roles: []string{"member"}},
 		Purpose:       serviceobs.PurposeFocusedWorkspace,
+		Focus:         &focus,
 	}
 }
 
@@ -214,7 +309,7 @@ func sourceByKey(facts serviceobs.ObservationFacts, key string) (health.SourceOb
 // ---- Subject / Purpose 必须由服务端给出 ----
 
 func TestSubjectAndPurposeAreRequired(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: &fakeSignals{}},
 		Permissions: allPermissions(),
 	})
@@ -251,7 +346,7 @@ func TestDirectorySummaryNeverFansOutEvidence(t *testing.T) {
 	traces := &fakeTraces{}
 	logs := &fakeLogs{}
 	access := &fakeAccess{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: signals, Traces: traces, Logs: logs, Access: access},
 		Permissions: allPermissions(),
 	})
@@ -294,7 +389,7 @@ func TestDirectorySummaryNeverFansOutEvidence(t *testing.T) {
 func TestOverviewReadsAllBindingsWithoutEvidence(t *testing.T) {
 	signals := &fakeSignals{}
 	logs := &fakeLogs{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: signals, Logs: logs},
 		Permissions: allPermissions(),
 	})
@@ -316,7 +411,7 @@ func TestFocusedWorkspaceReadsEvidenceSources(t *testing.T) {
 	traces := &fakeTraces{}
 	logs := &fakeLogs{}
 	access := &fakeAccess{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: signals, Traces: traces, Logs: logs, Access: access},
 		Permissions: allPermissions(),
 	})
@@ -332,8 +427,10 @@ func TestFocusedWorkspaceReadsEvidenceSources(t *testing.T) {
 // ---- 完全未配置 vs 部分配置 ----
 
 func TestFullyUnconfiguredKeepsPhase2Semantics(t *testing.T) {
-	coordinator := New(Options{Permissions: allPermissions()})
-	facts, err := coordinator.ReadObservations(context.Background(), workspaceRequest())
+	coordinator := newCoordinator(Options{Permissions: allPermissions()})
+	req := workspaceRequest()
+	req.Focus = nil
+	facts, err := coordinator.ReadObservations(context.Background(), req)
 	if err != nil {
 		t.Fatalf("ReadObservations 失败: %v", err)
 	}
@@ -365,7 +462,7 @@ func TestFullyUnconfiguredKeepsPhase2Semantics(t *testing.T) {
 // 一个 provider 都没有时的诚实答案是"我们不知道"。source 与 signal 侧仍逐字保留 Phase 2。
 func TestFullyUnconfiguredWithRequestedFocusIsUnknown(t *testing.T) {
 	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
-	coordinator := New(Options{Permissions: allPermissions()})
+	coordinator := newCoordinator(Options{Permissions: allPermissions()})
 	req := workspaceRequest()
 	req.Focus = &focusValue
 	facts, err := coordinator.ReadObservations(context.Background(), req)
@@ -400,7 +497,7 @@ func TestFullyUnconfiguredIgnoresFocusForNonEvidencePurposes(t *testing.T) {
 		serviceobs.PurposeDirectorySummary, serviceobs.PurposeOverview,
 	} {
 		t.Run(string(purpose), func(t *testing.T) {
-			coordinator := New(Options{Permissions: allPermissions()})
+			coordinator := newCoordinator(Options{Permissions: allPermissions()})
 			req := workspaceRequest()
 			req.Purpose = purpose
 			req.Focus = &focusValue
@@ -417,7 +514,7 @@ func TestFullyUnconfiguredIgnoresFocusForNonEvidencePurposes(t *testing.T) {
 
 // 聚焦工作区但没带 focus 值：没问过就是 not_requested，不能凭空报 unknown。
 func TestFullyUnconfiguredWithoutFocusStaysNotRequested(t *testing.T) {
-	coordinator := New(Options{Permissions: allPermissions()})
+	coordinator := newCoordinator(Options{Permissions: allPermissions()})
 	req := workspaceRequest()
 	req.Focus = nil
 	facts, err := coordinator.ReadObservations(context.Background(), req)
@@ -432,7 +529,7 @@ func TestFullyUnconfiguredWithoutFocusStaysNotRequested(t *testing.T) {
 // 部分配置：当前 purpose 选中但未连接的来源必须显式出现，不能省略。
 func TestPartialConfigurationReportsNotConnectedExplicitly(t *testing.T) {
 	t.Run("只有 Prometheus", func(t *testing.T) {
-		coordinator := New(Options{
+		coordinator := newCoordinator(Options{
 			Readers:     Readers{Signals: &fakeSignals{}},
 			Permissions: allPermissions(),
 		})
@@ -464,7 +561,7 @@ func TestPartialConfigurationReportsNotConnectedExplicitly(t *testing.T) {
 	})
 
 	t.Run("只有 OpenObserve", func(t *testing.T) {
-		coordinator := New(Options{
+		coordinator := newCoordinator(Options{
 			Readers: Readers{
 				Traces: &fakeTraces{}, Logs: &fakeLogs{}, Access: &fakeAccess{},
 			},
@@ -500,7 +597,7 @@ func TestPermissionDeniedMakesZeroUpstreamCalls(t *testing.T) {
 	traces := &fakeTraces{}
 	logs := &fakeLogs{}
 	access := &fakeAccess{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{Signals: signals, Traces: traces, Logs: logs, Access: access},
 		// member 缺省没有 logs.read：logs 与 access 都必须被挡住。
 		Permissions: &fakePermissions{granted: []serviceobs.Permission{
@@ -542,7 +639,7 @@ func TestPermissionDeniedMakesZeroUpstreamCalls(t *testing.T) {
 // resolver 为 nil 时默认拒绝一切，而不是放行。
 func TestNilPermissionResolverDeniesByDefault(t *testing.T) {
 	signals := &fakeSignals{}
-	coordinator := New(Options{Readers: Readers{Signals: signals}})
+	coordinator := newCoordinator(Options{Readers: Readers{Signals: signals}})
 	facts, err := coordinator.ReadObservations(context.Background(), workspaceRequest())
 	if err != nil {
 		t.Fatalf("ReadObservations 失败: %v", err)
@@ -560,7 +657,7 @@ func TestNilPermissionResolverDeniesByDefault(t *testing.T) {
 func TestPermissionResolverErrorFailsRequest(t *testing.T) {
 	sentinel := errors.New("policy store down")
 	signals := &fakeSignals{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: signals},
 		Permissions: &fakePermissions{err: sentinel},
 	})
@@ -593,7 +690,7 @@ func TestSingleSourceFailureDegradesOnlyItself(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := &fakeLogs{err: tc.err}
 			traces := &fakeTraces{}
-			coordinator := New(Options{
+			coordinator := newCoordinator(Options{
 				Readers: Readers{
 					Signals: &fakeSignals{}, Traces: traces, Logs: logs, Access: &fakeAccess{},
 				},
@@ -624,7 +721,7 @@ func TestSingleSourceFailureDegradesOnlyItself(t *testing.T) {
 
 // 上游凭据失效绝不能显示成当前用户的 Forbidden。
 func TestUpstreamAuthFailureIsNotUserForbidden(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: &fakeSignals{err: ErrUpstreamAuthFailed}},
 		Permissions: allPermissions(),
 	})
@@ -644,7 +741,7 @@ func TestUpstreamAuthFailureIsNotUserForbidden(t *testing.T) {
 // 单来源超时只降级自己，其它来源照常返回。
 func TestSingleSourceTimeoutDegradesOnlyItself(t *testing.T) {
 	slowLogs := &fakeLogs{delay: 2 * time.Second}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{}, Traces: &fakeTraces{}, Logs: slowLogs, Access: &fakeAccess{},
 		},
@@ -673,7 +770,7 @@ func TestSingleSourceTimeoutDegradesOnlyItself(t *testing.T) {
 
 // adapter panic 必须被隔离成稳定 reason，不能带走整个请求。
 func TestAdapterPanicIsIsolated(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{panicNow: true}, Traces: &fakeTraces{},
 			Logs: &fakeLogs{}, Access: &fakeAccess{},
@@ -698,7 +795,7 @@ func TestAdapterPanicIsIsolated(t *testing.T) {
 
 // 父 context 取消必须向上返回 context 错误，而不是把断开的请求伪装成一个可返回的 Partial。
 func TestParentCancellationReturnsContextError(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{delay: time.Second}, Traces: &fakeTraces{delay: time.Second},
 			Logs: &fakeLogs{delay: time.Second}, Access: &fakeAccess{},
@@ -717,7 +814,7 @@ func TestParentCancellationReturnsContextError(t *testing.T) {
 }
 
 func TestParentDeadlineReturnsContextError(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: &fakeSignals{delay: time.Second}},
 		Permissions: allPermissions(),
 	})
@@ -733,7 +830,7 @@ func TestParentDeadlineReturnsContextError(t *testing.T) {
 func TestAlreadyCanceledContextMakesNoCalls(t *testing.T) {
 	signals := &fakeSignals{}
 	permissions := allPermissions()
-	coordinator := New(Options{Readers: Readers{Signals: signals}, Permissions: permissions})
+	coordinator := newCoordinator(Options{Readers: Readers{Signals: signals}, Permissions: permissions})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := coordinator.ReadObservations(ctx, workspaceRequest()); !errors.Is(err, context.Canceled) {
@@ -747,7 +844,7 @@ func TestAlreadyCanceledContextMakesNoCalls(t *testing.T) {
 
 // 取消后不得遗留 goroutine：函数返回前所有子 goroutine 必须已退出。
 func TestNoGoroutineLeakAfterCancellation(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{delay: 500 * time.Millisecond},
 			Traces:  &fakeTraces{delay: 500 * time.Millisecond},
@@ -804,7 +901,7 @@ func TestFocusMergeFollowsMatchedUnknownEmptyPriority(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			coordinator := New(Options{
+			coordinator := newCoordinator(Options{
 				Readers: Readers{
 					Signals: &fakeSignals{},
 					Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: tc.traceFocus}},
@@ -832,7 +929,7 @@ func TestSignalMergeIsDeterministic(t *testing.T) {
 		{BindingKey: "golden_latency", Availability: model.SignalAvailabilityUnavailable},
 		{BindingKey: "golden_traffic", Availability: model.SignalAvailabilityAvailable, Value: &value},
 	}}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: signals},
 		Permissions: allPermissions(),
 	})
@@ -881,7 +978,7 @@ func TestJourneyStagesUseContractEnumOnly(t *testing.T) {
 			{StageKey: "routed", State: model.JourneyStageStateUnknown, ReasonCode: serviceobs.ReasonSourceTimeout},
 		},
 	}}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: &fakeSignals{}, Traces: traces, Logs: &fakeLogs{}, Access: &fakeAccess{}},
 		Permissions: allPermissions(),
 	})
@@ -915,7 +1012,7 @@ func TestIssuesAreSortedAndRedacted(t *testing.T) {
 				SourceKey: serviceobs.SourceKeyOpenObserveTraces},
 		},
 	}}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:     Readers{Signals: &fakeSignals{}, Traces: traces, Logs: &fakeLogs{}, Access: &fakeAccess{}},
 		Permissions: allPermissions(),
 	})
@@ -934,16 +1031,17 @@ func TestIssuesAreSortedAndRedacted(t *testing.T) {
 // Profile limits 只能收紧全局上界，不能放宽。
 func TestProfileLimitsOnlyTighten(t *testing.T) {
 	signals := &fakeSignals{}
-	coordinator := New(Options{
+	baseOpts := Options{
 		Readers:     Readers{Signals: signals},
 		Limits:      Limits{Signals: serviceobs.SourceLimits{MaxRows: 200}},
 		Permissions: allPermissions(),
-	})
+	}
 
 	t.Run("Profile 更小则收紧", func(t *testing.T) {
 		req := workspaceRequest()
 		req.Purpose = serviceobs.PurposeOverview
 		req.Profile.Limits.MaxRows = 50
+		coordinator := New(optsWithCompiled(baseOpts, req.Profile))
 		if _, err := coordinator.ReadObservations(context.Background(), req); err != nil {
 			t.Fatalf("失败: %v", err)
 		}
@@ -956,6 +1054,7 @@ func TestProfileLimitsOnlyTighten(t *testing.T) {
 		req := workspaceRequest()
 		req.Purpose = serviceobs.PurposeOverview
 		req.Profile.Limits.MaxRows = 10000
+		coordinator := New(optsWithCompiled(baseOpts, req.Profile))
 		if _, err := coordinator.ReadObservations(context.Background(), req); err != nil {
 			t.Fatalf("失败: %v", err)
 		}
@@ -967,7 +1066,7 @@ func TestProfileLimitsOnlyTighten(t *testing.T) {
 
 // 并发读取同一个 coordinator 必须安全（配合 -race）。
 func TestConcurrentReadsAreSafe(t *testing.T) {
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{}, Traces: &fakeTraces{}, Logs: &fakeLogs{}, Access: &fakeAccess{},
 		},
@@ -988,7 +1087,7 @@ func TestConcurrentReadsAreSafe(t *testing.T) {
 
 // Coordinator 必须满足 Phase 2 的 ObservationReader 端口：facade 与 API 因此不需要改。
 func TestCoordinatorSatisfiesPhase2Port(t *testing.T) {
-	var reader serviceobs.ObservationReader = New(Options{})
+	var reader serviceobs.ObservationReader = newCoordinator(Options{})
 	if reader == nil {
 		t.Fatal("Coordinator 应满足 ObservationReader")
 	}
@@ -1077,7 +1176,7 @@ func TestFocusIsNotPollutedByNonFocusSources(t *testing.T) {
 					serviceobs.PermissionMetricsRead, serviceobs.PermissionTracesRead,
 				}}
 			}
-			coordinator := New(Options{Readers: tc.readers, Permissions: permissions})
+			coordinator := newCoordinator(Options{Readers: tc.readers, Permissions: permissions})
 			req := workspaceRequest()
 			req.Focus = tc.focus
 			facts, err := coordinator.ReadObservations(context.Background(), req)
@@ -1094,7 +1193,7 @@ func TestFocusIsNotPollutedByNonFocusSources(t *testing.T) {
 // signal 来源失败在没有 focus 时也不该报告 focus 结论。
 func TestSignalFailureNeverReportsFocus(t *testing.T) {
 	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers: Readers{
 			Signals: &fakeSignals{err: errors.New("boom")},
 			Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusEmpty}},
@@ -1124,7 +1223,7 @@ func TestSignalFailureNeverReportsFocus(t *testing.T) {
 func TestCustomSummaryBindingKeysAreUsedForBothRequestAndBackfill(t *testing.T) {
 	custom := []string{"golden_latency", "red_rate"}
 	signals := &fakeSignals{}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Readers:            Readers{Signals: signals},
 		Permissions:        allPermissions(),
 		SummaryBindingKeys: func(model.Profile) []string { return custom },
@@ -1161,7 +1260,7 @@ func TestCustomSummaryBindingKeysAreUsedForBothRequestAndBackfill(t *testing.T) 
 // 完全未配置时也走同一份 key 解析。
 func TestNotConnectedUsesSameBindingKeyResolution(t *testing.T) {
 	custom := []string{"only_one"}
-	coordinator := New(Options{
+	coordinator := newCoordinator(Options{
 		Permissions:        allPermissions(),
 		SummaryBindingKeys: func(model.Profile) []string { return custom },
 	})
@@ -1173,5 +1272,75 @@ func TestNotConnectedUsesSameBindingKeyResolution(t *testing.T) {
 	}
 	if len(facts.Signals) != 1 || facts.Signals[0].BindingKey != "only_one" {
 		t.Fatalf("signals=%+v，应只补自定义摘要 key", facts.Signals)
+	}
+}
+
+// ---- Phase 3 Batch B 跨 lane 集成口径 ----
+
+func compiledBindingSourceWithoutAccess(profile model.Profile) integration.RuntimeBindingSource {
+	compiled := buildTestCompiledIntegration(profile)
+	bindings := make([]integration.CompiledBinding, 0, len(compiled.Bindings))
+	for _, binding := range compiled.Bindings {
+		if binding.SourceKey == serviceobs.SourceKeyOpenObserveAccess {
+			continue
+		}
+		bindings = append(bindings, binding)
+	}
+	compiled.Bindings = bindings
+	digest, err := integration.ProfileDigest(profile)
+	if err != nil {
+		panic(err)
+	}
+	compiled.SchemaVersion = integration.CompiledIntegrationSchemaVersion
+	compiled.ProfileKey = profile.ProfileKey
+	compiled.ProfileVersion = profile.ProfileVersion
+	compiled.ProfileDigest = digest
+	compiled.ServiceID = "svc-1"
+	compiled.Environment = "production"
+	return integration.NewStaticRuntimeBindingSource(map[string]integration.CompiledIntegration{
+		compiled.ServiceID + "\x1e" + compiled.Environment + "\x1e" +
+			profile.ProfileKey + "\x1e" + itoa(profile.ProfileVersion): compiled,
+	})
+}
+
+// compiled 只有 Prometheus+traces+logs 时，access reader 即使注册也不得调用。
+func TestBatchBCompiledOnlyPrometheusTracesLogsSkipsAccess(t *testing.T) {
+	profile := testProfile()
+	access := &fakeAccess{}
+	coordinator := New(Options{
+		Readers: Readers{
+			Signals: &fakeSignals{},
+			Traces:  &fakeTraces{},
+			Logs:    &fakeLogs{},
+			Access:  access,
+		},
+		Permissions:   allPermissions(),
+		BindingSource: compiledBindingSourceWithoutAccess(profile),
+	})
+	if _, err := coordinator.ReadObservations(context.Background(), workspaceRequest()); err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if access.calls.Load() != 0 {
+		t.Fatalf("access 调用次数=%d，compiled 无 access binding 时必须为 0", access.calls.Load())
+	}
+}
+
+// traces 已确认 empty + logs 超时：Focus 必须是 Unknown，不能宣称 Empty。
+func TestBatchBTracesEmptyLogsTimeoutFocusUnknown(t *testing.T) {
+	coordinator := newCoordinator(Options{
+		Readers: Readers{
+			Signals: &fakeSignals{},
+			Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusEmpty}},
+			Logs:    &fakeLogs{err: context.DeadlineExceeded},
+			Access:  &fakeAccess{facts: serviceobs.AccessFacts{Focus: serviceobs.FocusEmpty}},
+		},
+		Permissions: allPermissions(),
+	})
+	facts, err := coordinator.ReadObservations(context.Background(), workspaceRequest())
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if facts.Focus != serviceobs.FocusUnknown {
+		t.Fatalf("Focus=%q，logs 超时不能把结论降为 Empty", facts.Focus)
 	}
 }

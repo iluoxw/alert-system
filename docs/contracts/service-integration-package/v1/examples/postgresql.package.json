@@ -183,12 +183,6 @@
     "alias_namespaces": [
       "pg_instance"
     ],
-    "discovery": {
-      "identity_fields": [
-        "instance"
-      ],
-      "instance_role": "component"
-    },
     "overlay": {
       "stale_after_seconds": 600
     }

@@ -384,7 +384,74 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/fieldIdentifier" }
         },
-        "row_limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+        "row_limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "stage_mappings": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/stageValueMapping" }
+        },
+        "status_mappings": {
+          "type": "array",
+          "maxItems": 10,
+          "items": { "$ref": "#/$defs/statusValueMapping" }
+        },
+        "identity_mappings": {
+          "type": "array",
+          "maxItems": 10,
+          "items": { "$ref": "#/$defs/identityMapping" }
+        }
+      }
+    },
+    "stageValueMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage_key", "values"],
+      "properties": {
+        "stage_key": { "$ref": "#/$defs/objectKey" },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:/@+-]+$"
+          }
+        }
+      }
+    },
+    "statusValueMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "values"],
+      "properties": {
+        "state": { "enum": ["ok", "failed", "pending"] },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:/@+-]+$"
+          }
+        }
+      }
+    },
+    "identityMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "namespace", "role"],
+      "properties": {
+        "field": { "$ref": "#/$defs/fieldIdentifier" },
+        "namespace": { "$ref": "#/$defs/objectKey" },
+        "role": {
+          "enum": ["caller", "callee", "caller_instance", "callee_instance"]
+        }
       }
     },
     "metricIdentifier": {
@@ -440,22 +507,10 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/objectKey" }
         },
-        "discovery": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "identity_fields": {
-              "type": "array",
-              "minItems": 1,
-              "maxItems": 10,
-              "uniqueItems": true,
-              "items": { "$ref": "#/$defs/fieldIdentifier" }
-            },
-            "instance_role": {
-              "description": "component 表示这是稳定逻辑组件，instance 表示它是会随副本变化的实例清单成员。实例数量变化不得被解释成组件拓扑变更。",
-              "enum": ["component", "instance"]
-            }
-          }
+        "identity_mappings": {
+          "type": "array",
+          "maxItems": 10,
+          "items": { "$ref": "#/$defs/identityMapping" }
         },
         "overlay": {
           "type": "object",

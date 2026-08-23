@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"alert-system/internal/serviceobs/health"
+	"alert-system/internal/serviceobs/integration"
 	"alert-system/internal/serviceobs/model"
 )
 
@@ -71,6 +72,10 @@ const (
 	ReasonAliasConflict = "alias_conflict"
 	// ReasonAuditUnavailable 表示审计不可写。没有审计的结果一律不得进入 Page View。
 	ReasonAuditUnavailable = "audit_unavailable"
+	// ReasonNoSeries 表示查询成功但没有匹配 series。
+	ReasonNoSeries = "no_series"
+	// ReasonStageMappingUnavailable 表示 stage 映射缺失或不可用。
+	ReasonStageMappingUnavailable = "stage_mapping_unavailable"
 )
 
 // Subject 是服务端从 session 计算出的身份。
@@ -252,11 +257,33 @@ const (
 	AliasConflict AliasState = "conflict"
 )
 
+// ObservedInstanceHint 表示本窗口看到某 component 的某 instance。
+type ObservedInstanceHint struct {
+	Component   ExternalIdentity
+	Instance    ExternalIdentity
+	ObservedAt  time.Time
+	EvidenceIDs []string
+	SourceKey   string
+}
+
+// AliasResolvedEntry 是已解析 alias 的 canonical entity 投影。
+type AliasResolvedEntry struct {
+	Identity    ExternalIdentity
+	EntityID    string
+	EntityKey   string
+	Name        string
+	Layer       model.EntityLayer
+	Kind        string
+	Environment string
+}
+
 // AliasEntry 是一条解析结果。EntityID 只在 State=resolved 时有意义。
 type AliasEntry struct {
 	Identity ExternalIdentity
 	State    AliasState
 	EntityID string
+	// Resolved 在 State=resolved 时携带 canonical entity metadata。
+	Resolved *AliasResolvedEntry
 }
 
 // AliasResolution 是一批解析的结果。
@@ -289,6 +316,8 @@ type SignalRequest struct {
 	From          time.Time
 	To            time.Time
 	Limits        SourceLimits
+	// Bindings 是 Coordinator 从同一 compiled snapshot 选中的 server-only bindings。
+	Bindings []integration.CompiledBinding
 }
 
 // SignalFacts 是语义指标来源的返回。
@@ -315,6 +344,8 @@ type FocusRequest struct {
 	// Focus 为 nil 表示没有聚焦：实现必须返回 FocusNotRequested，不得自行放宽成全量扫描。
 	Focus  *model.Focus
 	Limits SourceLimits
+	// Bindings 是 Coordinator 从同一 compiled snapshot 选中的 server-only bindings。
+	Bindings []integration.CompiledBinding
 }
 
 // TraceFacts 是 trace 来源的返回：journey 观测、observed topology hint 与 trace 证据。

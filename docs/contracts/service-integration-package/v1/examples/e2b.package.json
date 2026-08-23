@@ -369,14 +369,23 @@
       "host_instance",
       "sandbox_pool"
     ],
-    "discovery": {
-      "identity_fields": [
-        "service_name",
-        "peer_service",
-        "instance"
-      ],
-      "instance_role": "instance"
-    },
+    "identity_mappings": [
+      {
+        "field": "service_name",
+        "namespace": "otel_service",
+        "role": "caller"
+      },
+      {
+        "field": "peer_service",
+        "namespace": "otel_service",
+        "role": "callee"
+      },
+      {
+        "field": "instance",
+        "namespace": "host_instance",
+        "role": "caller_instance"
+      }
+    ],
     "overlay": {
       "stale_after_seconds": 300,
       "max_hints": 200
@@ -575,7 +584,24 @@
         "stream": "default",
         "focus_field": "sandbox_id",
         "row_limit": 200,
-        "stage_field": "span_name"
+        "stage_field": "span_name",
+        "identity_mappings": [
+          {
+            "field": "service_name",
+            "namespace": "otel_service",
+            "role": "caller"
+          },
+          {
+            "field": "peer_service",
+            "namespace": "otel_service",
+            "role": "callee"
+          },
+          {
+            "field": "instance",
+            "namespace": "host_instance",
+            "role": "caller_instance"
+          }
+        ]
       }
     },
     {

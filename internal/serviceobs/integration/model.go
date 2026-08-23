@@ -216,18 +216,59 @@ type TemplateParams struct {
 	// 拆成三组是因为"分子与分母用同一组 label"必然算出恒 100%：E2B 的 error ratio 就踩过
 	// 这个坑——numerator 与 denominator 是同一个 counter、同一组 label，任何非零样本都会
 	// 算成 100% 错误率。compiler 因此拒绝"同 metric 且两侧有效选择器完全相同"。
-	CommonLabels      []LabelEquality `json:"common_labels,omitempty"`
-	NumeratorLabels   []LabelEquality `json:"numerator_labels,omitempty"`
-	DenominatorLabels []LabelEquality `json:"denominator_labels,omitempty"`
-	GroupBy           []string        `json:"group_by,omitempty"`
-	Quantile          *float64        `json:"quantile,omitempty"`
-	RangeSeconds      *int            `json:"range_seconds,omitempty"`
-	Stream            string          `json:"stream,omitempty"`
-	FocusField        string          `json:"focus_field,omitempty"`
-	StageField        string          `json:"stage_field,omitempty"`
-	StatusField       string          `json:"status_field,omitempty"`
-	SelectFields      []string        `json:"select_fields,omitempty"`
-	RowLimit          *int            `json:"row_limit,omitempty"`
+	CommonLabels      []LabelEquality      `json:"common_labels,omitempty"`
+	NumeratorLabels   []LabelEquality      `json:"numerator_labels,omitempty"`
+	DenominatorLabels []LabelEquality      `json:"denominator_labels,omitempty"`
+	GroupBy           []string             `json:"group_by,omitempty"`
+	Quantile          *float64             `json:"quantile,omitempty"`
+	RangeSeconds      *int                 `json:"range_seconds,omitempty"`
+	Stream            string               `json:"stream,omitempty"`
+	FocusField        string               `json:"focus_field,omitempty"`
+	StageField        string               `json:"stage_field,omitempty"`
+	StatusField       string               `json:"status_field,omitempty"`
+	SelectFields      []string             `json:"select_fields,omitempty"`
+	RowLimit          *int                 `json:"row_limit,omitempty"`
+	StageMappings     []StageValueMapping  `json:"stage_mappings,omitempty"`
+	StatusMappings    []StatusValueMapping `json:"status_mappings,omitempty"`
+	IdentityMappings  []IdentityMapping    `json:"identity_mappings,omitempty"`
+}
+
+// StageValueMapping 把上游 stage 字段的字面值映射到 journey stage key。
+type StageValueMapping struct {
+	StageKey string   `json:"stage_key"`
+	Values   []string `json:"values"`
+}
+
+// StatusValueMapping 把上游 status 字段的字面值映射到 ok/failed/pending。
+type StatusValueMapping struct {
+	State  string   `json:"state"` // ok|failed|pending
+	Values []string `json:"values"`
+}
+
+// IdentityRole 是 topology/inventory identity 的角色。
+type IdentityRole string
+
+const (
+	IdentityRoleCaller         IdentityRole = "caller"
+	IdentityRoleCallee         IdentityRole = "callee"
+	IdentityRoleCallerInstance IdentityRole = "caller_instance"
+	IdentityRoleCalleeInstance IdentityRole = "callee_instance"
+)
+
+func (r IdentityRole) IsValid() bool {
+	switch r {
+	case IdentityRoleCaller, IdentityRoleCallee, IdentityRoleCallerInstance, IdentityRoleCalleeInstance:
+		return true
+	default:
+		return false
+	}
+}
+
+// IdentityMapping 声明一个 identity 字段如何映射到 alias namespace 与角色。
+type IdentityMapping struct {
+	Field     string       `json:"field"`
+	Namespace string       `json:"namespace"`
+	Role      IdentityRole `json:"role"`
 }
 
 // LabelEquality 是 label 等值对。schema 的 value 字符集里没有 regex/否定/集合元字符与
@@ -239,16 +280,9 @@ type LabelEquality struct {
 
 // TopologyPolicy 声明 discovery 的 alias namespace 白名单与 observed overlay 边界。
 type TopologyPolicy struct {
-	AliasNamespaces []string         `json:"alias_namespaces"`
-	Discovery       *DiscoveryPolicy `json:"discovery,omitempty"`
-	Overlay         OverlayPolicy    `json:"overlay"`
-}
-
-type DiscoveryPolicy struct {
-	IdentityFields []string `json:"identity_fields,omitempty"`
-	// InstanceRole 区分"稳定逻辑组件"与"随副本变化的实例清单成员"：实例数量变化不得被
-	// 解释成组件拓扑变更。
-	InstanceRole string `json:"instance_role,omitempty"`
+	AliasNamespaces  []string          `json:"alias_namespaces"`
+	IdentityMappings []IdentityMapping `json:"identity_mappings,omitempty"`
+	Overlay          OverlayPolicy     `json:"overlay"`
 }
 
 type OverlayPolicy struct {

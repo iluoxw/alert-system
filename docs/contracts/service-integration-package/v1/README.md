@@ -181,3 +181,13 @@ go test ./internal/serviceobs/integration/...
 它覆盖 schema 与本目录的逐字节同步、两份 example 的双产物确定性编译与 digest 配对、selector
 零命中/多命中/环境错配/不可达、provider target 与 capability/permission 错配、未知 template、
 ratio 退化、参数错配、禁止键、自由 matcher 与 draft-only 发布门槛。
+
+## Batch B adapter 状态
+
+Batch B 已在 Go 代码库实现 Prometheus-compatible、OpenObserve 与 alias/overlay 三组只读
+adapter，并通过 fixtures/`httptest`/PostgreSQL integration tests 验收。**adapter 支持完成不等于
+production connected/published：** runtime bundle registry、API 接线与 discovery attestation 属于
+Task 8/9。2026-08-23 实测 OpenObserve HTTPS/auth/schema 可用，但数据约 52.4h stale；access focus
+字段、journey stage mapping、retention 与 fresh current data 仍 blocked。两份 example 继续
+`draft`；E2B 与 PostgreSQL 均走同一 compiler/runtime，无核心 E2B 特判。`CompiledIntegration`
+schema 现为 1.1，拒绝 1.0 artifact。

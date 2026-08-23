@@ -500,6 +500,8 @@ type ObservationFacts struct {
 	TopologyHints []ObservedTopologyHint
 	// Issues 是身份解析与边界缺口的可审计摘要，不含未脱敏原文。
 	Issues []ReconciliationIssue
+	// InstanceHints 是 context-local 动态 instance inventory 侧输出。
+	InstanceHints []ObservedInstanceHint
 }
 
 // ObservationReader 是 Golden/RED/USE 与 Evidence 的读取端口。Phase 3 用
