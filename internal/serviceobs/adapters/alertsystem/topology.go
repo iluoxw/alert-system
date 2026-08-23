@@ -74,19 +74,8 @@ func (a *TopologyAdapter) ReadTopology(
 			})
 			facts.ObservedAt = laterTime(facts.ObservedAt, node.ObservedAt)
 		}
-		facts.Relations = make([]serviceobs.TopologyRelation, 0, len(rows.Relations))
-		for _, relation := range rows.Relations {
-			facts.Relations = append(facts.Relations, serviceobs.TopologyRelation{
-				RelationID:     relation.RelationID,
-				SourceEntityID: relation.SourceEntityID,
-				TargetEntityID: relation.TargetEntityID,
-				Kind:           relation.Relation,
-				Provenance:     provenanceFor(relation.Origin),
-				Criticality:    relation.Criticality,
-				ObservedAt:     relation.ObservedAt,
-				// declared 配置在被显式替换前一直有效，所以只有 observed 会 stale。
-				Stale: relation.Stale && relation.Origin == string(model.ProvenanceObserved),
-			})
+		facts.Relations = mergeCanonicalRelations(rows.Relations)
+		for _, relation := range facts.Relations {
 			facts.ObservedAt = laterTime(facts.ObservedAt, relation.ObservedAt)
 		}
 		if rows.NodesTruncated || rows.RelationsTruncated {
@@ -129,20 +118,141 @@ func neighborhoodQuery(seeds []string, req serviceobs.TopologyRequest, limits Li
 	}
 }
 
-// provenanceFor 把 dependency_edges.origin 映射成契约 provenance。
+// mergeCanonicalRelations 把指向同一条 canonical 关系的多行依赖边归一成一条。
 //
-// 这里刻意不把同一对实体的 declared 与 observed 两行合并成 declared_and_observed：
-// relation_id 必须是真实且稳定的依赖边主键，Profile 的 relation_refs 才能可靠绑定；
-// 合并会强制发明一个随数据行增删而漂移的合成 ID。
-func provenanceFor(origin string) model.Provenance {
-	switch origin {
-	case string(model.ProvenanceDeclared):
+// 归一口径来自设计事实源：同一个 (source_entity_id, target_entity_id, kind) 上同时存在
+// declared 与 observed 行时，必须投影成一条 declared_and_observed 关系。一行一条边的做法
+// 让这个状态永远不可达，页面因此无法区分"只是声明过"与"声明了并且真的观察到了"。
+//
+// 三条不变式：
+//
+//  1. relation_id 永远是一个真实存在的 dependency_edges 主键，绝不是合成 ID。两者共存时
+//     取 declared 行的 ID 作为 canonical：declared 配置只会被显式替换，不会像 observed
+//     那样随时间老化，因此它是更稳的锚。只有 observed 时保留 observed 行自己的 ID。
+//     同 origin 内多行时按 ID 升序取最小值，保证同一份数据两次读取结果一致。
+//  2. MergedRelationIDs 列出被折叠进来的全部真实行 ID（含 canonical）。Profile 的
+//     relation_refs 与 signal scope refs 因此仍能命中——无论它当初引用的是哪一行。
+//  3. freshness 描述的是 observed overlay，因此 observed_at 与 stale 都只看 observed 成员：
+//     observed_at 取**最新的 observed** 成员时间戳，stale 取**最新 observed 成员**自己的
+//     过期判定。一条更新的 declared 配置时间戳绝不能让一个过期的实时叠加层看起来刚被观测
+//     过；同样，一个更老的 observed 成员过期也不能让当前仍然新鲜的观测被判成 stale。
+//     只有 declared 时 observed_at 取最新的 declared 时间戳。declared 底图始终存在，
+//     所以 provenance 保持 declared_and_observed，关系不会消失，页面把过期的实时叠加层
+//     画成灰色虚线而不是删掉这条边。
+func mergeCanonicalRelations(rows []store.NeighborhoodRelationRow) []serviceobs.TopologyRelation {
+	type canonicalKey struct {
+		source string
+		target string
+		kind   string
+	}
+	groups := map[canonicalKey][]store.NeighborhoodRelationRow{}
+	order := []canonicalKey{}
+	for _, row := range rows {
+		key := canonicalKey{row.SourceEntityID, row.TargetEntityID, row.Relation}
+		if _, exists := groups[key]; !exists {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], row)
+	}
+	// 组的输出顺序不依赖 map 迭代顺序。
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].source != order[j].source {
+			return order[i].source < order[j].source
+		}
+		if order[i].target != order[j].target {
+			return order[i].target < order[j].target
+		}
+		return order[i].kind < order[j].kind
+	})
+
+	merged := make([]serviceobs.TopologyRelation, 0, len(order))
+	for _, key := range order {
+		group := groups[key]
+		sort.Slice(group, func(i, j int) bool { return group[i].RelationID < group[j].RelationID })
+
+		relation := serviceobs.TopologyRelation{
+			SourceEntityID: key.source,
+			TargetEntityID: key.target,
+			Kind:           key.kind,
+		}
+		var hasDeclared, hasObserved bool
+		// observed overlay 的新鲜度只由最新的 observed 成员决定；declared 时间戳单独跟踪。
+		var latestObserved, latestDeclared time.Time
+		var newestObservedStale bool
+		memberIDs := make([]string, 0, len(group))
+		for _, row := range group {
+			memberIDs = append(memberIDs, row.RelationID)
+			if criticalityRank(row.Criticality) < criticalityRank(relation.Criticality) ||
+				relation.Criticality == "" {
+				relation.Criticality = row.Criticality
+			}
+			switch row.Origin {
+			case string(model.ProvenanceDeclared):
+				if !hasDeclared {
+					// 第一个（ID 最小的）declared 行就是 canonical ID。
+					relation.RelationID = row.RelationID
+				}
+				hasDeclared = true
+				latestDeclared = laterTime(latestDeclared, row.ObservedAt)
+			case string(model.ProvenanceObserved):
+				switch {
+				case !hasObserved || row.ObservedAt.After(latestObserved):
+					latestObserved = row.ObservedAt
+					newestObservedStale = row.Stale
+				case row.ObservedAt.Equal(latestObserved):
+					// 同一时刻的两条观测在同一个 TTL 下不该有不同结论。真出现冲突时
+					// fail closed 成 stale：绝不在证据矛盾时声称叠加层是新鲜的。
+					newestObservedStale = newestObservedStale || row.Stale
+				}
+				hasObserved = true
+			}
+		}
+		relation.MergedRelationIDs = memberIDs
+		if relation.RelationID == "" {
+			// 没有 declared 行：保留第一个（ID 最小的）行自己的 ID。
+			relation.RelationID = group[0].RelationID
+		}
+		relation.Provenance = mergedProvenance(hasDeclared, hasObserved)
+		if hasObserved {
+			relation.ObservedAt = latestObserved
+			// declared 配置在被显式替换前一直有效，所以只有 observed overlay 会 stale。
+			relation.Stale = newestObservedStale
+		} else {
+			relation.ObservedAt = latestDeclared
+		}
+		merged = append(merged, relation)
+	}
+	return merged
+}
+
+// mergedProvenance 依据组内出现过的 origin 决定 provenance。
+func mergedProvenance(hasDeclared, hasObserved bool) model.Provenance {
+	switch {
+	case hasDeclared && hasObserved:
+		return model.ProvenanceDeclaredAndObserved
+	case hasDeclared:
 		return model.ProvenanceDeclared
-	case string(model.ProvenanceObserved):
+	case hasObserved:
 		return model.ProvenanceObserved
 	default:
-		// 未知 origin 不猜：inferred 明确表示"这是系统推断的，不是任何一方声明或观察到的"。
+		// origin 不在词表内时不猜：inferred 明确表示"这既不是谁声明的，也不是观察到的"。
 		return model.ProvenanceInferred
+	}
+}
+
+// criticalityRank 让"取最高重要度"有确定顺序。未知值排在最后，不会盖掉已知值。
+func criticalityRank(criticality string) int {
+	switch criticality {
+	case "critical":
+		return 0
+	case "high":
+		return 1
+	case "medium":
+		return 2
+	case "low":
+		return 3
+	default:
+		return 4
 	}
 }
 

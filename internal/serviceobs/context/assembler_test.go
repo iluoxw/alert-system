@@ -4,11 +4,13 @@ import (
 	stdcontext "context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"alert-system/internal/serviceobs"
 	"alert-system/internal/serviceobs/contract"
+	"alert-system/internal/serviceobs/health"
 	"alert-system/internal/serviceobs/model"
 	"alert-system/internal/serviceobs/profile"
 )
@@ -731,6 +733,351 @@ func TestAssembleIsDeterministic(t *testing.T) {
 	if string(firstRaw) != string(secondRaw) {
 		t.Fatal("固定时钟与固定 request ID 下，两次装配必须逐字节一致")
 	}
+}
+
+// availableObservations 是一个"遥测已接入且全部可用"的假 reader，用来隔离测试那些
+// 与遥测无关的降级路径（否则 Phase 2 的 Unavailable reader 会让 Data 恒为 Partial，
+// 任何新的 Partial 原因都测不出来）。
+type availableObservations struct{ observedAt time.Time }
+
+func (a availableObservations) ReadObservations(
+	_ stdcontext.Context, req serviceobs.ObservationRequest,
+) (serviceobs.ObservationFacts, error) {
+	facts := serviceobs.ObservationFacts{EvidenceRefs: []model.EvidenceRef{}}
+	for _, binding := range req.Profile.SignalBindings {
+		value := 1.0
+		facts.Signals = append(facts.Signals, health.SignalObservation{
+			BindingKey: binding.Key, Availability: model.SignalAvailabilityAvailable,
+			Value: &value, ObservedAt: a.observedAt, SourceKey: serviceobs.SourceKeyTelemetry,
+		})
+	}
+	facts.Sources = []health.SourceObservation{{
+		SourceKey: serviceobs.SourceKeyTelemetry, State: model.AvailabilityAvailable,
+		Freshness: model.FreshnessFresh, ObservedAt: a.observedAt, Retryable: true,
+	}}
+	return facts, nil
+}
+
+func TestAssembleTopologyBoundsMakeDataPartialWithoutLosingFacts(t *testing.T) {
+	published := testProfile()
+	assembler, _, topology, _ := newAssembler(t, &published)
+	// 遥测可用，因此 Data 的唯一可能降级原因就是拓扑被截断。
+	assembler.Observations = availableObservations{observedAt: testNow.Add(-10 * time.Second)}
+	assembler.TelemetryConnected = true
+
+	t.Run("未截断时 Data Complete", func(t *testing.T) {
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+		})
+		if err != nil {
+			t.Fatalf("Assemble 失败: %v", err)
+		}
+		if snapshot.Evaluation.Data.State != model.DataStateComplete {
+			t.Fatalf("全部来源正常时应 Complete，实际 %q（这是基线，否则下一条断言无意义）",
+				snapshot.Evaluation.Data.State)
+		}
+	})
+
+	t.Run("达到 bounds 时 Data Partial 且事实保留", func(t *testing.T) {
+		bounded := testTopologyFacts()
+		bounded.Partial = true
+		bounded.PartialReason = serviceobs.ReasonTopologyBoundsReached
+		topology.facts = bounded
+
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+		})
+		if err != nil {
+			t.Fatalf("Assemble 失败: %v", err)
+		}
+		// 一张被截断的图绝不能被报成完整数据。
+		if snapshot.Evaluation.Data.State != model.DataStatePartial {
+			t.Fatalf("达到 bounds 必须让 Data Partial，实际 %q", snapshot.Evaluation.Data.State)
+		}
+		// 已返回的事实与 topology.partial 全部保留。
+		if len(snapshot.TopologyFacts.Nodes) != 2 || len(snapshot.TopologyFacts.Relations) != 1 {
+			t.Fatalf("截断不得丢弃已返回的事实: %+v", snapshot.TopologyFacts)
+		}
+		if !snapshot.TopologyFacts.Partial {
+			t.Fatal("topology.partial 必须保留")
+		}
+		// 局部状态用合法词表表达，reason 稳定。
+		section, _ := snapshot.SectionState(serviceobs.SectionKeyTopology)
+		if section.State != model.AvailabilityUnknown {
+			t.Fatalf("topology section 应为 unknown，实际 %q", section.State)
+		}
+		if section.ReasonCode != serviceobs.ReasonTopologyBoundsReached {
+			t.Fatalf("reason 必须稳定，实际 %q", section.ReasonCode)
+		}
+		var found bool
+		for _, source := range snapshot.Evaluation.Data.Sources {
+			if source.SourceKey != serviceobs.SourceKeyTopology {
+				continue
+			}
+			found = true
+			if source.State != model.AvailabilityUnknown {
+				t.Fatalf("topology source 应为 unknown，实际 %q", source.State)
+			}
+			if source.ReasonCode != serviceobs.ReasonTopologyBoundsReached {
+				t.Fatalf("source reason 必须稳定，实际 %q", source.ReasonCode)
+			}
+		}
+		if !found {
+			t.Fatal("必须有 topology source 状态")
+		}
+		// 只降级拓扑：identity 与 domain 不受影响。
+		if identity, _ := snapshot.SectionState(serviceobs.SectionKeyIdentity); identity.State != model.AvailabilityAvailable {
+			t.Fatalf("identity 不得被牵连: %+v", identity)
+		}
+		if domainSection, _ := snapshot.SectionState(serviceobs.SectionKeyDomain); domainSection.State != model.AvailabilityAvailable {
+			t.Fatalf("domain 不得被牵连: %+v", domainSection)
+		}
+		// Health 与 Data 正交：拓扑截断不改写信号健康。
+		if snapshot.Evaluation.Health.Status != model.HealthHealthy {
+			t.Fatalf("拓扑截断不得改写 Health，实际 %q", snapshot.Evaluation.Health.Status)
+		}
+	})
+}
+
+func TestAssembleTimezoneMustSatisfyContractLength(t *testing.T) {
+	published := testProfile()
+
+	t.Run("超长 timezone 被拒绝", func(t *testing.T) {
+		assembler, _, _, _ := newAssembler(t, &published)
+		_, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+			Timezone: strings.Repeat("z", maxTimezoneLength+1),
+		})
+		if !errors.Is(err, ErrInvalidTimezone) {
+			t.Fatalf("超过契约上限的 timezone 必须 typed 拒绝，实际 %v", err)
+		}
+	})
+
+	t.Run("恰好到上限可接受", func(t *testing.T) {
+		assembler, _, _, _ := newAssembler(t, &published)
+		timezone := strings.Repeat("z", maxTimezoneLength)
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID, Timezone: timezone,
+		})
+		if err != nil {
+			t.Fatalf("恰好到上限应可接受: %v", err)
+		}
+		if snapshot.Scope.Timezone != timezone {
+			t.Fatal("timezone 应原样保留")
+		}
+	})
+
+	t.Run("缺省退回 UTC", func(t *testing.T) {
+		assembler, _, _, _ := newAssembler(t, &published)
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+		})
+		if err != nil {
+			t.Fatalf("Assemble 失败: %v", err)
+		}
+		if snapshot.Scope.Timezone != "UTC" {
+			t.Fatalf("缺省 timezone 应是 UTC，实际 %q", snapshot.Scope.Timezone)
+		}
+	})
+}
+
+func TestAssembleRejectsFractionalWindowAndCannotBypassMaxWindow(t *testing.T) {
+	published := testProfile()
+	maxWindow := time.Duration(published.Limits.MaxWindowSeconds) * time.Second
+
+	t.Run("非整秒窗口被拒绝", func(t *testing.T) {
+		assembler, _, _, _ := newAssembler(t, &published)
+		to := testNow
+		from := to.Add(-90*time.Second - 500*time.Millisecond)
+		_, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID, From: from, To: to,
+		})
+		if !errors.Is(err, ErrInvalidTimeRange) {
+			t.Fatalf("非整秒窗口必须 typed 拒绝，实际 %v", err)
+		}
+	})
+
+	t.Run("小数余量不得绕过上限", func(t *testing.T) {
+		// 截断实现会把 maxWindow+0.9s 算成正好 maxWindow 而放行：既绕过上限，
+		// 也让 window_seconds 与 scope 的 from/to 互相矛盾。
+		assembler, _, _, _ := newAssembler(t, &published)
+		to := testNow
+		from := to.Add(-maxWindow - 900*time.Millisecond)
+		_, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID, From: from, To: to,
+		})
+		if err == nil {
+			t.Fatal("超过上限的窗口必须被拒绝")
+		}
+		if !errors.Is(err, ErrInvalidTimeRange) && !errors.Is(err, serviceobs.ErrScopeTooBroad) {
+			t.Fatalf("必须是 typed 请求错误，实际 %v", err)
+		}
+	})
+
+	t.Run("恰好到上限的整秒窗口可接受且 window_seconds 精确", func(t *testing.T) {
+		assembler, _, _, _ := newAssembler(t, &published)
+		to := testNow
+		from := to.Add(-maxWindow)
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID, From: from, To: to,
+		})
+		if err != nil {
+			t.Fatalf("恰好到上限应可接受: %v", err)
+		}
+		if snapshot.WindowSeconds != published.Limits.MaxWindowSeconds {
+			t.Fatalf("window_seconds 必须精确等于窗口秒数，实际 %d", snapshot.WindowSeconds)
+		}
+		// window_seconds 必须与 scope 的 from/to 完全一致，不能有小数被吞掉。
+		parsedFrom, _ := snapshot.Scope.TimeRange.From.Time()
+		parsedTo, _ := snapshot.Scope.TimeRange.To.Time()
+		if int(parsedTo.Sub(parsedFrom)/time.Second) != snapshot.WindowSeconds {
+			t.Fatal("window_seconds 与 scope from/to 必须一致")
+		}
+	})
+}
+
+func TestUnavailableTopologyNeverRendersWallClockOrYearZero(t *testing.T) {
+	published := testProfile()
+	assembler, _, topology, _ := newAssembler(t, &published)
+	topology.err = errors.New("topology unavailable")
+	future := testNow.Add(365 * 24 * time.Hour)
+	assembler.Clock = func() time.Time { return future }
+
+	snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+		Kind: KindWorkspace, ServiceID: testServiceID,
+		Subject: Subject{UserID: "user-1", Roles: []string{"member"}},
+	})
+	if err != nil {
+		t.Fatalf("Assemble 失败: %v", err)
+	}
+	observedAt := snapshot.Context.Topology.ObservedAt
+	// 零值会渲染成 0001-01-01：schema 合法但毫无意义。必须用真实事实时间锚。
+	if strings.HasPrefix(string(observedAt), "0001-") {
+		t.Fatalf("拓扑不可用时不得渲染 year 0001，实际 %q", observedAt)
+	}
+	if observedAt != model.NewTimestamp(snapshot.FactAnchor) {
+		t.Fatalf("应取真实事实时间锚 %q，实际 %q",
+			model.NewTimestamp(snapshot.FactAnchor), observedAt)
+	}
+	// 绝不能用 wall clock 冒充观测时间。
+	if observedAt == snapshot.Context.AssembledAt {
+		t.Fatal("topology observed_at 绝不能等于 assembled_at")
+	}
+	if observedAt == model.NewTimestamp(future) {
+		t.Fatal("topology observed_at 绝不能是当前时间")
+	}
+	// freshness 仍由原始事实判定，不因为填了锚点就变 fresh。
+	if snapshot.Context.Topology.Freshness != model.FreshnessUnknown {
+		t.Fatalf("没有拓扑观测时 freshness 必须 unknown，实际 %q",
+			snapshot.Context.Topology.Freshness)
+	}
+	if err := validateContext(t, snapshot.Context); err != nil {
+		t.Fatalf("拓扑不可用时 DiagnosticContext 仍须过 schema: %v", err)
+	}
+}
+
+func validateContext(t *testing.T, document *model.DiagnosticContext) error {
+	t.Helper()
+	validator, err := contract.NewValidator()
+	if err != nil {
+		t.Fatalf("构造 validator 失败: %v", err)
+	}
+	return validator.ValidateValue(contract.KindDiagnosticContext, document)
+}
+
+func TestContextNodeHealthComesFromSharedScopedAggregate(t *testing.T) {
+	// scoped signal 的对象健康必须由共享聚合得出，DiagnosticContext 与 Page View 因此
+	// 不可能漂移。这里用一个挂在 peer 节点上的 critical USE signal 验证。
+	published := testProfile()
+	critical := 99.0
+	published.SignalBindings = append(published.SignalBindings, model.SignalBinding{
+		Key: "use_peer_saturation", Label: "对端饱和度", Family: model.SignalFamilyUSE,
+		Semantic: model.SemanticSaturation,
+		Scope:    model.SignalBindingScope{Kind: model.ScopeKindResource, Refs: []string{testPeerID}},
+		ToolKey:  "metrics.query_semantic_signal.v1", OutputField: "series.pressure",
+		Unit: "percent", Aggregation: model.AggregationMax,
+		Thresholds: &model.SignalThresholds{
+			Mode: model.ThresholdModeAbsolute, Direction: model.ThresholdDirectionAbove,
+			Degraded: 85, Critical: 95,
+		},
+	})
+
+	assembler, _, _, _ := newAssembler(t, &published)
+	assembler.TelemetryConnected = true
+	assembler.Observations = singleCriticalObservation{
+		bindingKey: "use_peer_saturation", value: critical, observedAt: testNow.Add(-5 * time.Second),
+	}
+
+	snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+		Kind: KindWorkspace, ServiceID: testServiceID,
+	})
+	if err != nil {
+		t.Fatalf("Assemble 失败: %v", err)
+	}
+	// 挂上 critical signal 的节点健康必须是 Critical，而不是硬编码 Unknown。
+	if got := snapshot.ObjectHealth(testPeerID, ""); got != model.HealthCritical {
+		t.Fatalf("挂了 critical signal 的节点应 Critical，实际 %q", got)
+	}
+	var peer *model.ContextNode
+	for i := range snapshot.Context.Topology.Nodes {
+		if snapshot.Context.Topology.Nodes[i].EntityID == testPeerID {
+			peer = &snapshot.Context.Topology.Nodes[i]
+		}
+	}
+	if peer == nil {
+		t.Fatal("邻域应包含 peer 节点")
+	}
+	if peer.Health != model.HealthCritical {
+		t.Fatalf("DiagnosticContext 的节点健康必须来自共享聚合，实际 %q", peer.Health)
+	}
+	// 没有任何 signal 的 service 节点仍必须 Unknown：存在不等于健康。
+	for _, node := range snapshot.Context.Topology.Nodes {
+		if node.EntityID == testEntityID && node.Health != model.HealthUnknown {
+			t.Fatalf("没有 signal 的节点必须 Unknown，实际 %q", node.Health)
+		}
+	}
+	// 归属解析结果必须可见且不把 binding 丢掉。
+	placement, ok := snapshot.PlacementFor("use_peer_saturation")
+	if !ok || placement.NodeID != testPeerID {
+		t.Fatalf("归属解析结果不符: %+v", placement)
+	}
+	if len(snapshot.UnresolvedBindings) != 0 {
+		t.Fatalf("scope 可解析时不应有悬空 binding: %v", snapshot.UnresolvedBindings)
+	}
+}
+
+// singleCriticalObservation 只让一个 binding 可用（且越过 critical 阈值），其余保持
+// 未接入的 Unknown。它用来隔离验证 scoped 对象健康。
+type singleCriticalObservation struct {
+	bindingKey string
+	value      float64
+	observedAt time.Time
+}
+
+func (s singleCriticalObservation) ReadObservations(
+	_ stdcontext.Context, req serviceobs.ObservationRequest,
+) (serviceobs.ObservationFacts, error) {
+	facts := serviceobs.ObservationFacts{EvidenceRefs: []model.EvidenceRef{}}
+	for _, binding := range req.Profile.SignalBindings {
+		if binding.Key == s.bindingKey {
+			value := s.value
+			facts.Signals = append(facts.Signals, health.SignalObservation{
+				BindingKey: binding.Key, Availability: model.SignalAvailabilityAvailable,
+				Value: &value, ObservedAt: s.observedAt, SourceKey: serviceobs.SourceKeyTelemetry,
+			})
+			continue
+		}
+		facts.Signals = append(facts.Signals, health.SignalObservation{
+			BindingKey: binding.Key, Availability: model.SignalAvailabilityUnavailable,
+			SourceKey:     serviceobs.SourceKeyTelemetry,
+			UnknownReason: serviceobs.ReasonTelemetryNotConnected,
+		})
+	}
+	facts.Sources = []health.SourceObservation{{
+		SourceKey: serviceobs.SourceKeyTelemetry, State: model.AvailabilityUnknown,
+		Freshness: model.FreshnessUnknown, ReasonCode: serviceobs.ReasonTelemetryNotConnected,
+	}}
+	return facts, nil
 }
 
 func TestAssembleSurfacesProfileDiagnostic(t *testing.T) {

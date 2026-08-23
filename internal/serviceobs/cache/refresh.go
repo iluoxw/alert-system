@@ -218,14 +218,21 @@ func (c *Coordinator) Lookup(key Key, placeholder Summary) Result {
 
 // enqueue 尝试把键放进 bounded queue。
 //
-// 返回 false 有两种原因，都不会起 goroutine：同一个键已经在刷新中（per-key
-// singleflight，避免同键并发重复计算），或队列已满（此时保留 Unknown/Stale）。
+// 返回 false 有三种原因，都不会起 goroutine：协调器已关闭、同一个键已经在刷新中
+// （per-key singleflight，避免同键并发重复计算），或队列已满（此时保留 Unknown/Stale）。
+//
+// 整个"检查已关闭 -> 检查 inflight -> 投递"序列必须在同一把锁内完成。之前的版本先解锁
+// 再投递，于是 Shutdown 可以在这个窗口里 close(queue)，让投递变成向已关闭 channel 发送
+// 而直接 panic。队列是有缓冲的且这里用非阻塞 select，所以持锁投递不会阻塞；worker 也从不
+// 在持锁状态下投递，因此不存在锁顺序问题。
+//
+// inflight 标记只在投递成功后写入，"先标记再回滚"的窗口因此也不存在。
 func (c *Coordinator) enqueue(key Key) bool {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		c.emit(Event{Key: key, Dropped: true})
 		c.dropped.Add(1)
+		c.emit(Event{Key: key, Dropped: true})
 		return false
 	}
 	if _, exists := c.inflight[key]; exists {
@@ -234,19 +241,17 @@ func (c *Coordinator) enqueue(key Key) bool {
 		c.emit(Event{Key: key, Dropped: true})
 		return false
 	}
-	c.inflight[key] = struct{}{}
-	c.mu.Unlock()
-
 	select {
 	case c.queue <- key:
+		c.inflight[key] = struct{}{}
+		c.mu.Unlock()
 		c.enqueued.Add(1)
 		return true
 	default:
-		// 队列满：撤销 inflight 标记，保留 Unknown/Stale，不新起 goroutine。
-		c.mu.Lock()
-		delete(c.inflight, key)
+		// 队列满：保留 Unknown/Stale，不新起 goroutine。
 		c.mu.Unlock()
 		c.dropped.Add(1)
+		// emit 放在解锁之后：observer 是外部回调，不能在持锁时调用。
 		c.emit(Event{Key: key, Dropped: true})
 		return false
 	}
@@ -302,10 +307,12 @@ func (c *Coordinator) emit(event Event) {
 // "没停干净"而不是无限期挂住。
 func (c *Coordinator) Shutdown(ctx context.Context) error {
 	c.stopOnce.Do(func() {
+		// closed 与 close(queue) 必须在同一把锁内完成，enqueue 才不可能在两者之间
+		// 挤进一次向已关闭 channel 的发送。
 		c.mu.Lock()
 		c.closed = true
-		c.mu.Unlock()
 		close(c.queue)
+		c.mu.Unlock()
 		c.cancelBase()
 	})
 

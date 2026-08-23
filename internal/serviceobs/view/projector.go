@@ -223,18 +223,24 @@ type attachment struct {
 	unresolved []string
 }
 
-// attachSignals 把非 Golden binding 按 scope 挂到 bounded topology 上。
+// attachSignals 按 assembler 已解析好的归属把非 Golden signal 投影到拓扑对象上。
 //
-// 三条硬约束：
+// 归属解析本身**不在这里做**：它由 assembler 的 resolvePlacements 一次算出，
+// DiagnosticContext 的节点健康与这里的显示投影共用同一份结果。两处各解析一遍就会出现
+// "context 说这个节点 Unknown、页面说它 Critical"的漂移，而这类漂移正是 Page View 不得
+// 重算 Health 这条约束要防的。
+//
+// 三条硬约束仍然成立，只是判定来自共享结果：
 //
 //  1. scope.refs 缺省、为空或悬空时不发明 node/relation，也不扩大查询边界；
 //  2. 不把这些 binding 错误挂到 service 节点上冒充"有观测"；
 //  3. 该 binding 仍然完整保留在 evaluator 结果与 DiagnosticContext 的 signals 里，
 //     只是没有可挂载的显示位置，缺口通过 section 与 missing_requirements 表达。
-func attachSignals(snapshot *soctx.AssemblySnapshot, nodeIDs, relationIDs map[string]struct{}) attachment {
+func attachSignals(snapshot *soctx.AssemblySnapshot) attachment {
 	result := attachment{
 		nodeSignals:     map[string][]model.SignalValue{},
 		relationSignals: map[string][]model.SignalValue{},
+		unresolved:      cloneStrings(snapshot.UnresolvedBindings),
 	}
 	if snapshot.Profile == nil {
 		return result
@@ -245,28 +251,18 @@ func attachSignals(snapshot *soctx.AssemblySnapshot, nodeIDs, relationIDs map[st
 			// Golden 恒在顶层 golden_signals，不参与拓扑挂载。
 			continue
 		}
+		placement, ok := snapshot.PlacementFor(binding.Key)
+		if !ok || (placement.NodeID == "" && placement.RelationID == "") {
+			continue
+		}
 		signal := ProjectSignal(evaluation, snapshot.Identity.ServiceID,
 			snapshot.WindowSeconds, snapshot.FactAnchor)
-		attached := false
-		for _, ref := range binding.Scope.Refs {
-			switch binding.Scope.Kind {
-			case model.ScopeKindRelation:
-				if _, ok := relationIDs[ref]; ok {
-					result.relationSignals[ref] = append(result.relationSignals[ref], signal)
-					attached = true
-				}
-			case model.ScopeKindEntity, model.ScopeKindResource:
-				if _, ok := nodeIDs[ref]; ok {
-					result.nodeSignals[ref] = append(result.nodeSignals[ref], signal)
-					attached = true
-				}
-			case model.ScopeKindService:
-				// service 级的非 Golden binding 没有拓扑挂载位置。它不属于任何具体
-				// node/relation，硬挂到 service 节点会伪装成节点观测。
-			}
+		if placement.NodeID != "" {
+			result.nodeSignals[placement.NodeID] = append(result.nodeSignals[placement.NodeID], signal)
 		}
-		if !attached {
-			result.unresolved = append(result.unresolved, binding.Key)
+		if placement.RelationID != "" {
+			result.relationSignals[placement.RelationID] = append(
+				result.relationSignals[placement.RelationID], signal)
 		}
 	}
 	sort.Strings(result.unresolved)

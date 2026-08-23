@@ -33,8 +33,17 @@ import (
 )
 
 // ErrInvalidTimeRange 表示 from/to 不是一对合法的绝对 UTC 时间。
-// 上层按 422 处理：只传一个、顺序颠倒或非绝对时间都不静默修正。
+// 上层按 422 处理：只传一个、顺序颠倒、非整秒或非绝对时间都不静默修正。
 var ErrInvalidTimeRange = errors.New("serviceobs/context: 时间窗非法")
+
+// ErrInvalidTimezone 表示 timezone 不满足契约的长度约束。
+//
+// 契约把 scope.timezone 限制在 1..64 个字符。它只影响显示，但一个超长值会让整个
+// Page View 违约，所以必须在装配入口就 typed 拒绝，而不是等序列化时才炸。
+var ErrInvalidTimezone = errors.New("serviceobs/context: timezone 非法")
+
+// maxTimezoneLength 与契约 scope.timezone 的 maxLength 一致。
+const maxTimezoneLength = 64
 
 // Kind 区分两条装配路径。目录不走 assembler 的单服务装配，它读 snapshot cache。
 type Kind string
@@ -206,6 +215,18 @@ type AssemblySnapshot struct {
 	Capabilities  model.Capabilities
 	Policy        model.ContextPolicy
 
+	// Placements 是每个非 Golden binding 的挂载结果，按 binding key 升序。它由
+	// assembler 一次算出、DiagnosticContext 与 Page View 共同消费：两处各算一遍就会
+	// 出现"context 说这个节点 Unknown、页面说它 Critical"的漂移。
+	Placements []SignalPlacement
+	// UnresolvedBindings 是 scope.refs 缺省、为空或悬空，因而挂不到 bounded topology
+	// 的 binding key（升序）。它们仍然完整保留在 Evaluation 与 Context.Signals 里。
+	UnresolvedBindings []string
+	// NodeHealth / RelationHealth 由 health.AggregateObjectHealth 从挂上的 signal 算出。
+	// 没有条目表示该对象没有任何 signal，健康只能是 Unknown。
+	NodeHealth     map[string]model.Health
+	RelationHealth map[string]model.Health
+
 	// FactAnchor 是全部已提交事实里最新的真实时间。projector 用它渲染"从未观测过"的
 	// signal 的 observed_at：那个字段在契约里必填，但绝不允许用 wall clock 伪装成
 	// 刚刚观测过。
@@ -306,11 +327,120 @@ func (a *Assembler) Assemble(ctx stdcontext.Context, req Request) (*AssemblySnap
 		Sources: snapshot.Sources,
 	})
 
+	// 8. signal 归属与对象健康只算一次，供 context 与三页共用。
+	resolvePlacements(snapshot)
+
 	snapshot.Policy = a.policy(snapshot.Profile, limits)
 	if snapshot.Profile != nil {
 		snapshot.Context = buildDiagnosticContext(snapshot)
 	}
 	return snapshot, nil
+}
+
+// SignalPlacement 记录一个非 Golden binding 挂到了哪个 bounded topology 对象上。
+type SignalPlacement struct {
+	BindingKey string
+	// NodeID 与 RelationID 至多一个非空。两个都空表示这个 binding 没有可挂载的对象。
+	NodeID     string
+	RelationID string
+}
+
+// resolvePlacements 解析每个非 Golden binding 的归属，并算出各对象的健康。
+//
+// 三条硬约束：
+//
+//  1. scope.refs 缺省、为空或悬空时不发明 node/relation，也不扩大查询边界，更不会把
+//     binding 硬挂到 service 节点上冒充节点观测——它只是没有可挂载的位置；
+//  2. 这类 binding 仍然完整保留在 evaluator 结果与 Context.Signals 里，缺口通过
+//     UnresolvedBindings（进而 section 与 incomplete 摘要）表达；
+//  3. Golden 恒在顶层 golden_signals，不参与拓扑挂载。
+//
+// relation 引用同时接受 canonical ID 与被折叠的成员 ID：canonical 归一化不能让原本有效的
+// scope refs 变成悬空引用。
+func resolvePlacements(snapshot *AssemblySnapshot) {
+	snapshot.Placements = []SignalPlacement{}
+	snapshot.UnresolvedBindings = []string{}
+	snapshot.NodeHealth = map[string]model.Health{}
+	snapshot.RelationHealth = map[string]model.Health{}
+	if snapshot.Profile == nil {
+		return
+	}
+
+	nodeIDs := make(map[string]struct{}, len(snapshot.TopologyFacts.Nodes))
+	for _, node := range snapshot.TopologyFacts.Nodes {
+		nodeIDs[node.EntityID] = struct{}{}
+	}
+
+	nodeHealths := map[string][]model.SignalHealth{}
+	relationHealths := map[string][]model.SignalHealth{}
+	for _, evaluation := range snapshot.Evaluation.Signals {
+		binding := evaluation.Binding
+		if binding.Family == model.SignalFamilyGolden {
+			continue
+		}
+		placement := SignalPlacement{BindingKey: binding.Key}
+		for _, ref := range binding.Scope.Refs {
+			switch binding.Scope.Kind {
+			case model.ScopeKindRelation:
+				for _, relation := range snapshot.TopologyFacts.Relations {
+					if relation.ResolvesRelationRef(ref) {
+						placement.RelationID = relation.RelationID
+						relationHealths[relation.RelationID] = append(
+							relationHealths[relation.RelationID], evaluation.Health)
+					}
+				}
+			case model.ScopeKindEntity, model.ScopeKindResource:
+				if _, ok := nodeIDs[ref]; ok {
+					placement.NodeID = ref
+					nodeHealths[ref] = append(nodeHealths[ref], evaluation.Health)
+				}
+			case model.ScopeKindService:
+				// service 级的非 Golden binding 没有拓扑挂载位置。
+			}
+		}
+		if placement.NodeID == "" && placement.RelationID == "" {
+			snapshot.UnresolvedBindings = append(snapshot.UnresolvedBindings, binding.Key)
+		}
+		snapshot.Placements = append(snapshot.Placements, placement)
+	}
+	sort.Strings(snapshot.UnresolvedBindings)
+	sort.Slice(snapshot.Placements, func(i, j int) bool {
+		return snapshot.Placements[i].BindingKey < snapshot.Placements[j].BindingKey
+	})
+
+	for id, healths := range nodeHealths {
+		snapshot.NodeHealth[id] = health.AggregateObjectHealth(healths)
+	}
+	for id, healths := range relationHealths {
+		snapshot.RelationHealth[id] = health.AggregateObjectHealth(healths)
+	}
+}
+
+// PlacementFor 返回某个 binding 的挂载结果。
+func (s *AssemblySnapshot) PlacementFor(bindingKey string) (SignalPlacement, bool) {
+	for _, placement := range s.Placements {
+		if placement.BindingKey == bindingKey {
+			return placement, true
+		}
+	}
+	return SignalPlacement{}, false
+}
+
+// ObjectHealth 返回某个拓扑对象的健康。
+//
+// 没有任何 signal 挂在它上面时恒为 Unknown：拓扑里存在一个对象不能因此显示 Healthy。
+func (s *AssemblySnapshot) ObjectHealth(nodeID, relationID string) model.Health {
+	if nodeID != "" {
+		if status, ok := s.NodeHealth[nodeID]; ok {
+			return status
+		}
+	}
+	if relationID != "" {
+		if status, ok := s.RelationHealth[relationID]; ok {
+			return status
+		}
+	}
+	return model.HealthUnknown
 }
 
 // ListServices 是目录用的轻量身份查询直通。它不组装 Context：目录只需要身份 + 缓存摘要。
@@ -388,13 +518,22 @@ func (a *Assembler) readTopology(
 		state = model.AvailabilityEmpty
 	}
 	if facts.Partial {
+		// 达到 node/relation 上限：已返回的事实与 topology.partial 全部保留，但这个来源
+		// 的覆盖确实不完整，所以状态必须是 unknown 而不是 available。
+		// availability 词表里没有 "partial"，unknown 是表达"这一块判不准"的合法取值，
+		// 它同时把整页 Data 推到 Partial——否则其它来源都正常时会算出 Data Complete，
+		// 等于把一张被截断的图报成完整数据。
+		state = model.AvailabilityUnknown
 		reason = facts.PartialReason
+		if reason == "" {
+			reason = serviceobs.ReasonTopologyBoundsReached
+		}
 	}
 	snapshot.addSection(serviceobs.SectionKeyTopology, state, reason, false)
 
 	freshness := model.FreshnessFresh
 	for _, relation := range facts.Relations {
-		// observed 关系过期只让 Data Stale，declared 底图与 Health 都不受影响。
+		// observed overlay 过期只让 Data Stale，declared 底图与 Health 都不受影响。
 		if relation.Stale {
 			freshness = model.FreshnessStale
 			break
@@ -687,6 +826,10 @@ func resolveScope(
 	if timezone == "" {
 		timezone = "UTC"
 	}
+	if len(timezone) > maxTimezoneLength {
+		return model.ContextScope{}, 0, fmt.Errorf("%w: 长度 %d 超过上限 %d",
+			ErrInvalidTimezone, len(timezone), maxTimezoneLength)
+	}
 	defaultWindow := defaultDefaultWindowSecs
 	maxWindow := limits.MaxWindowSeconds
 	if published != nil {
@@ -709,11 +852,19 @@ func resolveScope(
 	if !from.Before(to) {
 		return model.ContextScope{}, 0, fmt.Errorf("%w: from 必须早于 to", ErrInvalidTimeRange)
 	}
-	windowSeconds := int(to.Sub(from) / time.Second)
+	duration := to.Sub(from)
+	// 必须是整秒。契约的 window_seconds 是整数，直接截断会让 3600.9s 的请求算出 3600：
+	// 既绕过了 3600s 的上限，也让 window_seconds 与 scope 里的 from/to 互相矛盾。
+	if duration%time.Second != 0 {
+		return model.ContextScope{}, 0, fmt.Errorf("%w: 窗口必须是整秒，实际 %s",
+			ErrInvalidTimeRange, duration)
+	}
+	windowSeconds := int(duration / time.Second)
 	if windowSeconds < 1 {
 		return model.ContextScope{}, 0, fmt.Errorf("%w: 窗口不足 1 秒", ErrInvalidTimeRange)
 	}
-	if windowSeconds > maxWindow {
+	// 上限比较用真实时长，不用截断后的整数，因此不存在任何绕过上限的余量。
+	if duration > time.Duration(maxWindow)*time.Second {
 		// 超限显式报错，绝不静默截断成一个用户没请求过的窗口。
 		return model.ContextScope{}, 0, fmt.Errorf("%w: 窗口 %ds 超过上限 %ds",
 			serviceobs.ErrScopeTooBroad, windowSeconds, maxWindow)
@@ -817,7 +968,12 @@ func buildDiagnosticContext(snapshot *AssemblySnapshot) *model.DiagnosticContext
 		// 而不是某张真实的图。
 		context.Topology.SnapshotID = "topo_unavailable"
 	}
-	context.Topology.ObservedAt = model.NewTimestamp(snapshot.TopologyFacts.ObservedAt)
+	// 拓扑不可用或为空时 observed_at 是零值。契约要求它必填且是合法 date-time，但绝不能
+	// 用 wall clock 填——那会把"没有拓扑观测"渲染成"刚刚观测过"。口径与 signal 一致：
+	// 取已提交事实的真实时间锚，没有锚时退回 Unix epoch。freshness 仍由原始事实判定，
+	// 因此这里不会把 unknown 说成 fresh。
+	context.Topology.ObservedAt = model.NewTimestamp(
+		ObservedAtOr(snapshot.TopologyFacts.ObservedAt, snapshot.FactAnchor))
 	context.Topology.Freshness = topologyFreshness(snapshot)
 	context.Topology.Nodes = contextNodes(snapshot)
 	context.Topology.Relations = contextRelations(snapshot)
@@ -849,9 +1005,10 @@ func contextNodes(snapshot *AssemblySnapshot) []model.ContextNode {
 			Name:      node.Name,
 			Layer:     string(node.Layer),
 			Kind:      node.Kind,
-			// 拓扑里存在一个节点不等于它健康：没有 signal 就是 Unknown。Phase 2 没有
-			// 任何可用 signal，所以所有节点都是 Unknown。
-			Health:    model.HealthUnknown,
+			// 健康来自共享的 scoped signal 聚合，因此 context 与 Page View 不可能漂移。
+			// 没有任何 signal 挂在这个节点上时恒为 Unknown：拓扑里存在一个节点不等于
+			// 它健康。
+			Health:    snapshot.ObjectHealth(node.EntityID, ""),
 			Freshness: nodeFreshness(node),
 		})
 	}

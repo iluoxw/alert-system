@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"strconv"
 	"sync"
 	"time"
 
@@ -123,13 +125,31 @@ func NewMemoryStore(opts MemoryOptions) (*MemoryStore, error) {
 	}, nil
 }
 
-// defaultJitter 用键的哈希派生一个确定的偏移。
+// defaultJitter 用完整四元组 Key 的哈希派生一个确定的偏移。
 //
-// 它刻意不用随机数：同一个键每次得到同一个偏移，因此重启前后的过期时刻是可预期的，
-// 同时不同键之间仍然错开，避免惊群。
+// 两个性质都必须成立：
+//
+//   - 同一个键每次得到同一个偏移，因此重启前后的过期时刻可预期、测试可断言；
+//   - 不同键得到不同偏移，因此大量服务不会在同一秒集体过期形成惊群。
+//
+// 只看 TTL 的实现会给所有键同一个偏移，那等于没有抖动。哈希输入包含四个字段，
+// 所以连"只有默认窗口不同"的两个键也会错开。
 func defaultJitter() Jitter {
-	return JitterFunc(func(ttl time.Duration) time.Duration {
-		return ttl / DefaultJitterRatio
+	return JitterFunc(func(key Key, ttl time.Duration) time.Duration {
+		span := ttl / DefaultJitterRatio
+		if span <= 0 {
+			return 0
+		}
+		digest := fnv.New64a()
+		// 写入定长分隔符，避免 "a"+"b" 与 "ab" 撞成同一个输入。
+		_, _ = digest.Write([]byte(key.ServiceID))
+		_, _ = digest.Write([]byte{0x1e})
+		_, _ = digest.Write([]byte(key.Environment))
+		_, _ = digest.Write([]byte{0x1e})
+		_, _ = digest.Write([]byte(strconv.Itoa(key.ProfileVersion)))
+		_, _ = digest.Write([]byte{0x1e})
+		_, _ = digest.Write([]byte(strconv.Itoa(key.DefaultWindowSeconds)))
+		return time.Duration(digest.Sum64() % uint64(span))
 	})
 }
 
@@ -153,10 +173,18 @@ func (s *MemoryStore) Get(key Key) (Entry, State) {
 		return Entry{}, StateMiss
 	}
 	s.order.MoveToFront(element)
-	if now.Before(item.entry.FreshUntil) {
-		return item.entry, StateFresh
+	// 必须交出深拷贝：Entry 里的 Summary 带 slice 与指针，直接返回内部值会让调用方
+	// 拿到共享底层数组——一个调用方修改自己拿到的结果就会改到缓存，下一个调用方看到
+	// 被污染的摘要。
+	entry := Entry{
+		Summary:    cloneSummary(item.entry.Summary),
+		StoredAt:   item.entry.StoredAt,
+		FreshUntil: item.entry.FreshUntil,
 	}
-	return item.entry, StateStale
+	if now.Before(item.entry.FreshUntil) {
+		return entry, StateFresh
+	}
+	return entry, StateStale
 }
 
 // Put 原子替换整个条目。
@@ -171,7 +199,7 @@ func (s *MemoryStore) Put(key Key, summary Summary) {
 	entry := Entry{
 		Summary:    cloneSummary(summary),
 		StoredAt:   now,
-		FreshUntil: now.Add(s.freshWindowLocked()),
+		FreshUntil: now.Add(s.freshWindowLocked(key)),
 	}
 	if element, ok := s.entries[key]; ok {
 		element.Value.(*lruItem).entry = entry
@@ -207,34 +235,43 @@ func (s *MemoryStore) Stats() MemoryStats {
 
 // freshWindowLocked 返回 TTL 加上夹紧后的抖动。
 //
-// 夹紧是必须的：一个坏的 Jitter 实现最多让条目多活一个 TTL，绝不可能变成永不过期，
-// 也不会因为负偏移而立刻过期。
-func (s *MemoryStore) freshWindowLocked() time.Duration {
-	offset := s.jitter.Offset(s.ttl)
+// 两层夹紧都是必须的：
+//
+//   - 夹到 [0, ttl]：一个坏的 Jitter 实现最多让条目多活一个 TTL，绝不可能变成永不过期，
+//     也不会因为负偏移而立刻过期；
+//   - 再夹到 max stale 的可见性期限内：FreshUntil 越过 StoredAt+maxStale 会让一个
+//     "已经不该可见"的条目仍被报成 fresh。maxStale 等于 TTL 时余量为 0，抖动因此归零，
+//     这正是合法配置下唯一正确的行为。
+func (s *MemoryStore) freshWindowLocked(key Key) time.Duration {
+	offset := s.jitter.Offset(key, s.ttl)
 	if offset < 0 {
 		offset = 0
 	}
 	if offset > s.ttl {
 		offset = s.ttl
 	}
+	if headroom := s.maxStale - s.ttl; offset > headroom {
+		offset = headroom
+	}
 	return s.ttl + offset
 }
 
-// reclaimDeadLocked 从 LRU 表尾开始清掉已超过 max stale 的死条目。
+// reclaimDeadLocked 清掉全部已超过 max stale 的死条目。
 //
-// 只扫尾部即可：LRU 顺序下越靠尾部越久未访问，一旦遇到仍在 max stale 内的条目就停止，
-// 因此单次回收的代价与死键数量成正比，而不是与总条目数成正比。
+// 必须整链扫描，不能从表尾开始"遇到活条目就停"：LRU 顺序是按最近**访问**排的，与写入
+// 时间无关。一个刚被读过、但写入时间很久的死键会待在表头，尾部扫描永远碰不到它，
+// 结果是死键长期占着容量、并且逼着真正有效但很久没读的条目被驱逐。
+//
+// 代价是有界的：链长恒不超过 max_entries，而 max_entries 本身有硬上限，所以单次清扫的
+// 工作量有确定上界。
 func (s *MemoryStore) reclaimDeadLocked(now time.Time) {
-	for {
-		oldest := s.order.Back()
-		if oldest == nil {
-			return
+	for element := s.order.Front(); element != nil; {
+		next := element.Next()
+		if now.Sub(element.Value.(*lruItem).entry.StoredAt) > s.maxStale {
+			s.removeLocked(element)
+			s.reclaimed++
 		}
-		if now.Sub(oldest.Value.(*lruItem).entry.StoredAt) <= s.maxStale {
-			return
-		}
-		s.removeLocked(oldest)
-		s.reclaimed++
+		element = next
 	}
 }
 

@@ -21,15 +21,7 @@ const (
 // 它只在存在 active published Profile 时被调用（assembler 已经用
 // serviceobs.ErrProfileUnconfigured 挡住未配置的服务），所以这里不需要再猜配置。
 func ProjectWorkspace(snapshot *soctx.AssemblySnapshot) model.WorkspaceView {
-	nodeIDs := make(map[string]struct{}, len(snapshot.TopologyFacts.Nodes))
-	for _, node := range snapshot.TopologyFacts.Nodes {
-		nodeIDs[node.EntityID] = struct{}{}
-	}
-	relationIDs := make(map[string]struct{}, len(snapshot.TopologyFacts.Relations))
-	for _, relation := range snapshot.TopologyFacts.Relations {
-		relationIDs[relation.RelationID] = struct{}{}
-	}
-	attached := attachSignals(snapshot, nodeIDs, relationIDs)
+	attached := attachSignals(snapshot)
 
 	view := model.WorkspaceView{
 		SchemaVersion:  model.SchemaVersion,
@@ -86,11 +78,7 @@ func workspaceSections(snapshot *soctx.AssemblySnapshot, attached attachment) []
 			Retryable:  false,
 		})
 	}
-	sections = append(sections, model.SectionStatus{
-		SectionKey: serviceobs.SectionKeyTimeline,
-		State:      timelineSectionState(snapshot),
-		Retryable:  true,
-	})
+	sections = append(sections, timelineSection(snapshot))
 	sections = append(sections, model.SectionStatus{
 		SectionKey: serviceobs.SectionKeyDiagnosis,
 		State:      model.AvailabilityAvailable,
@@ -99,12 +87,41 @@ func workspaceSections(snapshot *soctx.AssemblySnapshot, attached attachment) []
 	return sections
 }
 
-func timelineSectionState(snapshot *soctx.AssemblySnapshot) model.Availability {
+// timelineSection 决定时间线区块的状态。
+//
+// 时间线完全由领域事实派生，所以它必须跟随 domain source 的状态：domain 读取失败时
+// DomainFacts 是空的，但那不是"这个服务没有事件"——把它报成 Empty 等于用一次失败的查询
+// 冒充"确认无事件"。领域不可用/无权限/判不准时，时间线在最小范围内镜像同一个状态与
+// reason/retryable；只有真正成功但零事实才是 Empty。
+func timelineSection(snapshot *soctx.AssemblySnapshot) model.SectionStatus {
+	section := model.SectionStatus{SectionKey: serviceobs.SectionKeyTimeline, Retryable: true}
+	domain, ok := snapshot.SectionState(serviceobs.SectionKeyDomain)
+	if ok {
+		switch domain.State {
+		case model.AvailabilityUnavailable, model.AvailabilityForbidden, model.AvailabilityUnknown:
+			section.State = domain.State
+			section.ReasonCode = domain.ReasonCode
+			if section.ReasonCode == "" {
+				section.ReasonCode = serviceobs.ReasonDomainReadFailed
+			}
+			section.Retryable = domain.Retryable
+			return section
+		}
+	}
+	if !ok {
+		// 根本没有 domain adapter：同样不能说"没有事件"。
+		section.State = model.AvailabilityUnavailable
+		section.ReasonCode = serviceobs.ReasonDomainReadFailed
+		section.Retryable = false
+		return section
+	}
 	if len(snapshot.DomainFacts.Alerts) == 0 && len(snapshot.DomainFacts.Faults) == 0 &&
 		len(snapshot.DomainFacts.Impacts) == 0 && len(snapshot.DomainFacts.Incidents) == 0 {
-		return model.AvailabilityEmpty
+		section.State = model.AvailabilityEmpty
+		return section
 	}
-	return model.AvailabilityAvailable
+	section.State = model.AvailabilityAvailable
+	return section
 }
 
 // projectJourney 投影请求旅程。
@@ -175,11 +192,12 @@ func projectWorkspaceTopology(snapshot *soctx.AssemblySnapshot, attached attachm
 	for _, node := range snapshot.TopologyFacts.Nodes {
 		signals := attached.nodeSignals[node.EntityID]
 		topology.Nodes = append(topology.Nodes, model.TopologyNodeView{
-			EntityID:  node.EntityID,
-			Name:      node.Name,
-			Layer:     string(node.Layer),
-			Kind:      node.Kind,
-			Health:    aggregateSignalHealth(signals),
+			EntityID: node.EntityID,
+			Name:     node.Name,
+			Layer:    string(node.Layer),
+			Kind:     node.Kind,
+			// 健康取 assembler 算好的共享聚合，与 DiagnosticContext 的同一节点逐字节一致。
+			Health:    snapshot.ObjectHealth(node.EntityID, ""),
 			Freshness: nodeViewFreshness(node),
 			Signals:   signals,
 		})
@@ -198,7 +216,7 @@ func projectWorkspaceTopology(snapshot *soctx.AssemblySnapshot, attached attachm
 			TargetEntityID: relation.TargetEntityID,
 			Kind:           relation.Kind,
 			Provenance:     relation.Provenance,
-			Health:         aggregateSignalHealth(signals),
+			Health:         snapshot.ObjectHealth("", relation.RelationID),
 			Freshness:      freshness,
 			Signals:        signals,
 		})
@@ -223,35 +241,6 @@ func nodeViewFreshness(node serviceobs.TopologyNode) model.Freshness {
 		return model.FreshnessUnknown
 	}
 	return model.FreshnessFresh
-}
-
-// aggregateSignalHealth 由已挂载 signal 的 worst-of 得出节点/边健康。
-//
-// 没有任何 signal 就是 Unknown：拓扑里存在一个对象不能因此显示 Healthy。neutral 不参与
-// 聚合（它本来就没有健康意见），但一个只有 neutral 信号的对象仍然是 Unknown，因为没有
-// 任何信号对它的健康表态。
-func aggregateSignalHealth(signals []model.SignalValue) model.Health {
-	if len(signals) == 0 {
-		return model.HealthUnknown
-	}
-	opinionated := false
-	worst := model.HealthHealthy
-	for _, signal := range signals {
-		switch signal.Health {
-		case model.SignalHealthCritical:
-			return model.HealthCritical
-		case model.SignalHealthDegraded:
-			worst, opinionated = model.HealthDegraded, true
-		case model.SignalHealthHealthy:
-			opinionated = true
-		case model.SignalHealthUnknown:
-			return model.HealthUnknown
-		}
-	}
-	if !opinionated {
-		return model.HealthUnknown
-	}
-	return worst
 }
 
 // projectDiagnosticSummary 生成确定性诊断摘要。

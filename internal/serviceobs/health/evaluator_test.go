@@ -1020,3 +1020,92 @@ func TestEvaluateIsPureAndDeterministic(t *testing.T) {
 		t.Fatalf("Evaluate 改写了 Profile")
 	}
 }
+
+// AggregateObjectHealth 是 DiagnosticContext 与 Page View 共用的对象健康入口，
+// 因此它的优先级必须与输入顺序完全无关。这里用全排列穷举所有顺序。
+func TestAggregateObjectHealthIsOrderIndependent(t *testing.T) {
+	cases := []struct {
+		name   string
+		inputs []model.SignalHealth
+		want   model.Health
+	}{
+		{
+			name:   "critical 压过一切",
+			inputs: []model.SignalHealth{model.SignalHealthCritical, model.SignalHealthDegraded, model.SignalHealthUnknown, model.SignalHealthHealthy, model.SignalHealthNeutral},
+			want:   model.HealthCritical,
+		},
+		{
+			// 这一条正是修复前的缺陷：先看到 Unknown 就直接返回 Unknown，
+			// 之后的 Degraded 永远没机会生效。
+			name:   "degraded 压过 unknown 与 healthy",
+			inputs: []model.SignalHealth{model.SignalHealthUnknown, model.SignalHealthDegraded, model.SignalHealthHealthy},
+			want:   model.HealthDegraded,
+		},
+		{
+			name:   "unknown 压过 healthy",
+			inputs: []model.SignalHealth{model.SignalHealthHealthy, model.SignalHealthUnknown},
+			want:   model.HealthUnknown,
+		},
+		{
+			name:   "全部健康才是 healthy",
+			inputs: []model.SignalHealth{model.SignalHealthHealthy, model.SignalHealthHealthy},
+			want:   model.HealthHealthy,
+		},
+		{
+			// neutral 没有健康意见，不能让对象变健康。
+			name:   "neutral 不改写 healthy",
+			inputs: []model.SignalHealth{model.SignalHealthNeutral, model.SignalHealthHealthy},
+			want:   model.HealthHealthy,
+		},
+		{
+			name:   "只有 neutral 是 unknown",
+			inputs: []model.SignalHealth{model.SignalHealthNeutral, model.SignalHealthNeutral},
+			want:   model.HealthUnknown,
+		},
+		{
+			name:   "词表外的值 fail closed 成 unknown",
+			inputs: []model.SignalHealth{model.SignalHealthHealthy, model.SignalHealth("bogus")},
+			want:   model.HealthUnknown,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			permuteSignalHealth(test.inputs, func(permutation []model.SignalHealth) {
+				if got := AggregateObjectHealth(permutation); got != test.want {
+					t.Fatalf("AggregateObjectHealth(%v) = %q, want %q", permutation, got, test.want)
+				}
+			})
+		})
+	}
+}
+
+func TestAggregateObjectHealthEmptyIsUnknown(t *testing.T) {
+	// 拓扑里存在一个对象、但没有任何 signal 挂在它上面，绝不能显示 Healthy。
+	if got := AggregateObjectHealth(nil); got != model.HealthUnknown {
+		t.Fatalf("空输入必须 Unknown，实际 %q", got)
+	}
+	if got := AggregateObjectHealth([]model.SignalHealth{}); got != model.HealthUnknown {
+		t.Fatalf("空 slice 必须 Unknown，实际 %q", got)
+	}
+}
+
+// permuteSignalHealth 对输入做全排列，并对每个排列调用 visit。
+func permuteSignalHealth(items []model.SignalHealth, visit func([]model.SignalHealth)) {
+	working := make([]model.SignalHealth, len(items))
+	copy(working, items)
+	var recurse func(int)
+	recurse = func(index int) {
+		if index == len(working) {
+			snapshot := make([]model.SignalHealth, len(working))
+			copy(snapshot, working)
+			visit(snapshot)
+			return
+		}
+		for i := index; i < len(working); i++ {
+			working[index], working[i] = working[i], working[index]
+			recurse(index + 1)
+			working[index], working[i] = working[i], working[index]
+		}
+	}
+	recurse(0)
+}

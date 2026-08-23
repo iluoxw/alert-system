@@ -223,8 +223,11 @@ type TopologyNode struct {
 
 // TopologyRelation 的方向固定 consumer/caller -> provider/callee。
 //
-// 每条 canonical relation 对应一行真实的依赖边，RelationID 就是它的真实主键：
-// Profile 的 relation_refs 要能稳定绑定到它，所以绝不把多行合并成一个合成 ID。
+// 归一化在 adapter 内完成：指向同一个 (source, target, kind) 的多行依赖边被折叠成一条
+// canonical 关系，同时存在 declared 与 observed 时 Provenance 是 declared_and_observed。
+// RelationID 始终是一个真实存在的依赖边主键（两者共存时取 declared 行的 ID），绝不是合成
+// ID；被折叠的全部真实行 ID 保留在 MergedRelationIDs 里，因此 Profile 的 relation_refs 与
+// signal scope refs 无论引用了哪一行都仍能命中。
 type TopologyRelation struct {
 	RelationID     string
 	SourceEntityID string
@@ -232,9 +235,33 @@ type TopologyRelation struct {
 	Kind           string
 	Provenance     model.Provenance
 	Criticality    string
-	ObservedAt     time.Time
-	// Stale 只对 observed 关系有意义：declared 配置在被显式替换前一直有效。
+	// ObservedAt 是组内最新的真实观测时间。
+	ObservedAt time.Time
+	// Stale 只表达 observed overlay 是否过期：declared 配置在被显式替换前一直有效，
+	// 所以一条 declared_and_observed 关系可以既 stale 又保留 declared 底图。
 	Stale bool
+	// MergedRelationIDs 是被折叠进本条 canonical 关系的全部真实依赖边 ID（含
+	// RelationID），按 ID 升序。
+	MergedRelationIDs []string
+}
+
+// ResolvesRelationRef 判断一个 Profile 引用的关系 ID 是否指向这条 canonical 关系。
+//
+// 它同时接受 canonical ID 与任何被折叠的成员 ID：归一化不能让原本有效的
+// relation_refs / signal scope refs 变成悬空引用。
+func (r TopologyRelation) ResolvesRelationRef(relationID string) bool {
+	if relationID == "" {
+		return false
+	}
+	if relationID == r.RelationID {
+		return true
+	}
+	for _, member := range r.MergedRelationIDs {
+		if member == relationID {
+			return true
+		}
+	}
+	return false
 }
 
 // TopologyFacts 是一次 bounded 邻域读取的结果。

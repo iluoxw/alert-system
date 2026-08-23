@@ -443,6 +443,53 @@ func aggregateHealth(signals []SignalEvaluation) (model.Health, []string) {
 	}
 }
 
+// AggregateObjectHealth 由挂在同一个拓扑对象（节点或关系）上的 signal 健康推导该对象的
+// 健康。
+//
+// 它是 DiagnosticContext 与 Page View 共用的唯一入口：两处必须用同一个函数，否则同一批
+// scoped signal 会在 context 里算出一个结论、在 Page View 里算出另一个，页面与事实快照
+// 就此漂移。
+//
+// 优先级固定且与输入顺序无关：Critical > Degraded > Unknown > Healthy。先收集全部意见再
+// 判定，不在遍历中提前 return——那样"先看到 Unknown 还是先看到 Degraded"会改变结论。
+//
+// 两条边界：
+//   - Neutral 没有健康意见（Traffic/Rate 这类无方向阈值信号），不参与优先级；
+//   - 没有任何 signal，或全部 signal 都是 Neutral，一律 Unknown。拓扑里存在一个对象、
+//     或者只知道它的流量，都不足以说它健康。
+func AggregateObjectHealth(healths []model.SignalHealth) model.Health {
+	var critical, degraded, unknown, healthy bool
+	for _, health := range healths {
+		switch health {
+		case model.SignalHealthCritical:
+			critical = true
+		case model.SignalHealthDegraded:
+			degraded = true
+		case model.SignalHealthUnknown:
+			unknown = true
+		case model.SignalHealthHealthy:
+			healthy = true
+		case model.SignalHealthNeutral:
+			// 无意见：既不能让对象变健康，也不能让它变不健康。
+		default:
+			// 词表外的值 fail closed 成 Unknown，绝不当成健康。
+			unknown = true
+		}
+	}
+	switch {
+	case critical:
+		return model.HealthCritical
+	case degraded:
+		return model.HealthDegraded
+	case unknown:
+		return model.HealthUnknown
+	case healthy:
+		return model.HealthHealthy
+	default:
+		return model.HealthUnknown
+	}
+}
+
 // coverageReason 说明这个 required signal 为什么让覆盖不完整。区分 missing/forbidden/
 // unavailable/stale/freshness unknown，页面才能给出可操作的下一步。
 // 具体的 UnknownReason 先于笼统的 availability 判断：几个 fail-closed 分支会把

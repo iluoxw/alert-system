@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -393,7 +394,7 @@ func TestJitterIsInjectableAndBounded(t *testing.T) {
 		clock := newFakeClock(cacheBase)
 		store := newStore(t, clock, MemoryOptions{
 			TTL: ttl, MaxStale: 10 * time.Minute, MaxEntries: 4,
-			Jitter: JitterFunc(func(time.Duration) time.Duration { return 20 * time.Second }),
+			Jitter: JitterFunc(func(Key, time.Duration) time.Duration { return 20 * time.Second }),
 		})
 		key := testKey("svc-jitter")
 		store.Put(key, healthySummary(cacheFactAnchor))
@@ -409,8 +410,8 @@ func TestJitterIsInjectableAndBounded(t *testing.T) {
 
 	t.Run("越界抖动被夹紧", func(t *testing.T) {
 		for name, jitter := range map[string]Jitter{
-			"负偏移":  JitterFunc(func(time.Duration) time.Duration { return -time.Hour }),
-			"超大偏移": JitterFunc(func(time.Duration) time.Duration { return 10 * time.Hour }),
+			"负偏移":  JitterFunc(func(Key, time.Duration) time.Duration { return -time.Hour }),
+			"超大偏移": JitterFunc(func(Key, time.Duration) time.Duration { return 10 * time.Hour }),
 		} {
 			clock := newFakeClock(cacheBase)
 			store := newStore(t, clock, MemoryOptions{
@@ -430,15 +431,332 @@ func TestJitterIsInjectableAndBounded(t *testing.T) {
 		}
 	})
 
-	t.Run("默认抖动有界且确定", func(t *testing.T) {
-		offset := defaultJitter().Offset(ttl)
+	t.Run("默认抖动有界且对同一 key 确定", func(t *testing.T) {
+		key := testKey("svc-default-jitter")
+		offset := defaultJitter().Offset(key, ttl)
 		if offset < 0 || offset > ttl {
 			t.Fatalf("默认抖动必须落在 [0, TTL]，实际 %s", offset)
 		}
-		if offset != defaultJitter().Offset(ttl) {
-			t.Fatal("默认抖动必须确定，不能每次不同")
+		if offset != defaultJitter().Offset(key, ttl) {
+			t.Fatal("同一个 key 的默认抖动必须确定，不能每次不同")
 		}
 	})
+}
+
+func TestDefaultJitterSpreadsAcrossFullKey(t *testing.T) {
+	ttl := time.Minute
+	jitter := defaultJitter()
+	base := Key{ServiceID: "svc-1", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 300}
+	baseOffset := jitter.Offset(base, ttl)
+
+	// 四个字段各自单独变化都必须改变偏移：只看 TTL 的实现会让所有键同时过期，
+	// 抖动因此完全失效。
+	variants := map[string]Key{
+		"service 不同":     {ServiceID: "svc-2", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 300},
+		"environment 不同": {ServiceID: "svc-1", Environment: "staging", ProfileVersion: 1, DefaultWindowSeconds: 300},
+		"profile 版本不同":   {ServiceID: "svc-1", Environment: "production", ProfileVersion: 2, DefaultWindowSeconds: 300},
+		"默认窗口不同":         {ServiceID: "svc-1", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 900},
+	}
+	for name, variant := range variants {
+		offset := jitter.Offset(variant, ttl)
+		if offset == baseOffset {
+			t.Fatalf("%s 必须得到不同的抖动偏移（实际都是 %s）", name, offset)
+		}
+		if offset < 0 || offset > ttl {
+			t.Fatalf("%s 的抖动越界: %s", name, offset)
+		}
+	}
+}
+
+func TestDifferentKeysGetDifferentFreshUntil(t *testing.T) {
+	clock := newFakeClock(cacheBase)
+	// 用默认抖动（不是 NoJitter），因为被测行为就是默认抖动的分散性。
+	store, err := NewMemoryStore(MemoryOptions{
+		TTL: time.Minute, MaxStale: 30 * time.Minute, MaxEntries: 16, Clock: clock,
+	})
+	if err != nil {
+		t.Fatalf("构造 store 失败: %v", err)
+	}
+
+	keys := []Key{
+		{ServiceID: "svc-1", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 300},
+		{ServiceID: "svc-1", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 900},
+		{ServiceID: "svc-2", Environment: "production", ProfileVersion: 1, DefaultWindowSeconds: 300},
+		{ServiceID: "svc-1", Environment: "staging", ProfileVersion: 1, DefaultWindowSeconds: 300},
+	}
+	freshUntil := map[Key]time.Time{}
+	for _, key := range keys {
+		store.Put(key, healthySummary(cacheFactAnchor))
+		entry, state := store.Get(key)
+		if state != StateFresh {
+			t.Fatalf("%v 应 fresh，实际 %q", key, state)
+		}
+		freshUntil[key] = entry.FreshUntil
+	}
+	distinct := map[time.Time]struct{}{}
+	for _, moment := range freshUntil {
+		distinct[moment] = struct{}{}
+	}
+	if len(distinct) != len(keys) {
+		t.Fatalf("不同 key 必须错开过期时刻，实际只有 %d 个不同值: %v", len(distinct), freshUntil)
+	}
+	// 同一个 key 重复写入必须稳定得到同一个偏移。
+	store.Put(keys[0], healthySummary(cacheFactAnchor))
+	entry, _ := store.Get(keys[0])
+	if !entry.FreshUntil.Equal(freshUntil[keys[0]]) {
+		t.Fatalf("同一个 key 的过期时刻必须稳定: %v vs %v", entry.FreshUntil, freshUntil[keys[0]])
+	}
+}
+
+func TestFreshUntilNeverExceedsMaxStaleDeadline(t *testing.T) {
+	// 越界抖动 + maxStale 等于 TTL：FreshUntil 绝不能越过 max stale 的可见性期限，
+	// 否则一个"已经不该可见"的条目会被报成 fresh。
+	cases := map[string]struct {
+		ttl      time.Duration
+		maxStale time.Duration
+	}{
+		"maxStale 等于 TTL":  {time.Minute, time.Minute},
+		"maxStale 略大于 TTL": {time.Minute, 70 * time.Second},
+		"maxStale 远大于 TTL": {time.Minute, 10 * time.Minute},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeClock(cacheBase)
+			store := newStore(t, clock, MemoryOptions{
+				TTL: test.ttl, MaxStale: test.maxStale, MaxEntries: 4,
+				Jitter: JitterFunc(func(Key, time.Duration) time.Duration { return 10 * time.Hour }),
+			})
+			key := testKey("svc-deadline")
+			store.Put(key, healthySummary(cacheFactAnchor))
+			entry, state := store.Get(key)
+			if state != StateFresh {
+				t.Fatalf("刚写入应 fresh，实际 %q", state)
+			}
+			deadline := entry.StoredAt.Add(test.maxStale)
+			if entry.FreshUntil.After(deadline) {
+				t.Fatalf("FreshUntil %v 越过 max stale 期限 %v", entry.FreshUntil, deadline)
+			}
+			// 走到 max stale 之后必须彻底不可见，绝不会仍报 fresh。
+			clock.Advance(test.maxStale + time.Second)
+			if _, state := store.Get(key); state != StateMiss {
+				t.Fatalf("超过 max stale 必须 miss，实际 %q", state)
+			}
+		})
+	}
+}
+
+func TestGetReturnsDeepCopy(t *testing.T) {
+	clock := newFakeClock(cacheBase)
+	store := newStore(t, clock, MemoryOptions{TTL: time.Minute, MaxStale: 5 * time.Minute, MaxEntries: 4})
+	key := testKey("svc-get-copy")
+	store.Put(key, healthySummary(cacheFactAnchor))
+
+	first, state := store.Get(key)
+	if state != StateFresh {
+		t.Fatalf("应 fresh，实际 %q", state)
+	}
+	// 调用方修改自己拿到的结果，绝不能影响缓存里的共享状态。
+	first.Summary.Health.Status = model.HealthCritical
+	first.Summary.Health.ReasonCodes[0] = "tampered"
+	first.Summary.Data.Sources[0].State = model.AvailabilityForbidden
+	first.Summary.GoldenSignals[0].DisplayValue = "tampered"
+	*first.Summary.GoldenSignals[0].Value = 999
+
+	second, _ := store.Get(key)
+	if second.Summary.Health.Status != model.HealthHealthy {
+		t.Fatal("第一次 Get 的修改不得影响第二次 Get")
+	}
+	if second.Summary.Health.ReasonCodes[0] == "tampered" {
+		t.Fatal("reason codes 必须是深拷贝")
+	}
+	if second.Summary.Data.Sources[0].State != model.AvailabilityAvailable {
+		t.Fatal("source 状态必须是深拷贝")
+	}
+	if second.Summary.GoldenSignals[0].DisplayValue == "tampered" {
+		t.Fatal("Golden 显示值必须是深拷贝")
+	}
+	if *second.Summary.GoldenSignals[0].Value == 999 {
+		t.Fatal("Golden 数值指针必须是深拷贝")
+	}
+}
+
+func TestConcurrentGetIsolationIsRaceFree(t *testing.T) {
+	clock := newFakeClock(cacheBase)
+	store := newStore(t, clock, MemoryOptions{TTL: time.Hour, MaxStale: 2 * time.Hour, MaxEntries: 8})
+	key := testKey("svc-get-race")
+	store.Put(key, healthySummary(cacheFactAnchor))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				entry, state := store.Get(key)
+				if state != StateFresh {
+					t.Errorf("应始终 fresh，实际 %q", state)
+					return
+				}
+				// 每个 goroutine 都写自己拿到的副本：如果 Get 交出的是内部值，
+				// race detector 会立刻报告数据竞争。
+				entry.Summary.Health.ReasonCodes[0] = "local"
+				*entry.Summary.GoldenSignals[0].Value = float64(j)
+				if entry.Summary.Health.Status != model.HealthHealthy {
+					t.Error("缓存内容被并发修改污染")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	final, _ := store.Get(key)
+	if final.Summary.Health.ReasonCodes[0] != "all_required_signals_healthy" {
+		t.Fatalf("缓存内容被污染: %v", final.Summary.Health.ReasonCodes)
+	}
+}
+
+func TestReclaimRemovesDeadEntryAtMRUAndKeepsLiveAtLRU(t *testing.T) {
+	// LRU 顺序按最近**访问**排，与写入时间无关。一个先写入、后来被读过一次的条目会待在
+	// 表头；等它超过 max stale 时，只扫表尾的回收永远碰不到它，反而会驱逐位于表尾、
+	// 仍然有效的条目。这个测试精确构造那个布局。
+	const ttl, maxStale = 60 * time.Second, 100 * time.Second
+	clock := newFakeClock(cacheBase)
+	store := newStore(t, clock, MemoryOptions{TTL: ttl, MaxStale: maxStale, MaxEntries: 2})
+
+	dead, live := testKey("dead-at-mru"), testKey("live-at-lru")
+
+	store.Put(dead, healthySummary(cacheFactAnchor)) // t=0
+	clock.Advance(10 * time.Second)
+	store.Put(live, healthySummary(cacheFactAnchor)) // t=10：live 成为表头
+	clock.Advance(10 * time.Second)
+	// t=20：dead 仍在 max stale 内（age 20），读它一次把它挪到表头。
+	if _, state := store.Get(dead); state == StateMiss {
+		t.Fatal("此时 dead 还不该被回收")
+	}
+	// 现在链是 dead(表头) -> live(表尾)。
+	clock.Advance(85 * time.Second)
+	// t=105：dead age=105 > 100 已死；live age=95 <= 100 仍有效。
+
+	// 容量为 2，写第三个键触发容量压力：必须回收表头的死键，而不是驱逐表尾的活键。
+	store.Put(testKey("newcomer"), healthySummary(cacheFactAnchor))
+
+	if _, state := store.Get(live); state != StateFresh && state != StateStale {
+		t.Fatalf("仍然有效的条目不得被驱逐，实际 %q", state)
+	}
+	if _, state := store.Get(dead); state != StateMiss {
+		t.Fatalf("超过 max stale 的死键必须被回收，实际 %q", state)
+	}
+	stats := store.Stats()
+	if stats.Evicted != 0 {
+		t.Fatalf("有死键可回收时不应驱逐活键: %+v", stats)
+	}
+	if stats.Reclaimed != 1 {
+		t.Fatalf("应恰好回收 1 个死键: %+v", stats)
+	}
+}
+
+func TestReclaimSweepsEveryDeadEntryInChain(t *testing.T) {
+	// 多个死键散布在链上不同位置时，一次容量压力必须把它们全部回收，不能只清到第一个
+	// 活条目为止。
+	const ttl, maxStale = 30 * time.Second, 60 * time.Second
+	clock := newFakeClock(cacheBase)
+	store := newStore(t, clock, MemoryOptions{TTL: ttl, MaxStale: maxStale, MaxEntries: 4})
+
+	deadA, deadB := testKey("dead-a"), testKey("dead-b")
+	store.Put(deadA, healthySummary(cacheFactAnchor)) // t=0
+	clock.Advance(5 * time.Second)
+	store.Put(deadB, healthySummary(cacheFactAnchor)) // t=5
+	clock.Advance(5 * time.Second)
+	// t=10：交错读一次，让两个未来的死键分别落在链的不同位置。
+	store.Get(deadA)
+	clock.Advance(55 * time.Second)
+	// t=65：deadA age=65 > 60、deadB age=60 <= 60。再推 1 秒让两者都死。
+	clock.Advance(time.Second)
+	// t=66：deadA age=66、deadB age=61，都已超过 max stale。
+	// 写路径的全量清扫必须一次把两个死键都清掉，不能只清到第一个活条目为止。
+	live := testKey("live")
+	store.Put(live, healthySummary(cacheFactAnchor)) // t=66，仍然新鲜
+	if store.Len() != 1 {
+		t.Fatalf("两个死键都应被一次清扫掉，实际还剩 %d 条", store.Len())
+	}
+
+	for _, key := range []Key{deadA, deadB} {
+		if _, state := store.Get(key); state != StateMiss {
+			t.Fatalf("%v 必须被回收，实际 %q", key, state)
+		}
+	}
+	if _, state := store.Get(live); state != StateFresh {
+		t.Fatalf("活键必须留下，实际 %q", state)
+	}
+	if stats := store.Stats(); stats.Reclaimed != 2 || stats.Evicted != 0 {
+		t.Fatalf("应回收两个死键且不驱逐活键: %+v", stats)
+	}
+}
+
+func TestConcurrentLookupAndShutdownIsSafe(t *testing.T) {
+	// 压测 enqueue 与 Shutdown 的竞态：之前 enqueue 先解锁再投递，Shutdown 可以在窗口里
+	// close(queue)，导致向已关闭 channel 发送而 panic。
+	for attempt := 0; attempt < 20; attempt++ {
+		clock := newFakeClock(cacheBase)
+		store := newStore(t, clock, MemoryOptions{TTL: time.Nanosecond, MaxStale: time.Hour, MaxEntries: 256})
+		coordinator, err := New(Options{
+			Store: store, Workers: 4, QueueSize: 8,
+			Refresh: func(context.Context, Key) (Summary, error) {
+				return healthySummary(cacheFactAnchor), nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("构造协调器失败: %v", err)
+		}
+		coordinator.Start()
+
+		placeholder := UnknownPlaceholder(cacheFactAnchor, clock.Now())
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					// 任何 panic 都会让测试进程崩溃，因此"没有 panic"本身就是断言。
+					coordinator.Lookup(testKey("svc-stress-"+strconv.Itoa((index*50+j)%16)), placeholder)
+				}
+			}(i)
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownErr := make(chan error, 1)
+		go func() { shutdownErr <- coordinator.Shutdown(shutdownCtx) }()
+
+		wg.Wait()
+		if err := <-shutdownErr; err != nil {
+			cancel()
+			t.Fatalf("shutdown 必须在预算内完成: %v", err)
+		}
+		cancel()
+
+		stats := coordinator.Stats()
+		if stats.RunningWorkers != 0 {
+			t.Fatalf("shutdown 后不应有 worker 存活，实际 %d", stats.RunningWorkers)
+		}
+		// 每个入队的键最终都被处理并清掉 inflight 标记。
+		if stats.Inflight != 0 {
+			t.Fatalf("inflight 必须归零，实际 %d", stats.Inflight)
+		}
+		if stats.Started > stats.Enqueued {
+			t.Fatalf("执行次数不得超过入队次数: %+v", stats)
+		}
+
+		// 关闭之后再查找一律不入队。
+		before := coordinator.Stats().Enqueued
+		for i := 0; i < 10; i++ {
+			if coordinator.Lookup(testKey("svc-after"), placeholder).Enqueued {
+				t.Fatal("关闭后不得再入队")
+			}
+		}
+		if coordinator.Stats().Enqueued != before {
+			t.Fatal("关闭后入队计数不得增长")
+		}
+	}
 }
 
 // ---- 容量与 LRU ----

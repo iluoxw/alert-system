@@ -97,20 +97,23 @@ func (f ClockFunc) Now() time.Time { return f() }
 
 // Jitter 返回附加到 TTL 上的偏移。
 //
-// 实现必须是有界的：MemoryStore 会把结果夹到 [0, ttl]，因此一个坏实现最多让条目多活
-// 一个 TTL，不可能变成永不过期。
+// 它必须按 key 分散：抖动的全部意义是让大量服务不在同一秒集体过期形成惊群，而一个只看
+// TTL 的实现会给每个键同一个偏移，等于没有抖动。因此签名带上完整的四元组 Key。
+//
+// 实现不必自己控制边界：MemoryStore 会把结果夹到 [0, ttl]，并且进一步保证
+// FreshUntil 不越过 max stale 的可见性期限。
 type Jitter interface {
-	Offset(ttl time.Duration) time.Duration
+	Offset(key Key, ttl time.Duration) time.Duration
 }
 
 // JitterFunc 把普通函数适配成 Jitter。
-type JitterFunc func(ttl time.Duration) time.Duration
+type JitterFunc func(key Key, ttl time.Duration) time.Duration
 
-func (f JitterFunc) Offset(ttl time.Duration) time.Duration { return f(ttl) }
+func (f JitterFunc) Offset(key Key, ttl time.Duration) time.Duration { return f(key, ttl) }
 
 // NoJitter 关闭抖动。测试用它得到完全确定的过期时刻。
 func NoJitter() Jitter {
-	return JitterFunc(func(time.Duration) time.Duration { return 0 })
+	return JitterFunc(func(Key, time.Duration) time.Duration { return 0 })
 }
 
 // Store 是 snapshot 存储抽象。Phase 3 可以换成 PostgreSQL 实现。

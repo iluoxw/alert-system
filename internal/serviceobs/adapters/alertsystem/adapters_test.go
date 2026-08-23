@@ -422,6 +422,371 @@ func TestReadTopologyKeepsObservedStaleAndDeterministicSnapshotID(t *testing.T) 
 	}
 }
 
+func TestReadTopologyMergesDeclaredAndObservedIntoOneCanonicalRelation(t *testing.T) {
+	// 设计事实源要求：同一个 (source, target, kind) 上同时存在 declared 与 observed 行时，
+	// 必须投影成一条 declared_and_observed 关系。一行一条边会让这个状态永远不可达。
+	const declaredID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const observedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	declaredAt := fixedNow.Add(-72 * time.Hour)
+	observedAt := fixedNow.Add(-90 * time.Second)
+
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{
+			{EntityID: entityUUID, Name: "Example", Layer: domain.EntityLayerPlatform, Kind: "infrastructure_capability"},
+			{EntityID: providerUUID, Name: "PostgreSQL", Layer: domain.EntityLayerInfrastructure, Kind: "resource", Depth: 1},
+		},
+		Relations: []store.NeighborhoodRelationRow{
+			// 顺序刻意让 observed 排在前面，证明结果不依赖行顺序。
+			{
+				RelationID: observedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "observed", Criticality: "medium",
+				ObservedAt: observedAt, Stale: false,
+			},
+			{
+				RelationID: declaredID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "declared", Criticality: "critical",
+				ObservedAt: declaredAt, Stale: false,
+			},
+		},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+
+	if len(facts.Relations) != 1 {
+		t.Fatalf("同一条 canonical 关系必须只投影一条边: %+v", facts.Relations)
+	}
+	relation := facts.Relations[0]
+	if relation.Provenance != model.ProvenanceDeclaredAndObserved {
+		t.Fatalf("declared + observed 必须是 declared_and_observed，实际 %q", relation.Provenance)
+	}
+	// canonical ID 必须是真实存在的 declared 行主键，不是合成 ID。
+	if relation.RelationID != declaredID {
+		t.Fatalf("canonical ID 应取 declared 行的真实主键，实际 %q", relation.RelationID)
+	}
+	// 两个真实行 ID 都要保留，Profile 的 relation_refs / scope refs 才不会因归一化悬空。
+	if !relation.ResolvesRelationRef(declaredID) || !relation.ResolvesRelationRef(observedID) {
+		t.Fatalf("被折叠的成员 ID 必须仍可解析: %+v", relation.MergedRelationIDs)
+	}
+	if relation.ResolvesRelationRef("cccccccc-3333-4333-8333-cccccccccccc") {
+		t.Fatal("不属于本关系的 ID 不得被解析")
+	}
+	// observed_at 取组内最新的真实观测时间。
+	if !relation.ObservedAt.Equal(observedAt) {
+		t.Fatalf("observed_at 应取组内最新真实观测时间，实际 %v", relation.ObservedAt)
+	}
+	// 重要度取最高。
+	if relation.Criticality != "critical" {
+		t.Fatalf("criticality 应取最高值，实际 %q", relation.Criticality)
+	}
+	if relation.Stale {
+		t.Fatal("observed overlay 未过期时不应标 stale")
+	}
+}
+
+func TestReadTopologyMergedRelationKeepsDeclaredBaseWhenObservedIsStale(t *testing.T) {
+	const declaredID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const observedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+		Relations: []store.NeighborhoodRelationRow{
+			{
+				RelationID: declaredID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "declared", Criticality: "critical",
+				ObservedAt: fixedNow.Add(-72 * time.Hour), Stale: false,
+			},
+			{
+				RelationID: observedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "observed", Criticality: "medium",
+				ObservedAt: fixedNow.Add(-48 * time.Hour), Stale: true,
+			},
+		},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+	relation := facts.Relations[0]
+	// observed overlay 过期显式标 stale，但 declared 底图仍在：关系不消失，provenance
+	// 也不退回 observed-only。
+	if !relation.Stale {
+		t.Fatal("observed overlay 过期必须显式标 stale")
+	}
+	if relation.Provenance != model.ProvenanceDeclaredAndObserved {
+		t.Fatalf("declared 底图必须保留，实际 %q", relation.Provenance)
+	}
+	if relation.RelationID != declaredID {
+		t.Fatalf("canonical ID 仍应是 declared 行，实际 %q", relation.RelationID)
+	}
+	// freshness 描述 observed overlay，所以 observed_at 必须是 observed 成员的时间戳。
+	if !relation.ObservedAt.Equal(fixedNow.Add(-48 * time.Hour)) {
+		t.Fatalf("observed_at 应取 observed 成员时间戳，实际 %v", relation.ObservedAt)
+	}
+}
+
+func TestReadTopologyMergedObservedAtIgnoresNewerDeclaredTimestamp(t *testing.T) {
+	// declared 配置刚被改过（时间戳很新），但实时叠加层其实早就过期了。
+	// observed_at 必须仍然是那个过期的 observed 时间戳：否则页面会显示"刚刚观测过"，
+	// 而实际上根本没有新观测——这正是"缺数不假绿"要防的伪装。
+	const declaredID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const observedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	declaredAt := fixedNow.Add(-time.Minute)
+	observedAt := fixedNow.Add(-48 * time.Hour)
+
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+		Relations: []store.NeighborhoodRelationRow{
+			{
+				RelationID: declaredID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "declared", Criticality: "critical",
+				ObservedAt: declaredAt, Stale: false,
+			},
+			{
+				RelationID: observedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "observed", Criticality: "medium",
+				ObservedAt: observedAt, Stale: true,
+			},
+		},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+	relation := facts.Relations[0]
+	if !relation.ObservedAt.Equal(observedAt) {
+		t.Fatalf("更新的 declared 时间戳不得覆盖 observed overlay 的观测时间: %v", relation.ObservedAt)
+	}
+	if relation.ObservedAt.Equal(declaredAt) {
+		t.Fatal("observed_at 绝不能取 declared 时间戳")
+	}
+	if !relation.Stale {
+		t.Fatal("过期的 observed overlay 必须仍然标 stale")
+	}
+	if relation.Provenance != model.ProvenanceDeclaredAndObserved {
+		t.Fatalf("declared 底图必须保留，实际 %q", relation.Provenance)
+	}
+	// 拓扑级 observed_at 也不能被 declared 时间戳拉新。
+	if facts.ObservedAt.Equal(declaredAt) {
+		t.Fatalf("拓扑级 observed_at 不得取 declared 时间戳: %v", facts.ObservedAt)
+	}
+}
+
+func TestReadTopologyMergedStaleFollowsNewestObservedMember(t *testing.T) {
+	const declaredID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const oldObservedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	const freshObservedID = "cccccccc-3333-4333-8333-cccccccccccc"
+	oldObservedAt := fixedNow.Add(-48 * time.Hour)
+	freshObservedAt := fixedNow.Add(-30 * time.Second)
+
+	newRows := func() []store.NeighborhoodRelationRow {
+		return []store.NeighborhoodRelationRow{
+			{
+				RelationID: declaredID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "declared", Criticality: "critical",
+				ObservedAt: fixedNow.Add(-72 * time.Hour),
+			},
+			{
+				RelationID: oldObservedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "observed", Criticality: "medium",
+				ObservedAt: oldObservedAt, Stale: true,
+			},
+			{
+				RelationID: freshObservedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+				Relation: "depends_on", Origin: "observed", Criticality: "medium",
+				ObservedAt: freshObservedAt, Stale: false,
+			},
+		}
+	}
+
+	read := func(rows []store.NeighborhoodRelationRow) serviceobs.TopologyRelation {
+		reader := newFakeReader()
+		reader.neighborhood = store.NeighborhoodRows{
+			Nodes:     []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+			Relations: rows,
+		}
+		adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+		facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+		if err != nil {
+			t.Fatalf("ReadTopology 失败: %v", err)
+		}
+		if len(facts.Relations) != 1 {
+			t.Fatalf("应只有一条 canonical 关系: %+v", facts.Relations)
+		}
+		return facts.Relations[0]
+	}
+
+	t.Run("最新 observed 仍新鲜时不因旧成员过期而 stale", func(t *testing.T) {
+		relation := read(newRows())
+		// 只要当前仍有新鲜观测，这条叠加层就是新鲜的：一条更老的观测过期不能把它拖成 stale。
+		if relation.Stale {
+			t.Fatal("最新 observed 成员未过期时不得标 stale")
+		}
+		if !relation.ObservedAt.Equal(freshObservedAt) {
+			t.Fatalf("observed_at 应取最新 observed 成员时间戳，实际 %v", relation.ObservedAt)
+		}
+		if relation.Provenance != model.ProvenanceDeclaredAndObserved {
+			t.Fatalf("provenance 不符: %q", relation.Provenance)
+		}
+	})
+
+	t.Run("行顺序不影响结论", func(t *testing.T) {
+		rows := newRows()
+		reversed := []store.NeighborhoodRelationRow{rows[2], rows[1], rows[0]}
+		relation := read(reversed)
+		if relation.Stale {
+			t.Fatal("结论不得依赖行顺序")
+		}
+		if !relation.ObservedAt.Equal(freshObservedAt) {
+			t.Fatalf("observed_at 不得依赖行顺序，实际 %v", relation.ObservedAt)
+		}
+	})
+
+	t.Run("最新 observed 过期时整条叠加层 stale", func(t *testing.T) {
+		rows := newRows()
+		// 让最新的那条观测过期，较老的那条反而没标过期。
+		rows[1].Stale = false
+		rows[2].Stale = true
+		relation := read(rows)
+		if !relation.Stale {
+			t.Fatal("最新 observed 成员过期时必须标 stale")
+		}
+		if !relation.ObservedAt.Equal(freshObservedAt) {
+			t.Fatalf("observed_at 仍取最新 observed 成员时间戳，实际 %v", relation.ObservedAt)
+		}
+	})
+}
+
+func TestReadTopologyDeclaredOnlyUsesLatestDeclaredTimestamp(t *testing.T) {
+	olderAt := fixedNow.Add(-72 * time.Hour)
+	newerAt := fixedNow.Add(-2 * time.Hour)
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+		Relations: []store.NeighborhoodRelationRow{
+			{
+				RelationID: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", SourceEntityID: entityUUID,
+				TargetEntityID: providerUUID, Relation: "depends_on", Origin: "declared",
+				Criticality: "high", ObservedAt: olderAt,
+			},
+			{
+				RelationID: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", SourceEntityID: entityUUID,
+				TargetEntityID: providerUUID, Relation: "depends_on", Origin: "declared",
+				Criticality: "critical", ObservedAt: newerAt,
+			},
+		},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+	relation := facts.Relations[0]
+	if relation.Provenance != model.ProvenanceDeclared {
+		t.Fatalf("只有 declared 时 provenance 应是 declared，实际 %q", relation.Provenance)
+	}
+	// 没有 observed 成员时，observed_at 取最新的 declared 时间戳。
+	if !relation.ObservedAt.Equal(newerAt) {
+		t.Fatalf("declared-only 应取最新 declared 时间戳，实际 %v", relation.ObservedAt)
+	}
+	if relation.Stale {
+		t.Fatal("declared 配置在被显式替换前一直有效，不因时间过期")
+	}
+	if relation.Criticality != "critical" {
+		t.Fatalf("criticality 应取最高值，实际 %q", relation.Criticality)
+	}
+}
+
+func TestReadTopologyObservedOnlyKeepsItsOwnID(t *testing.T) {
+	const observedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+		Relations: []store.NeighborhoodRelationRow{{
+			RelationID: observedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID,
+			Relation: "calls", Origin: "observed", Criticality: "high",
+			ObservedAt: fixedNow.Add(-time.Minute), Stale: false,
+		}},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+	relation := facts.Relations[0]
+	if relation.Provenance != model.ProvenanceObserved {
+		t.Fatalf("只有 observed 时 provenance 应是 observed，实际 %q", relation.Provenance)
+	}
+	// 只有 observed 时保留 observed 行自己的 ID。
+	if relation.RelationID != observedID {
+		t.Fatalf("observed-only 应保留自己的 ID，实际 %q", relation.RelationID)
+	}
+	if len(relation.MergedRelationIDs) != 1 || relation.MergedRelationIDs[0] != observedID {
+		t.Fatalf("成员 ID 列表不符: %v", relation.MergedRelationIDs)
+	}
+}
+
+func TestReadTopologyMergeDoesNotCollapseDifferentCanonicalRelations(t *testing.T) {
+	// 只有 (source, target, kind) 三者全等才归一。方向相反或类型不同都是不同的关系。
+	reader := newFakeReader()
+	reader.neighborhood = store.NeighborhoodRows{
+		Nodes: []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}},
+		Relations: []store.NeighborhoodRelationRow{
+			{RelationID: "r1", SourceEntityID: entityUUID, TargetEntityID: providerUUID, Relation: "depends_on", Origin: "declared"},
+			{RelationID: "r2", SourceEntityID: providerUUID, TargetEntityID: entityUUID, Relation: "depends_on", Origin: "observed"},
+			{RelationID: "r3", SourceEntityID: entityUUID, TargetEntityID: providerUUID, Relation: "part_of", Origin: "declared"},
+		},
+	}
+	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+	facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+	if err != nil {
+		t.Fatalf("ReadTopology 失败: %v", err)
+	}
+	if len(facts.Relations) != 3 {
+		t.Fatalf("三条不同的 canonical 关系不得被合并: %+v", facts.Relations)
+	}
+}
+
+func TestReadTopologyMergedSnapshotIDIsDeterministic(t *testing.T) {
+	const declaredID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const observedID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+	rowsInOrder := []store.NeighborhoodRelationRow{
+		{RelationID: declaredID, SourceEntityID: entityUUID, TargetEntityID: providerUUID, Relation: "depends_on", Origin: "declared", ObservedAt: fixedNow.Add(-time.Hour)},
+		{RelationID: observedID, SourceEntityID: entityUUID, TargetEntityID: providerUUID, Relation: "depends_on", Origin: "observed", ObservedAt: fixedNow.Add(-time.Minute)},
+	}
+	nodes := []store.NeighborhoodNodeRow{{EntityID: entityUUID, Name: "Example"}}
+
+	snapshotFor := func(relations []store.NeighborhoodRelationRow) string {
+		reader := newFakeReader()
+		reader.neighborhood = store.NeighborhoodRows{Nodes: nodes, Relations: relations}
+		adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)
+		facts, err := adapter.ReadTopology(context.Background(), serviceobs.TopologyRequest{ServiceEntityID: entityUUID})
+		if err != nil {
+			t.Fatalf("ReadTopology 失败: %v", err)
+		}
+		return facts.SnapshotID
+	}
+
+	first := snapshotFor(rowsInOrder)
+	if first == "" {
+		t.Fatal("snapshot ID 不能为空")
+	}
+	if second := snapshotFor(rowsInOrder); first != second {
+		t.Fatalf("同一份数据两次读取必须得到同一个 snapshot ID: %q vs %q", first, second)
+	}
+	// 行顺序颠倒不改变归一化结果，因此 snapshot ID 也不能变。
+	reversed := []store.NeighborhoodRelationRow{rowsInOrder[1], rowsInOrder[0]}
+	if third := snapshotFor(reversed); first != third {
+		t.Fatalf("行顺序不得影响 snapshot ID: %q vs %q", first, third)
+	}
+}
+
 func TestReadTopologyEmptySeedsDoesNotWidenQuery(t *testing.T) {
 	reader := newFakeReader()
 	adapter := NewTopologyAdapter(newRunner(reader), Limits{}, fixedClock)

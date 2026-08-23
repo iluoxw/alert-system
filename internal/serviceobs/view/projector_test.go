@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +108,7 @@ type fixtureReaders struct {
 	domain       serviceobs.DomainFacts
 	observations serviceobs.ObservationFacts
 	topologyErr  error
+	domainErr    error
 }
 
 func (f *fixtureReaders) ListServices(stdcontext.Context, serviceobs.RegistrationFilter) (serviceobs.RegistrationList, error) {
@@ -125,6 +127,9 @@ func (f *fixtureReaders) ReadTopology(stdcontext.Context, serviceobs.TopologyReq
 }
 
 func (f *fixtureReaders) ReadDomain(stdcontext.Context, serviceobs.DomainRequest) (serviceobs.DomainFacts, error) {
+	if f.domainErr != nil {
+		return serviceobs.DomainFacts{}, f.domainErr
+	}
 	return f.domain, nil
 }
 
@@ -767,6 +772,212 @@ func TestOverviewTopologyFailureKeepsDomainSection(t *testing.T) {
 	}
 }
 
+func TestTimelineSectionMirrorsDomainFailureInsteadOfClaimingEmpty(t *testing.T) {
+	// 时间线完全由领域事实派生。domain 读取失败时 DomainFacts 是空的，但那不是"这个服务
+	// 没有事件"——报成 Empty 等于用一次失败的查询冒充"确认无事件"。
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+	readers.domainErr = errDomainUnavailable
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	if err := newValidator(t).ValidateValue(contract.KindPageView, workspace); err != nil {
+		t.Fatalf("domain 失败的工作区仍必须过 schema: %v", err)
+	}
+
+	timeline := findSection(workspace.Sections, serviceobs.SectionKeyTimeline)
+	if timeline == nil {
+		t.Fatal("必须有 timeline section")
+	}
+	if timeline.State == model.AvailabilityEmpty {
+		t.Fatal("domain 失败时 timeline 绝不能报 Empty")
+	}
+	domain := findSection(workspace.Sections, serviceobs.SectionKeyDomain)
+	if domain == nil || domain.State != model.AvailabilityUnavailable {
+		t.Fatalf("domain section 应 unavailable: %+v", domain)
+	}
+	// 最小范围镜像同一个状态与 reason/retryable。
+	if timeline.State != domain.State {
+		t.Fatalf("timeline 应镜像 domain 状态: %q vs %q", timeline.State, domain.State)
+	}
+	if timeline.ReasonCode == "" || timeline.ReasonCode != domain.ReasonCode {
+		t.Fatalf("timeline 必须带与 domain 一致的稳定 reason: %+v", timeline)
+	}
+	if timeline.Retryable != domain.Retryable {
+		t.Fatalf("retryable 应与 domain 一致: %+v", timeline)
+	}
+	if len(workspace.Timeline) != 0 {
+		t.Fatal("读不到领域事实时不得凭空产生事件")
+	}
+	// 只降级领域相关区块：identity 与 declared topology 保留。
+	if len(workspace.Topology.Nodes) == 0 {
+		t.Fatal("domain 失败不得清空 declared topology")
+	}
+}
+
+func TestTimelineSectionIsEmptyOnlyForSuccessfulZeroFacts(t *testing.T) {
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+	// 一次成功查询，边界内确实没有任何领域对象。
+	readers.domain = serviceobs.DomainFacts{BoundaryEntityIDs: []string{identity.EntityID}}
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	timeline := findSection(workspace.Sections, serviceobs.SectionKeyTimeline)
+	if timeline == nil || timeline.State != model.AvailabilityEmpty {
+		t.Fatalf("成功查询但零事实才是 Empty: %+v", timeline)
+	}
+	if timeline.ReasonCode != "" {
+		t.Fatalf("Empty 不需要失败 reason: %+v", timeline)
+	}
+}
+
+func TestTimelineSectionIsAvailableWithFacts(t *testing.T) {
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	timeline := findSection(workspace.Sections, serviceobs.SectionKeyTimeline)
+	if timeline == nil || timeline.State != model.AvailabilityAvailable {
+		t.Fatalf("有领域事实时 timeline 应 available: %+v", timeline)
+	}
+	if len(workspace.Timeline) == 0 {
+		t.Fatal("有领域事实时应产生时间线事件")
+	}
+}
+
+func TestNodeAndRelationHealthDoNotDriftFromContext(t *testing.T) {
+	// 同一批 scoped evaluation 必须在 DiagnosticContext 与 Page View 得出同一个对象健康。
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	if snapshot.Context == nil {
+		t.Fatal("有 Profile 时必须构造 DiagnosticContext")
+	}
+
+	contextHealth := map[string]model.Health{}
+	for _, node := range snapshot.Context.Topology.Nodes {
+		contextHealth[node.EntityID] = node.Health
+	}
+	sawOpinionated := false
+	for _, node := range workspace.Topology.Nodes {
+		want, ok := contextHealth[node.EntityID]
+		if !ok {
+			t.Fatalf("工作区出现了 context 里没有的节点 %q", node.EntityID)
+		}
+		if node.Health != want {
+			t.Fatalf("节点 %q 健康漂移: 页面 %q vs context %q", node.EntityID, node.Health, want)
+		}
+		if len(node.Signals) == 0 && node.Health != model.HealthUnknown {
+			t.Fatalf("没有 signal 的节点必须 Unknown: %+v", node)
+		}
+		if len(node.Signals) > 0 && node.Health != model.HealthUnknown {
+			sawOpinionated = true
+		}
+	}
+	// fixture 的 host fleet 挂了 critical/degraded USE signal，因此至少要有一个节点
+	// 得出非 Unknown 的结论——否则这个测试无法证明共享聚合真的生效。
+	if !sawOpinionated {
+		t.Fatal("fixture 应至少让一个挂了 signal 的节点得出非 Unknown 健康")
+	}
+
+	// 关系健康同样来自共享聚合。
+	for _, relation := range workspace.Topology.Relations {
+		want := snapshot.ObjectHealth("", relation.RelationID)
+		if relation.Health != want {
+			t.Fatalf("关系 %q 健康漂移: %q vs %q", relation.RelationID, relation.Health, want)
+		}
+		if len(relation.Signals) == 0 && relation.Health != model.HealthUnknown {
+			t.Fatalf("没有 signal 的关系必须 Unknown: %+v", relation)
+		}
+	}
+
+	// 总览的依赖台账复用同一份节点健康，绝不因"拓扑里存在"就显示绿色。
+	overviewSnapshot := assembleFixture(t, soctx.KindOverview, readers, &published, nil)
+	overview := ProjectOverview(overviewSnapshot)
+	for _, dependency := range overview.Dependencies {
+		want := overviewSnapshot.ObjectHealth(dependency.EntityID, "")
+		if dependency.Health != want {
+			t.Fatalf("依赖 %q 健康漂移: %q vs %q", dependency.EntityID, dependency.Health, want)
+		}
+		if dependency.Health == model.HealthHealthy {
+			if got := overviewSnapshot.ObjectHealth(dependency.EntityID, ""); got != model.HealthHealthy {
+				t.Fatalf("依赖不得凭拓扑里存在就显示绿色: %+v", dependency)
+			}
+		}
+	}
+}
+
+func TestMergedRelationKeepsProfileScopeRefResolvable(t *testing.T) {
+	// canonical 归一化把 declared 与 observed 两行折叠成一条边。Profile 的 signal scope
+	// 可能引用的是被折叠掉的那一行，归一化绝不能因此让它变成悬空引用。
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+
+	const declaredID = "rel_service_provider_declared"
+	const observedID = "rel_api_orchestrator"
+	// 找到 fixture 里 RED signal 引用的那条 observed 关系，给它加一个 declared 孪生行，
+	// 并把 canonical ID 换成 declared 的那一个——正是归一化后的真实形态。
+	replaced := false
+	for i := range readers.topology.Relations {
+		if readers.topology.Relations[i].RelationID != observedID {
+			continue
+		}
+		readers.topology.Relations[i].RelationID = declaredID
+		readers.topology.Relations[i].Provenance = model.ProvenanceDeclaredAndObserved
+		readers.topology.Relations[i].MergedRelationIDs = []string{declaredID, observedID}
+		replaced = true
+	}
+	if !replaced {
+		t.Fatalf("fixture 应包含关系 %q", observedID)
+	}
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	if err := newValidator(t).ValidateValue(contract.KindPageView, workspace); err != nil {
+		t.Fatalf("归一化后的工作区仍必须过 schema: %v", err)
+	}
+
+	// Profile 的 RED binding 仍然挂在这条 canonical 关系上，没有变成悬空。
+	var canonical *model.TopologyRelationView
+	for i := range workspace.Topology.Relations {
+		if workspace.Topology.Relations[i].RelationID == declaredID {
+			canonical = &workspace.Topology.Relations[i]
+		}
+	}
+	if canonical == nil {
+		t.Fatalf("应存在 canonical 关系 %q: %+v", declaredID, workspace.Topology.Relations)
+	}
+	if len(canonical.Signals) == 0 {
+		t.Fatal("引用被折叠成员 ID 的 signal scope 必须仍能挂到 canonical 关系上")
+	}
+	if canonical.Provenance != model.ProvenanceDeclaredAndObserved {
+		t.Fatalf("provenance 应是 declared_and_observed，实际 %q", canonical.Provenance)
+	}
+	for _, key := range snapshot.UnresolvedBindings {
+		if strings.HasPrefix(key, "red_") {
+			t.Fatalf("归一化不得让 RED binding 变成悬空引用: %v", snapshot.UnresolvedBindings)
+		}
+	}
+	// 关系健康仍与 context 一致。
+	if canonical.Health != snapshot.ObjectHealth("", declaredID) {
+		t.Fatal("归一化后关系健康仍必须来自共享聚合")
+	}
+}
+
 func TestProjectionIsDeterministic(t *testing.T) {
 	published := loadCanonicalProfile(t)
 	fixture := loadCanonicalContext(t)
@@ -911,7 +1122,10 @@ type staticError string
 
 func (e staticError) Error() string { return string(e) }
 
-const errTopologyUnavailable staticError = "topology unavailable"
+const (
+	errTopologyUnavailable staticError = "topology unavailable"
+	errDomainUnavailable   staticError = "domain unavailable"
+)
 
 func floatPtr(value float64) *float64 { return &value }
 

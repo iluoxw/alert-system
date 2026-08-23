@@ -67,8 +67,9 @@ func profileDiagnosticSection(snapshot *soctx.AssemblySnapshot) []model.SectionS
 // source 时对端是 provider，service 是 target 时对端是 consumer。group_key/group_label
 // 是服务端投影事实，浏览器不按实体名猜分组。
 //
-// 每行的 Health 恒为 Unknown（Phase 2 没有任何可用 signal）：拓扑里存在一个依赖不等于
-// 它健康。
+// 每行的 Health 复用 assembler 算好的共享节点健康，因此与工作区同一节点、与
+// DiagnosticContext 同一节点全部一致。没有任何 signal 挂在这个对端上时恒为 Unknown：
+// 拓扑里存在一个依赖绝不等于它健康。
 func projectDependencies(snapshot *soctx.AssemblySnapshot) []model.DependencyRow {
 	nodes := make(map[string]serviceobs.TopologyNode, len(snapshot.TopologyFacts.Nodes))
 	for _, node := range snapshot.TopologyFacts.Nodes {
@@ -106,7 +107,7 @@ func projectDependencies(snapshot *soctx.AssemblySnapshot) []model.DependencyRow
 			GroupLabel: dependencyGroupLabel(peer.Layer),
 			Role:       role,
 			Provenance: relation.Provenance,
-			Health:     model.HealthUnknown,
+			Health:     snapshot.ObjectHealth(peer.EntityID, ""),
 			Freshness:  dependencyFreshness(relation),
 		}
 		if !relation.ObservedAt.IsZero() {
