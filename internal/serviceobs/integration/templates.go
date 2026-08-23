@@ -177,16 +177,19 @@ var registry = func() map[string]Template {
 			Summary:            "gauge 的最坏值",
 		},
 		{
-			// 逐条 focus 记录搜索。E2B 的逐条关联字段在 logs 流（e2b_logs）上，因此它的
-			// source 与权限都是 logs 一侧，不借 traces.read 放行。
+			// 逐条 focus 记录搜索：回答"这个 focus 值命中了吗"。
+			//
+			// 权限与 source 沿用既有语义（traces.read / openobserve_traces）。这是通用模板，
+			// 不因为某个服务的逐条字段恰好也出现在日志流里就改成 logs.read——那是把单个
+			// 接入方的数据布局写进平台契约。真要改必须有权威文档或输出 schema 依据。
 			Ref:                "focus_records.v1",
 			Capability:         CapabilityOpenObserve,
 			AllowedKinds:       []BindingKind{KindFocus},
-			SourceKey:          SourceKeyOpenObserveLogs,
+			SourceKey:          SourceKeyOpenObserveTraces,
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotSelectFields, SlotRowLimit},
 			Optional:           []ParamSlot{SlotStageField, SlotStatusField},
 			Outputs:            []string{"records.count", "records.first_observed_at", "records.last_observed_at"},
-			RequiredPermission: PermissionLogsRead,
+			RequiredPermission: PermissionTracesRead,
 			Summary:            "按 focus 逐条取记录",
 		},
 		{

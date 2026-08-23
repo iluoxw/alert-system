@@ -423,3 +423,162 @@ func TestTemplateKindAndSourceInvariants(t *testing.T) {
 		}
 	}
 }
+
+// kind=focus 的可达性用 synthetic package 证明，而不是塞进 docs fixture。
+//
+// 理由是分工：两份 example package 各自表达一个真实的产品形态（E2B 的请求旅程型服务、
+// PostgreSQL 的 signals-only 非旅程型服务），不该为了覆盖某个 kind 而挂一条它本来不需要的
+// binding。E2B 的 focus 判定由 trace_by_focus journey binding 的可信 side output 提供，
+// PostgreSQL 则完全不需要 focus 查询——所以显式 kind=focus 的编译路径在这里单独证明。
+func TestExplicitFocusBindingIsReachable(t *testing.T) {
+	// 从 PostgreSQL fixture 派生：加一条显式 focus binding 与它需要的 tool ref。
+	// focus_records.v1 要求 traces.read + openobserve capability，因此配
+	// evidence.search_traces.v1（traces.read / openobserve）。
+	raw := mutate(t, readPackage(t, "postgresql.package.json"), func(doc map[string]any) {
+		template := profileTemplate(doc)
+		template["tool_refs"] = append(
+			template["tool_refs"].([]any), "evidence.search_traces.v1")
+		doc["provider_bindings"] = append(doc["provider_bindings"].([]any), map[string]any{
+			"key":          "focus_database_records",
+			"kind":         "focus",
+			"target_ref":   "database_name",
+			"tool_key":     "evidence.search_traces.v1",
+			"template_ref": "focus_records.v1",
+			"params": map[string]any{
+				"stream":        "pg_statement_trace",
+				"focus_field":   "database_name",
+				"select_fields": []any{"database_name", "query_id"},
+				"row_limit":     float64(100),
+			},
+		})
+	})
+
+	compiled, err := newCompiler(t, postgresResolver()).Compile(
+		context.Background(), CompileRequest{Raw: raw})
+	if err != nil {
+		t.Fatalf("显式 focus binding 应可编译: %v", err)
+	}
+
+	var focus CompiledBinding
+	for _, binding := range compiled.Integration.Bindings {
+		if binding.Kind == KindFocus {
+			focus = binding
+		}
+	}
+	if focus.Key == "" {
+		t.Fatal("CompiledIntegration 里应有 focus binding")
+	}
+	// 权限与 source 必须是 registry 推导的既有语义，不是 package 自报。
+	if focus.RequiredPermission != PermissionTracesRead {
+		t.Fatalf("focus binding 权限=%q，want %q", focus.RequiredPermission, PermissionTracesRead)
+	}
+	if focus.SourceKey != SourceKeyOpenObserveTraces {
+		t.Fatalf("focus binding source=%q, want %q", focus.SourceKey, SourceKeyOpenObserveTraces)
+	}
+	// focus target 是 focus kind，没有 canonical ID：必须是空数组而不是 null。
+	if len(focus.ResolvedTargetIDs) != 0 {
+		t.Fatalf("focus binding 不该有 resolved target: %v", focus.ResolvedTargetIDs)
+	}
+	if err := ValidateBundle(compiled.Bundle()); err != nil {
+		t.Fatalf("激活单元校验失败: %v", err)
+	}
+}
+
+// 同一 focus kind 上两条显式 focus binding 必须被拒绝（至多一条）。
+func TestDuplicateExplicitFocusBindingIsRejected(t *testing.T) {
+	raw := mutate(t, readPackage(t, "postgresql.package.json"), func(doc map[string]any) {
+		template := profileTemplate(doc)
+		template["tool_refs"] = append(
+			template["tool_refs"].([]any), "evidence.search_traces.v1")
+		focus := func(key string) map[string]any {
+			return map[string]any{
+				"key": key, "kind": "focus", "target_ref": "database_name",
+				"tool_key": "evidence.search_traces.v1", "template_ref": "focus_records.v1",
+				"params": map[string]any{
+					"stream": "pg_statement_trace", "focus_field": "database_name",
+					"select_fields": []any{"database_name"}, "row_limit": float64(100),
+				},
+			}
+		}
+		doc["provider_bindings"] = append(
+			doc["provider_bindings"].([]any), focus("focus_one"), focus("focus_two"))
+	})
+	_, err := newCompiler(t, postgresResolver()).Compile(context.Background(), CompileRequest{Raw: raw})
+	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {
+		t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonDuplicateBindingTarget)
+	}
+}
+
+// 显式 focus binding 与 side output 提供者共存必须被拒绝：那是同一判定的第三次查询。
+//
+// E2B 的 journey binding 已经用一次 trace 读取顺带给出 focus，因此再加一条显式 focus binding
+// 就是重复。这条同时守住"E2B 不需要显式 focus binding"这个设计意图。
+func TestExplicitFocusConflictsWithJourneySideOutput(t *testing.T) {
+	raw := mutate(t, readPackage(t, "e2b.package.json"), func(doc map[string]any) {
+		doc["provider_bindings"] = append(doc["provider_bindings"].([]any), map[string]any{
+			"key":          "focus_sandbox_records",
+			"kind":         "focus",
+			"target_ref":   "sandbox_id",
+			"tool_key":     "evidence.search_traces.v1",
+			"template_ref": "focus_records.v1",
+			"params": map[string]any{
+				"stream": "default", "focus_field": "sandbox_id",
+				"select_fields": []any{"sandbox_id"}, "row_limit": float64(100),
+			},
+		})
+	})
+	_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: raw})
+	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {
+		t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonDuplicateBindingTarget)
+	}
+}
+
+// 两份 docs fixture 的形态是有意的，用断言把它固定下来：
+// E2B 的 focus 来自 journey side output（没有显式 focus binding），PostgreSQL 是 signals-only。
+func TestExampleFixtureShapesAreIntentional(t *testing.T) {
+	e2b, err := newCompiler(t, e2bResolver()).Compile(
+		context.Background(), CompileRequest{Raw: readPackage(t, "e2b.package.json")})
+	if err != nil {
+		t.Fatalf("编译 E2B 失败: %v", err)
+	}
+	kinds := map[BindingKind]int{}
+	for _, binding := range e2b.Integration.Bindings {
+		kinds[binding.Kind]++
+	}
+	if kinds[KindFocus] != 0 {
+		t.Fatalf("E2B 不应有显式 focus binding：focus 由 journey 的 trace side output 提供，得到 %d 条",
+			kinds[KindFocus])
+	}
+	if kinds[KindJourney] != 1 || kinds[KindEvidence] != 1 {
+		t.Fatalf("E2B 应有 1 条 journey 与 1 条独立 logs evidence，得到 %v", kinds)
+	}
+	// journey binding 必须真的声明 focus side output，否则上面那条"不需要显式 focus"就不成立。
+	for _, binding := range e2b.Integration.Bindings {
+		if binding.Kind != KindJourney {
+			continue
+		}
+		hasFocus := false
+		for _, side := range binding.SideOutputs {
+			if side == SideOutputFocus {
+				hasFocus = true
+			}
+		}
+		if !hasFocus {
+			t.Fatalf("journey binding 必须声明 focus side output: %v", binding.SideOutputs)
+		}
+	}
+
+	postgres, err := newCompiler(t, postgresResolver()).Compile(
+		context.Background(), CompileRequest{Raw: readPackage(t, "postgresql.package.json")})
+	if err != nil {
+		t.Fatalf("编译 PostgreSQL 失败: %v", err)
+	}
+	for _, binding := range postgres.Integration.Bindings {
+		if binding.Kind != KindSignal {
+			t.Fatalf("PostgreSQL fixture 应是 signals-only，出现了 kind=%s", binding.Kind)
+		}
+	}
+	if len(postgres.Profile.Journeys) != 0 {
+		t.Fatalf("PostgreSQL fixture 的 journeys 应为空，得到 %d", len(postgres.Profile.Journeys))
+	}
+}

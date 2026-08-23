@@ -3,7 +3,7 @@
   "package_key": "postgresql_core",
   "package_version": 1,
   "status": "draft",
-  "description": "结构与 E2B 明显不同的最小 package：实例级 focus、没有任何 journey、只用 Golden 与 USE、不声明 request_journey/dependency_topology renderer。它同时证明 kind=focus 在没有 journey 的服务上可独立可达，focus 判定不必来自 trace 读取的 side output。metric、stream 与字段形状同样未经 discovery，是 draft，不是 Phase 4 的产品验收物。",
+  "description": "结构与 E2B 明显不同的最小 package：实例级 focus、没有任何 journey、只用 Golden 与 USE、不声明 request_journey/dependency_topology renderer。它存在的唯一目的是证明同一份 SIP 契约与compiler 能表达非请求旅程型服务，核心 renderer/assembler 不需要新增分支。metric、stream 与字段形状未经 discovery，是 draft，不是 Phase 4 的产品验收物。",
   "compatibility": {
     "profile_schema_version": "1.0",
     "min_compiler_version": 1
@@ -167,7 +167,6 @@
     ],
     "tool_refs": [
       "metrics.query_semantic_signal.v1",
-      "evidence.search_logs.v1",
       "domain.list_service_faults.v1"
     ],
     "limits": {
@@ -283,22 +282,6 @@
         "group_by": [
           "instance"
         ]
-      }
-    },
-    {
-      "key": "focus_database_records",
-      "kind": "focus",
-      "target_ref": "database_name",
-      "tool_key": "evidence.search_logs.v1",
-      "template_ref": "focus_records.v1",
-      "params": {
-        "stream": "pg_statement_log",
-        "focus_field": "database_name",
-        "select_fields": [
-          "database_name",
-          "query_id"
-        ],
-        "row_limit": 100
       }
     }
   ]

@@ -137,6 +137,10 @@ key/capability/permission，并与 Profile 通过 manifest 中的 `profile_diges
 | logs_by_focus.v1 | openobserve | 按 focus 取日志摘要 |
 | access_by_focus.v1 | openobserve | 按 focus 取 access 记录摘要 |
 
+每个模板的 capability、source key 与 required permission 都是 registry 的既有事实，由平台维护。
+它们不会因为某个接入方的逐条字段恰好也出现在另一个流里就改变——那等于把单个服务的数据布局
+写进平台契约。要改动既有权限语义必须有权威文档或模板输出 schema 的明确依据。
+
 `counter_ratio_percent.v1` 使用 `common_labels`、`numerator_labels`、`denominator_labels` 三组
 typed 等值条件。任一有效 selector 内 label 名重复，或 numerator/denominator 是同一 metric 且
 两边的有效 label selector 完全相同时，compiler 必须拒绝；否则会把任意非零样本恒算成 100%。E2B draft
