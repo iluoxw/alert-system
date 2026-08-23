@@ -10,6 +10,14 @@
 //   - AssemblySnapshot 是不对外序列化的内部超集，持有 DiagnosticContext、每个 source
 //     与 section 的状态、Profile diagnostic 与真实事实时间锚。
 //
+// 三条契约边界在装配入口就被强制，绝不留给序列化时才炸：
+//
+//   - scope.timezone 必须落在契约的 1..64 字符内；
+//   - 时间窗必须是整秒，并且用真实时长（而不是截断后的整数）与上限比较，否则
+//     "上限 + 0.9 秒"会被算成正好等于上限而放行，同时让 window_seconds 与 from/to 矛盾；
+//   - 没有拓扑观测时 observed_at 用真实事实时间锚或 Unix epoch，绝不用 wall clock，
+//     也绝不留下零值渲染出的 year 0001。
+//
 // 包名与 stdlib 的 context 同名，因此本文件把标准库别名成 stdcontext。调用方通常写
 // `import soctx "alert-system/internal/serviceobs/context"`。
 package context

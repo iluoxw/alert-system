@@ -15,6 +15,19 @@
 //  3. 一切都有界：固定 worker 数、bounded queue、per-key singleflight、max_entries 与
 //     可注入的 bounded TTL jitter。队列满时保留 Unknown/Stale，不额外起 goroutine。
 //
+// 另外四条隔离与生命周期约束同样是硬要求，它们都容易在实现里被写错：
+//
+//   - Get 必须交出深拷贝。Summary 带 slice 与指针，直接返回内部值会让一个调用方修改自己
+//     拿到的结果时改到缓存，下一个调用方读到被污染的摘要。
+//   - 惰性回收必须整链扫描。LRU 顺序按最近**访问**排，与写入时间无关，因此一个刚被读过
+//     但写入很久的死键会待在表头；只扫表尾会永远漏掉它，还会逼着仍然有效、只是很久没读
+//     的条目被驱逐。
+//   - 入队与关闭必须在同一把锁下串行。先解锁再向队列投递，会让 Shutdown 在窗口里
+//     close(queue)，把投递变成向已关闭 channel 发送而 panic。
+//   - TTL jitter 必须按完整四元组 Key 分散，并且 FreshUntil 不得越过 max stale 的可见性
+//     期限。只看 TTL 的实现给每个键同一个偏移，等于没有抖动；越过 max stale 会让一个
+//     已经不该可见的条目仍被报成 fresh。
+//
 // 接口刻意保持可替换：Phase 3 可以用 PostgreSQL snapshot store 换掉 MemoryStore，
 // Coordinator 不变。
 package cache
@@ -118,9 +131,14 @@ func NoJitter() Jitter {
 
 // Store 是 snapshot 存储抽象。Phase 3 可以换成 PostgreSQL 实现。
 type Store interface {
-	// Get 返回条目与其状态。超过 max stale 的死条目在这里被惰性回收并报 StateMiss。
+	// Get 返回条目与其状态。
+	//
+	// 实现必须返回深拷贝：调用方对返回值的任何修改都不得影响缓存中的共享状态，
+	// 也不得被下一个调用方看到。超过 max stale 的死条目在这里被惰性回收并报 StateMiss，
+	// 因此旧的 Healthy 在 max stale 之后彻底不可见。
 	Get(key Key) (Entry, State)
-	// Put 原子替换整个条目。刷新失败时调用方不调用它，从而保留最后一次成功值。
+	// Put 原子替换整个条目：整个 Entry 一次性换掉，读侧不可能看到半新半旧的摘要。
+	// 刷新失败时调用方不调用它，从而保留最后一次成功值。
 	Put(key Key, summary Summary)
 	// Len 返回当前条目数，用于证明 max_entries 是硬上限。
 	Len() int
