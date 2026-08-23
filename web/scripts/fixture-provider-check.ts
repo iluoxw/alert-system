@@ -223,6 +223,15 @@ async function main(): Promise<void> {
     ['2026-8-22T02:04:22Z', false],
     ['2026-08-22T02:04:22.000000001Z', true],
     ['2026-08-22T02:04:22ZZ', false],
+    // Go 的通用解析路径接受逗号小数秒（RFC3339 允许 `,`），但必须至少一位数字。
+    ['2026-08-22T02:04:22,123Z', true],
+    ['2026-08-22T02:04:22,1Z', true],
+    ['2026-08-22T02:04:22,123456789Z', true],
+    ['2026-08-22T02:04:22,123+08:00', true],
+    ['2026-08-22T02:04:22,Z', false],
+    ['2026-08-22T02:04:22;123Z', false],
+    ['2026-08-22T02:04:22,,1Z', false],
+    ['2026-08-22T02:04:22,12,3Z', false],
   ]
   for (const [candidate, accepted] of rfc3339Table) {
     const to = accepted ? candidate : base.scope.to
@@ -260,6 +269,50 @@ async function main(): Promise<void> {
   equal('超长 service ID 优先 404', fixtures.getWorkspaceFixture('s'.repeat(65), null, {
     focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
   }).view, null)
+
+  // ---- 显式场景不豁免环境归属（最终 parity 缺口 1）----
+
+  const otherEnv = `${base.scope.environment}-other`
+  equal('场景 + 另一环境是 404', fixtures.getWorkspaceFixture(serviceId, 'partial', {
+    environment: otherEnv,
+  }).view, null)
+  // 即使带着过期/非法 focus，另一个环境仍然是 404 而不是端出当前环境的事实。
+  equal('场景 + 另一环境 + 非法 focus 仍是 404', fixtures.getWorkspaceFixture(serviceId, 'partial', {
+    environment: otherEnv, focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+  }).view, null)
+  // 匹配环境 + 过期非法 focus 必须继续可用（这是刻意保留的 fixture-only 例外）。
+  const scenarioMatching = fixtures.getWorkspaceFixture(serviceId, 'partial', {
+    environment: base.scope.environment, focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+  })
+  equal('场景 + 匹配环境 + 非法 focus 仍加载场景',
+    scenarioMatching.scenario?.key, 'telemetry_bundle_timeout_partial_unknown')
+  equal('场景 + 匹配环境时 focus 回到场景视图',
+    scenarioMatching.view?.focus?.value, baseFocusValue)
+  // 缺省环境同样可用。
+  equal('场景 + 缺省环境仍加载场景',
+    fixtures.getWorkspaceFixture(serviceId, 'partial', {}).scenario?.key,
+    'telemetry_bundle_timeout_partial_unknown')
+
+  // ---- environment 必须先于 focus 判定（最终 parity 缺口 2）----
+
+  // live handler 是 parseEnvironment -> parseFocus，所以两者都非法时报 invalid_filter。
+  await expectApiError('环境形状非法优先于 focus 非法', 'invalid_filter', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, {
+      environment: '-bad env', focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+    }))
+  // 环境合法、focus 非法时仍然是 invalid_focus。
+  await expectApiError('环境合法时 focus 非法仍是 invalid_focus', 'invalid_focus', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, {
+      environment: base.scope.environment, focusKind: primaryFocus.key, focusValue: 'not-a-sandbox',
+    }))
+  // 环境非法 + 时间窗非法同样报环境。
+  await expectApiError('环境形状非法优先于时间窗非法', 'invalid_filter', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, { environment: '-bad env', from: base.scope.from }))
+  // focus 非法必须先于时间窗非法（live 的 parseFocus 在 parseTimeRange 之前）。
+  await expectApiError('focus 非法优先于时间窗非法', 'invalid_focus', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, {
+      focusKind: primaryFocus.key, focusValue: 'not-a-sandbox', from: base.scope.from,
+    }))
 
   // ---- environment 契约（复审缺口 3）----
 

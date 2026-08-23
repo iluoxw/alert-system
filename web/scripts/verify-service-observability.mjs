@@ -689,11 +689,38 @@ assert.ok(
   focusGuardAt < missingServiceAt,
   'the normal fixture path must validate the query before answering 404, matching the live handler',
 )
-// 显式场景分支仍要校验非 focus 字段。
+// 显式场景分支仍要校验非 focus 字段，并且必须应用环境**语义**不匹配：只校验语法会让
+// `scenario=partial&environment=staging` 端出另一个环境的事实。
 const scenarioBranch = workspaceProviderBody.slice(scenarioAt, focusGuardAt)
 assert.ok(
   scenarioBranch.includes('guardWorkspaceScope(query)'),
   'the explicit scenario branch must still validate the non-focus query fields',
+)
+assert.ok(
+  scenarioBranch.includes('environmentMismatch(query.environment, base)'),
+  'the explicit scenario branch must reject a mismatched environment with 404, not serve other-environment facts',
+)
+assert.ok(
+  scenarioBranch.indexOf('guardWorkspaceScope(query)')
+    < scenarioBranch.indexOf('environmentMismatch(query.environment, base)'),
+  'non-focus validation must run before the environment mismatch check',
+)
+assert.ok(
+  scenarioBranch.indexOf('environmentMismatch(query.environment, base)')
+    < scenarioBranch.indexOf('applyJsonPatch(base, scenario.patch)'),
+  'the environment mismatch check must run before the scenario patch is applied',
+)
+// environment 必须先于 focus 判定（live handler 是 parseEnvironment -> parseFocus）。
+const environmentGuardAt = workspaceProviderBody.indexOf('guardEnvironment(query.environment)')
+assert.ok(environmentGuardAt !== -1, 'the normal path must validate environment explicitly')
+assert.ok(
+  environmentGuardAt < focusGuardAt,
+  'environment must be validated before focus so both-invalid returns invalid_filter like Go',
+)
+const scopeGuardAt = workspaceProviderBody.indexOf('guardWorkspaceScope(query)', focusGuardAt)
+assert.ok(
+  focusGuardAt < scopeGuardAt,
+  'focus must still be validated before the time range, matching parseFocus -> parseTimeRange',
 )
 
 // ---- 复审缺口 1：RFC3339 必须是自洽严格解析，不依赖 Date.parse ----
@@ -705,6 +732,10 @@ assert.ok(
 assert.ok(
   queryContractSource.includes('daysInMonth') && queryContractSource.includes('isLeapYear'),
   'strict RFC3339 must validate the calendar, not just the shape',
+)
+assert.ok(
+  /\[\.,\]\\d\+/.test(queryContractSource),
+  'strict RFC3339 must accept a dot or comma fractional separator followed by digits, like Go',
 )
 assert.ok(
   !/Date\.parse/.test(stripComments(queryContractSource)),
@@ -735,6 +766,14 @@ for (const [candidate, accepted] of [
   ['2026-08-22', false],
   ['2026-8-22T02:04:22Z', false],
   ['2026-08-22T02:04:22.000000001Z', true],
+  // Go 的通用解析路径接受逗号小数秒；分隔符后必须至少一位数字。
+  ['2026-08-22T02:04:22,123Z', true],
+  ['2026-08-22T02:04:22,1Z', true],
+  ['2026-08-22T02:04:22,123+08:00', true],
+  ['2026-08-22T02:04:22,Z', false],
+  ['2026-08-22T02:04:22;123Z', false],
+  ['2026-08-22T02:04:22,,1Z', false],
+  ['2026-08-22T02:04:22,12,3Z', false],
 ]) {
   assert.equal(
     queryContract.isStrictRFC3339(candidate), accepted,
@@ -778,9 +817,18 @@ assert.ok(
   'the directory fixture must scope itself by the environment carried in its own page view',
 )
 assert.ok(
-  fixtureProviderSource.includes('base.scope.environment')
+  fixtureProviderSource.includes('view.scope.environment')
     && fixtureProviderSource.includes('overviewFixture.service.environment'),
   'overview/workspace fixtures must compare the requested environment with their own page view',
+)
+// 环境归属判定只有一份实现，两条工作区分支共用它。
+assert.ok(
+  fixtureProviderSource.includes('function environmentMismatch('),
+  'the environment ownership check must live in a single shared helper',
+)
+assert.equal(
+  (fixtureProviderSource.match(/environmentMismatch\(query\.environment, base\)/g) ?? []).length, 2,
+  'both workspace branches (scenario and normal) must apply the environment ownership check',
 )
 
 // ---- C6：团队筛选来自团队目录，而不是已加载分页 ----

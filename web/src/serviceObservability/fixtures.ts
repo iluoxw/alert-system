@@ -174,6 +174,17 @@ function isUsableServiceID(serviceId: string): boolean {
   return trimmed !== '' && new TextEncoder().encode(trimmed).length <= maxServiceIDBytes
 }
 
+// environmentMismatch 判断"显式请求的环境是否不属于这个 Page View"。
+//
+// 环境取自 Page View 自身的 scope，不是任何写死的服务 ID；空值表示未传，沿用该视图环境。
+function environmentMismatch(
+  requested: string | undefined,
+  view: { scope: { environment: string } },
+): boolean {
+  const environment = guardEnvironment(requested)
+  return environment !== '' && environment !== view.scope.environment
+}
+
 // fixture 的契约文件是**一个环境作用域**的 Page View。环境从 Page View 数据派生，
 // 没有任何服务专属 ID 分支。
 function directoryEnvironments(): Set<string> {
@@ -268,21 +279,26 @@ export function getWorkspaceFixture(
   const base = getBaseWorkspaceFixture(serviceId)
   const scenario = resolveWorkspaceScenario(scenarioValue)
   if (base && scenario) {
-    // fixture-only 例外：非 focus 字段（environment、时间窗、timezone）仍然校验。
+    // fixture-only 例外只豁免 focus，**不豁免环境归属**：非 focus 字段先校验语法，
+    // 再应用语义不匹配。否则 `scenario=partial&environment=staging` 会把当前环境的
+    // 事实端给另一个环境，那正是"统一 404、不泄露其它环境是否存在"要防的事。
     guardWorkspaceScope(query)
+    if (environmentMismatch(query.environment, base)) return { view: null, scenario: null }
     return { view: applyJsonPatch(base, scenario.patch), scenario }
   }
 
-  // 正常路径与 live 同序：先把 query 判完，再判服务存在性。
+  // 正常路径与 live 同序。environment 必须在 focus **之前**判：live handler 是
+  // parseEnvironment -> parseFocus，所以"环境形状非法 + focus 非法"必须报
+  // invalid_filter 而不是 invalid_focus。这里显式先判一次环境语法；下面的
+  // guardWorkspaceScope 会再判一次（幂等），但不能靠它，否则时间窗校验就会插到
+  // focus 之前，反过来破坏另一个顺序。
+  guardEnvironment(query.environment)
   guardWorkspaceFocus(query)
   guardWorkspaceScope(query)
   if (!base) return { view: null, scenario: null }
 
   // 显式环境与该服务登记环境不符统一按"服务不存在"处理。
-  const environment = guardEnvironment(query.environment)
-  if (environment !== '' && environment !== base.scope.environment) {
-    return { view: null, scenario: null }
-  }
+  if (environmentMismatch(query.environment, base)) return { view: null, scenario: null }
 
   const requested = query.focusValue?.trim() ?? ''
   const baseFocusValue = base.focus?.value ?? ''
