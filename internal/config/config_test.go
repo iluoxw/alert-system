@@ -349,3 +349,110 @@ func TestLoad_FlapEnvOverrides(t *testing.T) {
 		t.Errorf("FlapThreshold = %d, want 5", cfg.FlapThreshold)
 	}
 }
+
+func TestLoad_ServiceObservabilityDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	so := cfg.ServiceObservability
+	// profile dir 默认为空：空目录是合法的空 registry，不是启动错误。
+	if so.ProfileDir != "" {
+		t.Errorf("ProfileDir = %q, want 空（未配置 Profile 目录）", so.ProfileDir)
+	}
+	if so.CacheTTL != defaultServiceObservabilityCacheTTL {
+		t.Errorf("CacheTTL = %v, want %v", so.CacheTTL, defaultServiceObservabilityCacheTTL)
+	}
+	if so.CacheMaxStale != defaultServiceObservabilityCacheMaxStale {
+		t.Errorf("CacheMaxStale = %v, want %v", so.CacheMaxStale, defaultServiceObservabilityCacheMaxStale)
+	}
+	if so.CacheMaxEntries != defaultServiceObservabilityCacheMaxEntries {
+		t.Errorf("CacheMaxEntries = %d, want %d", so.CacheMaxEntries, defaultServiceObservabilityCacheMaxEntries)
+	}
+	if so.RefreshWorkers != defaultServiceObservabilityRefreshWorkers {
+		t.Errorf("RefreshWorkers = %d, want %d", so.RefreshWorkers, defaultServiceObservabilityRefreshWorkers)
+	}
+	if so.RefreshQueue != defaultServiceObservabilityRefreshQueue {
+		t.Errorf("RefreshQueue = %d, want %d", so.RefreshQueue, defaultServiceObservabilityRefreshQueue)
+	}
+	if so.MaxWindowSeconds != defaultServiceObservabilityMaxWindowSeconds {
+		t.Errorf("MaxWindowSeconds = %d, want %d", so.MaxWindowSeconds, defaultServiceObservabilityMaxWindowSeconds)
+	}
+}
+
+func TestLoad_ServiceObservabilityYAMLAndEnvOverrides(t *testing.T) {
+	path := writeTempYAML(t, `
+service_observability:
+  profile_dir: "/etc/alert-system/profiles"
+  cache_ttl: "30s"
+  cache_max_stale: "2m"
+  cache_max_entries: 128
+  refresh_workers: 2
+  refresh_queue: 64
+  max_window_seconds: 3600
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	so := cfg.ServiceObservability
+	if so.ProfileDir != "/etc/alert-system/profiles" || so.CacheTTL != 30*time.Second ||
+		so.CacheMaxStale != 2*time.Minute || so.CacheMaxEntries != 128 ||
+		so.RefreshWorkers != 2 || so.RefreshQueue != 64 || so.MaxWindowSeconds != 3600 {
+		t.Fatalf("YAML 未生效: %+v", so)
+	}
+
+	// 环境变量优先级高于 YAML。
+	t.Setenv("SERVICE_OBSERVABILITY_PROFILE_DIR", "/srv/profiles")
+	t.Setenv("SERVICE_OBSERVABILITY_CACHE_TTL", "10s")
+	t.Setenv("SERVICE_OBSERVABILITY_CACHE_MAX_STALE", "90s")
+	t.Setenv("SERVICE_OBSERVABILITY_CACHE_MAX_ENTRIES", "256")
+	t.Setenv("SERVICE_OBSERVABILITY_REFRESH_WORKERS", "8")
+	t.Setenv("SERVICE_OBSERVABILITY_REFRESH_QUEUE", "512")
+	t.Setenv("SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS", "7200")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	so = cfg.ServiceObservability
+	if so.ProfileDir != "/srv/profiles" || so.CacheTTL != 10*time.Second ||
+		so.CacheMaxStale != 90*time.Second || so.CacheMaxEntries != 256 ||
+		so.RefreshWorkers != 8 || so.RefreshQueue != 512 || so.MaxWindowSeconds != 7200 {
+		t.Fatalf("环境变量未覆盖 YAML: %+v", so)
+	}
+}
+
+// 非法值必须让启动失败，而不是静默退回默认值——否则"配置写错"会看起来像"配置生效了"。
+func TestLoad_ServiceObservabilityRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"TTL 非正", map[string]string{"SERVICE_OBSERVABILITY_CACHE_TTL": "0s"}, "cache_ttl"},
+		{"TTL 无法解析", map[string]string{"SERVICE_OBSERVABILITY_CACHE_TTL": "soon"}, "cache_ttl"},
+		{"max stale 小于 TTL", map[string]string{
+			"SERVICE_OBSERVABILITY_CACHE_TTL":       "60s",
+			"SERVICE_OBSERVABILITY_CACHE_MAX_STALE": "30s",
+		}, "cache_max_stale"},
+		{"max entries 非正", map[string]string{"SERVICE_OBSERVABILITY_CACHE_MAX_ENTRIES": "0"}, "cache_max_entries"},
+		{"max entries 非整数", map[string]string{"SERVICE_OBSERVABILITY_CACHE_MAX_ENTRIES": "many"}, "cache_max_entries"},
+		{"worker 非正", map[string]string{"SERVICE_OBSERVABILITY_REFRESH_WORKERS": "-1"}, "refresh_workers"},
+		{"queue 非正", map[string]string{"SERVICE_OBSERVABILITY_REFRESH_QUEUE": "0"}, "refresh_queue"},
+		{"窗口低于契约下界", map[string]string{"SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS": "30"}, "max_window_seconds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			_, err := Load("")
+			if err == nil {
+				t.Fatal("非法配置必须让 Load 失败")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("错误信息应指出具体配置项 %q，实际 %v", tc.want, err)
+			}
+		})
+	}
+}

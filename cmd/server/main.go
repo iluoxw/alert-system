@@ -196,6 +196,23 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
+
+	// ---- Service Observability 只读读路径：Profile Registry、alert-system adapter、
+	// Unavailable telemetry reader、共享 evaluator、目录摘要缓存与 facade 全部在
+	// internal/app 里装配，这里只注册 API 与关闭钩子。显式配置但不可读的 Profile 目录
+	// 或 resolver 基础设施错误都会让启动失败，避免误以为 Profile 已加载。----
+	serviceObs, err := app.BuildServiceObservability(ctx, st, cfg.ServiceObservability, logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), app.DefaultShutdownBudget)
+		defer cancel()
+		if err := serviceObs.Shutdown(shutdownCtx); err != nil {
+			logger.Error("alert-system: 关闭 Service Observability 刷新 worker 失败", "err", err)
+		}
+	}()
+	router.RegisterServiceObservabilityRoutes(serviceObs.PageViews)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)

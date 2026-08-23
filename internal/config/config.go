@@ -48,6 +48,21 @@ const (
 	defaultFlapWindowSeconds = 0
 	// defaultFlapThreshold 是窗口内状态翻转次数阈值，仅在窗口>0 时生效。
 	defaultFlapThreshold = 3
+
+	// Service Observability 目录摘要缓存与窗口上界的默认值。
+	//
+	// TTL 45s / max stale 5m 是设计稿的口径：目录读缓存，过期后仍可显式 Stale 展示，
+	// 超过 max stale 旧值必须彻底不可见。profile dir 默认为空——空目录是合法的空
+	// registry（总览 Unconfigured、工作区 409），只有显式配置且不可读才启动失败。
+	defaultServiceObservabilityCacheTTL         = 45 * time.Second
+	defaultServiceObservabilityCacheMaxStale    = 5 * time.Minute
+	defaultServiceObservabilityCacheMaxEntries  = 4096
+	defaultServiceObservabilityRefreshWorkers   = 4
+	defaultServiceObservabilityRefreshQueue     = 256
+	defaultServiceObservabilityMaxWindowSeconds = 86400
+	// minServiceObservabilityMaxWindowSeconds 与契约 policy.max_window_seconds 的下界
+	// 一致：低于它的配置会让所有工作区请求都超限，属于配置错误而不是从严策略。
+	minServiceObservabilityMaxWindowSeconds = 60
 )
 
 // Config 是服务启动所需的全部配置项。
@@ -72,6 +87,33 @@ type Config struct {
 	// 与翻转次数阈值；FlapWindowSeconds<=0 表示关闭（opt-in，默认关闭）。
 	FlapWindowSeconds int
 	FlapThreshold     int
+
+	// ServiceObservability 是 Service Observability 只读聚合边界的配置。
+	ServiceObservability ServiceObservabilityConfig
+}
+
+// ServiceObservabilityConfig 是 file-based Profile Registry 与目录摘要缓存的配置。
+//
+// 全部数值都必须为正且关系合法（max stale 不小于 TTL），非法值直接让启动失败：带着一个
+// 会立刻回收全部条目的缓存或一个无界刷新池上线，比没有缓存更糟。
+type ServiceObservabilityConfig struct {
+	// ProfileDir 为空表示未配置 Profile 目录：启动成功、registry 为空，总览显示
+	// Unconfigured、工作区 409。显式配置但不可读时启动失败，避免部署者误以为
+	// Profile 已加载。
+	ProfileDir string
+	// CacheTTL 是目录摘要的新鲜期。
+	CacheTTL time.Duration
+	// CacheMaxStale 是过期摘要仍可展示的最长时间，必须不小于 CacheTTL。
+	CacheMaxStale time.Duration
+	// CacheMaxEntries 是缓存条目硬上限。
+	CacheMaxEntries int
+	// RefreshWorkers / RefreshQueue 是 bounded stale-while-revalidate 的固定 worker 数
+	// 与队列容量。队列满时保留 Unknown/Stale，不额外起 goroutine。
+	RefreshWorkers int
+	RefreshQueue   int
+	// MaxWindowSeconds 是全局时间窗上界。每次请求的有效上界取它与 Profile limits
+	// 的最小值。
+	MaxWindowSeconds int
 }
 
 // SMTPConfig 是 email 通知渠道（R3）所需的 SMTP 凭据配置。Host 为空表示未配置，
@@ -146,6 +188,18 @@ type fileConfig struct {
 
 	FlapWindowSeconds int `yaml:"flap_window_seconds"`
 	FlapThreshold     int `yaml:"flap_threshold"`
+
+	ServiceObservability fileServiceObservabilityConfig `yaml:"service_observability"`
+}
+
+type fileServiceObservabilityConfig struct {
+	ProfileDir       string `yaml:"profile_dir"`
+	CacheTTL         string `yaml:"cache_ttl"`
+	CacheMaxStale    string `yaml:"cache_max_stale"`
+	CacheMaxEntries  int    `yaml:"cache_max_entries"`
+	RefreshWorkers   int    `yaml:"refresh_workers"`
+	RefreshQueue     int    `yaml:"refresh_queue"`
+	MaxWindowSeconds int    `yaml:"max_window_seconds"`
 }
 
 type fileSMTPConfig struct {
@@ -194,6 +248,14 @@ func Load(path string) (Config, error) {
 		},
 		FlapWindowSeconds: defaultFlapWindowSeconds,
 		FlapThreshold:     defaultFlapThreshold,
+		ServiceObservability: fileServiceObservabilityConfig{
+			CacheTTL:         defaultServiceObservabilityCacheTTL.String(),
+			CacheMaxStale:    defaultServiceObservabilityCacheMaxStale.String(),
+			CacheMaxEntries:  defaultServiceObservabilityCacheMaxEntries,
+			RefreshWorkers:   defaultServiceObservabilityRefreshWorkers,
+			RefreshQueue:     defaultServiceObservabilityRefreshQueue,
+			MaxWindowSeconds: defaultServiceObservabilityMaxWindowSeconds,
+		},
 	}
 
 	if path != "" {
@@ -236,6 +298,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	serviceObservability, err := normalizeServiceObservability(fc.ServiceObservability)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPPort:              fc.HTTPPort,
@@ -267,8 +333,62 @@ func Load(path string) (Config, error) {
 			SweepInterval:       retentionSweepInterval,
 			BatchSize:           fc.Retention.BatchSize,
 		},
-		FlapWindowSeconds: fc.FlapWindowSeconds,
-		FlapThreshold:     fc.FlapThreshold,
+		FlapWindowSeconds:    fc.FlapWindowSeconds,
+		FlapThreshold:        fc.FlapThreshold,
+		ServiceObservability: serviceObservability,
+	}, nil
+}
+
+// normalizeServiceObservability 解析并校验 Service Observability 配置。
+//
+// 校验是从严的：任何非正值或非法关系都返回错误让启动失败，而不是静默兜底成默认值——
+// 一个把 max stale 配得比 TTL 还小的部署会让缓存刚写入就被回收，看起来"缓存没生效"却
+// 没有任何报错。
+func normalizeServiceObservability(fc fileServiceObservabilityConfig) (ServiceObservabilityConfig, error) {
+	cacheTTL, err := time.ParseDuration(fc.CacheTTL)
+	if err != nil {
+		return ServiceObservabilityConfig{},
+			fmt.Errorf("invalid service_observability.cache_ttl %q: %w", fc.CacheTTL, err)
+	}
+	cacheMaxStale, err := time.ParseDuration(fc.CacheMaxStale)
+	if err != nil {
+		return ServiceObservabilityConfig{},
+			fmt.Errorf("invalid service_observability.cache_max_stale %q: %w", fc.CacheMaxStale, err)
+	}
+	if cacheTTL <= 0 {
+		return ServiceObservabilityConfig{},
+			fmt.Errorf("invalid service_observability.cache_ttl %q: must be positive", fc.CacheTTL)
+	}
+	if cacheMaxStale < cacheTTL {
+		return ServiceObservabilityConfig{}, fmt.Errorf(
+			"invalid service_observability.cache_max_stale %q: must not be shorter than cache_ttl %q",
+			fc.CacheMaxStale, fc.CacheTTL)
+	}
+	if fc.CacheMaxEntries <= 0 {
+		return ServiceObservabilityConfig{}, fmt.Errorf(
+			"invalid service_observability.cache_max_entries %d: must be positive", fc.CacheMaxEntries)
+	}
+	if fc.RefreshWorkers <= 0 {
+		return ServiceObservabilityConfig{}, fmt.Errorf(
+			"invalid service_observability.refresh_workers %d: must be positive", fc.RefreshWorkers)
+	}
+	if fc.RefreshQueue <= 0 {
+		return ServiceObservabilityConfig{}, fmt.Errorf(
+			"invalid service_observability.refresh_queue %d: must be positive", fc.RefreshQueue)
+	}
+	if fc.MaxWindowSeconds < minServiceObservabilityMaxWindowSeconds {
+		return ServiceObservabilityConfig{}, fmt.Errorf(
+			"invalid service_observability.max_window_seconds %d: must be at least %d",
+			fc.MaxWindowSeconds, minServiceObservabilityMaxWindowSeconds)
+	}
+	return ServiceObservabilityConfig{
+		ProfileDir:       strings.TrimSpace(fc.ProfileDir),
+		CacheTTL:         cacheTTL,
+		CacheMaxStale:    cacheMaxStale,
+		CacheMaxEntries:  fc.CacheMaxEntries,
+		RefreshWorkers:   fc.RefreshWorkers,
+		RefreshQueue:     fc.RefreshQueue,
+		MaxWindowSeconds: fc.MaxWindowSeconds,
 	}, nil
 }
 
@@ -367,6 +487,46 @@ func applyEnvOverrides(fc *fileConfig) {
 			fc.FlapThreshold = n
 		}
 	}
+	applyServiceObservabilityEnvOverrides(fc)
+}
+
+// applyServiceObservabilityEnvOverrides 覆盖 Service Observability 配置。
+//
+// 数值项刻意不吞掉解析失败：写错的环境变量必须让启动失败，而不是静默退回默认值让部署者
+// 以为自己调大了队列。duration 项原样交给 normalizeServiceObservability 解析，非法值同样
+// 变成启动错误。
+func applyServiceObservabilityEnvOverrides(fc *fileConfig) {
+	if v := os.Getenv("SERVICE_OBSERVABILITY_PROFILE_DIR"); v != "" {
+		fc.ServiceObservability.ProfileDir = v
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_CACHE_TTL"); v != "" {
+		fc.ServiceObservability.CacheTTL = v
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_CACHE_MAX_STALE"); v != "" {
+		fc.ServiceObservability.CacheMaxStale = v
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_CACHE_MAX_ENTRIES"); v != "" {
+		fc.ServiceObservability.CacheMaxEntries = invalidIfNotInteger(v)
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_REFRESH_WORKERS"); v != "" {
+		fc.ServiceObservability.RefreshWorkers = invalidIfNotInteger(v)
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_REFRESH_QUEUE"); v != "" {
+		fc.ServiceObservability.RefreshQueue = invalidIfNotInteger(v)
+	}
+	if v := os.Getenv("SERVICE_OBSERVABILITY_MAX_WINDOW_SECONDS"); v != "" {
+		fc.ServiceObservability.MaxWindowSeconds = invalidIfNotInteger(v)
+	}
+}
+
+// invalidIfNotInteger 把非整数环境变量映射成一个必然被校验拒绝的值（0），从而让启动
+// 失败。它不返回默认值：静默回落会让"配置写错"看起来像"配置生效了"。
+func invalidIfNotInteger(value string) int {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func normalizeOrigins(values []string) ([]string, error) {
