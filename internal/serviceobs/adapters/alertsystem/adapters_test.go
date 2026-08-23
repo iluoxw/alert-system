@@ -69,6 +69,10 @@ type fakeReader struct {
 	domainQuery store.DomainFactsQuery
 	domainErr   error
 
+	aliasResults []store.AliasLookupResult
+	aliasKeys    []store.AliasIdentityKey
+	aliasErr     error
+
 	calls map[string]int
 }
 
@@ -158,6 +162,36 @@ func (f *fakeReader) ReadDomainFacts(_ context.Context, query store.DomainFactsQ
 	f.record("ReadDomainFacts")
 	f.domainQuery = query
 	return f.domainRows, f.domainErr
+}
+
+func (f *fakeReader) LookupAliasesBatch(_ context.Context, identities []store.AliasIdentityKey) ([]store.AliasLookupResult, error) {
+	f.record("LookupAliasesBatch")
+	f.aliasKeys = identities
+	if f.aliasErr != nil {
+		return nil, f.aliasErr
+	}
+	return f.aliasResults, nil
+}
+
+type fakeAliasRunner struct {
+	reader *fakeReader
+	txs    int
+	err    error
+}
+
+func (r *fakeAliasRunner) WithRead(ctx context.Context, fn func(AliasBatchReader) error) error {
+	r.txs++
+	if r.err != nil {
+		return r.err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn(r.reader)
+}
+
+func newAliasRunner(reader *fakeReader) *fakeAliasRunner {
+	return &fakeAliasRunner{reader: reader}
 }
 
 // fakeRunner 把 fakeReader 交给 adapter，并记录开了几次只读事务。每个 adapter 调用必须
@@ -1298,6 +1332,128 @@ func TestProfileResolverSeparatesNotFoundFromInfrastructureError(t *testing.T) {
 func containsString(items []string, value string) bool {
 	for _, item := range items {
 		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAliasAdapterResolveBatchInOneReadTransaction(t *testing.T) {
+	reader := newFakeReader()
+	reader.aliasResults = []store.AliasLookupResult{{
+		Namespace: "service", Value: "api-a", MatchCount: 1,
+		Match: &store.AliasLookupMatch{
+			EntityID: entityUUID, EntityKey: "platform/example", Name: "Example",
+			Layer: domain.EntityLayerPlatform, Kind: domain.ResourceNodeKindInfrastructureCapability,
+		},
+	}}
+	runner := newAliasRunner(reader)
+	adapter := NewAliasAdapter(runner, AliasLimits{}, []string{"service"}, fixedClock)
+
+	resolution, err := adapter.ResolveAliases(context.Background(), []serviceobs.ExternalIdentity{
+		{Namespace: "service", Value: "api-a"},
+		{Namespace: "service", Value: "api-a"},
+		{Namespace: "datacenter", Value: "ignored"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveAliases 失败: %v", err)
+	}
+	if runner.txs != 1 {
+		t.Fatalf("应恰好一个只读事务，实际 %d", runner.txs)
+	}
+	if reader.calls["LookupAliasesBatch"] != 1 {
+		t.Fatal("必须批量查询而不是 N+1")
+	}
+	if len(reader.aliasKeys) != 1 || reader.aliasKeys[0].Value != "api-a" {
+		t.Fatalf("重复输入应 dedupe: %+v", reader.aliasKeys)
+	}
+	if len(resolution.Entries) != 1 || resolution.Entries[0].State != serviceobs.AliasResolved {
+		t.Fatalf("resolved entry 不符: %+v", resolution.Entries)
+	}
+	if resolution.Entries[0].Resolved == nil || resolution.Entries[0].Resolved.EntityKey == "" {
+		t.Fatal("resolved entry 必须携带 canonical metadata")
+	}
+	if !resolution.ReadAt.Equal(fixedNow) {
+		t.Fatalf("ReadAt 应来自注入时钟，实际 %v", resolution.ReadAt)
+	}
+}
+
+func TestAliasAdapterIssuesDoNotLeakAliasValues(t *testing.T) {
+	reader := newFakeReader()
+	reader.aliasResults = []store.AliasLookupResult{
+		{Namespace: "service", Value: "missing", MatchCount: 0},
+		{Namespace: "service", Value: "conflict", MatchCount: 2},
+	}
+	adapter := NewAliasAdapter(newAliasRunner(reader), AliasLimits{}, []string{"service"}, fixedClock)
+	resolution, err := adapter.ResolveAliases(context.Background(), []serviceobs.ExternalIdentity{
+		{Namespace: "service", Value: "missing"},
+		{Namespace: "service", Value: "conflict"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveAliases 失败: %v", err)
+	}
+	for _, issue := range resolution.Issues {
+		if issue.ReasonCode != serviceobs.ReasonAliasNotFound && issue.ReasonCode != serviceobs.ReasonAliasConflict {
+			t.Fatalf("未知 issue: %+v", issue)
+		}
+		if issue.Namespace != "service" {
+			t.Fatalf("issue namespace 不符: %+v", issue)
+		}
+	}
+	if !issueCount(resolution.Issues, serviceobs.ReasonAliasNotFound, "service", 1) {
+		t.Fatalf("not-found issue 不符: %+v", resolution.Issues)
+	}
+	if !issueCount(resolution.Issues, serviceobs.ReasonAliasConflict, "service", 1) {
+		t.Fatalf("conflict issue 不符: %+v", resolution.Issues)
+	}
+}
+
+func TestAliasAdapterRejectsDifferentNamespacesWithoutMerging(t *testing.T) {
+	reader := newFakeReader()
+	reader.aliasResults = []store.AliasLookupResult{
+		{Namespace: "dc", Value: "guangzhou", MatchCount: 1, Match: &store.AliasLookupMatch{EntityID: entityUUID, EntityKey: "platform/dc", Name: "DC"}},
+		{Namespace: "datacenter", Value: "dc1", MatchCount: 1, Match: &store.AliasLookupMatch{EntityID: providerUUID, EntityKey: "platform/other", Name: "Other"}},
+	}
+	adapter := NewAliasAdapter(newAliasRunner(reader), AliasLimits{}, []string{"dc", "datacenter"}, fixedClock)
+	resolution, err := adapter.ResolveAliases(context.Background(), []serviceobs.ExternalIdentity{
+		{Namespace: "dc", Value: "guangzhou"},
+		{Namespace: "datacenter", Value: "dc1"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveAliases 失败: %v", err)
+	}
+	if len(resolution.Entries) != 2 || resolution.Entries[0].Identity.Namespace == resolution.Entries[1].Identity.Namespace {
+		t.Fatalf("不同 namespace 必须分开返回: %+v", resolution.Entries)
+	}
+	if len(reader.aliasKeys) != 2 {
+		t.Fatalf("两个 namespace 必须分别查询: %+v", reader.aliasKeys)
+	}
+}
+
+func TestAliasAdapterBoundsAndAllowlist(t *testing.T) {
+	adapter := NewAliasAdapter(newAliasRunner(newFakeReader()), AliasLimits{MaxIdentities: 1}, []string{"service"}, fixedClock)
+	_, err := adapter.ResolveAliases(context.Background(), []serviceobs.ExternalIdentity{
+		{Namespace: "service", Value: "a"},
+		{Namespace: "service", Value: "b"},
+	})
+	if !errors.Is(err, serviceobs.ErrScopeTooBroad) {
+		t.Fatalf("超过 identity 上界应失败，实际 %v", err)
+	}
+
+	filtered, err := adapter.ResolveAliases(context.Background(), []serviceobs.ExternalIdentity{
+		{Namespace: "environment", Value: "prod"},
+	})
+	if err != nil {
+		t.Fatalf("allowlist 过滤后空输入失败: %v", err)
+	}
+	if len(filtered.Entries) != 0 || len(filtered.Issues) != 0 {
+		t.Fatalf("allowlist 外 namespace 应被忽略: %+v", filtered)
+	}
+}
+
+func issueCount(issues []serviceobs.ReconciliationIssue, reason, namespace string, count int) bool {
+	for _, issue := range issues {
+		if issue.ReasonCode == reason && issue.Namespace == namespace && issue.Count == count {
 			return true
 		}
 	}

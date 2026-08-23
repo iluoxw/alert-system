@@ -250,7 +250,7 @@ func insertObservabilityIncident(ctx context.Context, tx pgx.Tx, userID, faultID
 // countObservabilityRows 汇总被测表的行数，用来证明只读查询确实没有副作用。
 func countObservabilityRows(t *testing.T, ctx context.Context, st *Store) map[string]int {
 	t.Helper()
-	tables := []string{"resource_nodes", "dependency_edges", "service_registrations",
+	tables := []string{"resource_nodes", "dependency_edges", "service_registrations", "entity_aliases",
 		"alerts", "faults", "fault_alert_links", "fault_impacts", "incidents", "incident_fault_links"}
 	counts := map[string]int{}
 	for _, table := range tables {
@@ -816,4 +816,223 @@ func containsID(items []string, value string) bool {
 		}
 	}
 	return false
+}
+
+type aliasQueryCounter struct {
+	pgx.Tx
+	queries *int
+}
+
+func (t *aliasQueryCounter) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	*t.queries++
+	return t.Tx.Query(ctx, sql, args...)
+}
+
+func insertObservabilityAlias(ctx context.Context, tx pgx.Tx, namespace, value, entityID string, enabled bool) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO entity_aliases (namespace, alias_value, entity_id, enabled)
+		VALUES ($1, $2, $3::uuid, $4)
+	`, namespace, value, entityID, enabled)
+	return err
+}
+
+func TestServiceObservabilityAliasBatchLookupStates(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	fixture := seedObservabilityFixture(t, ctx, st)
+	repo := NewServiceObservabilityRepo()
+	topology := NewTopologyRepo()
+
+	var conflictEntityID string
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		conflict, err := topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
+			EntityKey: "platform/observability/conflict", Layer: domain.EntityLayerPlatform,
+			Kind: domain.ResourceNodeKindInfrastructureCapability, Name: "Conflict Owner",
+			Environment: "prod", OwnerTeamID: mustTeam(t, ctx, st, "alias-conflict-owner").ID, Managed: true,
+		})
+		if err != nil {
+			return err
+		}
+		conflictEntityID = conflict.ID
+		if err := insertObservabilityAlias(ctx, tx, "service", "resolved-api", fixture.primaryEntityID, true); err != nil {
+			return err
+		}
+		if err := insertObservabilityAlias(ctx, tx, "service", "conflict-host", fixture.providerEntityID, true); err != nil {
+			return err
+		}
+		return insertObservabilityAlias(ctx, tx, "service", "conflict-host", conflictEntityID, true)
+	}); err != nil {
+		t.Fatalf("seed alias fixture 失败: %v", err)
+	}
+
+	type wantState struct {
+		count    int
+		entityID string
+	}
+	cases := map[string]struct {
+		namespace string
+		value     string
+		want      wantState
+	}{
+		"not-found": {namespace: "service", value: "missing-host", want: wantState{count: 0}},
+		"resolved":  {namespace: "service", value: "resolved-api", want: wantState{count: 1, entityID: fixture.primaryEntityID}},
+		"conflict":  {namespace: "service", value: "conflict-host", want: wantState{count: 2}},
+	}
+
+	var results []AliasLookupResult
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		keys := []AliasIdentityKey{
+			{Namespace: "service", Value: "missing-host"},
+			{Namespace: "service", Value: "resolved-api"},
+			{Namespace: "service", Value: "conflict-host"},
+			{Namespace: "service", Value: "resolved-api"},
+		}
+		var err error
+		results, err = repo.LookupAliasesBatch(ctx, &aliasQueryCounter{Tx: tx, queries: new(int)}, keys)
+		return err
+	}); err != nil {
+		t.Fatalf("LookupAliasesBatch 失败: %v", err)
+	}
+
+	if len(results) != 3 {
+		t.Fatalf("duplicate input 应只返回 3 个稳定 entry，实际 %d: %+v", len(results), results)
+	}
+	byValue := map[string]AliasLookupResult{}
+	for _, result := range results {
+		byValue[result.Value] = result
+	}
+	for name, tc := range cases {
+		result, ok := byValue[tc.value]
+		if !ok {
+			t.Fatalf("缺少 %s 结果", name)
+		}
+		if result.MatchCount != tc.want.count {
+			t.Fatalf("%s MatchCount=%d want %d", name, result.MatchCount, tc.want.count)
+		}
+		if tc.want.count == 1 {
+			if result.Match == nil || result.Match.EntityID != tc.want.entityID {
+				t.Fatalf("%s 应返回 canonical metadata: %+v", name, result.Match)
+			}
+			if result.Match.EntityKey == "" || result.Match.Name == "" {
+				t.Fatalf("%s metadata 不完整: %+v", name, result.Match)
+			}
+		}
+		if tc.want.count != 1 && result.Match != nil {
+			t.Fatalf("%s 不应返回 Match: %+v", name, result.Match)
+		}
+	}
+}
+
+func TestServiceObservabilityAliasBatchLookupEmptyAndBounds(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	repo := NewServiceObservabilityRepo()
+
+	var empty []AliasLookupResult
+	queryCount := 0
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		counter := &aliasQueryCounter{Tx: tx, queries: &queryCount}
+		var err error
+		empty, err = repo.LookupAliasesBatch(ctx, counter, nil)
+		return err
+	}); err != nil {
+		t.Fatalf("空输入查询失败: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("空输入应返回空结果: %+v", empty)
+	}
+	if queryCount != 0 {
+		t.Fatalf("空输入不应查库，实际 query count=%d", queryCount)
+	}
+
+	keys := make([]AliasIdentityKey, MaxAliasBatchIdentities+1)
+	for i := range keys {
+		keys[i] = AliasIdentityKey{Namespace: "service", Value: "too-many-" + string(rune('a'+i%26))}
+	}
+	err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		_, lookupErr := repo.LookupAliasesBatch(ctx, tx, keys)
+		return lookupErr
+	})
+	if !errors.Is(err, ErrAliasBatchTooLarge) {
+		t.Fatalf("超界应返回 ErrAliasBatchTooLarge，实际 %v", err)
+	}
+}
+
+func TestServiceObservabilityAliasBatchLookupUsesSingleQuery(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	fixture := seedObservabilityFixture(t, ctx, st)
+	repo := NewServiceObservabilityRepo()
+
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		return insertObservabilityAlias(ctx, tx, "service", "batch-a", fixture.rootEntityID, true)
+	}); err != nil {
+		t.Fatalf("seed alias 失败: %v", err)
+	}
+
+	before := countObservabilityRows(t, ctx, st)
+	queryCount := 0
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		counter := &aliasQueryCounter{Tx: tx, queries: &queryCount}
+		keys := []AliasIdentityKey{
+			{Namespace: "service", Value: "batch-a"},
+			{Namespace: "service", Value: "missing-b"},
+			{Namespace: "service", Value: "missing-c"},
+		}
+		results, err := repo.LookupAliasesBatch(ctx, counter, keys)
+		if err != nil {
+			return err
+		}
+		if len(results) != 3 {
+			t.Fatalf("结果数=%d want 3", len(results))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("批量 alias 查询失败: %v", err)
+	}
+	if queryCount != 1 {
+		t.Fatalf("批量 alias 查询应使用单条 SQL，实际 query count=%d", queryCount)
+	}
+	after := countObservabilityRows(t, ctx, st)
+	for table, count := range before {
+		if after[table] != count {
+			t.Fatalf("%s 行数被改写: %d -> %d", table, count, after[table])
+		}
+	}
+	if _, ok := before["entity_aliases"]; !ok {
+		t.Fatal("entity_aliases 应纳入只读断言")
+	}
+}
+
+func TestServiceObservabilityAliasBatchLookupDisabledClaimIgnored(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	fixture := seedObservabilityFixture(t, ctx, st)
+	repo := NewServiceObservabilityRepo()
+
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := insertObservabilityAlias(ctx, tx, "service", "disabled-only", fixture.secondaryEntityID, false); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed disabled alias 失败: %v", err)
+	}
+
+	var result AliasLookupResult
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		results, err := repo.LookupAliasesBatch(ctx, tx, []AliasIdentityKey{
+			{Namespace: "service", Value: "disabled-only"},
+		})
+		if err != nil {
+			return err
+		}
+		result = results[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("LookupAliasesBatch 失败: %v", err)
+	}
+	if result.MatchCount != 0 {
+		t.Fatalf("disabled claim 不应计入，实际 MatchCount=%d", result.MatchCount)
+	}
 }
