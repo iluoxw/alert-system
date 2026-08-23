@@ -1,0 +1,463 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.alert-system.invalid/service-integration-package/v1/service-integration-package.schema.json",
+  "title": "Service Integration Package v1",
+  "description": "声明式服务接入单元。它是静态、可校验、可审查的文档，不是动态执行插件：只能选择受信 provider template 并传递类型化参数，编译后生成使用真实 ID 的 Service Observability Profile v1。每一层对象都是 additionalProperties=false，因此任何未在此声明的键都无法进入文档。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_key",
+    "package_version",
+    "status",
+    "compatibility",
+    "target",
+    "profile_template",
+    "telemetry_bindings",
+    "topology_policy"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "package_key": { "$ref": "#/$defs/packageKey" },
+    "package_version": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "status": { "enum": ["draft", "published"] },
+    "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "compatibility": { "$ref": "#/$defs/compatibility" },
+    "target": { "$ref": "#/$defs/target" },
+    "profile_template": { "$ref": "#/$defs/profileTemplate" },
+    "telemetry_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": { "$ref": "#/$defs/telemetryBinding" }
+    },
+    "topology_policy": { "$ref": "#/$defs/topologyPolicy" }
+  },
+  "$defs": {
+    "packageKey": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+    },
+    "objectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+
+    "entityKey": {
+      "description": "canonical entity key。与 alert-system 写入侧的 entity_key 口径逐字一致，因此 selector 无法表达系统装不下的身份。",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._:/-]{2,127}$"
+    },
+    "entitySelector": {
+      "description": "按稳定 entity_key 选择一个 canonical 对象。刻意不接受 UUID：UUID 每个环境都不同，package 必须跨环境可移植，真实 ID 由 compiler 在发布前解析。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_key"],
+      "properties": {
+        "entity_key": { "$ref": "#/$defs/entityKey" }
+      }
+    },
+
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_schema_version", "min_compiler_version"],
+      "properties": {
+        "profile_schema_version": { "const": "1.0" },
+        "min_compiler_version": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["environment", "service_selector", "root_selectors"],
+      "properties": {
+        "environment": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z][a-z0-9_-]*$" },
+        "service_selector": { "$ref": "#/$defs/entitySelector" },
+        "root_selectors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/entitySelector" }
+        }
+      }
+    },
+
+    "profileTemplate": {
+      "description": "编译目标 Profile 的声明部分。它刻意不含 service_ref / profile_version / status：那三项由 compiler 从 target 解析与 package 元数据生成，package 作者不能手写真实 ID。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_key", "focus_kinds", "journeys", "views", "signal_bindings", "tool_refs", "limits"],
+      "properties": {
+        "profile_key": { "$ref": "#/$defs/objectKey" },
+        "focus_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/focusKind" }
+        },
+        "journeys": {
+          "description": "允许为空数组：非请求旅程型服务（例如数据库实例）没有 journey，这是结构差异而不是缺陷。",
+          "type": "array",
+          "maxItems": 30,
+          "items": { "$ref": "#/$defs/journey" }
+        },
+        "views": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/view" }
+        },
+        "signal_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/signalBinding" }
+        },
+        "tool_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/toolKey" }
+        },
+        "limits": { "$ref": "#/$defs/limits" }
+      }
+    },
+    "focusKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "value_pattern", "primary"],
+      "properties": {
+        "key": { "$ref": "#/$defs/objectKey" },
+        "label": { "$ref": "#/$defs/label" },
+        "value_pattern": {
+          "description": "必须能被 Go RE2 编译。它只用于校验用户输入的 focus 值，绝不参与查询构造。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "placeholder": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "primary": { "type": "boolean" }
+      }
+    },
+    "journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "focus_kind", "stages"],
+      "properties": {
+        "key": { "$ref": "#/$defs/objectKey" },
+        "label": { "$ref": "#/$defs/label" },
+        "focus_kind": { "$ref": "#/$defs/objectKey" },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/journeyStage" }
+        }
+      }
+    },
+    "journeyStage": {
+      "description": "stage 的 canonical 引用同样使用 entity selector，由 compiler 解析成真实 ID。stage 状态本身只能来自受信 adapter 的观测事实，package 不能声明状态。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label"],
+      "properties": {
+        "key": { "$ref": "#/$defs/objectKey" },
+        "label": { "$ref": "#/$defs/label" },
+        "entity_selectors": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/entitySelector" }
+        },
+        "relation_selectors": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relationSelector" }
+        }
+      }
+    },
+    "relationSelector": {
+      "description": "按两端 entity_key 与 canonical 关系类型选择一条依赖边。方向固定 consumer/caller -> provider/callee。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_entity_key", "to_entity_key", "kind"],
+      "properties": {
+        "from_entity_key": { "$ref": "#/$defs/entityKey" },
+        "to_entity_key": { "$ref": "#/$defs/entityKey" },
+        "kind": { "enum": ["depends_on", "part_of"] }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "renderer", "title", "order"],
+      "properties": {
+        "key": { "$ref": "#/$defs/objectKey" },
+        "renderer": {
+          "description": "只能选择服务端已实现的有限通用 renderer。package 不能上传前端代码，也不能新增 renderer。",
+          "enum": [
+            "golden_overview",
+            "request_journey",
+            "dependency_topology",
+            "resource_fleet",
+            "evidence_list",
+            "domain_timeline"
+          ]
+        },
+        "title": { "$ref": "#/$defs/label" },
+        "order": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "journey_ref": { "$ref": "#/$defs/objectKey" },
+        "signal_refs": {
+          "type": "array",
+          "maxItems": 60,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/objectKey" }
+        },
+        "tool_refs": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/toolKey" }
+        }
+      }
+    },
+    "signalBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "family", "semantic", "scope", "tool_key", "output_field", "unit", "aggregation"],
+      "properties": {
+        "key": { "$ref": "#/$defs/objectKey" },
+        "label": { "$ref": "#/$defs/label" },
+        "family": { "enum": ["golden", "red", "use"] },
+        "semantic": {
+          "enum": [
+            "latency",
+            "traffic",
+            "errors",
+            "saturation",
+            "rate",
+            "duration",
+            "utilization"
+          ]
+        },
+        "scope": { "$ref": "#/$defs/signalScope" },
+        "tool_key": { "$ref": "#/$defs/toolKey" },
+        "output_field": {
+          "description": "必须是所引用 provider template 声明的输出字段之一；compiler 交叉校验，不接受任意路径。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+        },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 20, "pattern": "^[A-Za-z%/_]+$" },
+        "aggregation": { "enum": ["sum", "avg", "max", "min", "count", "rate", "p50", "p95", "p99"] },
+        "measurement_role": { "enum": ["direct", "proxy"] },
+        "proxy_reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "baseline_ref": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "thresholds": { "$ref": "#/$defs/thresholds" }
+      }
+    },
+    "signalScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["service", "entity", "relation", "resource"] },
+        "entity_selectors": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/entitySelector" }
+        },
+        "relation_selectors": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relationSelector" }
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "direction", "degraded", "critical"],
+      "properties": {
+        "mode": { "enum": ["absolute", "baseline_deviation"] },
+        "direction": { "enum": ["above", "below"] },
+        "degraded": { "type": "number" },
+        "critical": { "type": "number" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_window_seconds",
+        "max_window_seconds",
+        "max_nodes",
+        "max_relations",
+        "max_rows",
+        "max_evidence_refs",
+        "freshness_ttl_seconds"
+      ],
+      "properties": {
+        "default_window_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 },
+        "max_window_seconds": { "type": "integer", "minimum": 60, "maximum": 604800 },
+        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "max_relations": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_evidence_refs": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "freshness_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+      }
+    },
+    "toolKey": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
+    },
+
+    "telemetryBinding": {
+      "description": "把一个 signal binding 绑到一个受信 provider template 上。package 只能给出 template ref 与类型化参数；PromQL/SQL 由服务端 adapter 从模板构造，package 永远提交不了查询文本。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding_key", "template_ref", "params"],
+      "properties": {
+        "binding_key": { "$ref": "#/$defs/objectKey" },
+        "template_ref": { "$ref": "#/$defs/templateRef" },
+        "params": { "$ref": "#/$defs/templateParams" }
+      }
+    },
+    "templateRef": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*\\.v[1-9][0-9]*$"
+    },
+    "templateParams": {
+      "description": "参数槽位是封闭集合：每个槽位都有固定语义与严格形状。compiler 再按 template 声明校验必填/禁止，因此未知 template 或错配参数都无法发布。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metric": { "$ref": "#/$defs/metricIdentifier" },
+        "numerator_metric": { "$ref": "#/$defs/metricIdentifier" },
+        "denominator_metric": { "$ref": "#/$defs/metricIdentifier" },
+        "bucket_metric": { "$ref": "#/$defs/metricIdentifier" },
+        "total_metric": { "$ref": "#/$defs/metricIdentifier" },
+        "free_metric": { "$ref": "#/$defs/metricIdentifier" },
+        "labels": { "$ref": "#/$defs/labelEqualitySet" },
+        "group_by": {
+          "type": "array",
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/fieldIdentifier" }
+        },
+        "quantile": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+        "range_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "stream": { "$ref": "#/$defs/streamIdentifier" },
+        "focus_field": { "$ref": "#/$defs/fieldIdentifier" },
+        "stage_field": { "$ref": "#/$defs/fieldIdentifier" },
+        "status_field": { "$ref": "#/$defs/fieldIdentifier" },
+        "select_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/fieldIdentifier" }
+        },
+        "row_limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "metricIdentifier": {
+      "description": "Prometheus metric 名的合法字符集。它不接受空格、括号、引号、逗号或任何运算符，因此参数位无法夹带表达式。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[a-zA-Z_:][a-zA-Z0-9_:]*$"
+    },
+    "fieldIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+    },
+    "streamIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    },
+    "labelEqualitySet": {
+      "description": "只允许 label 等值对。名字必须是 identifier，值必须是严格字面量：字符集里没有 * ~ ! | ( ) { } \" ' \\ 与空白，因此 regex、否定与集合选择器在语法层面就无法表达。",
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": { "$ref": "#/$defs/fieldIdentifier" },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:/@+-]+$"
+          }
+        }
+      }
+    },
+
+    "topologyPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias_namespaces", "overlay"],
+      "properties": {
+        "alias_namespaces": {
+          "description": "discovery 得到的 external identity 只能按这里声明的 namespace 归一化。namespace 不在白名单内的 hint 一律 Unknown，不建实体。",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/objectKey" }
+        },
+        "discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity_fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 10,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/fieldIdentifier" }
+            },
+            "instance_role": {
+              "description": "component 表示这是稳定逻辑组件，instance 表示它是会随副本变化的实例清单成员。实例数量变化不得被解释成组件拓扑变更。",
+              "enum": ["component", "instance"]
+            }
+          }
+        },
+        "overlay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stale_after_seconds"],
+          "properties": {
+            "stale_after_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+            "max_hints": { "type": "integer", "minimum": 1, "maximum": 500 }
+          }
+        }
+      }
+    }
+  }
+}

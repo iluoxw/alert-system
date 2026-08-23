@@ -1,0 +1,390 @@
+{
+  "schema_version": "1.0",
+  "package_key": "e2b",
+  "package_version": 1,
+  "status": "draft",
+  "description": "E2B 首个 Service Integration Package（draft）。metric 名与 label 取 OTel spanmetrics connector 与 node_exporter 的上游默认形状，尚未经运行时 discovery 确认，因此 status 保持 draft，编译产物也只能是 draft Profile。USE Saturation 与 USE Errors 刻意不声明：placement admission wait/queue 的直接指标尚未确认存在，宁可让该槽位缺席并保持 Unknown，也不复用 utilization 冒充 saturation。",
+  "compatibility": {
+    "profile_schema_version": "1.0",
+    "min_compiler_version": 1
+  },
+  "target": {
+    "environment": "production",
+    "service_selector": { "entity_key": "platform:e2b" },
+    "root_selectors": [
+      { "entity_key": "platform:e2b:api" },
+      { "entity_key": "platform:e2b:orchestrator" }
+    ]
+  },
+  "profile_template": {
+    "profile_key": "e2b",
+    "focus_kinds": [
+      {
+        "key": "sandbox_id",
+        "label": "Sandbox ID",
+        "value_pattern": "^sbx_[A-Za-z0-9]+$",
+        "placeholder": "sbx_hp16c3",
+        "primary": true
+      },
+      {
+        "key": "trace_id",
+        "label": "Trace ID",
+        "value_pattern": "^[A-Fa-f0-9]{16,32}$",
+        "placeholder": "输入 Trace ID",
+        "primary": false
+      }
+    ],
+    "journeys": [
+      {
+        "key": "sandbox_create",
+        "label": "Sandbox 创建阶段",
+        "focus_kind": "sandbox_id",
+        "stages": [
+          {
+            "key": "accept",
+            "label": "ACCEPT",
+            "entity_selectors": [{ "entity_key": "platform:e2b:api" }]
+          },
+          {
+            "key": "place",
+            "label": "PLACE",
+            "entity_selectors": [{ "entity_key": "platform:e2b:orchestrator" }],
+            "relation_selectors": [
+              {
+                "from_entity_key": "platform:e2b:api",
+                "to_entity_key": "platform:e2b:orchestrator",
+                "kind": "depends_on"
+              }
+            ]
+          },
+          {
+            "key": "fc_start",
+            "label": "FC START",
+            "entity_selectors": [{ "entity_key": "infrastructure:e2b:sandbox-pool" }]
+          },
+          {
+            "key": "envd_ready",
+            "label": "ENVD READY",
+            "entity_selectors": [{ "entity_key": "infrastructure:e2b:sandbox-pool" }]
+          },
+          {
+            "key": "routed",
+            "label": "ROUTED",
+            "entity_selectors": [{ "entity_key": "platform:e2b:api" }]
+          }
+        ]
+      }
+    ],
+    "views": [
+      {
+        "key": "overview",
+        "renderer": "golden_overview",
+        "title": "四大黄金信号",
+        "order": 10,
+        "signal_refs": [
+          "golden_create_latency",
+          "golden_create_traffic",
+          "golden_create_errors",
+          "golden_capacity_saturation"
+        ],
+        "tool_refs": ["metrics.query_semantic_signal.v1"]
+      },
+      {
+        "key": "create_journey",
+        "renderer": "request_journey",
+        "title": "Sandbox 创建阶段",
+        "order": 20,
+        "journey_ref": "sandbox_create",
+        "tool_refs": ["context.resolve_focus.v1", "evidence.search_traces.v1"]
+      },
+      {
+        "key": "request_topology",
+        "renderer": "dependency_topology",
+        "title": "请求与依赖拓扑",
+        "order": 30,
+        "signal_refs": [
+          "red_api_orchestrator_rate",
+          "red_api_orchestrator_errors",
+          "red_api_orchestrator_duration"
+        ],
+        "tool_refs": ["topology.expand_neighbors.v1", "metrics.query_semantic_signal.v1"]
+      },
+      {
+        "key": "host_capacity",
+        "renderer": "resource_fleet",
+        "title": "宿主机与资源池",
+        "order": 40,
+        "signal_refs": ["use_host_hugepages_utilization"],
+        "tool_refs": ["metrics.query_semantic_signal.v1"]
+      },
+      {
+        "key": "evidence",
+        "renderer": "evidence_list",
+        "title": "证据",
+        "order": 50,
+        "tool_refs": ["evidence.search_logs.v1", "evidence.search_traces.v1"]
+      },
+      {
+        "key": "timeline",
+        "renderer": "domain_timeline",
+        "title": "事件时间线",
+        "order": 60,
+        "tool_refs": ["domain.list_service_faults.v1"]
+      }
+    ],
+    "signal_bindings": [
+      {
+        "key": "golden_create_latency",
+        "label": "创建延迟 P95",
+        "family": "golden",
+        "semantic": "latency",
+        "scope": { "kind": "service" },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.quantile_value",
+        "unit": "ms",
+        "aggregation": "p95",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 3000, "critical": 8000 }
+      },
+      {
+        "key": "golden_create_traffic",
+        "label": "创建流量",
+        "family": "golden",
+        "semantic": "traffic",
+        "scope": { "kind": "service" },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.rate_per_second",
+        "unit": "req/s",
+        "aggregation": "rate"
+      },
+      {
+        "key": "golden_create_errors",
+        "label": "创建错误率",
+        "family": "golden",
+        "semantic": "errors",
+        "scope": { "kind": "service" },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.ratio_percent",
+        "unit": "%",
+        "aggregation": "avg",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 5, "critical": 15 }
+      },
+      {
+        "key": "golden_capacity_saturation",
+        "label": "最坏容量压力 proxy",
+        "family": "golden",
+        "semantic": "saturation",
+        "scope": { "kind": "service" },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.ratio_percent",
+        "unit": "%",
+        "aggregation": "max",
+        "measurement_role": "proxy",
+        "proxy_reason": "placement admission wait/queue 的直接指标尚未确认存在；这里用宿主 HugePages 使用率作为容量压力 proxy，页面必须显式标注 proxy，不得称为真实 saturation。",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 85, "critical": 95 }
+      },
+      {
+        "key": "red_api_orchestrator_rate",
+        "label": "API 到 Orchestrator 请求率",
+        "family": "red",
+        "semantic": "rate",
+        "scope": {
+          "kind": "relation",
+          "relation_selectors": [
+            {
+              "from_entity_key": "platform:e2b:api",
+              "to_entity_key": "platform:e2b:orchestrator",
+              "kind": "depends_on"
+            }
+          ]
+        },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.rate_per_second",
+        "unit": "req/s",
+        "aggregation": "rate"
+      },
+      {
+        "key": "red_api_orchestrator_errors",
+        "label": "API 到 Orchestrator 错误率",
+        "family": "red",
+        "semantic": "errors",
+        "scope": {
+          "kind": "relation",
+          "relation_selectors": [
+            {
+              "from_entity_key": "platform:e2b:api",
+              "to_entity_key": "platform:e2b:orchestrator",
+              "kind": "depends_on"
+            }
+          ]
+        },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.ratio_percent",
+        "unit": "%",
+        "aggregation": "avg",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 2, "critical": 5 }
+      },
+      {
+        "key": "red_api_orchestrator_duration",
+        "label": "API 到 Orchestrator P95",
+        "family": "red",
+        "semantic": "duration",
+        "scope": {
+          "kind": "relation",
+          "relation_selectors": [
+            {
+              "from_entity_key": "platform:e2b:api",
+              "to_entity_key": "platform:e2b:orchestrator",
+              "kind": "depends_on"
+            }
+          ]
+        },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.quantile_value",
+        "unit": "ms",
+        "aggregation": "p95",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 1000, "critical": 3000 }
+      },
+      {
+        "key": "use_host_hugepages_utilization",
+        "label": "宿主 HugePages 使用率",
+        "family": "use",
+        "semantic": "utilization",
+        "scope": {
+          "kind": "resource",
+          "entity_selectors": [{ "entity_key": "infrastructure:e2b:host-fleet" }]
+        },
+        "tool_key": "metrics.query_semantic_signal.v1",
+        "output_field": "series.ratio_percent",
+        "unit": "%",
+        "aggregation": "max",
+        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 85, "critical": 95 }
+      }
+    ],
+    "tool_refs": [
+      "context.resolve_focus.v1",
+      "topology.expand_neighbors.v1",
+      "metrics.query_semantic_signal.v1",
+      "evidence.search_logs.v1",
+      "evidence.search_traces.v1",
+      "domain.list_service_faults.v1"
+    ],
+    "limits": {
+      "default_window_seconds": 300,
+      "max_window_seconds": 86400,
+      "max_nodes": 100,
+      "max_relations": 200,
+      "max_rows": 200,
+      "max_evidence_refs": 100,
+      "freshness_ttl_seconds": 60
+    }
+  },
+  "telemetry_bindings": [
+    {
+      "binding_key": "golden_create_latency",
+      "template_ref": "histogram_quantile_rate.v1",
+      "params": {
+        "bucket_metric": "traces_spanmetrics_latency_bucket",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "span_name", "value": "SandboxCreate" }
+        ],
+        "quantile": 0.95,
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "golden_create_traffic",
+      "template_ref": "counter_rate.v1",
+      "params": {
+        "metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "span_name", "value": "SandboxCreate" }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "golden_create_errors",
+      "template_ref": "counter_ratio_percent.v1",
+      "params": {
+        "numerator_metric": "traces_spanmetrics_calls_total",
+        "denominator_metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "span_name", "value": "SandboxCreate" }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "golden_capacity_saturation",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "node_memory_HugePages_Total",
+        "free_metric": "node_memory_HugePages_Free",
+        "labels": [{ "name": "job", "value": "node-exporter" }],
+        "group_by": ["instance"]
+      }
+    },
+    {
+      "binding_key": "red_api_orchestrator_rate",
+      "template_ref": "counter_rate.v1",
+      "params": {
+        "metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "peer_service", "value": "e2b-orchestrator" }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "red_api_orchestrator_errors",
+      "template_ref": "counter_ratio_percent.v1",
+      "params": {
+        "numerator_metric": "traces_spanmetrics_calls_total",
+        "denominator_metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "peer_service", "value": "e2b-orchestrator" }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "red_api_orchestrator_duration",
+      "template_ref": "histogram_quantile_rate.v1",
+      "params": {
+        "bucket_metric": "traces_spanmetrics_latency_bucket",
+        "labels": [
+          { "name": "service_name", "value": "e2b-api" },
+          { "name": "peer_service", "value": "e2b-orchestrator" }
+        ],
+        "quantile": 0.95,
+        "range_seconds": 300
+      }
+    },
+    {
+      "binding_key": "use_host_hugepages_utilization",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "node_memory_HugePages_Total",
+        "free_metric": "node_memory_HugePages_Free",
+        "labels": [{ "name": "job", "value": "node-exporter" }],
+        "group_by": ["instance"]
+      }
+    }
+  ],
+  "topology_policy": {
+    "alias_namespaces": ["otel_service", "host_instance", "sandbox_pool"],
+    "discovery": {
+      "identity_fields": ["service_name", "peer_service", "instance"],
+      "instance_role": "instance"
+    },
+    "overlay": {
+      "stale_after_seconds": 300,
+      "max_hints": 200
+    }
+  }
+}

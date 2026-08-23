@@ -135,11 +135,9 @@ func scanForbiddenKeys(value any, path string) (string, bool) {
 	return "", false
 }
 
-// toolCatalog 是 Registry 需要的 catalog 能力子集。用接口注入，profile 包因此不依赖
-// tools 包的加载方式，测试可以给一个最小 fake。
-type toolCatalog interface {
-	Has(key string) bool
-}
+// toolCatalog 是 Registry 需要的 catalog 能力子集，等同于导出的 ToolCatalog。
+// 用别名而不是重复声明：两处方法集不可能漂移。
+type toolCatalog = ToolCatalog
 
 // validateStructure 执行 Task 3 校验顺序里的第 5、6 步：focus/journey/view/signal 的
 // 键唯一性、引用完整性、阈值合法性、proxy 自证，以及 golden binding 与 golden_overview
