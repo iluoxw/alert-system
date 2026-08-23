@@ -153,9 +153,9 @@ Provider 认证模式显式为 `none|basic|bearer`（OpenObserve 实测是 Basic
 的 env 或文件提供，文件必须是常规文件且不超过 4 KiB。endpoint 未配置却声明凭据会让启动失败。
 
 配置结构的 `String`/`GoString`/`MarshalJSON`/`LogValue` 全部只输出安全表示：连 username 与
-organization 都不输出，因此把整份配置打进日志或做一次 `json.Marshal` 都不会泄露。生产仍然只接受
-HTTPS，没有任何 YAML 或环境变量开关能切换到明文；UAT 仅 HTTP 是外部发布 blocker，不在本仓库
-加绕过。
+organization 都不输出，因此把整份配置打进日志或做一次 `json.Marshal` 都不会泄露。生产只接受
+HTTPS，没有任何 YAML 或环境变量开关能切换到明文——这条不变量不因某个环境当下是否可达而放宽，
+需要明文时只能在该环境侧配 TLS。
 
 ## 校验
 
