@@ -21,6 +21,8 @@ var (
 	ErrSchemaError = errors.New("openobserve: 上游 schema 或 SQL 错误")
 	// ErrParseResponse 表示响应体无法按契约解析。
 	ErrParseResponse = errors.New("openobserve: 响应解析失败")
+	// ErrInvalidIdentityMapping 表示 compiled artifact 含重复 identity role 等非法映射。
+	ErrInvalidIdentityMapping = errors.New("openobserve: identity mapping 非法")
 )
 
 // mapHTTPError 把 HTTP 状态与 provider 错误映射为 observe sentinel。

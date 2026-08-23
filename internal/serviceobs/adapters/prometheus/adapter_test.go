@@ -3,6 +3,8 @@ package prometheus_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"alert-system/internal/serviceobs/adapters/prometheus"
 	"alert-system/internal/serviceobs/integration"
 	"alert-system/internal/serviceobs/model"
+	"alert-system/internal/serviceobs/observe"
 	"alert-system/internal/serviceobs/provider"
 )
 
@@ -304,5 +307,64 @@ func TestDiscoverManifest_bounded(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "Authorization") || strings.Contains(string(raw), "10.0.0.1") {
 		t.Fatalf("manifest leaked sensitive/sample data: %s", raw)
+	}
+}
+
+func TestReadSignals_upstreamAuthFailure(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	adapter := prometheus.NewAdapter(prometheus.Options{Client: client})
+	_, err := adapter.ReadSignals(context.Background(), serviceobs.SignalRequest{
+		Purpose: serviceobs.PurposeDirectorySummary,
+		Bindings: []integration.CompiledBinding{
+			prometheusBinding("counter_rate.v1", integration.TemplateParams{
+				Metric: "http_requests_total", RangeSeconds: intPtr(60),
+			}),
+		},
+		Limits: serviceobs.SourceLimits{MaxSeries: 10},
+	})
+	if !errors.Is(err, observe.ErrUpstreamAuthFailed) {
+		t.Fatalf("err=%v want ErrUpstreamAuthFailed", err)
+	}
+}
+
+func TestReadSignals_networkFailureStaysReadFailed(t *testing.T) {
+	endpoint, err := provider.ParseEndpoint("http://127.0.0.1:1", provider.ModeLoopbackTest)
+	if err != nil {
+		t.Fatalf("ParseEndpoint: %v", err)
+	}
+	client, err := provider.NewClient(provider.ClientOptions{
+		Endpoint: endpoint,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return nil, errors.New("connection refused")
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	adapter := prometheus.NewAdapter(prometheus.Options{Client: client})
+	facts, err := adapter.ReadSignals(context.Background(), serviceobs.SignalRequest{
+		Purpose: serviceobs.PurposeDirectorySummary,
+		Bindings: []integration.CompiledBinding{
+			prometheusBinding("counter_rate.v1", integration.TemplateParams{
+				Metric: "http_requests_total", RangeSeconds: intPtr(60),
+			}),
+		},
+		Limits: serviceobs.SourceLimits{MaxSeries: 10},
+	})
+	if err != nil {
+		t.Fatalf("network failure should not surface as auth error: %v", err)
+	}
+	if len(facts.Signals) != 1 {
+		t.Fatalf("signals=%+v", facts.Signals)
+	}
+	if facts.Signals[0].UnknownReason != serviceobs.ReasonSourceReadFailed {
+		t.Fatalf("reason=%q want source_read_failed", facts.Signals[0].UnknownReason)
+	}
+	if facts.Source.ReasonCode != serviceobs.ReasonSourceReadFailed {
+		t.Fatalf("source reason=%q want source_read_failed", facts.Source.ReasonCode)
 	}
 }

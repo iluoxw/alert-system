@@ -353,6 +353,7 @@ type TraceFacts struct {
 	Focus         FocusResult
 	JourneyStages []JourneyStageObservation
 	TopologyHints []ObservedTopologyHint
+	InstanceHints []ObservedInstanceHint
 	EvidenceRefs  []model.EvidenceRef
 	Issues        []ReconciliationIssue
 	Source        health.SourceObservation

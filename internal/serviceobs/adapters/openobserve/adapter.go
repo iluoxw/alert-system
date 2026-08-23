@@ -354,6 +354,10 @@ func materializeTraceFacts(
 	seenFingerprints := map[string]struct{}{}
 
 	for _, binding := range bindings {
+		if err := validateIdentityMappings(binding); err != nil {
+			failures++
+			continue
+		}
 		exec := agg.ByFingerprint[binding.Key]
 		if exec.Err != nil {
 			failures++
@@ -399,13 +403,13 @@ func materializeTraceFacts(
 	if focus == serviceobs.FocusEmpty && len(bindings) > 0 && failures == 0 {
 		focus = serviceobs.FocusEmpty
 	}
-	_ = instanceHints // 侧输出由 reconcile 层消费；此处保持投影逻辑可单测。
 	source := buildSource(serviceobs.SourceKeyOpenObserveTraces, successes, failures, matched, readAt, agg)
 	serviceobs.SortIssues(issues)
 	return serviceobs.TraceFacts{
 		Focus:         focus,
 		JourneyStages: stages,
 		TopologyHints: hints,
+		InstanceHints: instanceHints,
 		EvidenceRefs:  evidence,
 		Issues:        issues,
 		Source:        source,
@@ -565,19 +569,8 @@ func projectTopology(
 	evidence []model.EvidenceRef,
 	readAt time.Time,
 ) ([]serviceobs.ObservedTopologyHint, []serviceobs.ObservedInstanceHint, []serviceobs.ReconciliationIssue) {
-	roleCount := map[integration.IdentityRole]int{}
-	for _, mapping := range binding.Params.IdentityMappings {
-		roleCount[mapping.Role]++
-	}
-	for role, count := range roleCount {
-		if count > 1 {
-			return nil, nil, []serviceobs.ReconciliationIssue{{
-				ReasonCode: serviceobs.ReasonStageMappingUnavailable,
-				Namespace:  string(role),
-				Count:      count,
-				SourceKey:  binding.SourceKey,
-			}}
-		}
+	if err := validateIdentityMappings(binding); err != nil {
+		return nil, nil, nil
 	}
 
 	byField := map[integration.IdentityRole]integration.IdentityMapping{}
@@ -639,6 +632,19 @@ func projectTopology(
 		}
 	}
 	return hints, instances, nil
+}
+
+func validateIdentityMappings(binding integration.CompiledBinding) error {
+	roleCount := map[integration.IdentityRole]int{}
+	for _, mapping := range binding.Params.IdentityMappings {
+		roleCount[mapping.Role]++
+	}
+	for _, count := range roleCount {
+		if count > 1 {
+			return ErrInvalidIdentityMapping
+		}
+	}
+	return nil
 }
 
 func mergeJourneyStages(existing, incoming []serviceobs.JourneyStageObservation) []serviceobs.JourneyStageObservation {

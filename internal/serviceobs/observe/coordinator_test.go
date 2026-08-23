@@ -1326,6 +1326,95 @@ func TestBatchBCompiledOnlyPrometheusTracesLogsSkipsAccess(t *testing.T) {
 }
 
 // traces 已确认 empty + logs 超时：Focus 必须是 Unknown，不能宣称 Empty。
+func signalOnlyBindingSource(profile model.Profile) integration.RuntimeBindingSource {
+	bindings := make([]integration.CompiledBinding, 0, len(profile.SignalBindings))
+	for _, signal := range profile.SignalBindings {
+		bindings = append(bindings, integration.CompiledBinding{
+			Key: signal.Key, Kind: integration.KindSignal, TargetRef: signal.Key,
+			SourceKey: serviceobs.SourceKeyPrometheus, ResolvedTargetIDs: []string{},
+		})
+	}
+	compiled := integration.CompiledIntegration{Bindings: bindings}
+	digest, err := integration.ProfileDigest(profile)
+	if err != nil {
+		panic(err)
+	}
+	compiled.SchemaVersion = integration.CompiledIntegrationSchemaVersion
+	compiled.ProfileKey = profile.ProfileKey
+	compiled.ProfileVersion = profile.ProfileVersion
+	compiled.ProfileDigest = digest
+	compiled.ServiceID = "svc-1"
+	compiled.Environment = "production"
+	return integration.NewStaticRuntimeBindingSource(map[string]integration.CompiledIntegration{
+		compiled.ServiceID + "\x1e" + compiled.Environment + "\x1e" +
+			profile.ProfileKey + "\x1e" + itoa(profile.ProfileVersion): compiled,
+	})
+}
+
+func TestBatchBFocusUnknownSkipsEvidenceUpstreamCalls(t *testing.T) {
+	profile := testProfile()
+	traces := &fakeTraces{}
+	logs := &fakeLogs{}
+	access := &fakeAccess{}
+	coordinator := New(Options{
+		Readers: Readers{
+			Signals: &fakeSignals{},
+			Traces:  traces,
+			Logs:    logs,
+			Access:  access,
+		},
+		Permissions:   allPermissions(),
+		BindingSource: signalOnlyBindingSource(profile),
+	})
+	facts, err := coordinator.ReadObservations(context.Background(), workspaceRequest())
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if facts.Focus != serviceobs.FocusUnknown {
+		t.Fatalf("Focus=%q want unknown", facts.Focus)
+	}
+	if traces.calls.Load() != 0 || logs.calls.Load() != 0 || access.calls.Load() != 0 {
+		t.Fatalf("evidence upstream must not run: traces=%d logs=%d access=%d",
+			traces.calls.Load(), logs.calls.Load(), access.calls.Load())
+	}
+}
+
+func TestCoordinatorMergesTraceInstanceHints(t *testing.T) {
+	now := time.Date(2026, 8, 23, 2, 9, 22, 0, time.UTC)
+	hint := serviceobs.ObservedInstanceHint{
+		Component:  serviceobs.ExternalIdentity{Namespace: "service", Value: "orchestrator"},
+		Instance:   serviceobs.ExternalIdentity{Namespace: "host", Value: "node-1"},
+		ObservedAt: now,
+		SourceKey:  serviceobs.SourceKeyOpenObserveTraces,
+	}
+	coordinator := newCoordinator(Options{
+		Readers: Readers{
+			Signals: &fakeSignals{},
+			Traces: &fakeTraces{facts: serviceobs.TraceFacts{
+				Focus:         serviceobs.FocusMatched,
+				InstanceHints: []serviceobs.ObservedInstanceHint{hint},
+				ReadAt:        now,
+			}},
+			Logs:   &fakeLogs{facts: serviceobs.LogFacts{Focus: serviceobs.FocusEmpty, ReadAt: now}},
+			Access: &fakeAccess{facts: serviceobs.AccessFacts{Focus: serviceobs.FocusEmpty, ReadAt: now}},
+		},
+		Permissions: allPermissions(),
+	})
+	facts, err := coordinator.ReadObservations(context.Background(), workspaceRequest())
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if len(facts.InstanceHints) != 1 {
+		t.Fatalf("InstanceHints=%+v", facts.InstanceHints)
+	}
+	if facts.InstanceHints[0].Instance.Value != "node-1" {
+		t.Fatalf("instance=%+v", facts.InstanceHints[0])
+	}
+	if !facts.ReadAt.Equal(now) {
+		t.Fatalf("ReadAt=%v want %v", facts.ReadAt, now)
+	}
+}
+
 func TestBatchBTracesEmptyLogsTimeoutFocusUnknown(t *testing.T) {
 	coordinator := newCoordinator(Options{
 		Readers: Readers{

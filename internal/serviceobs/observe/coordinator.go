@@ -153,33 +153,6 @@ func defaultSummaryBindingKeys(profile model.Profile) []string {
 	return keys
 }
 
-// sourcePlan 是一次请求要读的来源清单（legacy renderer 规划，仅无 binding source 时保留）。
-type sourcePlan struct {
-	signals bool
-	traces  bool
-	logs    bool
-	access  bool
-}
-
-// planSources 按 purpose 与 Profile renderer 决定读哪些来源（Phase 2 兼容路径）。
-func planSources(purpose serviceobs.Purpose, profile model.Profile) sourcePlan {
-	plan := sourcePlan{signals: len(profile.SignalBindings) > 0}
-	if !purpose.NeedsFocusEvidence() {
-		return plan
-	}
-	for _, view := range profile.Views {
-		switch view.Renderer {
-		case model.RendererRequestJourney, model.RendererDependencyTopology:
-			plan.traces = true
-		case model.RendererEvidenceList:
-			plan.traces = true
-			plan.logs = true
-			plan.access = true
-		}
-	}
-	return plan
-}
-
 // sourceOutcome 是单个来源的归一化结果。
 type sourceOutcome struct {
 	source        health.SourceObservation
@@ -187,8 +160,10 @@ type sourceOutcome struct {
 	evidence      []model.EvidenceRef
 	journeyStages []serviceobs.JourneyStageObservation
 	hints         []serviceobs.ObservedTopologyHint
+	instanceHints []serviceobs.ObservedInstanceHint
 	issues        []serviceobs.ReconciliationIssue
 	focus         serviceobs.FocusResult
+	readAt        time.Time
 	// focusReported 表示该来源是否真的表达了 focus 结论。只有表达过的来源才参与合并，
 	// 否则一个不读 focus 的来源会把结论拉回 not_requested。
 	focusReported bool
@@ -332,6 +307,11 @@ func (c *Coordinator) runSources(
 	permissions serviceobs.Permissions,
 	bindingKeys []string,
 ) []sourceOutcome {
+	if plan.FocusUnknown {
+		plan.Traces = nil
+		plan.Logs = nil
+		plan.Access = nil
+	}
 	type task struct {
 		sourceKey    string
 		permission   serviceobs.Permission
@@ -370,7 +350,9 @@ func (c *Coordinator) runSources(
 				if err != nil {
 					return sourceOutcome{}, err
 				}
-				return sourceOutcome{source: facts.Source, signals: facts.Signals}, nil
+				return sourceOutcome{
+					source: facts.Source, signals: facts.Signals, readAt: facts.ReadAt,
+				}, nil
 			},
 		})
 	}
@@ -405,7 +387,8 @@ func (c *Coordinator) runSources(
 				return sourceOutcome{
 					source: facts.Source, evidence: facts.EvidenceRefs,
 					journeyStages: facts.JourneyStages, hints: facts.TopologyHints,
-					issues: facts.Issues, focus: facts.Focus, focusReported: true,
+					instanceHints: facts.InstanceHints, issues: facts.Issues,
+					focus: facts.Focus, focusReported: true, readAt: facts.ReadAt,
 				}, nil
 			},
 		})
@@ -426,7 +409,7 @@ func (c *Coordinator) runSources(
 				}
 				return sourceOutcome{
 					source: facts.Source, evidence: facts.EvidenceRefs,
-					focus: facts.Focus, focusReported: true,
+					focus: facts.Focus, focusReported: true, readAt: facts.ReadAt,
 				}, nil
 			},
 		})
@@ -447,7 +430,7 @@ func (c *Coordinator) runSources(
 				}
 				return sourceOutcome{
 					source: facts.Source, evidence: facts.EvidenceRefs,
-					focus: facts.Focus, focusReported: true,
+					focus: facts.Focus, focusReported: true, readAt: facts.ReadAt,
 				}, nil
 			},
 		})
@@ -617,14 +600,19 @@ func withFocusPlaceholder(outcome sourceOutcome, focusRequested bool) sourceOutc
 //     另一个来源失败不能把它抹掉。
 func mergeOutcomes(bindingKeys []string, outcomes []sourceOutcome) serviceobs.ObservationFacts {
 	facts := serviceobs.ObservationFacts{
-		Signals:      []health.SignalObservation{},
-		Sources:      []health.SourceObservation{},
-		EvidenceRefs: []model.EvidenceRef{},
-		Focus:        serviceobs.FocusNotRequested,
+		Signals:       []health.SignalObservation{},
+		Sources:       []health.SourceObservation{},
+		EvidenceRefs:  []model.EvidenceRef{},
+		InstanceHints: []serviceobs.ObservedInstanceHint{},
+		Focus:         serviceobs.FocusNotRequested,
 	}
 
+	var latestReadAt time.Time
 	seenBinding := map[string]struct{}{}
 	for _, outcome := range outcomes {
+		if outcome.readAt.After(latestReadAt) {
+			latestReadAt = outcome.readAt
+		}
 		if outcome.source.SourceKey != "" {
 			facts.Sources = append(facts.Sources, outcome.source)
 		}
@@ -638,8 +626,10 @@ func mergeOutcomes(bindingKeys []string, outcomes []sourceOutcome) serviceobs.Ob
 		facts.EvidenceRefs = append(facts.EvidenceRefs, outcome.evidence...)
 		facts.JourneyStages = append(facts.JourneyStages, outcome.journeyStages...)
 		facts.TopologyHints = append(facts.TopologyHints, outcome.hints...)
+		facts.InstanceHints = append(facts.InstanceHints, outcome.instanceHints...)
 		facts.Issues = append(facts.Issues, outcome.issues...)
 	}
+	facts.ReadAt = latestReadAt
 
 	// 被请求但没有回值的 binding 必须显式 Unknown。补齐用的就是 ReadObservations 解析出来
 	// 的同一份 key 列表，因此"请求集"与"补齐集"不可能不一致。

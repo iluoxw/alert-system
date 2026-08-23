@@ -2,6 +2,7 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"alert-system/internal/serviceobs/health"
 	"alert-system/internal/serviceobs/integration"
 	"alert-system/internal/serviceobs/model"
+	"alert-system/internal/serviceobs/observe"
 	"alert-system/internal/serviceobs/provider"
 )
 
@@ -122,6 +124,7 @@ func (a *Adapter) ReadSignals(ctx context.Context, req serviceobs.SignalRequest)
 		failureCount int
 		emptyCount   int
 		partialCount int
+		authFailures int
 		latestObs    time.Time
 	)
 
@@ -131,7 +134,10 @@ func (a *Adapter) ReadSignals(ctx context.Context, req serviceobs.SignalRequest)
 		signal, partial, err := a.projectBinding(binding, plan, result, req)
 		if err != nil {
 			failureCount++
-			signals = append(signals, unknownSignal(binding, serviceobs.ReasonSourceReadFailed, true))
+			if errors.Is(err, observe.ErrUpstreamAuthFailed) {
+				authFailures++
+			}
+			signals = append(signals, unknownSignal(binding, reasonForBindingError(err), !errors.Is(err, observe.ErrUpstreamAuthFailed)))
 			continue
 		}
 		if signal.Availability == model.SignalAvailabilityAvailable {
@@ -150,7 +156,11 @@ func (a *Adapter) ReadSignals(ctx context.Context, req serviceobs.SignalRequest)
 		signals = append(signals, signal)
 	}
 
-	source := a.buildSource(successCount, failureCount, emptyCount, partialCount, len(bindings), latestObs)
+	if failureCount == len(bindings) && authFailures == failureCount && failureCount > 0 {
+		return serviceobs.SignalFacts{}, observe.ErrUpstreamAuthFailed
+	}
+
+	source := a.buildSource(successCount, failureCount, emptyCount, partialCount, authFailures, len(bindings), latestObs)
 	return serviceobs.SignalFacts{
 		Signals: signals,
 		Source:  source,
@@ -243,7 +253,7 @@ func (a *Adapter) projectBinding(
 	req serviceobs.SignalRequest,
 ) (health.SignalObservation, bool, error) {
 	if result.err != nil {
-		return unknownSignal(binding, serviceobs.ReasonSourceReadFailed, true), false, result.err
+		return unknownSignal(binding, reasonForBindingError(result.err), !errors.Is(result.err, observe.ErrUpstreamAuthFailed)), false, result.err
 	}
 	switch plan.TemplateRef {
 	case "gauge_ratio_percent.v1":
@@ -606,7 +616,22 @@ func maxMatrixLen(series ...[]SampleSeries) int {
 	return maxLen
 }
 
-func (a *Adapter) buildSource(success, failure, empty, partial, total int, observedAt time.Time) health.SourceObservation {
+func reasonForBindingError(err error) string {
+	switch {
+	case errors.Is(err, observe.ErrUpstreamAuthFailed):
+		return serviceobs.ReasonUpstreamAuthFailed
+	case errors.Is(err, observe.ErrUpstreamRateLimited):
+		return serviceobs.ReasonUpstreamRateLimited
+	case errors.Is(err, observe.ErrResponseTooLarge):
+		return serviceobs.ReasonResponseTooLarge
+	case errors.Is(err, observe.ErrCardinalityExceeded):
+		return serviceobs.ReasonCardinalityExceeded
+	default:
+		return serviceobs.ReasonSourceReadFailed
+	}
+}
+
+func (a *Adapter) buildSource(success, failure, empty, partial, authFailures, total int, observedAt time.Time) health.SourceObservation {
 	source := health.SourceObservation{
 		SourceKey: serviceobs.SourceKeyPrometheus,
 		Freshness: model.FreshnessFresh,
@@ -615,6 +640,11 @@ func (a *Adapter) buildSource(success, failure, empty, partial, total int, obser
 		source.ObservedAt = observedAt
 	}
 	switch {
+	case failure == total && authFailures == failure && failure > 0:
+		source.State = model.AvailabilityUnavailable
+		source.Freshness = model.FreshnessUnknown
+		source.ReasonCode = serviceobs.ReasonUpstreamAuthFailed
+		source.Retryable = false
 	case failure == total:
 		source.State = model.AvailabilityUnavailable
 		source.Freshness = model.FreshnessUnknown

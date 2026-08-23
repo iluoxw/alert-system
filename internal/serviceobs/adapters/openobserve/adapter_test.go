@@ -197,7 +197,39 @@ func TestAdapterReadTracesJourneyTopologyDedup(t *testing.T) {
 	}
 }
 
-func TestAdapterDuplicateCallerMappingYieldsNoTopology(t *testing.T) {
+func TestAdapterInstanceHintsReachTraceFacts(t *testing.T) {
+	t.Parallel()
+	body := readFixture(t, "search_trace_hit.json")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	adapter := newTestAdapter(t, server.URL)
+	windowFrom, windowTo := testWindow()
+	binding := sampleTraceBinding("sandbox_id", "default")
+	binding.Params.IdentityMappings = append(binding.Params.IdentityMappings,
+		integration.IdentityMapping{
+			Field: "service_name", Namespace: "service", Role: integration.IdentityRoleCallerInstance,
+		},
+	)
+	req := serviceobs.FocusRequest{
+		From: windowFrom, To: windowTo,
+		Focus:    &model.Focus{Kind: "sandbox_id", Value: "sbx-123"},
+		Bindings: []integration.CompiledBinding{binding},
+		Limits:   serviceobs.SourceLimits{Timeout: 2 * time.Second, MaxRows: 25},
+	}
+	facts, err := adapter.ReadTraces(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadTraces: %v", err)
+	}
+	if len(facts.InstanceHints) == 0 {
+		t.Fatalf("expected instance hints from adapter, got %+v", facts.InstanceHints)
+	}
+}
+
+func TestAdapterDuplicateCallerMappingFailsBindingClosed(t *testing.T) {
 	t.Parallel()
 	body := readFixture(t, "search_trace_hit.json")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -223,11 +255,23 @@ func TestAdapterDuplicateCallerMappingYieldsNoTopology(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTraces: %v", err)
 	}
+	if facts.Focus == serviceobs.FocusMatched {
+		t.Fatalf("focus=%q must not stay matched on forged duplicate role", facts.Focus)
+	}
+	if facts.Source.State != model.AvailabilityUnavailable {
+		t.Fatalf("source state=%q want unavailable binding failure", facts.Source.State)
+	}
+	if facts.Source.ReasonCode != serviceobs.ReasonSourceReadFailed {
+		t.Fatalf("source reason=%q want source_read_failed", facts.Source.ReasonCode)
+	}
 	if len(facts.TopologyHints) != 0 {
 		t.Fatalf("expected zero topology hints, got %+v", facts.TopologyHints)
 	}
-	if len(facts.Issues) == 0 {
-		t.Fatal("expected reconciliation issue for duplicate caller mapping")
+	if len(facts.InstanceHints) != 0 {
+		t.Fatalf("expected zero instance hints, got %+v", facts.InstanceHints)
+	}
+	if len(facts.JourneyStages) != 0 {
+		t.Fatalf("expected zero journey stages, got %+v", facts.JourneyStages)
 	}
 }
 
