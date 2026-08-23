@@ -99,7 +99,8 @@ typed params；`kind` 仅允许：
 - `focus`：target 指向 `focus_kinds[].key`，同一 focus kind 至多一个；
 - `journey`：target 指向 `journeys[].key`，每个 journey 恰好一个；
 - `evidence`：target 指向用于参数化查询的 `focus_kinds[].key`，logs/traces/access class 由受信
-  template registry 推导。
+  template registry 推导；同一 focus 可以各有一条 logs、traces、access binding，只有相同
+  `(target_ref, derived evidence class/source key)` 的重复项才拒绝。
 
 Observed topology hints 是 trace template 的声明输出，由 `topology_policy` 约束，不另设会重复同一
 trace 查询的 `topology` binding。请求 purpose 不属于 SIP；它只能由服务端路由选择。registry

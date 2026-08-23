@@ -147,7 +147,8 @@ CompiledIntegration 继续禁止 raw query、endpoint、header、secret，不得
 - `signal`：target_ref 命中 signal binding，每个 signal 恰好一个；
 - `focus`：target_ref 命中 focus kind，同一 focus kind 至多一个；
 - `journey`：target_ref 命中 journey，每个 journey 恰好一个；
-- `evidence`：target_ref 命中查询所依赖的 focus kind，logs/traces/access class 由 template 推导。
+- `evidence`：target_ref 命中查询所依赖的 focus kind，logs/traces/access class 由 template 推导；
+  同一 focus 可各有一条不同 class，只有相同 `(target_ref, derived class/source key)` 才算重复。
 
 Observed topology hints 是 trace template 的声明输出，由 topology policy 约束，不新增会重复 trace
 查询的 `topology` kind。请求 purpose 继续由服务端路由选择，绝不成为 package 编译事实；source
@@ -365,8 +366,9 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - 缺一半、篡改或错配 profile/integration digest 一律拒绝加载；
 - selector 0/2+ 命中、环境错配、root 不可达、resolver infra error 分类、未知 template、版本不兼容、
   禁止字段、raw query/secret/executable key 全部 fail closed；
-- provider binding 未知 kind、悬空 target、重复 kind+target、signal/journey 缺失或多绑定、evidence
-  指向未知 focus、template/tool capability 或 permission 不一致全部用稳定 reason 拒绝；
+- provider binding 未知 kind、悬空 target、signal/focus/journey 重复 kind+target、evidence 重复
+  target+derived class/source、signal/journey 缺失或多绑定、evidence 指向未知 focus、template/tool
+  capability 或 permission 不一致全部用稳定 reason 拒绝；
 - `status=published` 且无显式发布 gate 授权时拒绝；
 - compiler 不接受 fixture service ID 作为 production fallback；
 - 第二个结构不同的最小 package fixture 能通过 contract，但不算 Phase 4 产品验收。
