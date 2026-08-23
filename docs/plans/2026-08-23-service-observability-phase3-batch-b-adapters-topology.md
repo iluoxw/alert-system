@@ -14,7 +14,9 @@
 
 - 仓库：`iluoxw/alert-system`。
 - 分支：`codex/service-observability-phase3-20260823`。
-- Batch B 基线必须是：`096174c2c2136a9113c0393de5e52c774b2352a7`。
+- Batch B 的**运行时代码 diff 基线**必须是：`096174c2c2136a9113c0393de5e52c774b2352a7`。
+- 实施起点必须是 Codex 在编码指令里给出的、已经过 Fable review 的计划 tip；它会晚于运行时代码
+  基线。不得把二者混为同一个 SHA。
 - `096174c` 已通过 Codex 全量门禁与 Grok exact-SHA review；Grok 结论为 `PASS / no P0-P2 / no PR`。
 - 生产主落地是 alert-system；E2B 是第一个一等 Service Profile，不是核心分支。
 - fixtures 优先。所有 adapter 测试只使用合成 fixture、`httptest` 与隔离 PostgreSQL；本 Batch 不读取 `OBS_*`，不访问用户 `~/.zshrc`，不连接真实 Prometheus/OpenObserve。
@@ -30,8 +32,14 @@
 
 ```bash
 git status --short --branch
-test "$(git rev-parse HEAD)" = "096174c2c2136a9113c0393de5e52c774b2352a7"
-test "$(git rev-parse origin/codex/service-observability-phase3-20260823)" = "096174c2c2136a9113c0393de5e52c774b2352a7"
+RUNTIME_BASE_SHA=096174c2c2136a9113c0393de5e52c774b2352a7
+START_SHA="$(git rev-parse HEAD)"
+test "$START_SHA" = "$(git rev-parse origin/codex/service-observability-phase3-20260823)"
+git merge-base --is-ancestor "$RUNTIME_BASE_SHA" "$START_SHA"
+git diff --name-only "$RUNTIME_BASE_SHA..$START_SHA"
+BATCH_B_UNEXPECTED_START_PATHS="$(git diff --name-only "$RUNTIME_BASE_SHA..$START_SHA" | \
+  rg -v '^docs/plans/(2026-08-23-service-observability-phase3-production-readonly-telemetry|2026-08-23-service-observability-phase3-batch-b-adapters-topology)\.md$' || true)"
+test -z "$BATCH_B_UNEXPECTED_START_PATHS"
 test -z "$(git status --short -- \
   deploy/observability \
   docs/adr/2026-08-13-otel-prometheus-dual-write-demo.md \
@@ -42,7 +50,8 @@ test -z "$(git diff --name-only 096174c2c2136a9113c0393de5e52c774b2352a7..HEAD -
   docs/plans/2026-08-13-e2b-otel-prometheus-remote-write-demo.md)"
 ```
 
-预期：worktree clean；本地与远端均为同一 SHA；Cloud worktree 没有创建或修改三个 hold path。
+预期：worktree clean；本地与远端均为 Codex 指令中的同一 reviewed plan tip；`096174c..START_SHA`
+只包含本计划与 Phase 3 主计划文档，不含运行时代码；Cloud worktree 没有创建或修改三个 hold path。
 
 三个 hold path 是原始本地 checkout 的未跟踪用户文件，普通 branch diff 无法证明它们未被改写。Codex
 在原始 checkout `/Users/luoxiaowei/code/go/src/alert-system` 的只读基线摘要为：
@@ -80,6 +89,12 @@ type RuntimeBindingSource interface {
 接口不得接受 SIP 原文、endpoint、query 或 secret；不能只按 profile key/version 命中后跳过 digest、
 service/environment 与 bundle identity 交叉核对。
 
+Profile Registry 持有的是已解码并 normalize 的 `model.Profile`，不是原始字节。因此 digest 复核必须
+用 integration compiler 相同的 canonical marshal 对本次 Profile 副本重新序列化，再与
+`CompiledIntegration.ProfileDigest` 比对；不能退化成只比 key/version。测试必须证明
+`compile -> strict decode -> normalize -> canonical marshal` 与原产物逐字节、逐 digest 相同，并证明
+任意 Profile 语义字段变更都会 fail closed。
+
 Coordinator 与每个 adapter 都只按这个精确 identity 解析 bindings：
 
 - Coordinator 只解析一次，用它决定本次是否执行 signals/traces/logs/access；
@@ -90,6 +105,9 @@ Coordinator 与每个 adapter 都只按这个精确 identity 解析 bindings：
 - adapter 只从请求 bindings 取得 `template_ref + typed params + source_key + permission`；
 - `Profile.Views[].renderer` 只决定展示，不再决定 provider 执行；
 - 没有对应 binding 的 source 是 **not requested**，不是 `*_not_connected`；
+- 但 aggregate focus 的 `not_requested` 只表示用户没有提出 focus 问题。若
+  `Purpose.NeedsFocusEvidence() && Focus != nil`，而 focus kind 过滤后没有任何 focus-affecting binding，
+  结论必须是 `FocusUnknown`，不能用 source 的 not-requested 语义替用户撤回问题；
 - resolver 返回的 identity 与请求 Profile 不一致时 fail closed，绝不回退到 renderer 或 SIP。
 
 当前 source 尚无生产 loader 是有意的：Task 8/9 再把原子 bundle registry 接入。Batch B 用只读
@@ -156,6 +174,9 @@ type IdentityMapping struct {
 - `caller_instance`/`callee_instance` 只进入 instance inventory，不自动成为逻辑 component；
 - namespace 必须同时属于 topology policy allowlist；不同 namespace 永不静默合并；
 - adapter 只能选择 mapping 声明的字段；未知字段不查询、不输出；
+- 单个 binding 内每个 role 最多一条 mapping；产生 topology hint 时 caller/callee 必须各恰好一条，
+  instance mapping 只能依附对应的 caller/callee。compiler 拒绝同 role 多字段，adapter 对伪造的重复
+  role artifact 也 fail closed，绝不按声明顺序猜一个或做 identity 笛卡尔积；
 - instance 增减只改变 inventory count/summary，不改写 declared component/dependency；
 - draft E2B mapping 可以继续存在，但不能充当 production discovery/owner attestation。
 
@@ -248,6 +269,9 @@ https://cursor.com/agents/bc-5a993b86-e20a-46b1-b033-028118eced93
 - directory/overview 即使 compiled 有 evidence binding 也只计划 requested signal；
 - focused workspace 没有 focus 时不 fan-out evidence；
 - focus kind A 不能触发只绑定 kind B 的 evidence；
+- focused workspace 带 focus、但 compiled 没有任何 focus-affecting binding 时 aggregate focus 为
+  `FocusUnknown`，且 evidence upstream 调用为 0；
+- focus kind 过滤后从“有 binding”变成空集时同样为 `FocusUnknown`，不是 `FocusNotRequested`；
 - requested signal keys 只选中对应 compiled signal bindings；
 - source key/capability/permission/identity 错配 fail closed；
 - no providers 保持现有 `telemetry_not_connected` 精确语义；partial provider + 无 binding 不伪造 not-connected。
@@ -260,8 +284,9 @@ env -u DB_DSN go test ./internal/serviceobs/integration ./internal/serviceobs/ob
 
 **Step 2: 实现最小 runtime source 与 planner**
 
-- `RuntimeBindingSource.ResolveCompiled` 返回深拷贝并校验实际 Profile digest；测试 fake 不暴露共享可变
-  slice；
+- `RuntimeBindingSource.ResolveCompiled` 返回深拷贝，并用 compiler 相同 canonical marshal 对
+  decode/normalize 后的实际 Profile 重算 digest；覆盖 round-trip 等字节、等 digest、字段篡改拒绝，测试
+  fake 不暴露共享可变 slice；
 - Coordinator 在任何 provider 已配置时只解析一次 exact compiled integration；
 - `planSources` 输入 purpose、focus、requested binding keys、Profile 与 compiled bindings；
 - source plan 按稳定 source key 保存 selected `[]CompiledBinding`，而不是只有四个从 renderer 猜出来的
@@ -296,8 +321,11 @@ git commit -m "refactor(serviceobs): plan runtime sources from compiled bindings
 - journey 的 `ResolvedTargetIDs` 为空；
 - signal/focus/evidence 原语义不变；
 - canonical marshal 两次字节与 digest 相同；strict bundle decode 仍拒绝未知字段。
+- compile 后的 Profile bytes strict decode、normalize、canonical re-marshal 后仍与原产物和 digest 相同；
+- `CompiledIntegrationSchemaVersion` 从 `1.0` bump 到 `1.1`，旧 `1.0` artifact 被当前 strict loader
+  明确拒绝；Task 8 前没有持久化 runtime bundle，不做隐式兼容读取。
 
-**Step 2: 实现 `CompiledJourneyStageTarget` 与深拷贝/identity 校验**
+**Step 2: 实现 `CompiledJourneyStageTarget`、schema version bump 与深拷贝/identity 校验**
 
 数组一律非 nil、按 Profile stage 顺序输出；每个 ID 列表保持 selector 声明顺序且不得含空 ID。
 
@@ -333,8 +361,9 @@ env -u DB_DSN go test ./internal/serviceobs/integration -run 'Journey|Compiled|B
 - `skipped` 或未知 status state；
 - status mappings 没有 status field、stage mappings 没有 stage field；
 - regex/SQL 控制字符/超长 mapping value；
-- identity mapping 的未知 role、重复 field+role、namespace 不在 allowlist；
+- identity mapping 的未知 role、重复 field+role、同一 role 多字段、namespace 不在 allowlist；
 - caller/callee 缺任一端却声称能产 topology hints；
+- caller_instance/callee_instance 没有对应 component role；伪造 compiled artifact 含重复 role；
 - legacy `identity_fields`/`instance_role` 作为 unknown fields 被 strict schema 拒绝。
 
 **Step 2: 实现封闭 slots 与 compiled mapping**
@@ -342,6 +371,8 @@ env -u DB_DSN go test ./internal/serviceobs/integration -run 'Journey|Compiled|B
 - `trace_by_focus.v1` 可选接收 stage/status mappings；
 - mappings 只允许 exact literals；compiler 对 target journey 做 stage key 交叉校验；
 - `CompiledTopologyPolicy` 保存完整 `IdentityMappings`，不再保存两组无对应关系的数组；
+- 每个 binding 的 caller/callee/caller_instance/callee_instance 各至多一条；adapter 只能输出唯一配对，
+  不做 first-wins、cross-product 或跨 record 猜测；
 - E2B package 保持 `draft`。未确认 stage values 不填写，不把历史 stale 数据写成生产映射；
 - PostgreSQL package 验证平台通用性，不得被迫携带 E2B 字段。
 
@@ -523,6 +554,10 @@ env -u DB_DSN go test ./internal/serviceobs/adapters/openobserve -run 'Query|Ide
 - logs/traces/access 按 compiled source key 分开选 binding、调用、limits 与 source status；
 - 只解析 allowlisted selected fields、`_timestamp` 与受控 record/trace/span identity；额外 raw attributes 丢弃；
 - zero hits -> FocusEmpty/section Empty；不写当前 observed_at；
+- 必须用 httptest 把“合法字段的 HTTP 200 + zero hits”和“unknown required field 的非 2xx
+  SQL/schema error”分开：前者是 Empty，后者只让该 binding/section
+  `Unknown/source_read_failed`，不得 message substring fallback，也不得当 Empty。若 provider 对未知字段
+  含糊地返回 200 zero hits，adapter 无法诚实区分，Task 9 discovery attestation 必须阻止该 SIP publish；
 - 401/403 仅在收到 HTTP response 后映射 upstream auth failure；用户 Forbidden 由 Coordinator 在调用前处理，
   upstream call count 必须为 0；
 - 429/timeout/cancel/5xx/parse/oversize/row bound 使用稳定 typed mapping；
@@ -545,6 +580,8 @@ env -u DB_DSN go test ./internal/serviceobs/adapters/openobserve -run 'Query|Ide
 - 没有事实不推导 skipped；focus empty 时 journey section Empty，不造 progress；
 - stage evidence IDs 必须引用本次结果里的 EvidenceRef；
 - caller/callee/caller_instance/callee_instance 只从 compiled `IdentityMappings` 取字段；
+- 每个 role 唯一；伪造 artifact 同时给两个 caller mapping 时当前 binding Unknown 且零 topology hint，
+  不按顺序取第一个、不生成两条或 cross-product；
 - caller→callee 产生 `ObservedTopologyHint`；instance 产生 `ObservedInstanceHint`，不直接建 node/relation；
 - 同一 trace binding 同时投影 focus、journey、trace evidence、topology/inventory，只发一次 exact query；
 - 两条逐字节相同 binding 也按 execution fingerprint 去重，不因多个展示位重复上游调用。
@@ -617,6 +654,7 @@ env -u DB_DSN go test -tags=integration ./internal/store -run 'ServiceObservabil
   必变且长度 <128；
 - overlay node 使用 resolver 返回的 canonical metadata，不创建 synthetic canonical ID；
 - 任一端 unresolved/conflict 不建 edge；
+- 同一 hint 的 component/instance 解析冲突只降级该 hint；不得借另一个 role 或另一个 record 补配对；
 - caller→callee 不反转；
 - stale hint 只让该 overlay stale；
 - topology source 失败/overlay bounds 不改变 domain boundary；
@@ -648,6 +686,11 @@ git diff --check -- internal/store/service_observability_aliases.go \
 env -u DB_DSN go test -race ./internal/serviceobs/adapters/alertsystem ./internal/serviceobs/reconcile -count=1
 env -u DB_DSN go test -tags=integration ./internal/store -run 'ServiceObservability.*Alias' -count=1
 ```
+
+Cursor Cloud 没有 Docker 时，第二条不得伪报 PASS；改跑
+`go test -tags=integration ./internal/store -run '^$' -count=1`（只编译 integration-tag test binary）与
+`go vet -tags=integration ./internal/store`，并逐字审查静态 SQL/只读事务。真实 PostgreSQL 集成测试由
+Codex 在本地 Docker 环境执行，是接受 Lane T 的前置，不是可选项。
 
 ## 7. Task B4 — 主 Agent join、共享 glue 与验收
 
@@ -681,7 +724,9 @@ env -u DB_DSN go test -tags=integration ./internal/store -run 'ServiceObservabil
 3. traces matched + logs Forbidden：Focus 仍 matched，logs 上游调用 0；
 4. traces empty + logs timeout：Focus Unknown，不宣称 Empty；
 5. stale trace observation：journey/topology/evidence 只在自己的 scope Stale/Unknown，declared topology 保留；
-6. access compiled binding 存在但 exact focus field discovery 缺失：access 局部 Unknown，不能 fallback；
+6. access compiled binding 存在且 synthetic upstream 对 unknown exact focus field 返回非 2xx schema/SQL
+   error：access 局部 `Unknown/source_read_failed`；同一 fixture 对合法字段返回 HTTP 200 zero hits 时才是
+   Empty，两者不能 fallback 或混淆；
 7. 同 trace binding 的 journey/evidence/topology side outputs只有一次 HTTP；
 8. second-service synthetic compiled integration 使用完全相同 runtime，无 E2B branch；
 9. overlay reconciliation 不改变 domain reader seeds/boundary；
