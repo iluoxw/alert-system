@@ -271,7 +271,10 @@ func TestNormalizeNeverEmitsNullForRequiredArrays(t *testing.T) {
 				p.Normalize()
 				return p
 			},
-			required: []string{"focus_kinds", "journeys", "views", "signal_bindings", "tool_refs"},
+			// root_entity_ids 嵌在 required 的 service_ref 里，同样是 required 数组，
+			// 因此序列化形状必须是 [] 而不是 null。
+			required: []string{"root_entity_ids", "focus_kinds", "journeys", "views",
+				"signal_bindings", "tool_refs"},
 		},
 		{
 			name: "diagnostic_context",
@@ -331,6 +334,70 @@ func TestNormalizeNeverEmitsNullForRequiredArrays(t *testing.T) {
 			}
 		})
 	}
+}
+
+// root_entity_ids 是 required 数组，所以序列化形状必须是 []；但它同时带 minItems=1，
+// 所以空数组依然是非法 Profile。这两件事必须同时成立：Normalize 只负责修正形状，绝不是
+// 把"没有 root entity"变成合法配置——那种 Profile 仍然会被 v1 schema 拒绝并 quarantine。
+func TestProfileNormalizeFixesShapeWithoutRelaxingMinItems(t *testing.T) {
+	profile := &Profile{SchemaVersion: SchemaVersion}
+	profile.Normalize()
+
+	if profile.ServiceRef.RootEntityIDs == nil {
+		t.Fatalf("Normalize 后 root_entity_ids 不能是 nil slice")
+	}
+	encoded, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	if strings.Contains(string(encoded), `"root_entity_ids":null`) {
+		t.Fatalf("root_entity_ids 序列化成 null，会让页面在解构时崩溃: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"root_entity_ids":[]`) {
+		t.Fatalf("root_entity_ids 应序列化成空数组: %s", encoded)
+	}
+
+	// 直接读 canonical schema，确认 minItems 语义没有被这次修正顺手放宽。
+	raw, err := os.ReadFile(filepath.Join(examplesDir, "..", "service-observability-profile.schema.json"))
+	if err != nil {
+		t.Fatalf("读取 canonical profile schema 失败: %v", err)
+	}
+	// service_ref 是顶层 properties 里的内联定义，不在 $defs 里。
+	var schema struct {
+		Properties struct {
+			ServiceRef struct {
+				Required   []string `json:"required"`
+				Properties struct {
+					RootEntityIDs struct {
+						MinItems *int `json:"minItems"`
+					} `json:"root_entity_ids"`
+				} `json:"properties"`
+			} `json:"service_ref"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("解析 canonical profile schema 失败: %v", err)
+	}
+	serviceRef := schema.Properties.ServiceRef
+	if !containsString(serviceRef.Required, "root_entity_ids") {
+		t.Fatalf("canonical schema 里 root_entity_ids 应为 required: %v", serviceRef.Required)
+	}
+	minItems := serviceRef.Properties.RootEntityIDs.MinItems
+	if minItems == nil {
+		t.Fatalf("canonical schema 的 root_entity_ids 应仍带 minItems=1，现在完全没有该关键字")
+	}
+	if *minItems != 1 {
+		t.Fatalf("canonical schema 的 root_entity_ids.minItems 应仍为 1, got %d", *minItems)
+	}
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // nullable 字段必须真的输出 null，而不是被 omitempty 吞掉：契约里 focus/profile/

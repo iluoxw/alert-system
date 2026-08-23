@@ -3,6 +3,7 @@ package profile
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -76,28 +77,58 @@ func (s *DirSource) List() ([]string, error) {
 	return names, nil
 }
 
+// Read 读取单个 Profile 文档。
+//
+// 所有检查都绑定到同一个已打开的文件描述符，而不是反复用路径去 stat/读取：路径在两次
+// 系统调用之间可以被换成 symlink 或另一个文件（TOCTOU），"先按路径检查、再按路径读取"
+// 会读到检查过的那个文件之外的内容。
+//
+// 顺序上先 Lstat 再 Open：Open 会跟随 symlink，所以拒绝直接 symlink 必须发生在打开之前；
+// 打开之后再用 fd 的 Stat 加 os.SameFile 确认拿到的仍是刚才检查过的那个普通文件。
+// 读取本身经 io.LimitReader 有界，因此大小上限在内存分配之前生效——被换成超大文件也不会
+// 先整份读进内存再报错。
 func (s *DirSource) Read(name string) ([]byte, error) {
 	if err := validateDocumentName(name); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(s.dir, name)
-	info, err := os.Lstat(path)
+
+	lstatInfo, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("profile: 无法 stat %s: %w", name, err)
 	}
-	// 二次确认：List 与 Read 之间文件可能被替换成 symlink 或目录。
-	if !info.Mode().IsRegular() {
+	if !lstatInfo.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s", ErrNotRegularJSONFile, name)
 	}
-	if info.Size() > MaxDocumentBytes {
-		return nil, fmt.Errorf("%w: %s 为 %d 字节，上限 %d", ErrDocumentTooLarge, name, info.Size(), MaxDocumentBytes)
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("profile: 打开 %s 失败: %w", name, err)
 	}
-	raw, err := os.ReadFile(path)
+	defer file.Close()
+
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("profile: 无法 stat 已打开的 %s: %w", name, err)
+	}
+	// 身份检查：Lstat 与 Open 之间文件被替换（rename、换成 symlink 指向别处）会让
+	// dev+inode 不同，这里直接拒绝，而不是读一份来源不明的内容。
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(lstatInfo, openedInfo) {
+		return nil, fmt.Errorf("%w: %s 在检查与打开之间被替换", ErrNotRegularJSONFile, name)
+	}
+	if openedInfo.Size() > MaxDocumentBytes {
+		return nil, fmt.Errorf("%w: %s 为 %d 字节，上限 %d",
+			ErrDocumentTooLarge, name, openedInfo.Size(), MaxDocumentBytes)
+	}
+
+	// 多读 1 字节，用来区分"正好等于上限"（合法）与"超过上限"（拒绝）。即使 fd 上报的
+	// size 不可信，这条有界读取仍然是硬上限。
+	raw, err := io.ReadAll(io.LimitReader(file, MaxDocumentBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("profile: 读取 %s 失败: %w", name, err)
 	}
 	if len(raw) > MaxDocumentBytes {
-		return nil, fmt.Errorf("%w: %s 为 %d 字节，上限 %d", ErrDocumentTooLarge, name, len(raw), MaxDocumentBytes)
+		return nil, fmt.Errorf("%w: %s 超过上限 %d", ErrDocumentTooLarge, name, MaxDocumentBytes)
 	}
 	return raw, nil
 }

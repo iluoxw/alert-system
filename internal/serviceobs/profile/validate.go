@@ -26,7 +26,6 @@ const (
 	ReasonPrimaryFocusNotUnique   = "profile_primary_focus_not_unique"
 	ReasonDuplicateKey            = "profile_duplicate_key"
 	ReasonDanglingRef             = "profile_dangling_ref"
-	ReasonInvalidScope            = "profile_invalid_scope"
 	ReasonInvalidThreshold        = "profile_invalid_threshold"
 	ReasonProxyReasonMissing      = "profile_proxy_reason_missing"
 	ReasonGoldenBindingInvalid    = "profile_golden_binding_invalid"
@@ -194,12 +193,10 @@ func validateStructure(profile model.Profile) error {
 			return failf(ReasonDanglingRef, "signal_bindings[%s].tool_key=%s 未在 tool_refs 中声明",
 				binding.Key, binding.ToolKey)
 		}
-		// entity/relation/resource 作用域必须指明目标；没有 refs 的非 service 作用域是
-		// 一个没有观测对象的 binding。
-		if binding.Scope.Kind != model.ScopeKindService && len(binding.Scope.Refs) == 0 {
-			return failf(ReasonInvalidScope, "signal_bindings[%s].scope.kind=%s 必须声明 refs",
-				binding.Key, binding.Scope.Kind)
-		}
+		// 这里刻意不校验 scope.refs 是否为空：canonical profile schema 里 refs 是
+		// optional 且没有 minItems，设计交接稿、契约 README 与 Phase 2 计划都没有要求
+		// 非 service 作用域必须声明 refs。Registry 不能自行缩小合法 v1 Profile 集合，
+		// 否则一份完全符合契约的 Profile 会被无授权地 quarantine。
 		if binding.MeasurementRole == model.MeasurementRoleProxy && strings.TrimSpace(binding.ProxyReason) == "" {
 			return failf(ReasonProxyReasonMissing, "signal_bindings[%s] 是 proxy，必须给出 proxy_reason", binding.Key)
 		}

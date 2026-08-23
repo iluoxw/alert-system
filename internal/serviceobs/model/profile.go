@@ -106,7 +106,12 @@ type ProfileLimits struct {
 }
 
 // Normalize 把 required 数组的 nil 补成空 slice，避免序列化出 null。
+//
+// 注意 service_ref.root_entity_ids 也在其中：它是 schema required 的数组，所以序列化
+// 形状必须是 []。这只修正形状，不改变 schema 的 minItems=1 语义——空的 root_entity_ids
+// 依然是非法 Profile，会被 v1 schema 校验拒绝并 quarantine。
 func (p *Profile) Normalize() {
+	p.ServiceRef.RootEntityIDs = nonNilSlice(p.ServiceRef.RootEntityIDs)
 	p.FocusKinds = nonNilSlice(p.FocusKinds)
 	p.Journeys = nonNilSlice(p.Journeys)
 	for i := range p.Journeys {

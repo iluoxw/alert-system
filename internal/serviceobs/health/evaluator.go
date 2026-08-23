@@ -52,6 +52,9 @@ const (
 	ReasonPrefixFreshnessUnknown    = "signal_freshness_unknown:"
 	ReasonPrefixValueMissing        = "signal_value_missing:"
 	ReasonPrefixBaselineUnavailable = "signal_baseline_unavailable:"
+	// ReasonPrefixStateInvalid 用于 adapter 报了契约词表外的 availability。它是配置/
+	// 实现缺陷而不是普通缺数，单独一个 code 才能在页面上区分出来。
+	ReasonPrefixStateInvalid = "signal_state_invalid:"
 
 	// ReasonAllRequiredSignalsHealthy 是 Healthy 唯一的 reason code：这个状态不由某个
 	// 具体 binding "造成"，所以不带 binding key。
@@ -71,6 +74,24 @@ const (
 
 // MaxReasonCodes 与 Page View schema 的 health.reason_codes maxItems 对齐。
 const MaxReasonCodes = 20
+
+// signal 级 unknown reason 的稳定取值。它们既写进 SignalEvaluation.UnknownReason，
+// 也被 coverageReason 用来挑选服务级 reason code，所以必须是常量而不是散落的字面量。
+const (
+	// UnknownReasonNotReturned 表示 adapter 完全没返回这个 required binding。
+	UnknownReasonNotReturned = "signal_not_returned_by_adapter"
+	// UnknownReasonStateInvalid 表示 adapter 给出的 availability 不在契约词表内
+	// （例如把 EvidenceRef 专属的 expired 强转了进来）。fail closed 成 Unknown。
+	UnknownReasonStateInvalid = "signal_state_invalid"
+	// UnknownReasonValueMissing 表示声称 available 却没有数值，是不自洽的观测。
+	UnknownReasonValueMissing = "value_missing"
+	// UnknownReasonFreshnessUndeterminable 表示 adapter 拿到了数值但无法判断新鲜度。
+	UnknownReasonFreshnessUndeterminable = "freshness_undeterminable"
+	// UnknownReasonObservationStale 表示观测已超出 Profile 的 freshness TTL。
+	UnknownReasonObservationStale = "observation_stale"
+	// UnknownReasonBaselineUnavailable 表示 baseline_deviation 阈值拿不到基线偏差。
+	UnknownReasonBaselineUnavailable = "baseline_unavailable"
+)
 
 // SignalObservation 是 adapter 返回的一次原始观测。它不带健康判定：阈值、freshness TTL
 // 与最终健康全部由 evaluator 依据 Profile 计算。
@@ -213,55 +234,60 @@ func evaluateSignal(
 	if !found {
 		// adapter 完全没返回这个 required binding：最小 Unknown，且 observed_at 保持零值
 		// （没有任何观测过），绝不能填当前时间。
-		result.Availability = model.SignalAvailabilityUnavailable
-		result.Freshness = model.FreshnessUnknown
-		result.Health = model.SignalHealthUnknown
-		result.UnknownReason = "signal_not_returned_by_adapter"
-		result.RequiredCoverageMissing = true
-		return result
+		return unknownSignal(result, model.SignalAvailabilityUnavailable, UnknownReasonNotReturned)
 	}
 
-	result.Availability = observation.Availability
 	result.ObservedAt = observation.ObservedAt
 	result.SourceKey = observation.SourceKey
-	result.UnknownReason = observation.UnknownReason
 	result.BaselineDeltaPercent = observation.BaselineDeltaPercent
 	result.Sparkline = cloneFloats(observation.Sparkline)
 
-	if observation.Availability != model.SignalAvailabilityAvailable {
-		// Forbidden/Unavailable/Unknown：契约要求 value=null、health=unknown。
-		result.Freshness = model.FreshnessUnknown
-		result.Health = model.SignalHealthUnknown
-		result.RequiredCoverageMissing = true
-		if result.UnknownReason == "" {
-			result.UnknownReason = string(observation.Availability)
-		}
-		return result
+	if !observation.Availability.IsValid() {
+		// availability 不在契约词表内（例如 EvidenceRef 专属的 expired 被强转进来）。
+		// 绝不能把它原样下传：source/signal 的 availability 词表里没有 expired，
+		// 下传会让 Page View 直接违约。这里 fail closed 成 Unknown，并强制使用稳定
+		// reason code——一个状态本身就非法的观测，它自报的 reason 也不可信。
+		return unknownSignal(result, model.SignalAvailabilityUnknown, UnknownReasonStateInvalid)
 	}
 
-	if observation.FreshnessUnknown {
-		// adapter 说"我无法判断新鲜度"：这是失败导致的 unknown，会把 Data 推到 Partial。
-		result.Freshness = model.FreshnessUnknown
-		result.Health = model.SignalHealthUnknown
-		result.RequiredCoverageMissing = true
-		if result.UnknownReason == "" {
-			result.UnknownReason = "freshness_undeterminable"
+	result.Availability = observation.Availability
+	result.UnknownReason = observation.UnknownReason
+
+	if observation.Availability != model.SignalAvailabilityAvailable {
+		// Forbidden/Unavailable/Unknown：契约要求 value=null、health=unknown。
+		reason := result.UnknownReason
+		if reason == "" {
+			reason = string(observation.Availability)
 		}
-		return result
+		return unknownSignal(result, observation.Availability, reason)
 	}
 
 	if observation.Value == nil {
-		// available 但没有数值，是不自洽的观测。fail closed 成 Unknown，不当成 0。
-		result.Freshness = freshnessFor(observation.ObservedAt, now, ttl)
+		// 声称 available 却没有数值，是不自洽的观测。Page View 的 signalValue 要求
+		// available => value 是 number，所以不能保留 available+null；归一成合法的
+		// non-available Unknown，也绝不把缺失当成 0。
+		//
+		// 这个判断必须排在 FreshnessUnknown 之前：否则"无法判断新鲜度"且没有数值的
+		// 观测会走到下面那条保留 available 的分支，输出 available+null。
+		return unknownSignal(result, model.SignalAvailabilityUnknown, UnknownReasonValueMissing)
+	}
+
+	// 到这里 availability 一定是 available 且数值存在，所以后续所有分支都保留数值深拷贝，
+	// available => number 的契约不变式由此恒成立。
+	result.Value = cloneFloat(observation.Value)
+
+	if observation.FreshnessUnknown {
+		// adapter 拿到了数值但说"我无法判断新鲜度"：这是失败导致的 unknown，会把 Data
+		// 推到 Partial。保留数值供展示，但健康与新鲜度都退化成 unknown，不假绿。
+		result.Freshness = model.FreshnessUnknown
 		result.Health = model.SignalHealthUnknown
 		result.RequiredCoverageMissing = true
 		if result.UnknownReason == "" {
-			result.UnknownReason = "value_missing"
+			result.UnknownReason = UnknownReasonFreshnessUndeterminable
 		}
 		return result
 	}
 
-	result.Value = cloneFloat(observation.Value)
 	result.Freshness = freshnessFor(observation.ObservedAt, now, ttl)
 
 	if declared.Thresholds == nil {
@@ -278,7 +304,7 @@ func evaluateSignal(
 		result.Health = model.SignalHealthUnknown
 		result.RequiredCoverageMissing = true
 		if result.UnknownReason == "" {
-			result.UnknownReason = "observation_stale"
+			result.UnknownReason = UnknownReasonObservationStale
 		}
 		return result
 	}
@@ -307,9 +333,30 @@ func thresholdInput(thresholds model.SignalThresholds, value float64, baselineDe
 		return value, ""
 	}
 	if baselineDelta == nil {
-		return 0, "baseline_unavailable"
+		return 0, UnknownReasonBaselineUnavailable
 	}
 	return *baselineDelta, ""
+}
+
+// unknownSignal 把结果收敛成一个契约合法的 non-available Unknown：value 必为 nil、
+// health 必为 unknown、freshness 为 unknown、必带非空 unknown reason，并计入 required
+// coverage 缺口。所有"拿不到可信数值"的分支都必须经过它，这样 Page View 的
+// "availability=available => value 是 number" 不变式在 evaluator 出口就已经成立。
+func unknownSignal(result SignalEvaluation, availability model.SignalAvailability, reason string) SignalEvaluation {
+	if !availability.IsValid() || availability == model.SignalAvailabilityAvailable {
+		// 兜底：调用方传了 available 或非法值时也不允许泄漏出去。
+		availability = model.SignalAvailabilityUnknown
+	}
+	result.Availability = availability
+	result.Value = nil
+	result.Freshness = model.FreshnessUnknown
+	result.Health = model.SignalHealthUnknown
+	result.RequiredCoverageMissing = true
+	result.UnknownReason = reason
+	if result.UnknownReason == "" {
+		result.UnknownReason = string(availability)
+	}
+	return result
 }
 
 // thresholdHealth 用 >= / <= 判定越界：阈值语义是"达到即越界"，所以 value 恰好等于
@@ -398,19 +445,26 @@ func aggregateHealth(signals []SignalEvaluation) (model.Health, []string) {
 
 // coverageReason 说明这个 required signal 为什么让覆盖不完整。区分 missing/forbidden/
 // unavailable/stale/freshness unknown，页面才能给出可操作的下一步。
+// 具体的 UnknownReason 先于笼统的 availability 判断：几个 fail-closed 分支会把
+// availability 归一成 Unknown，若先看 availability 就会把"没有数值""拿不到基线"
+// "adapter 根本没返回"全都压成同一个 signal_unavailable，丢掉可操作的下一步。
 func coverageReason(signal SignalEvaluation) string {
-	switch {
-	case signal.UnknownReason == "signal_not_returned_by_adapter":
+	switch signal.UnknownReason {
+	case UnknownReasonNotReturned:
 		return ReasonPrefixMissing + signal.Binding.Key
+	case UnknownReasonValueMissing:
+		return ReasonPrefixValueMissing + signal.Binding.Key
+	case UnknownReasonBaselineUnavailable:
+		return ReasonPrefixBaselineUnavailable + signal.Binding.Key
+	case UnknownReasonStateInvalid:
+		return ReasonPrefixStateInvalid + signal.Binding.Key
+	}
+	switch {
 	case signal.Availability == model.SignalAvailabilityForbidden:
 		return ReasonPrefixForbidden + signal.Binding.Key
 	case signal.Availability == model.SignalAvailabilityUnavailable,
 		signal.Availability == model.SignalAvailabilityUnknown:
 		return ReasonPrefixUnavailable + signal.Binding.Key
-	case signal.UnknownReason == "baseline_unavailable":
-		return ReasonPrefixBaselineUnavailable + signal.Binding.Key
-	case signal.UnknownReason == "value_missing":
-		return ReasonPrefixValueMissing + signal.Binding.Key
 	case signal.Freshness == model.FreshnessStale:
 		return ReasonPrefixStale + signal.Binding.Key
 	default:

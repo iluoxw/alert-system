@@ -354,6 +354,317 @@ func TestMinimalUnknownCauses(t *testing.T) {
 
 func ptr(observation SignalObservation) *SignalObservation { return &observation }
 
+// evaluator 的输出必须始终能被未来的 projector 合法投影成 Page View 的 signalValue。
+// schema 的硬约束是：availability=available => value 是 number；否则 value=null、
+// health=unknown 且必须带 unknown_reason。这条不变式在 evaluator 出口就要成立，不能
+// 指望 projector 去补救。
+//
+// 表里刻意混入契约词表外的 availability（含 EvidenceRef 专属的 expired），确认它们
+// fail closed 而不是被原样下传。
+func TestSignalOutputAlwaysSatisfiesAvailabilityContract(t *testing.T) {
+	target := binding("target", model.SignalFamilyUSE, model.SemanticSaturation, above(85, 95))
+	neutral := binding("neutral", model.SignalFamilyGolden, model.SemanticTraffic, nil)
+	baseline := binding("baseline", model.SignalFamilyGolden, model.SemanticTraffic,
+		&model.SignalThresholds{
+			Mode: model.ThresholdModeBaselineDeviation, Direction: model.ThresholdDirectionAbove,
+			Degraded: 30, Critical: 60,
+		})
+	profile := profileWith(target, neutral, baseline)
+
+	withValueAndFreshnessUnknown := fresh(target.Key, 42)
+	withValueAndFreshnessUnknown.FreshnessUnknown = true
+
+	valueNilAndFreshnessUnknown := fresh(target.Key, 0)
+	valueNilAndFreshnessUnknown.Value = nil
+	valueNilAndFreshnessUnknown.FreshnessUnknown = true
+
+	availableButNoValue := fresh(target.Key, 0)
+	availableButNoValue.Value = nil
+
+	// 强转进来的非法状态：expired 属于 EvidenceRef，绝不能出现在 signal 上。
+	expiredCast := fresh(target.Key, 42)
+	expiredCast.Availability = model.SignalAvailability(model.EvidenceAvailabilityExpired)
+
+	garbageCast := fresh(target.Key, 42)
+	garbageCast.Availability = model.SignalAvailability("totally-made-up")
+
+	emptyCast := fresh(target.Key, 42)
+	emptyCast.Availability = model.SignalAvailability("")
+
+	// 非法状态但自报了一个看起来正常的 reason：必须被稳定 code 覆盖，因为一个状态本身
+	// 就非法的观测，它自报的 reason 也不可信。
+	expiredWithSelfReportedReason := expiredCast
+	expiredWithSelfReportedReason.UnknownReason = "looks_fine"
+
+	cases := []struct {
+		name             string
+		observations     []SignalObservation
+		wantAvailability model.SignalAvailability
+		wantValueNonNil  bool
+		wantReason       string
+		wantCoverageCode string
+	}{
+		{
+			name:             "available + 有数值 + 新鲜",
+			observations:     []SignalObservation{fresh(target.Key, 42)},
+			wantAvailability: model.SignalAvailabilityAvailable,
+			wantValueNonNil:  true,
+		},
+		{
+			name:             "available + 有数值 + 无法判断新鲜度 -> 保留数值",
+			observations:     []SignalObservation{withValueAndFreshnessUnknown},
+			wantAvailability: model.SignalAvailabilityAvailable,
+			wantValueNonNil:  true,
+			wantReason:       UnknownReasonFreshnessUndeterminable,
+			wantCoverageCode: ReasonPrefixFreshnessUnknown + "target",
+		},
+		{
+			name:             "available + 无数值 -> 归一成 non-available Unknown",
+			observations:     []SignalObservation{availableButNoValue},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonValueMissing,
+			wantCoverageCode: ReasonPrefixValueMissing + "target",
+		},
+		{
+			// 无数值必须先于无法判断新鲜度判定，否则会输出 available+null。
+			name:             "available + 无数值 + 无法判断新鲜度 -> 仍归一成 Unknown",
+			observations:     []SignalObservation{valueNilAndFreshnessUnknown},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonValueMissing,
+			wantCoverageCode: ReasonPrefixValueMissing + "target",
+		},
+		{
+			name:             "expired 强转 -> fail closed，绝不下传",
+			observations:     []SignalObservation{expiredCast},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonStateInvalid,
+			wantCoverageCode: ReasonPrefixStateInvalid + "target",
+		},
+		{
+			name:             "expired 强转且自报 reason -> 强制稳定 code",
+			observations:     []SignalObservation{expiredWithSelfReportedReason},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonStateInvalid,
+			wantCoverageCode: ReasonPrefixStateInvalid + "target",
+		},
+		{
+			name:             "任意非法字符串 -> fail closed",
+			observations:     []SignalObservation{garbageCast},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonStateInvalid,
+			wantCoverageCode: ReasonPrefixStateInvalid + "target",
+		},
+		{
+			name:             "空字符串 availability -> fail closed",
+			observations:     []SignalObservation{emptyCast},
+			wantAvailability: model.SignalAvailabilityUnknown,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonStateInvalid,
+			wantCoverageCode: ReasonPrefixStateInvalid + "target",
+		},
+		{
+			name:             "Forbidden",
+			observations:     []SignalObservation{forbidden(target.Key)},
+			wantAvailability: model.SignalAvailabilityForbidden,
+			wantValueNonNil:  false,
+			wantReason:       "missing_permission",
+			wantCoverageCode: ReasonPrefixForbidden + "target",
+		},
+		{
+			name:             "Unavailable",
+			observations:     []SignalObservation{unavailable(target.Key)},
+			wantAvailability: model.SignalAvailabilityUnavailable,
+			wantValueNonNil:  false,
+			wantReason:       "telemetry_not_connected",
+			wantCoverageCode: ReasonPrefixUnavailable + "target",
+		},
+		{
+			name:             "adapter 完全没返回",
+			observations:     nil,
+			wantAvailability: model.SignalAvailabilityUnavailable,
+			wantValueNonNil:  false,
+			wantReason:       UnknownReasonNotReturned,
+			wantCoverageCode: ReasonPrefixMissing + "target",
+		},
+		{
+			name:             "过期观测 -> 保留数值但健康 Unknown",
+			observations:     []SignalObservation{staleObservation(target.Key, 42)},
+			wantAvailability: model.SignalAvailabilityAvailable,
+			wantValueNonNil:  true,
+			wantReason:       UnknownReasonObservationStale,
+			wantCoverageCode: ReasonPrefixStale + "target",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := Evaluate(Input{Profile: profile, Now: evaluatedAt, Signals: tc.observations})
+
+			// 全局不变式：对结果里的每一个 signal 都成立，不只是被测的那个。
+			assertAvailabilityContract(t, result)
+
+			var subject *SignalEvaluation
+			for i := range result.Signals {
+				if result.Signals[i].Binding.Key == target.Key {
+					subject = &result.Signals[i]
+				}
+			}
+			if subject == nil {
+				t.Fatalf("找不到 target signal")
+			}
+			if subject.Availability != tc.wantAvailability {
+				t.Fatalf("availability=%q want %q", subject.Availability, tc.wantAvailability)
+			}
+			if tc.wantValueNonNil && subject.Value == nil {
+				t.Fatalf("availability=%q 时 value 必须非 nil", subject.Availability)
+			}
+			if !tc.wantValueNonNil && subject.Value != nil {
+				t.Fatalf("availability=%q 时 value 必须是 nil, got %v", subject.Availability, *subject.Value)
+			}
+			if tc.wantReason != "" && subject.UnknownReason != tc.wantReason {
+				t.Fatalf("unknown_reason=%q want %q", subject.UnknownReason, tc.wantReason)
+			}
+			if tc.wantCoverageCode != "" {
+				if !containsReason(result.Health.ReasonCodes, tc.wantCoverageCode) {
+					t.Fatalf("reason codes=%v 应包含 %q", result.Health.ReasonCodes, tc.wantCoverageCode)
+				}
+			}
+		})
+	}
+}
+
+// assertAvailabilityChecked 断言 Page View signalValue 的三条硬约束，并顺带确认
+// evaluator 从不输出契约词表外的 availability（尤其是 EvidenceRef 专属的 expired）。
+func assertAvailabilityContract(t *testing.T, result Evaluation) {
+	t.Helper()
+	for _, signal := range result.Signals {
+		key := signal.Binding.Key
+		if !signal.Availability.IsValid() {
+			t.Fatalf("%s availability=%q 不在契约词表内", key, signal.Availability)
+		}
+		if signal.Availability == model.SignalAvailability(model.EvidenceAvailabilityExpired) {
+			t.Fatalf("%s 输出了 expired；它只属于 EvidenceRef", key)
+		}
+		if !signal.Freshness.IsValid() {
+			t.Fatalf("%s freshness=%q 不在契约词表内", key, signal.Freshness)
+		}
+		if !signal.Health.IsValid() {
+			t.Fatalf("%s health=%q 不在契约词表内", key, signal.Health)
+		}
+		if signal.Availability == model.SignalAvailabilityAvailable {
+			if signal.Value == nil {
+				t.Fatalf("%s availability=available 但 value=nil，违反 available => number", key)
+			}
+			continue
+		}
+		if signal.Value != nil {
+			t.Fatalf("%s availability=%q 但仍带数值 %v", key, signal.Availability, *signal.Value)
+		}
+		if signal.Health != model.SignalHealthUnknown {
+			t.Fatalf("%s availability=%q 时 health 必须是 unknown, got %q", key, signal.Availability, signal.Health)
+		}
+		if signal.UnknownReason == "" {
+			t.Fatalf("%s availability=%q 时必须带 unknown_reason", key, signal.Availability)
+		}
+	}
+}
+
+func containsReason(codes []string, want string) bool {
+	for _, code := range codes {
+		if code == want {
+			return true
+		}
+	}
+	return false
+}
+
+// FreshnessUnknown 分支保留的必须是深拷贝：调用方之后改自己的 observation 不能影响
+// 已经算出来的结果。
+func TestFreshnessUnknownPreservesDeepCopiedValue(t *testing.T) {
+	target := binding("target", model.SignalFamilyUSE, model.SemanticSaturation, above(85, 95))
+	original := 42.0
+	observation := SignalObservation{
+		BindingKey: target.Key, Availability: model.SignalAvailabilityAvailable,
+		Value: &original, ObservedAt: evaluatedAt.Add(-10 * time.Second),
+		SourceKey: "prometheus_compatible", FreshnessUnknown: true,
+	}
+
+	result := Evaluate(Input{Profile: profileWith(target), Now: evaluatedAt,
+		Signals: []SignalObservation{observation}})
+	signal := result.Signals[0]
+
+	if signal.Value == nil || *signal.Value != 42 {
+		t.Fatalf("应保留数值 42, got %v", signal.Value)
+	}
+	if signal.Value == &original {
+		t.Fatalf("必须是深拷贝，不能与入参共享指针")
+	}
+	original = 999
+	if *signal.Value != 42 {
+		t.Fatalf("入参被改后结果跟着变了，说明不是深拷贝: %v", *signal.Value)
+	}
+	// 保留数值不等于假绿：健康与新鲜度都必须是 unknown。
+	if signal.Health != model.SignalHealthUnknown || signal.Freshness != model.FreshnessUnknown {
+		t.Fatalf("health=%q freshness=%q，都应是 unknown", signal.Health, signal.Freshness)
+	}
+	if !signal.RequiredCoverageMissing {
+		t.Fatalf("无法判断新鲜度必须计入 required coverage 缺口")
+	}
+	if signal.Eligible {
+		t.Fatalf("无法判断新鲜度的 signal 不得参与 worst-of 聚合")
+	}
+	if result.Health.Status != model.HealthUnknown {
+		t.Fatalf("服务 health=%q want unknown", result.Health.Status)
+	}
+}
+
+// 非法 availability 只降级它自己：Critical 优先与最小范围 Unknown 的语义不变。
+func TestInvalidAvailabilityKeepsMinimalScopeAndCriticalPrecedence(t *testing.T) {
+	broken := binding("broken", model.SignalFamilyUSE, model.SemanticSaturation, above(85, 95))
+	burning := binding("burning", model.SignalFamilyRED, model.SemanticErrors, above(2, 5))
+	fine := binding("fine", model.SignalFamilyGolden, model.SemanticErrors, above(5, 15))
+	profile := profileWith(broken, burning, fine)
+
+	expiredCast := fresh(broken.Key, 42)
+	expiredCast.Availability = model.SignalAvailability(model.EvidenceAvailabilityExpired)
+
+	result := Evaluate(Input{Profile: profile, Now: evaluatedAt, Signals: []SignalObservation{
+		expiredCast, fresh(burning.Key, 7.2), fresh(fine.Key, 1),
+	}})
+	assertAvailabilityContract(t, result)
+
+	// Critical 仍然压过 coverage 缺口：当前确实在烧，不能因为一个 adapter 报了非法
+	// 状态就把结论软化成 Unknown。
+	if result.Health.Status != model.HealthCritical {
+		t.Fatalf("health=%q want critical", result.Health.Status)
+	}
+	if !reflect.DeepEqual(result.Health.ReasonCodes, []string{"signal_critical:burning"}) {
+		t.Fatalf("reason codes=%v", result.Health.ReasonCodes)
+	}
+	// 最小范围降级：另外两个 signal 保持自己的判定。
+	for _, signal := range result.Signals {
+		switch signal.Binding.Key {
+		case broken.Key:
+			if signal.Health != model.SignalHealthUnknown {
+				t.Fatalf("broken health=%q", signal.Health)
+			}
+		case burning.Key:
+			if signal.Health != model.SignalHealthCritical {
+				t.Fatalf("burning health=%q", signal.Health)
+			}
+		case fine.Key:
+			if signal.Health != model.SignalHealthHealthy {
+				t.Fatalf("fine health=%q", signal.Health)
+			}
+		}
+	}
+}
+
 // EvidenceRef 的 expired 只属于证据，不得被复用成 signal 或 source 状态。
 // signal 侧由 Go 类型隔离（SignalAvailability 没有 expired）；source 侧如果被硬塞进
 // 一个 "expired" 字面量，必须 fail closed 成 Unknown -> Data Partial，而不是被当成

@@ -8,6 +8,7 @@
 package profile
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -225,6 +226,39 @@ func TestNewAcceptsCanonicalE2BProfile(t *testing.T) {
 	}
 }
 
+// 非 service 作用域省略 refs 或给空数组都是合法 v1 Profile：canonical profile schema 里
+// scope.refs 是 optional 且没有 minItems，设计交接稿、契约 README 与 Phase 2 计划也都没有
+// 要求它非空。Registry 不得自行缩小合法 Profile 集合，否则一份完全符合契约的 Profile 会被
+// 无授权地 quarantine。
+func TestNewAcceptsNonServiceScopeWithoutRefs(t *testing.T) {
+	registry := newRegistry(t, loadTestdata(t, "valid-scope-refs-optional.json"), newFakeResolver())
+
+	if quarantined := registry.Quarantined(); len(quarantined) != 0 {
+		t.Fatalf("省略/留空 scope.refs 的合法 Profile 不应被隔离: %+v", quarantined)
+	}
+	profile, ok := registry.PublishedForService("svc_e2b_fixture")
+	if !ok {
+		t.Fatalf("省略/留空 scope.refs 的 Profile 应进入 active registry")
+	}
+
+	// 确认 fixture 真的覆盖了三种写法，否则这条回归会变成空跑。
+	var omitted, empty, resourceOmitted bool
+	for _, b := range profile.SignalBindings {
+		switch b.Key {
+		case "red_api_orchestrator_rate":
+			omitted = b.Scope.Kind == model.ScopeKindRelation && b.Scope.Refs == nil
+		case "red_api_orchestrator_errors":
+			empty = b.Scope.Kind == model.ScopeKindRelation && b.Scope.Refs != nil && len(b.Scope.Refs) == 0
+		case "use_host_placement_saturation":
+			resourceOmitted = b.Scope.Kind == model.ScopeKindResource && b.Scope.Refs == nil
+		}
+	}
+	if !omitted || !empty || !resourceOmitted {
+		t.Fatalf("fixture 未覆盖三种写法: relation 省略=%v relation 空=%v resource 省略=%v",
+			omitted, empty, resourceOmitted)
+	}
+}
+
 // 每一类结构/引用错误都要落到明确的稳定 reason code，而不是笼统的"校验失败"。
 func TestNewQuarantinesInvalidDocuments(t *testing.T) {
 	cases := []struct {
@@ -250,7 +284,6 @@ func TestNewQuarantinesInvalidDocuments(t *testing.T) {
 		{"invalid-two-golden-overview-views.json", ReasonGoldenBindingInvalid},
 		{"invalid-duplicate-view-order.json", ReasonDuplicateKey},
 		{"invalid-proxy-reason-blank.json", ReasonProxyReasonMissing},
-		{"invalid-scope-without-refs.json", ReasonInvalidScope},
 		{"invalid-unpublished-tool.json", ReasonToolNotPublished},
 		{"invalid-service-not-found.json", ReasonRefNotFound},
 		{"invalid-service-ambiguous.json", ReasonRefAmbiguous},
@@ -575,6 +608,162 @@ func TestDirSourceRejectsNonRegularAndOversizedDocuments(t *testing.T) {
 	if len(quarantined) != 1 || quarantined[0].ReasonCode != ReasonTooLarge {
 		t.Fatalf("超大文档应以 %s 隔离: %+v", ReasonTooLarge, quarantined)
 	}
+}
+
+// DirSource.Read 的安全边界：普通文件正常读到原始字节，symlink 即使按名字直接读也必须
+// 被拒绝（Open 会跟随 symlink，所以拒绝必须发生在打开之前），大小上限在边界上精确生效。
+func TestDirSourceReadRegularFileSymlinkAndSizeBoundary(t *testing.T) {
+	dir := t.TempDir()
+	content, err := os.ReadFile(filepath.Join(testdataDir, "valid-e2b.json"))
+	if err != nil {
+		t.Fatalf("读取 fixture 失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plain.json"), content, 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	source := NewDirSource(dir)
+
+	got, err := source.Read("plain.json")
+	if err != nil {
+		t.Fatalf("普通文件应可读: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("读到的内容与写入的不一致")
+	}
+
+	// symlink 指向目录内的合法文件也要拒绝：Read 的入参可能不来自 List。
+	if err := os.Symlink(filepath.Join(dir, "plain.json"), filepath.Join(dir, "inside-link.json")); err != nil {
+		t.Fatalf("建 symlink 失败: %v", err)
+	}
+	if _, err := source.Read("inside-link.json"); !errors.Is(err, ErrNotRegularJSONFile) {
+		t.Fatalf("指向目录内文件的 symlink 也应被拒绝, got %v", err)
+	}
+
+	// symlink 指向目录外的文件（经典穿越形态）同样拒绝。
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, content, 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "outside-link.json")); err != nil {
+		t.Fatalf("建 symlink 失败: %v", err)
+	}
+	if _, err := source.Read("outside-link.json"); !errors.Is(err, ErrNotRegularJSONFile) {
+		t.Fatalf("指向目录外文件的 symlink 应被拒绝, got %v", err)
+	}
+
+	// 目录即使叫 .json 也不是普通文件。
+	if err := os.MkdirAll(filepath.Join(dir, "adir.json"), 0o700); err != nil {
+		t.Fatalf("建目录失败: %v", err)
+	}
+	if _, err := source.Read("adir.json"); !errors.Is(err, ErrNotRegularJSONFile) {
+		t.Fatalf("目录应被拒绝, got %v", err)
+	}
+
+	// 大小上限的精确边界：恰好等于上限可读，多一个字节被拒。
+	atLimit := filepath.Join(dir, "at-limit.json")
+	if err := os.WriteFile(atLimit, bytes.Repeat([]byte("x"), MaxDocumentBytes), 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	raw, err := source.Read("at-limit.json")
+	if err != nil {
+		t.Fatalf("恰好等于上限的文档应可读: %v", err)
+	}
+	if len(raw) != MaxDocumentBytes {
+		t.Fatalf("读到 %d 字节, want %d", len(raw), MaxDocumentBytes)
+	}
+
+	overLimit := filepath.Join(dir, "over-limit.json")
+	if err := os.WriteFile(overLimit, bytes.Repeat([]byte("x"), MaxDocumentBytes+1), 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if _, err := source.Read("over-limit.json"); !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("超过上限一个字节就应被拒绝, got %v", err)
+	}
+
+	// 无论成功还是失败，返回的内容都不可能超过上限。
+	for _, name := range []string{"plain.json", "at-limit.json", "over-limit.json"} {
+		body, _ := source.Read(name)
+		if len(body) > MaxDocumentBytes {
+			t.Fatalf("Read(%s) 返回 %d 字节，超过硬上限", name, len(body))
+		}
+	}
+}
+
+// 身份检查：路径在 Lstat 与实际读取之间被换掉时，绝不能返回替换目标的内容。
+//
+// 这个窗口只能通过并发替换来触及，所以这里用固定轮数的 rename 交换来撞它。覆盖是概率性的，
+// 但断言是确定性的：任何一次成功的 Read 都必须返回登记文档的原始内容，永远不能返回诱饵。
+// 实测中修复前的实现（Lstat 通过后再按路径 os.ReadFile）在第 321 次读取就返回了诱饵内容。
+//
+// symlink/目录/超限这些确定性用例在
+// TestDirSourceReadRegularFileSymlinkAndSizeBoundary 里覆盖，所以即使某次运行没撞到窗口，
+// 安全边界本身仍然有确定性的回归保护。
+func TestDirSourceReadNeverReturnsSwappedContent(t *testing.T) {
+	dir := t.TempDir()
+	legit := []byte(`{"document":"legitimate-profile"}`)
+	decoy := []byte(`{"document":"decoy-substituted-content"}`)
+
+	target := filepath.Join(dir, "doc.json")
+	if err := os.WriteFile(target, legit, 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	// 诱饵放在目录外，模拟"symlink 把读取引向别处"。
+	decoyPath := filepath.Join(t.TempDir(), "decoy.json")
+	if err := os.WriteFile(decoyPath, decoy, 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+
+	// 两个候选：一个真正的普通文件，一个指向诱饵的 symlink。用 rename 原子地互换，
+	// 保证目标路径始终存在，避免测试自己制造 ENOENT 噪声。
+	regularStaging := filepath.Join(dir, ".staging-regular")
+	linkStaging := filepath.Join(dir, ".staging-link")
+	if err := os.WriteFile(regularStaging, legit, 0o600); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if err := os.Symlink(decoyPath, linkStaging); err != nil {
+		t.Fatalf("建 symlink 失败: %v", err)
+	}
+
+	source := NewDirSource(dir)
+	stop := make(chan struct{})
+	var swapper sync.WaitGroup
+	swapper.Add(1)
+	go func() {
+		defer swapper.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// 换成 symlink→诱饵，再换回普通文件。每一步都是 rename，因此原子。
+			_ = os.Symlink(decoyPath, linkStaging)
+			_ = os.Rename(linkStaging, target)
+			_ = os.WriteFile(regularStaging, legit, 0o600)
+			_ = os.Rename(regularStaging, target)
+		}
+	}()
+
+	for i := 0; i < 3000; i++ {
+		body, err := source.Read("doc.json")
+		if err != nil {
+			// symlink 命中窗口时被拒绝是正确行为；错误类型不做强断言，因为竞态下
+			// stat/open 也可能返回瞬时错误。
+			continue
+		}
+		if bytes.Equal(body, decoy) {
+			close(stop)
+			swapper.Wait()
+			t.Fatalf("第 %d 次 Read 返回了替换后的诱饵内容，说明读取没有绑定到已检查的文件", i)
+		}
+		if !bytes.Equal(body, legit) {
+			close(stop)
+			swapper.Wait()
+			t.Fatalf("第 %d 次 Read 返回了意料之外的内容: %q", i, body)
+		}
+	}
+	close(stop)
+	swapper.Wait()
 }
 
 // 目录候选文件数超上限是部署错误（例如指向了日志目录），必须让构造失败。

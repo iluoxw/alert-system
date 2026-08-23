@@ -246,9 +246,7 @@
       "semantic": "errors",
       "scope": {
         "kind": "relation",
-        "refs": [
-          "rel_api_orchestrator"
-        ]
+        "refs": []
       },
       "tool_key": "metrics.query_semantic_signal.v1",
       "output_field": "series.error_percent",
@@ -311,10 +309,7 @@
       "family": "use",
       "semantic": "saturation",
       "scope": {
-        "kind": "resource",
-        "refs": [
-          "entity_e2b_host_fleet"
-        ]
+        "kind": "resource"
       },
       "tool_key": "metrics.query_semantic_signal.v1",
       "output_field": "series.placement_saturation_percent",
