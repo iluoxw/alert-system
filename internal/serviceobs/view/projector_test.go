@@ -1259,6 +1259,78 @@ func TestDirectorySortsByTriageOrderAndKeepsNullCursor(t *testing.T) {
 	}
 }
 
+// 显式排序必须被 projector 尊重：把一个按用户选择排好的页面又静默按分诊顺序重排，
+// 会让列头排序失效，也会让 cursor 位置与展示顺序错位。
+func TestDirectoryHonoursExplicitSortInsteadOfReSortingByTriage(t *testing.T) {
+	rows := []DirectoryRow{
+		directorySortRow("svc-a", "Alpha", model.HealthCritical, model.ServiceTier0, 3),
+		directorySortRow("svc-b", "Bravo", model.HealthHealthy, model.ServiceTier1, 1),
+		directorySortRow("svc-c", "Charlie", model.HealthDegraded, model.ServiceTier2, 2),
+	}
+	cases := []struct {
+		name string
+		sort DirectorySort
+		want []string
+	}{
+		{"默认分诊", DirectorySort{}, []string{"svc-a", "svc-c", "svc-b"}},
+		{"名称升序", DirectorySort{Key: SortKeyService}, []string{"svc-a", "svc-b", "svc-c"}},
+		{"名称降序", DirectorySort{Key: SortKeyService, Descending: true}, []string{"svc-c", "svc-b", "svc-a"}},
+		{"Fault 升序", DirectorySort{Key: SortKeyFault}, []string{"svc-b", "svc-c", "svc-a"}},
+		{"Fault 降序", DirectorySort{Key: SortKeyFault, Descending: true}, []string{"svc-a", "svc-c", "svc-b"}},
+		{"健康降序", DirectorySort{Key: SortKeyHealth, Descending: true}, []string{"svc-b", "svc-c", "svc-a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := ProjectDirectory(DirectoryInput{
+				RequestID: "req_directory_sort", AssembledAt: fixtureNow,
+				Rows: rows, Summary: SummaryOf(rows), Sort: tc.sort,
+			})
+			got := make([]string, 0, len(directory.Items))
+			for _, item := range directory.Items {
+				got = append(got, item.Service.ServiceID)
+			}
+			if !equalStringSlices(got, tc.want) {
+				t.Fatalf("排序结果=%v, want %v", got, tc.want)
+			}
+			if err := newValidator(t).ValidateValue(contract.KindPageView, directory); err != nil {
+				t.Fatalf("目录必须过 schema: %v", err)
+			}
+		})
+	}
+}
+
+func directorySortRow(
+	serviceID, name string, status model.Health, tier model.ServiceTier, faults int,
+) DirectoryRow {
+	return DirectoryRow{
+		Identity: serviceobs.ServiceIdentity{
+			ServiceID: serviceID, EntityID: "e-" + serviceID, EntityKey: "k-" + serviceID,
+			Name: name, Layer: model.EntityLayerPlatform,
+			Kind: model.EntityKindInfrastructureCapability, Environment: "prod",
+			OwnerTeamID: "t", OwnerTeamName: "Team " + name, Tier: tier,
+		},
+		Health: model.HealthSummary{
+			Status: status, ReasonCodes: []string{"signal_unavailable:x"},
+			EvaluatedAt: model.NewTimestamp(fixtureNow),
+		},
+		DataStatus:   model.DataStatus{State: model.DataStatePartial, Sources: []model.SourceStatus{}},
+		DomainCounts: model.DomainCounts{ActiveFaults: faults, ConfirmedImpacts: faults},
+		ObservedAt:   fixtureFactAnchor,
+	}
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestFormatSignalValueNeverFakesZero(t *testing.T) {
 	cases := []struct {
 		value *float64

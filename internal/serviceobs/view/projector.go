@@ -425,23 +425,32 @@ func ProjectFocusKinds(published *model.Profile) []model.ViewFocusKind {
 // ProjectLinks 生成责任与跳转入口。href 全部是 alert-system 内部路径或登记的 URL，
 // 不含任何数据源凭据或查询模板。
 func ProjectLinks(snapshot *soctx.AssemblySnapshot) []model.Link {
+	return LinksForIdentity(snapshot.Identity)
+}
+
+// LinksForIdentity 只用 registration 身份生成入口。
+//
+// 目录读的是缓存摘要，没有装配快照，但每一行仍然需要"服务登记 / canonical 实体 /
+// Dashboard / Runbook"这四个入口。它与 ProjectLinks 共用同一份实现，保证目录行与
+// 总览页的入口逐字节一致。
+func LinksForIdentity(identity serviceobs.ServiceIdentity) []model.Link {
 	links := []model.Link{{
 		Kind:  model.LinkKindServiceRegistration,
 		Label: "服务登记",
-		Href:  "/settings/services/" + snapshot.Identity.ServiceID,
+		Href:  "/settings/services/" + identity.ServiceID,
 	}, {
 		Kind:  model.LinkKindEntity,
 		Label: "canonical 实体",
-		Href:  "/infrastructure/entities/" + snapshot.Identity.EntityID,
+		Href:  "/infrastructure/entities/" + identity.EntityID,
 	}}
-	if snapshot.Identity.DashboardURL != "" {
+	if identity.DashboardURL != "" {
 		links = append(links, model.Link{
-			Kind: model.LinkKindDashboard, Label: "Dashboard", Href: snapshot.Identity.DashboardURL,
+			Kind: model.LinkKindDashboard, Label: "Dashboard", Href: identity.DashboardURL,
 		})
 	}
-	if snapshot.Identity.RunbookURL != "" {
+	if identity.RunbookURL != "" {
 		links = append(links, model.Link{
-			Kind: model.LinkKindRunbook, Label: "Runbook", Href: snapshot.Identity.RunbookURL,
+			Kind: model.LinkKindRunbook, Label: "Runbook", Href: identity.RunbookURL,
 		})
 	}
 	sort.SliceStable(links, func(i, j int) bool { return links[i].Kind < links[j].Kind })

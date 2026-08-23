@@ -130,16 +130,10 @@ func (r *ServiceObservabilityRepo) ListServiceIdentities(
 	ctx context.Context, tx pgx.Tx, filter ServiceIdentityFilter,
 ) ([]ServiceIdentityRow, bool, error) {
 	limit := clampObservabilityLimit(filter.Limit)
-	rows, err := tx.Query(ctx, serviceIdentitySelect+`
-		WHERE sr.enabled
-			AND ($1::text = '' OR n.environment = $1::text)
-			AND (NULLIF($2::text, '') IS NULL OR sr.owner_team_id = NULLIF($2::text, '')::uuid)
-			AND ($3::text = '' OR sr.tier = $3::text)
-			AND ($4::text = '' OR n.name ILIKE '%' || $4::text || '%' ESCAPE '\'
-				OR n.entity_key ILIKE '%' || $4::text || '%' ESCAPE '\')
-		ORDER BY sr.tier, n.name, sr.id
-		LIMIT $5
-	`, filter.Environment, filter.TeamID, filter.Tier,
+	// 与 ScanServiceIdentities 共用同一条静态语句：两处各写一份 WHERE 迟早会漂移，
+	// 而目录摘要与目录分页必须落在完全相同的候选口径上。
+	rows, err := tx.Query(ctx, serviceIdentityScanFirstBatch,
+		filter.Environment, filter.TeamID, filter.Tier,
 		escapeLikeFragment(filter.Query), limit+1)
 	if err != nil {
 		return nil, false, fmt.Errorf("store: 查询服务身份列表失败: %w", err)
@@ -162,6 +156,85 @@ func (r *ServiceObservabilityRepo) ListServiceIdentities(
 		return nil, false, fmt.Errorf("store: 遍历服务身份失败: %w", err)
 	}
 	return items, truncated, nil
+}
+
+// ServiceIdentityScanCursor 是完整候选集合分批遍历的 keyset 锚点。
+//
+// 它精确对应 ListServiceIdentities/ScanServiceIdentities 的 `ORDER BY sr.tier,
+// n.name, sr.id`：三个字段一起才是全序，只用 name 或只用 id 都会在同名服务上漏行或
+// 重复行。ServiceID 为空表示"从头开始"。
+type ServiceIdentityScanCursor struct {
+	Tier      string
+	Name      string
+	ServiceID string
+}
+
+// serviceIdentityScanFilter 是两条静态 SQL 共用的过滤片段。
+//
+// keyset 条件写成两条独立静态语句而不是一条带开关的语句：把未使用的锚点当 uuid 下传，
+// 会让"从头开始"这一批因为空字符串转 uuid 而整条事务失败。
+const serviceIdentityScanFilter = `
+	WHERE sr.enabled
+		AND ($1::text = '' OR n.environment = $1::text)
+		AND (NULLIF($2::text, '') IS NULL OR sr.owner_team_id = NULLIF($2::text, '')::uuid)
+		AND ($3::text = '' OR sr.tier = $3::text)
+		AND ($4::text = '' OR n.name ILIKE '%' || $4::text || '%' ESCAPE '\'
+			OR n.entity_key ILIKE '%' || $4::text || '%' ESCAPE '\')
+`
+
+const serviceIdentityScanFirstBatch = serviceIdentitySelect + serviceIdentityScanFilter + `
+	ORDER BY sr.tier, n.name, sr.id
+	LIMIT $5
+`
+
+const serviceIdentityScanNextBatch = serviceIdentitySelect + serviceIdentityScanFilter + `
+		AND (sr.tier, n.name, sr.id) > ($6::text, $7::text, $8::uuid)
+	ORDER BY sr.tier, n.name, sr.id
+	LIMIT $5
+`
+
+// ScanServiceIdentities 按 keyset 顺序返回**一批**候选身份。
+//
+// 它与 ListServiceIdentities 的区别是用途而不是过滤口径：List 服务于"取前 N 行"，
+// Scan 服务于"把 metadata 过滤后的完整候选集合分批走完"。目录摘要的分母必须覆盖完整
+// 候选集合，所以调用方需要能真正走完，而不是被一个页面级 limit 悄悄截断。
+//
+// 批大小仍受 MaxObservabilityRows 硬上界约束：单批有界，总量由调用方用显式安全上界
+// 控制并在超限时显式失败。
+func (r *ServiceObservabilityRepo) ScanServiceIdentities(
+	ctx context.Context, tx pgx.Tx, filter ServiceIdentityFilter,
+	after ServiceIdentityScanCursor, batchSize int,
+) ([]ServiceIdentityRow, error) {
+	batch := clampObservabilityLimit(batchSize)
+	args := []any{filter.Environment, filter.TeamID, filter.Tier,
+		escapeLikeFragment(filter.Query), batch}
+	query := serviceIdentityScanFirstBatch
+	if after.ServiceID != "" {
+		if !looksLikeUUID(after.ServiceID) {
+			// 明显非法的锚点不下传：uuid 转换失败会污染整个只读事务。
+			return nil, ErrServiceObservabilityInvalidID
+		}
+		query = serviceIdentityScanNextBatch
+		args = append(args, after.Tier, after.Name, after.ServiceID)
+	}
+
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: 分批查询服务身份失败: %w", err)
+	}
+	defer rows.Close()
+	items := make([]ServiceIdentityRow, 0, batch)
+	for rows.Next() {
+		item, scanErr := scanServiceIdentity(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("store: 扫描服务身份失败: %w", scanErr)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历服务身份失败: %w", err)
+	}
+	return items, nil
 }
 
 // GetServiceIdentity 按 registration ID 读取单个服务身份。

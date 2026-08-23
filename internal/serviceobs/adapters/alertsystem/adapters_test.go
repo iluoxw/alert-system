@@ -3,6 +3,7 @@ package alertsystem
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -37,6 +38,12 @@ type fakeReader struct {
 	identitiesFilter    store.ServiceIdentityFilter
 	identitiesErr       error
 
+	// scanRows 是完整候选扫描的全集；fake 自己按 keyset 锚点切批，这样"分批走完"
+	// 与"多取一行判定超界"都能被断言，而不是只靠 code review。
+	scanRows    []store.ServiceIdentityRow
+	scanBatches []int
+	scanCursors []store.ServiceIdentityScanCursor
+	scanErr     error
 	identity    store.ServiceIdentityRow
 	identityErr error
 
@@ -81,6 +88,32 @@ func (f *fakeReader) ListServiceIdentities(_ context.Context, filter store.Servi
 	f.record("ListServiceIdentities")
 	f.identitiesFilter = filter
 	return f.identities, f.identitiesTruncated, f.identitiesErr
+}
+
+func (f *fakeReader) ScanServiceIdentities(
+	_ context.Context, _ store.ServiceIdentityFilter,
+	after store.ServiceIdentityScanCursor, batchSize int,
+) ([]store.ServiceIdentityRow, error) {
+	f.record("ScanServiceIdentities")
+	f.scanBatches = append(f.scanBatches, batchSize)
+	f.scanCursors = append(f.scanCursors, after)
+	if f.scanErr != nil {
+		return nil, f.scanErr
+	}
+	start := 0
+	if after.ServiceID != "" {
+		for i, row := range f.scanRows {
+			if row.ServiceID == after.ServiceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + batchSize
+	if end > len(f.scanRows) {
+		end = len(f.scanRows)
+	}
+	return f.scanRows[start:end], nil
 }
 
 func (f *fakeReader) GetServiceIdentity(_ context.Context, _ string) (store.ServiceIdentityRow, error) {
@@ -209,6 +242,116 @@ func TestListServicesIsLightweightAndParameterized(t *testing.T) {
 	if runner.txs != 1 {
 		t.Fatalf("目录查询应恰好开一个只读事务，实际 %d", runner.txs)
 	}
+}
+
+// 完整候选扫描必须真正走完 metadata 过滤后的全部候选，而不是被单批大小截断：目录摘要
+// 的分母就是这个集合。同时它只能开一个只读事务，保证所有批次落在同一个一致读快照上。
+func TestScanCandidatesWalksEveryCandidateInOneSnapshot(t *testing.T) {
+	reader := newFakeReader()
+	reader.scanRows = candidateRows(7)
+	runner := newRunner(reader)
+	adapter := NewRegistrationAdapter(runner, Limits{DirectoryLimit: 50}, fixedClock)
+
+	set, err := adapter.ScanCandidates(context.Background(), serviceobs.CandidateScanRequest{
+		Filter:        serviceobs.CandidateFilter{Environment: "production"},
+		BatchSize:     3,
+		MaxCandidates: 100,
+	})
+	if err != nil {
+		t.Fatalf("ScanCandidates 失败: %v", err)
+	}
+	if len(set.Items) != 7 {
+		t.Fatalf("完整候选集合应为 7 行，实际 %d", len(set.Items))
+	}
+	if runner.txs != 1 {
+		t.Fatalf("完整扫描必须在一个只读快照内完成，实际开了 %d 个事务", runner.txs)
+	}
+	// 3 + 3 + 1：最后一批不足 batchSize 即终止，不再多问一次。
+	if got := reader.calls["ScanServiceIdentities"]; got != 3 {
+		t.Fatalf("keyset 分批次数=%d, want 3", got)
+	}
+	for i, cursor := range reader.scanCursors {
+		if i == 0 && cursor.ServiceID != "" {
+			t.Fatal("第一批必须从头开始，不能带锚点")
+		}
+		if i > 0 && cursor.ServiceID == "" {
+			t.Fatalf("第 %d 批必须带上一批末行的 keyset 锚点", i+1)
+		}
+	}
+	if !set.ReadAt.Equal(fixedNow) {
+		t.Fatalf("ReadAt 应来自注入时钟，实际 %v", set.ReadAt)
+	}
+}
+
+// 恰好等于安全上界必须被接受；只有严格超过才显式失败。判定方式是多取一行，
+// 不是"取满即报错"——否则一个刚好 N 个服务的部署会永远看不到目录。
+func TestScanCandidatesAcceptsExactBoundAndFailsBeyondIt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		rows      int
+		bound     int
+		wantError bool
+	}{
+		{"低于上界", 3, 4, false},
+		{"恰好等于上界", 4, 4, false},
+		{"严格超过上界", 5, 4, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newFakeReader()
+			reader.scanRows = candidateRows(tc.rows)
+			adapter := NewRegistrationAdapter(newRunner(reader), Limits{DirectoryLimit: 50}, fixedClock)
+
+			set, err := adapter.ScanCandidates(context.Background(), serviceobs.CandidateScanRequest{
+				BatchSize: 2, MaxCandidates: tc.bound,
+			})
+			if tc.wantError {
+				if !errors.Is(err, serviceobs.ErrCandidateSetTooLarge) {
+					t.Fatalf("超过上界必须显式失败，实际 err=%v", err)
+				}
+				// 超界必须是"可由收窄筛选解决"的基数问题，而不是基础设施故障。
+				if !errors.Is(err, serviceobs.ErrScopeTooBroad) {
+					t.Fatalf("候选超界应归入 scope too broad 语义，实际 err=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("未超界不应报错: %v", err)
+			}
+			if len(set.Items) != tc.rows {
+				t.Fatalf("候选行数=%d, want %d", len(set.Items), tc.rows)
+			}
+		})
+	}
+}
+
+// 单批大小必须被 adapter 上界收敛，且完整扫描不得逐行拉 aliases/dependencies。
+func TestScanCandidatesClampsBatchAndStaysLightweight(t *testing.T) {
+	reader := newFakeReader()
+	reader.scanRows = candidateRows(2)
+	adapter := NewRegistrationAdapter(newRunner(reader), Limits{DirectoryLimit: 5}, fixedClock)
+
+	if _, err := adapter.ScanCandidates(context.Background(), serviceobs.CandidateScanRequest{
+		BatchSize: 5000,
+	}); err != nil {
+		t.Fatalf("ScanCandidates 失败: %v", err)
+	}
+	if reader.scanBatches[0] != 5 {
+		t.Fatalf("单批大小未被收敛到 adapter 上界，实际 %d", reader.scanBatches[0])
+	}
+	if reader.calls["ListDeclaredDependencies"] != 0 {
+		t.Fatal("完整候选扫描不得逐行读取 declared dependencies（N+1）")
+	}
+}
+
+func candidateRows(count int) []store.ServiceIdentityRow {
+	rows := make([]store.ServiceIdentityRow, 0, count)
+	for i := 0; i < count; i++ {
+		row := identityRow()
+		row.ServiceID = fmt.Sprintf("1111111%d-1111-4111-8111-111111111111", i)
+		row.Name = fmt.Sprintf("Example %02d", i)
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 func TestReadServiceReturnsDeclaredDependencies(t *testing.T) {

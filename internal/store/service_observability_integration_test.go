@@ -345,6 +345,73 @@ func TestServiceObservabilityRegistrationListIsEnabledOnlyAndFiltered(t *testing
 	}
 }
 
+// keyset 分批遍历必须与单条 ListServiceIdentities 落在同一个候选口径上，并且逐批走完
+// 不漏行不重复：目录摘要的分母就是这个完整集合。
+func TestServiceObservabilityScanWalksCompleteCandidateSetByKeyset(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	fixture := seedObservabilityFixture(t, ctx, st)
+	repo := NewServiceObservabilityRepo()
+
+	var walked []string
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		var after ServiceIdentityScanCursor
+		for {
+			// 单批 1 行：强制走完整 keyset 链路，而不是一批取回全部。
+			rows, err := repo.ScanServiceIdentities(ctx, tx, ServiceIdentityFilter{}, after, 1)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				return nil
+			}
+			for _, row := range rows {
+				walked = append(walked, row.ServiceID)
+				after = ServiceIdentityScanCursor{
+					Tier: string(row.Tier), Name: row.Name, ServiceID: row.ServiceID,
+				}
+			}
+		}
+	}); err != nil {
+		t.Fatalf("ScanServiceIdentities 分批遍历失败: %v", err)
+	}
+
+	if len(walked) != 2 {
+		t.Fatalf("完整候选集合应为 2 个 enabled 登记，实际 %d: %v", len(walked), walked)
+	}
+	if !containsID(walked, fixture.primaryServiceID) || !containsID(walked, fixture.secondaryServiceID) {
+		t.Fatalf("keyset 遍历漏行: %v", walked)
+	}
+	seen := map[string]int{}
+	for _, id := range walked {
+		seen[id]++
+		if seen[id] > 1 {
+			t.Fatalf("keyset 遍历重复返回 %s", id)
+		}
+	}
+
+	// 过滤口径与 List 完全一致：staging 环境没有登记，keyset 遍历也必须为空。
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		rows, err := repo.ScanServiceIdentities(ctx, tx,
+			ServiceIdentityFilter{Environment: "staging"}, ServiceIdentityScanCursor{}, 10)
+		if err != nil {
+			return err
+		}
+		if len(rows) != 0 {
+			t.Fatalf("environment 过滤未生效: %+v", rows)
+		}
+		// 非法锚点不下传数据库：否则 uuid 转换失败会污染整个只读事务。
+		_, err = repo.ScanServiceIdentities(ctx, tx, ServiceIdentityFilter{},
+			ServiceIdentityScanCursor{ServiceID: "not-a-uuid"}, 10)
+		if !errors.Is(err, ErrServiceObservabilityInvalidID) {
+			t.Fatalf("非法锚点应返回 typed 错误，实际 %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("过滤/锚点校验失败: %v", err)
+	}
+}
+
 func TestServiceObservabilityBoundaryIsolatesSecondService(t *testing.T) {
 	st := setupTestStore(t)
 	ctx := context.Background()

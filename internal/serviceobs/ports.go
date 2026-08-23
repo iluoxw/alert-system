@@ -20,6 +20,7 @@ package serviceobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"alert-system/internal/serviceobs/health"
@@ -101,6 +102,12 @@ var (
 	// ErrScopeTooBroad 表示时间窗或基数超出 Profile/global 限制。超限显式报错，
 	// 不静默截断。
 	ErrScopeTooBroad = errors.New("serviceobs: 查询范围超出限制")
+	// ErrCandidateSetTooLarge 表示 metadata 过滤后的候选服务数超过显式安全上界。
+	//
+	// 它必须是一个错误而不是一次静默截断：目录摘要的分母是"完整候选集合"，返回一个
+	// 被截掉尾巴的计数等于报出一个看起来完整、实际错误的数字。调用方按"基数超限"
+	// 处理（可由收窄 environment/team/tier/q 解决），不是基础设施故障。
+	ErrCandidateSetTooLarge = fmt.Errorf("%w: 候选服务集合超过安全上界", ErrScopeTooBroad)
 )
 
 // ServiceIdentity 是 Service Registration 与 canonical service entity 的规范化身份。
@@ -196,6 +203,60 @@ type RegistrationReader interface {
 	// ReadService 返回单个服务的身份与 declared dependencies。不存在返回
 	// ErrServiceNotFound。
 	ReadService(ctx context.Context, serviceID string) (ServiceFacts, error)
+}
+
+// DefaultMaxDirectoryCandidates 是目录完整候选集合的默认安全上界。
+//
+// 它是"这个部署有多少个受管服务"的量级上界，不是页面 limit：页面每次最多 200 行，
+// 但摘要分母必须覆盖 metadata 过滤后的全部候选。
+const DefaultMaxDirectoryCandidates = 2000
+
+// DefaultCandidateBatchSize 是完整候选扫描的默认单批大小。
+const DefaultCandidateBatchSize = 200
+
+// CandidateScanRequest 是完整候选集合的有界扫描请求。
+//
+// 与 RegistrationFilter 的区别在语义：这里没有"页面 limit"，只有单批大小与全局安全
+// 上界。metadata 过滤（environment/team/tier/q）之后的候选集合必须被完整走完，因为
+// 目录摘要的分母就是它；health/data_status 是结果筛选，不参与这一层。
+type CandidateScanRequest struct {
+	Filter CandidateFilter
+	// BatchSize <= 0 时使用 DefaultCandidateBatchSize，并受 adapter 的单批硬上界约束。
+	BatchSize int
+	// MaxCandidates <= 0 时使用 DefaultMaxDirectoryCandidates。恰好等于上界必须被接受，
+	// 只有严格超过才返回 ErrCandidateSetTooLarge——实现方式是多取一行判断，而不是
+	// "取满即报错"。
+	MaxCandidates int
+}
+
+// CandidateFilter 只包含 metadata 过滤维度。
+//
+// 它刻意不含 health/data_status：那两个是对已算出的摘要做结果筛选，如果下推到候选
+// 查询，摘要分母就会随筛选漂移。
+type CandidateFilter struct {
+	Environment string
+	TeamID      string
+	Tier        string
+	// Query 是名称/entity key 的模糊匹配片段，长度上限由 adapter 收敛。
+	Query string
+}
+
+// CandidateSet 是一次完整候选扫描的结果。
+//
+// 它没有 Truncated 字段：完整候选集合要么被完整返回，要么因超过安全上界而显式失败。
+// 一个"可能被截断的完整集合"没有正确的用法。
+type CandidateSet struct {
+	Items []ServiceIdentity
+	// ReadAt 是这次一致读的时刻。全部批次在同一个只读快照内完成，因此它对整批有效。
+	ReadAt time.Time
+}
+
+// CandidateScanner 提供 metadata 过滤后完整候选集合的有界分批遍历。
+//
+// 它与 RegistrationReader 分开是为了让实现可以各自演进，也让既有调用方与测试替身不必
+// 因为目录摘要口径的修正而被迫改签名。
+type CandidateScanner interface {
+	ScanCandidates(ctx context.Context, req CandidateScanRequest) (CandidateSet, error)
 }
 
 // TopologyRequest 是 bounded canonical neighborhood 的请求。

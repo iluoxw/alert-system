@@ -1,6 +1,7 @@
 # 编译产物
 /server
 /bin/
+/alert-system
 
 # 运行时日志
 *.log

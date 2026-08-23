@@ -33,6 +33,7 @@ import (
 // internal/store 的只读仓储，SQL 由 store 层负责。
 type Reader interface {
 	ListServiceIdentities(ctx context.Context, filter store.ServiceIdentityFilter) ([]store.ServiceIdentityRow, bool, error)
+	ScanServiceIdentities(ctx context.Context, filter store.ServiceIdentityFilter, after store.ServiceIdentityScanCursor, batchSize int) ([]store.ServiceIdentityRow, error)
 	GetServiceIdentity(ctx context.Context, serviceID string) (store.ServiceIdentityRow, error)
 	ListDeclaredDependencies(ctx context.Context, entityID string, limit int) ([]store.DeclaredEdgeRow, error)
 	ListCanonicalNeighborhood(ctx context.Context, query store.NeighborhoodQuery) (store.NeighborhoodRows, error)
@@ -160,6 +161,10 @@ func (t *txReader) ListServiceIdentities(ctx context.Context, filter store.Servi
 	return t.repo.ListServiceIdentities(ctx, t.tx, filter)
 }
 
+func (t *txReader) ScanServiceIdentities(ctx context.Context, filter store.ServiceIdentityFilter, after store.ServiceIdentityScanCursor, batchSize int) ([]store.ServiceIdentityRow, error) {
+	return t.repo.ScanServiceIdentities(ctx, t.tx, filter, after, batchSize)
+}
+
 func (t *txReader) GetServiceIdentity(ctx context.Context, serviceID string) (store.ServiceIdentityRow, error) {
 	return t.repo.GetServiceIdentity(ctx, t.tx, serviceID)
 }
@@ -204,7 +209,82 @@ func NewRegistrationAdapter(runner ReadRunner, limits Limits, clock Clock) *Regi
 	return &RegistrationAdapter{runner: runner, limits: limits.withDefaults(), clock: clock}
 }
 
-var _ serviceobs.RegistrationReader = (*RegistrationAdapter)(nil)
+var (
+	_ serviceobs.RegistrationReader = (*RegistrationAdapter)(nil)
+	_ serviceobs.CandidateScanner   = (*RegistrationAdapter)(nil)
+)
+
+// ScanCandidates 在**一个**只读一致读事务内用 keyset 分批走完 metadata 过滤后的完整
+// 候选集合。
+//
+// 三条口径是这个方法存在的全部理由：
+//
+//  1. 目录摘要的分母是完整候选集合，所以不能被页面 limit 或 adapter 的 DirectoryLimit
+//     悄悄截断——那会报出一个看起来完整、实际错误的计数；
+//  2. 遍历必须有界：单批有 BatchSize（再受 store 单批硬上界约束），总量有显式安全上界；
+//  3. 超过安全上界必须**显式失败**（ErrCandidateSetTooLarge），绝不返回被截断的集合。
+//     判定方式是多取一行：恰好等于上界被接受，只有严格超过才失败。
+//
+// 全部批次共用同一个 REPEATABLE READ 快照，因此候选身份集合本身是一致的，不会因为
+// 遍历期间的登记变更而漏行或重复。
+func (a *RegistrationAdapter) ScanCandidates(
+	ctx context.Context, req serviceobs.CandidateScanRequest,
+) (serviceobs.CandidateSet, error) {
+	batchSize := req.BatchSize
+	if batchSize <= 0 {
+		batchSize = serviceobs.DefaultCandidateBatchSize
+	}
+	if batchSize > a.limits.DirectoryLimit {
+		batchSize = a.limits.DirectoryLimit
+	}
+	maxCandidates := req.MaxCandidates
+	if maxCandidates <= 0 {
+		maxCandidates = serviceobs.DefaultMaxDirectoryCandidates
+	}
+	filter := store.ServiceIdentityFilter{
+		Environment: req.Filter.Environment,
+		TeamID:      req.Filter.TeamID,
+		Tier:        req.Filter.Tier,
+		Query:       truncate(req.Filter.Query, maxFilterFragment),
+	}
+
+	items := make([]serviceobs.ServiceIdentity, 0, batchSize)
+	overflow := false
+	err := a.runner.WithRead(ctx, func(reader Reader) error {
+		var after store.ServiceIdentityScanCursor
+		for {
+			rows, err := reader.ScanServiceIdentities(ctx, filter, after, batchSize)
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				items = append(items, projectIdentity(row))
+				after = store.ServiceIdentityScanCursor{
+					Tier: string(row.Tier), Name: row.Name, ServiceID: row.ServiceID,
+				}
+				// 只需要多取一行就能判定"严格超过上界"：恰好等于上界必须被接受，
+				// 因此这里是 > 而不是 >=，而且判定发生在追加之后。
+				if len(items) > maxCandidates {
+					overflow = true
+					return nil
+				}
+			}
+			// 不足一批说明候选集合已经走完。恰好取满时再要一批（可能为空），
+			// 这就是"取一行到上界之外"的自然实现。
+			if len(rows) < batchSize {
+				return nil
+			}
+		}
+	})
+	if err != nil {
+		return serviceobs.CandidateSet{}, fmt.Errorf("alertsystem: 扫描候选服务失败: %w", err)
+	}
+	if overflow {
+		return serviceobs.CandidateSet{}, fmt.Errorf("%w: 上界 %d",
+			serviceobs.ErrCandidateSetTooLarge, maxCandidates)
+	}
+	return serviceobs.CandidateSet{Items: items, ReadAt: a.clock.now()}, nil
+}
 
 // ListServices 是目录用的轻量 identity 查询。
 //
