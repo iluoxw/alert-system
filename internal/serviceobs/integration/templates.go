@@ -63,9 +63,10 @@ const (
 
 // SideOutput 是模板在同一次有界读取里必然额外投影的产物。
 //
-// 它存在的目的正是**防止重复查询**：一次 trace 读取本来就能同时给出 journey 阶段、focus
-// 结论、trace EvidenceRef 与 observed topology hints，没有理由让 package 为每一项各建一条
-// binding。compiler 因此把 side output 也算进"谁提供了这个东西"的唯一性判定。
+// 它把一次读取必然产生的额外事实变成受信契约：一次 trace 读取可以同时给出 journey 阶段、
+// focus 结论、trace EvidenceRef 与 observed topology hints，adapter 必须一起投影。side output
+// 不参与 primary binding 多重性；多个来源或覆盖范围不同的 binding 可以共存，精确重复执行由
+// adapter 合并，而不是由 compiler 猜测两个 binding 是否等价。
 type SideOutput string
 
 const (

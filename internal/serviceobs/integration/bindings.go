@@ -10,16 +10,15 @@ import (
 // 它回答四个问题，且每一个都 fail closed：
 //
 //  1. kind/target 是否指向 Profile 里真实存在的对象；
-//  2. 每种 kind 的多重性是否满足（signal/journey 恰好一个，focus 至多一个，
-//     evidence 按 class 至多一个）；
+//  2. 每种 kind 的多重性是否满足（signal/journey 每个 target 恰好一个 primary binding，
+//     focus 每个 target 至多一个显式 binding，evidence 只拒绝 target/class/source 三元组重复）；
 //  3. template 是否允许充当这个 kind、参数是否恰好满足契约、输出字段是否是它真的会产出的；
 //  4. tool 是否已发布、是否在 package 的 tool_refs 里、capability 是否等于 ToolDescriptor 的
 //     source_adapter、template 所需权限是否被 descriptor 覆盖。
 //
-// 还有一条不那么显然但同样重要的规则：**side output 参与唯一性判定**。一次 trace 读取本来
-// 就能同时给出 journey 阶段、focus 结论、trace EvidenceRef 与 topology hints；如果 package 又
-// 为 focus 或 trace evidence 单独建一条 binding，那就是同一次查询被发两遍。compiler 因此把
-// "谁提供了 focus / 谁提供了某个 evidence class"算成一个集合，重复即拒绝。
+// side output 不参与 primary 多重性：多个独立来源可以各自报告同一个 focus，journey 的 trace
+// side output 也可以与覆盖范围不同的显式 evidence binding 共存。一次读取若同时服务多个展示位，
+// 由 adapter 按精确执行身份合并并投影固定 side outputs；compiler 不把合法的多来源输入误判为重复。
 
 // ToolDescriptorSource 是 compiler 需要的 Tool catalog 能力子集。
 //

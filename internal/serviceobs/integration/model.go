@@ -188,8 +188,8 @@ func (k BindingKind) IsValid() bool {
 // ProviderBinding 把 Profile 里的一个目标绑到一个受信 provider template。
 //
 // Kind 只标识**主要**目标。focus、trace EvidenceRef、topology hints 这类固定 side output 由
-// template registry 声明，adapter 必须在同一次有界读取里投影它们；package 既不能自行增加
-// side output，也不能为同一次 trace 读取再建一条 binding。
+// template registry 声明，package 不能自行增加，adapter 必须在同一次有界读取里投影它们。
+// 多来源或覆盖范围不同的 binding 可以共存；精确重复执行由 adapter 合并。
 type ProviderBinding struct {
 	Key         string         `json:"key"`
 	Kind        BindingKind    `json:"kind"`

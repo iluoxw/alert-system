@@ -122,12 +122,12 @@ journey/evidence/topology 就重复查询。Package 不能自行增加 side outp
 运行时以 manifest 为激活/回滚单位：Profile Registry 加载 Profile，受信 adapter 只从配对的
 CompiledIntegration 读取运行时 binding；缺任一半、摘要错配或单独激活均 quarantine 整对，不能
 静默混用旧版本。摘要链只能证明字节完整，证明不了内容没被换掉——能改产物的人同样能重算摘要——
-所以激活校验必须**严格解析两份产物**（拒绝未知字段与尾随 JSON），并在 manifest、
-CompiledIntegration 与**实际 Profile 文档**三者之间逐项核对重复记录的激活身份字段：
-compiler version、profile key/version/digest、package key/version/status、environment、
-service id、service entity id、root entity ids、integration digest。这份三处冗余唯一的用处就是
+所以激活校验必须**严格解析两份产物**（拒绝未知字段与尾随 JSON），按 manifest 校验两份实际
+产物摘要，并在 manifest、CompiledIntegration 与**实际 Profile 文档**之间逐项核对各自重复记录的
+激活身份字段：compiler version、profile key/version/digest、package key/version/status、
+environment、service id、service entity id、root entity ids。这份冗余唯一的用处就是
 让"只改了其中一处"暴露出来：把 manifest 的 `package_status` 从 draft 改成 published 能绕过编译期
-的 publish 授权门，但改不动已签摘要的 Profile 文档里的 status，交叉核对因此 fail closed。
+的 publish 授权门，但实际 Profile 文档里的 status 仍是 draft，交叉核对因此 fail closed。
 回滚引用（previous profile digest 与 previous integration digest）必须同时为空或同时存在，
 只回退一半就等于混版。SIP 不参与请求路径、不绕过现有 Registry，也不让 v1 字段产生 entity-key
 fallback。Phase 3 先提供离线/启动前编译与验证能力，不修改 Kubernetes 发布配置。
@@ -152,10 +152,10 @@ SIP 不能声明请求 purpose 或权限。`directory_summary|overview|focused_w
 没有命中时，只要一个已请求的 focus 来源失败、未连接或 Forbidden 就是 Unknown；只有全部成功
 确认无记录才是 Empty；请求没有 focus 时恒为 NotRequested。
 
-Provider 认证显式区分 `none|basic|bearer`。Basic 的 username/password 与 Bearer token 只能从
-有界的 env/file secret provider 读取，配置互斥且默认拒绝；错误与日志不得回显 secret、env 值、
-文件路径、organization 或 endpoint path。生产 HTTPS 是固定不变量，UAT HTTP 不通过增加绕过开关
-解决。
+Provider 认证显式区分 `none|basic|bearer`。Basic 的 username/password 与 Bearer token 只能通过
+env/file secret 引用读取，引用互斥；文件必须是常规文件且最多 4 KiB，凭据中的控制字符与 Basic
+username 冒号在启动时拒绝。错误与日志不得回显 secret、env 值、文件路径、organization 或
+endpoint path。生产 HTTPS 是固定不变量，不因某个环境曾只有 HTTP endpoint 而增加绕过开关。
 
 ### 6. 运行时 discovery 先产出清单，再发布生产绑定
 
@@ -172,11 +172,17 @@ published：
 - retention、freshness TTL、HugePages 公式、placement rejection 语义和阈值均有审计记录；
 - 未确认的 USE Saturation 继续为 Unknown，不能复用 utilization。
 
-2026-08-23 的只读 UAT 核对进一步固定以下发布约束：查询成功但零 series 是 Empty，不是 0 或
-Stale；HugePages `Total<=0` 的成员局部 Unknown；当前 frozen 15 hosts 与实时 17 hosts 的漂移按
-“固定逻辑组件 + 动态实例清单”处理；`dc`、`zone`、`environment` 不同语义必须分 namespace 并显式
-reconcile；网络超时/HTTP000 不是 auth、Forbidden、Empty 或 Stale；`sandboxID` 不能替代逐条
-`sandbox_id`；UAT 仅 HTTP 是基础设施发布 blocker；17/17 host up 也不能推出整个 E2B Healthy。
+2026-08-23 的只读核对进一步固定以下发布约束：查询成功但零 series 是 Empty，不是 0 或 Stale；
+HugePages `Total<=0` 的成员局部 Unknown；当前 frozen 15 hosts 与实时 17 hosts 的漂移按“固定逻辑
+组件 + 动态实例清单”处理；`dc`、`zone`、`environment` 不同语义必须分 namespace 并显式 reconcile；
+网络超时/HTTP000 不是 auth、Forbidden、Empty 或 Stale；17/17 host up 也不能推出整个 E2B Healthy。
+
+同日后续 OpenObserve 实测通过用户提供的 HTTPS endpoint 完成 health 200、Basic auth 与
+logs/traces/metrics stream metadata 读取，推翻了“当前仅 HTTP/网络不可达”的旧事实。字段事实是：
+logs 与 traces 有精确 `sandbox_id`；logs 还存在遗留 `sandboxid`，但没有 `sandboxID`；access/system
+没有 `sandbox_id`，也没有可直接复用的通用 stage 字段。最近样本约 52.4 小时前，远超现有
+freshness TTL，只能判 Stale/Unknown，不能判 Empty 或当前 Healthy。TLS、网络与认证门已打开，
+但 fresh current data、access focus、journey operation/service 映射与 retention 仍阻塞生产发布。
 
 ### 7. Agent 未来按 Agent-as-a-Service 设计，但本阶段零实现
 

@@ -328,7 +328,7 @@
     },
 
     "providerBinding": {
-      "description": "把 Profile 里的一个目标绑到一个受信 provider template 上。package 只能给出 kind、target、tool、template ref 与类型化参数；PromQL/SQL 由服务端 adapter 从模板构造，package 永远提交不了查询文本。kind 只标识**主要**目标：focus、trace EvidenceRef、topology hints 这类固定 side output 由受信 template registry 声明，package 既不能自行增加，也不能为同一次 trace 读取重复建 binding。",
+      "description": "把 Profile 里的一个目标绑到一个受信 provider template 上。package 只能给出 kind、target、tool、template ref 与类型化参数；PromQL/SQL 由服务端 adapter 从模板构造，package 永远提交不了查询文本。kind 只标识**主要**目标：focus、trace EvidenceRef、topology hints 这类固定 side output 由受信 template registry 声明，package 不能自行增加，adapter 必须在同一次有界读取中投影；多来源或覆盖范围不同的 binding 可以共存，精确重复执行由 adapter 合并。",
       "type": "object",
       "additionalProperties": false,
       "required": ["key", "kind", "target_ref", "tool_key", "template_ref", "params"],

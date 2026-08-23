@@ -82,6 +82,12 @@ binding 的 metric/label/stream 经 discovery 确认、owner 对 threshold/proxy
 两份 example 都是 `draft`：它们的 metric 名取自 OTel spanmetrics connector 与
 node_exporter 的上游默认形状，尚未经 discovery 确认，不是生产事实。
 
+2026-08-23 的 OpenObserve 只读实测已经打开 HTTPS/TLS、Basic auth、stream/schema discovery
+与历史 logs/traces 精确 `sandbox_id` 这几道门，但没有把 example 提升为生产事实：最近样本约
+52.4 小时前，远超 60s/300s freshness TTL，应判 Stale/Unknown；access/system schema 没有
+`sandbox_id`，通用 stage 字段、journey 映射与 retention 也尚未确认。生产 E2B SIP 因此继续是
+draft，不能把历史可查询等同于当前可观测或发布验收。
+
 ## 有意缺席的槽位
 
 E2B package 刻意**不声明** USE Saturation 与 USE Errors：placement admission wait/queue 的

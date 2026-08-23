@@ -575,9 +575,14 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - 只读 endpoint/credential 已由用户或部署环境提供；
 - 不在终端输出 secret、完整 Authorization、日志正文或个人数据；
 - 网络不可达不是理由去修改 Kubernetes/OTel 配置。
-- 2026-08-23 probe 只证明 Prometheus-compatible host 数据可读；OpenObserve 是 Basic 凭据形态但
-  连接超时，两个 UAT endpoint 均为 HTTP。生产 client 仍要求 HTTPS；TLS、网络可达性与严格字段
-  形状是外部发布 blocker，不能通过本仓库环境开关绕过。
+- 2026-08-23 首轮 probe 证明 Prometheus-compatible host 数据可读；同日后续 OpenObserve probe
+  已通过用户提供的 HTTPS endpoint 完成 health 200、Basic auth 与 stream/schema discovery，
+  “仅 HTTP/连接超时”不再是当前事实。`OBS_ENDPOINT` / `OBS_AUTH` 只作为 operator-local 探针输入，
+  alert-system 不读取这些别名，也不 source `~/.zshrc`；应用配置仍只接受
+  `SERVICE_OBSERVABILITY_*` 与独立 env/file secret refs。
+- OpenObserve logs/traces 存在精确 `sandbox_id`，logs 另有遗留 `sandboxid`；access/system 没有
+  `sandbox_id`，也未发现通用 stage 字段。最近样本约 52.4 小时前，远超 60s/300s TTL，因此当前
+  只能判 Stale/Unknown。fresh data、access focus、journey mapping 与 retention 仍是外部发布 blocker。
 
 **步骤**
 
@@ -587,13 +592,16 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 3. 验证 RED histogram buckets 与 labels 能计算 P95；
 4. 验证 HugePages Total/Free、host alias/IP 映射；Total<=0 的成员局部 Unknown，不能填 0；
 5. 验证 placement rejection metric/log 语义；直接 saturation 不存在时保持 Unknown；
-6. replay 一个已有 UAT `sandbox_id`，不创建新 Sandbox、不注入故障；
-7. 比对 journey、API -> Orchestrator RED、host USE、EvidenceRef、domain deep link；
+6. replay 一个已有的历史 `sandbox_id`，不创建新 Sandbox、不注入故障，并把超过 TTL 的结果显式
+   判为 Stale/Unknown；
+7. 比对 journey、API -> Orchestrator RED、host USE、EvidenceRef、domain deep link；通用 stage 字段
+   缺失时必须先完成受信 operation/service 映射，不能从日志正文猜阶段；
 8. 记录 retention、observed_at、timezone、freshness 与 threshold approval 状态；
 9. 核对成功但零 series 的 app RED/Golden 来源为 Empty，不写 0、不改判 Stale；host up 只说明
    inventory source 可用，不能推出服务整体 Healthy；
-10. 严格检查 normalized record 的 `sandbox_id`；当前 Vector 把字段改为 `sandboxID` 的分支不能
-    通过 gate，ClickHouse 分支的恢复也不能代替 OpenObserve 逐条证据；
+10. 严格检查 normalized record 的 `sandbox_id`；最新 OpenObserve schema 中 logs/traces 有精确字段，
+    logs 还存在 `sandboxid`，但 access/system 没有。`sandboxid`、历史配置里出现的 `sandboxID` 与
+    ClickHouse 分支都不能替代目标 stream 的逐条精确字段；没有字段的 access 绑定保持未发布；
 11. 只有全部 required binding、HTTPS/可达性与 owner gate 完成后，Task 9 才能携 discovery digest
     与 owner attestation 显式打开 published compiler gate，并把证据摘要写入 manifest；
 12. fixture 的 91% 故障叙事不得复制为生产事实；本次 probe 的有效节点最大约 19.72%，也不作为
@@ -605,8 +613,8 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - 任一 required 事实未确认时发布命令 fail closed，并明确缺口；
 - published compiler gate 默认关闭；缺 discovery digest、owner attestation、HTTPS 或逐条
   `sandbox_id` 时，即使 package 写了 `status: published` 也必须拒绝；
-- UAT source 暂不可达时，本地 contract/adapters 仍可完成，但 Phase 3 状态必须标记“实现完成、
-  生产发布未验收”，不能宣称整个 Phase 完成。
+- source 不可达、数据过期或 required schema/retention/mapping 不完整时，本地 contract/adapters 仍可
+  完成，但 Phase 3 状态必须标记“实现完成、生产发布未验收”，不能宣称整个 Phase 完成。
 
 ### Task 10：Phase 3 全量验收与文档收口
 
@@ -691,6 +699,11 @@ UAT。`ObservationFacts.ReadAt` 当前无消费者，避免在 merge 层制造�
 adapter 回填 per-source ReadAt、coordinator 只透传的后续项。Correction 通过 Codex 独立全量门禁
 后才允许进入 Batch B。
 
+Correction implementation `6f3cfbb3745b5f435c9cea3921d4462acc79dc0a` 已通过 Codex 本地
+gofmt/diff-check、contract verifier、build、普通与 integration vet、focused race、全量 unit + Docker
+e2e，以及全量 integration-race。Grok 仍需对包含本节事实同步的最终候选 SHA 做集中 review；review
+完成前不启动 Batch B。
+
 ### Opus 5 High Batch B：Task 4–6
 
 Prometheus/OpenObserve/alias-overlay。完成后一次 push，Codex 跑 provider `httptest`、projection、
@@ -708,6 +721,10 @@ store integration 与 security negative tests。
 
 Cursor 每个 batch 只报告：base SHA、head SHA、改动文件、关键决策、命令真实结果、未运行项、
 hold path 检查和 push 状态。中间进度以远端 SHA 为准，不要求 Codex 高频轮询 GUI。
+
+Cursor 编码阶段允许在**同一固定 Cloud 会话**内按文件冲突域并发：独立 package/config/test 可交给
+子任务，共享 schema/README/manifest 由唯一 owner 串行修改。子任务不得 commit/push；主 Agent 在
+全部 join 后统一复核、跑全量门禁并形成该 batch 的单一候选提交。
 
 ## 9. Grok review 策略
 
