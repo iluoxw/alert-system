@@ -348,6 +348,39 @@ async function main(): Promise<void> {
     environment: otherEnvironment, focusKind: base.focus.kind, focusValue: baseFocusValue,
   }).view, null)
 
+  // ---- C4：timezone 必须真的可用，并反映到返回视图 ----
+
+  // 形状合法但不存在的时区必须 422（与后端 time.LoadLocation 同口径；生产权威在后端）。
+  // `+08:00` 被 Intl 接受但形状规则必须拒绝（Go 的正则要求以字母开头）。
+  for (const timezone of [
+    'Mars/Olympus', 'Asia/Atlantis', 'Asia Shanghai', 'z'.repeat(65), '+08:00', '_bad',
+  ]) {
+    await expectApiError(`时区 ${timezone} 应被拒绝`, 'invalid_timezone', () =>
+      fixtures.getWorkspaceFixture(serviceId, null, { timezone }))
+  }
+  // UTC 与真实 IANA 时区通过，并且**反映到** scope.timezone：URL 与显示时区必须一致。
+  for (const timezone of ['UTC', 'Asia/Shanghai', 'America/New_York', 'Europe/Berlin']) {
+    const scoped = fixtures.getWorkspaceFixture(serviceId, null, {
+      timezone, focusKind: base.focus.kind, focusValue: baseFocusValue,
+    })
+    equal(`主视图反映时区 ${timezone}`, scoped.view?.scope.timezone, timezone)
+  }
+  // Empty 与显式场景同样反映。
+  equal('Empty 视图反映请求时区', fixtures.getWorkspaceFixture(serviceId, null, {
+    timezone: 'America/New_York', focusKind: base.focus.kind,
+    focusValue: `${baseFocusValue.slice(0, -1)}q9`,
+  }).view?.scope.timezone, 'America/New_York')
+  equal('显式场景反映请求时区', fixtures.getWorkspaceFixture(serviceId, 'partial', {
+    timezone: 'Europe/Berlin',
+  }).view?.scope.timezone, 'Europe/Berlin')
+  // 缺省时保留 fixture 自己撰写的时区，不被改写。
+  equal('缺省时区保留 fixture 撰写值',
+    fixtures.getWorkspaceFixture(serviceId, null, {}).view?.scope.timezone, base.scope.timezone)
+  // 时区只影响显示，不改查询边界。
+  const tzScoped = fixtures.getWorkspaceFixture(serviceId, null, { timezone: 'America/New_York' })
+  equal('时区不改 from', tzScoped.view?.scope.from, base.scope.from)
+  equal('时区不改 to', tzScoped.view?.scope.to, base.scope.to)
+
   // 未知服务返回 null，让页面走统一 404 状态。
   equal('未知服务的工作区为 null', fixtures.getWorkspaceFixture('svc_unknown', null, {}).view, null)
   equal('未知服务的总览为 null', fixtures.getOverviewFixture('svc_unknown'), null)

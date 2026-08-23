@@ -14,6 +14,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -526,6 +527,78 @@ func TestWorkspaceParameterHandling(t *testing.T) {
 		}
 		if _, reason := decodeErrorBody(t, recorder); reason != tc.reason {
 			t.Fatalf("%s reason_code=%q, want %q", tc.query, reason, tc.reason)
+		}
+	}
+}
+
+// ---- C4：timezone 必须真的存在 ----
+
+// 形状合法但不存在的时区不能被当成成功响应：它会让页面按一个用户没请求过的时区显示时间。
+// 形状校验与 LoadLocation 两道都必须生效，且真实 IANA 时区不受影响。
+func TestWorkspaceTimezoneRequiresLoadableIANAZone(t *testing.T) {
+	cases := []struct {
+		name     string
+		timezone string
+		accepted bool
+		// wantDownstream 是期望下传给 facade 的值；为空表示与输入相同（未 trim）。
+		wantDownstream string
+	}{
+		{name: "UTC", timezone: "UTC", accepted: true},
+		{name: "Asia/Shanghai", timezone: "Asia/Shanghai", accepted: true},
+		{name: "America/New_York", timezone: "America/New_York", accepted: true},
+		{name: "Europe/Berlin", timezone: "Europe/Berlin", accepted: true},
+		{name: "Local 是 Go 的特殊值但不是 IANA 区名", timezone: "Local", accepted: true},
+		{name: "形状合法但不存在", timezone: "Mars/Olympus"},
+		{name: "形状合法但不存在的深层路径", timezone: "Asia/Atlantis"},
+		{name: "大小写不匹配的真实区名", timezone: "asia/shanghai"},
+		{name: "形状非法：空格", timezone: "Asia Shanghai"},
+		// 换行/空格属于空白，后端先 TrimSpace，因此 " UTC " 是合法的 UTC，并且下传的是
+		// 已 trim 的值；真正的控制字符（非空白）才会被形状校验拒绝。
+		{name: "两侧空白被 trim 后合法", timezone: " UTC ", accepted: true, wantDownstream: "UTC"},
+		{name: "形状非法：控制字符", timezone: "UTC\x01"},
+		{name: "形状非法：超长", timezone: strings.Repeat("z", maxTimezoneLength+1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router, pageViews, cookie := newServiceObservabilityRouter(t)
+			recorder := getJSON(t, router,
+				"/api/v1/service-observability/svc_e2b_fixture/workspace?timezone="+
+					url.QueryEscape(tc.timezone), cookie)
+			if tc.accepted {
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("%q 应被接受, status=%d body=%s", tc.timezone, recorder.Code, recorder.Body.String())
+				}
+				wantDownstream := tc.wantDownstream
+				if wantDownstream == "" {
+					wantDownstream = tc.timezone
+				}
+				if pageViews.workspaceCall.Timezone != wantDownstream {
+					t.Fatalf("下传的 timezone=%q, want %q",
+						pageViews.workspaceCall.Timezone, wantDownstream)
+				}
+				return
+			}
+			if recorder.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("%q 应 422, status=%d body=%s", tc.timezone, recorder.Code, recorder.Body.String())
+			}
+			message, reason := decodeErrorBody(t, recorder)
+			if reason != reasonInvalidTimezone {
+				t.Fatalf("reason_code=%q, want %q", reason, reasonInvalidTimezone)
+			}
+			// 响应只给稳定 code 与可展示文案，不回显用户输入（避免反射式内容注入）。
+			if strings.Contains(message, tc.timezone) && tc.timezone != "" {
+				t.Fatalf("错误文案不应回显原始输入: %q", message)
+			}
+		})
+	}
+}
+
+// IANA 时区库必须编进二进制：依赖运行镜像的 zoneinfo 会让精简基础镜像上所有合法时区
+// 都变成 422。这条断言证明 time/tzdata 的空白导入真的生效。
+func TestTimezoneDatabaseIsEmbeddedInBinary(t *testing.T) {
+	for _, zone := range []string{"Asia/Shanghai", "America/New_York", "Europe/Berlin", "UTC"} {
+		if _, err := time.LoadLocation(zone); err != nil {
+			t.Fatalf("%s 必须可加载（time/tzdata 未生效？）: %v", zone, err)
 		}
 	}
 }

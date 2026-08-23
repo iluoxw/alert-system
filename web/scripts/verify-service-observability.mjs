@@ -854,5 +854,258 @@ assert.ok(
   'team options must no longer be limited to the loaded pages',
 )
 
+
+// ============================================================
+// R2：C3 游标 fail-closed / C4 timezone 真值 / C5 链接安全策略
+// ============================================================
+
+// ---- C3：游标必须要求 io.EOF（Go 侧断言，防止实现被回退）----
+
+const cursorSource = await readFile(
+  path.join(repoRoot, 'internal/serviceobs/facade/cursor.go'), 'utf8',
+)
+assert.ok(
+  /errors\.Is\(err, io\.EOF\)/.test(cursorSource),
+  'cursor decoding must require io.EOF so concatenated JSON payloads are rejected',
+)
+assert.ok(
+  cursorSource.includes('DisallowUnknownFields'),
+  'cursor decoding must keep rejecting unknown fields',
+)
+
+// ---- C4：后端 timezone 必须 LoadLocation，且 tzdata 编进二进制 ----
+
+assert.ok(
+  /time\.LoadLocation\(timezone\)/.test(goAPISource),
+  'the API timezone boundary must verify the zone actually loads',
+)
+assert.ok(
+  goAPISource.includes('_ "time/tzdata"'),
+  'the binary must embed the IANA database instead of depending on image zoneinfo',
+)
+// 形状校验不得被 LoadLocation 取代。
+assert.ok(
+  goAPISource.includes('timezonePattern.MatchString(timezone)'),
+  'the shape/length guard must stay in front of LoadLocation',
+)
+// 前端 fixture 契约必须同口径：形状 + 运行时可加载。
+assert.ok(
+  queryContractSource.includes('export function validateTimezone')
+    && queryContractSource.includes('isLoadableTimezone'),
+  'the fixture query contract must validate timezone shape and runtime availability',
+)
+const goTimezonePattern = /timezonePattern = regexp\.MustCompile\(`([^`]+)`\)/.exec(goAPISource)
+assert.ok(goTimezonePattern, 'cannot read the Go timezone pattern')
+assert.ok(
+  queryContractSource.includes(goTimezonePattern[1]),
+  `TS timezone pattern must match Go ${goTimezonePattern[1]}`,
+)
+assert.ok(
+  /Go .*time\.LoadLocation|生产权威/.test(queryContractSource),
+  'the fixture contract must document that Go LoadLocation stays the production authority',
+)
+// 可执行：真实时区通过，形状合法但不存在的时区被拒。
+for (const zone of ['UTC', 'Asia/Shanghai', 'America/New_York', 'Europe/Berlin']) {
+  assert.equal(queryContract.validateTimezone(zone), zone, `${zone} must be accepted`)
+}
+assert.equal(queryContract.validateTimezone(' UTC '), 'UTC', 'timezone must be trimmed like Go')
+assert.equal(queryContract.validateTimezone(undefined), '', 'blank timezone stays blank')
+// `+08:00` / `-05:00` 是形状规则的行为判别用例：Intl 接受它们（ES2024 的偏移量时区），
+// 但后端形状正则要求以字母开头，Go 的 LoadLocation 也不接受。少了形状校验就会出现
+// "fixture 通过、live 422"。
+for (const zone of [
+  'Mars/Olympus', 'Asia/Atlantis', 'Asia Shanghai', 'z'.repeat(65),
+  '+08:00', '-05:00', '_bad', '9Bad',
+]) {
+  expectReason(() => queryContract.validateTimezone(zone), 'invalid_timezone', `timezone=${zone}`)
+}
+// fixture provider 必须把有效时区反映到返回视图。
+assert.ok(
+  fixtureProviderSource.includes('applyRequestedTimezone('),
+  'the fixture workspace must reflect a valid requested timezone in scope.timezone',
+)
+assert.equal(
+  (fixtureProviderSource.match(/applyRequestedTimezone\(/g) ?? []).length, 4,
+  'main, Empty and explicit scenario paths must all reflect the requested timezone',
+)
+
+// ---- C4：时间渲染必须显式指定时区 ----
+
+const formatSource = await readFile(
+  path.join(repoRoot, 'web/src/serviceObservability/format.ts'), 'utf8',
+)
+assert.ok(
+  /formatClock\(value: string, timezone = 'UTC'\)/.test(formatSource)
+    && /formatDateTime\(value: string, timezone = 'UTC'\)/.test(formatSource),
+  'default time formatting must be UTC, never a silent regional zone',
+)
+assert.ok(
+  !formatSource.includes("timezone = 'Asia/Shanghai'"),
+  'no formatter may default to Asia/Shanghai',
+)
+// Service Observability 路由内的每个调用点都必须显式传时区。
+const timeRenderingSources = await Promise.all([
+  'web/src/pages/ServiceDirectory.tsx',
+  'web/src/pages/ServiceOverview.tsx',
+  'web/src/pages/ServiceObservabilityWorkspace.tsx',
+  'web/src/components/ServiceObservability.tsx',
+  'web/src/components/serviceObservability/WorkspaceContext.tsx',
+  'web/src/components/serviceObservability/JourneyRail.tsx',
+  'web/src/components/serviceObservability/DomainTimeline.tsx',
+  'web/src/components/serviceObservability/TopologyExplorer.tsx',
+].map(async (filename) => [filename, await readFile(path.join(repoRoot, filename), 'utf8')]))
+for (const [filename, source] of timeRenderingSources) {
+  for (const call of source.matchAll(/format(?:Clock|DateTime)\(([^)]*)\)/g)) {
+    assert.ok(
+      call[1].includes(','),
+      `${filename} must pass an explicit timezone: ${call[0]}`,
+    )
+  }
+}
+// Directory 没有 scope，显式 UTC；Workspace 的证据行用 view.scope.timezone。
+assert.ok(
+  directoryPage.includes("const directoryTimezone = 'UTC'"),
+  'the directory must render UTC explicitly because DirectoryView carries no timezone',
+)
+const workspaceContextSource = timeRenderingSources
+  .find(([filename]) => filename.endsWith('WorkspaceContext.tsx'))[1]
+assert.ok(
+  /function EvidenceRow\(\{ evidence, timezone \}/.test(workspaceContextSource),
+  'the workspace evidence row must receive the page view timezone',
+)
+assert.ok(
+  /timezone=\{view\.scope\.timezone\}/.test(workspaceContextSource),
+  'evidence rows must be rendered with view.scope.timezone',
+)
+
+// ---- C5：链接安全策略只有一份，两侧同口径 ----
+
+const goSafeLinkSource = await readFile(path.join(repoRoot, 'internal/safelink/safelink.go'), 'utf8')
+const tsSafeHrefSource = await readFile(
+  path.join(repoRoot, 'web/src/serviceObservability/safeHref.ts'), 'utf8',
+)
+// 写入校验与投影必须复用同一个 Go 策略包，不各写一份。
+const serviceCatalogSource = await readFile(
+  path.join(repoRoot, 'internal/api/service_catalog.go'), 'utf8',
+)
+const projectorSource = await readFile(
+  path.join(repoRoot, 'internal/serviceobs/view/projector.go'), 'utf8',
+)
+assert.ok(
+  serviceCatalogSource.includes('alert-system/internal/safelink')
+    && projectorSource.includes('alert-system/internal/safelink'),
+  'service write validation and page view projection must share one link policy package',
+)
+assert.ok(
+  serviceCatalogSource.includes('service_link_invalid'),
+  'invalid dashboard/runbook writes must return the stable service_link_invalid reason code',
+)
+assert.ok(
+  /safelink\.SafeOrEmpty\(identity\.DashboardURL\)/.test(projectorSource)
+    && /safelink\.SafeOrEmpty\(identity\.RunbookURL\)/.test(projectorSource),
+  'the projector must fail closed on historical unsafe dashboard/runbook values',
+)
+// 两侧策略描述必须一致（同一批被拒 scheme 与形态）。
+for (const rejected of ['javascript', 'data:', 'vbscript', 'mailto', 'scheme-relative']) {
+  assert.ok(
+    goSafeLinkSource.includes(rejected),
+    `the Go link policy must document rejecting ${rejected}`,
+  )
+  assert.ok(
+    tsSafeHrefSource.includes(rejected),
+    `the TS link policy must document rejecting ${rejected}`,
+  )
+}
+// EvidenceRef deep link 必须过共享 helper，且不安全时不渲染 anchor/Button href。
+assert.ok(
+  workspaceContextSource.includes("from '../../serviceObservability/safeHref'"),
+  'evidence deep links must go through the shared safeHref helper',
+)
+// 正向断言：locator 必须经过 safeHref 才能变成 href。只断言"没有原始 href={...}"太窄——
+// 把 `const href = safeHref(...)` 改成 `const href = evidence.locator.deep_link` 也能绕过。
+assert.ok(
+  /const href = safeHref\(evidence\.locator\.deep_link\)/.test(workspaceContextSource),
+  'the evidence row href must come from safeHref(evidence.locator.deep_link)',
+)
+assert.ok(
+  !/href=\{evidence\.locator\.deep_link\}/.test(workspaceContextSource)
+    && !/href=\{traceEvidence\.locator\.deep_link\}/.test(workspaceContextSource),
+  'raw evidence locators must never be rendered as an href',
+)
+assert.ok(
+  workspaceContextSource.includes('is-unopenable') && workspaceContextSource.includes('不可打开'),
+  'unsafe evidence must still render summary/availability as a non-clickable row',
+)
+assert.ok(
+  /traceEvidence && safeHref\(traceEvidence\.locator\.deep_link\)/.test(workspaceContextSource),
+  'the trace action must be omitted when the locator is unsafe',
+)
+
+// 可执行：TS 策略与 Go 表逐例一致。
+const safeHrefModulePath = path.join(tmpDir, 'safeHref.js')
+execFileSync('npx', [
+  'tsc', '--ignoreConfig', 'src/serviceObservability/safeHref.ts',
+  '--outDir', tmpDir, '--module', 'commonjs', '--target', 'es2022', '--skipLibCheck',
+], { cwd: webRoot, stdio: 'pipe' })
+const safeHrefModule = require(safeHrefModulePath)
+for (const [href, safe] of [
+  ['/', true],
+  ['/settings/services/svc-1', true],
+  ['/alerts?service_id=svc-1', true],
+  ['  /runbooks/e2b  ', true],
+  ['https://grafana.example.com/d/abc', true],
+  ['http://grafana.example.com:3000/d', true],
+  ['HtTpS://grafana.example.com/d', true],
+  ['javascript:alert(1)', false],
+  ['JavaScript:alert(1)', false],
+  ['  javascript:alert(1)', false],
+  ['data:text/html;base64,PHNjcmlwdD4=', false],
+  ['vbscript:msgbox(1)', false],
+  ['mailto:sre@example.com', false],
+  ['firebreak://open/service', false],
+  ['//evil.example.com/path', false],
+  ['grafana.example.com/d/abc', false],
+  ['runbooks/e2b', false],
+  ['/\\evil.example.com', false],
+  ['\\\\evil.example.com', false],
+  ['/runbooks\nevil', false],
+  ['/runbooks\x00evil', false],
+  ['http://', false],
+  ['http:///runbooks', false],
+  ['', false],
+  ['   ', false],
+]) {
+  assert.equal(
+    safeHrefModule.isSafeHref(href), safe,
+    `TS link policy must ${safe ? 'accept' : 'reject'} ${JSON.stringify(href)}`,
+  )
+  assert.equal(
+    safeHrefModule.safeHref(href), safe ? href.trim() : undefined,
+    `safeHref must ${safe ? 'return the trimmed value' : 'return undefined'} for ${JSON.stringify(href)}`,
+  )
+}
+
+// 契约 fixture 里现有的链接必须全部仍然安全（不得因为收紧而破坏既有 demo）。
+for (const item of directory.items) {
+  for (const link of item.links ?? []) {
+    assert.ok(
+      safeHrefModule.isSafeHref(link.href),
+      `existing directory fixture link must stay renderable: ${link.href}`,
+    )
+  }
+}
+for (const link of overview.links) {
+  assert.ok(
+    safeHrefModule.isSafeHref(link.href),
+    `existing overview fixture link must stay renderable: ${link.href}`,
+  )
+}
+for (const evidence of workspace.evidence_refs) {
+  assert.ok(
+    safeHrefModule.isSafeHref(evidence.locator.deep_link),
+    `existing fixture evidence deep link must stay clickable: ${evidence.locator.deep_link}`,
+  )
+}
+
 console.log(`service-observability verification passed: 3 routes, ${scenarios.scenarios.length + 1} workspace states, `
   + `${tsSortKeys.length} shared sort keys, executable query-contract regressions`)

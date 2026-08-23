@@ -1331,6 +1331,61 @@ func equalStringSlices(left, right []string) bool {
 	return true
 }
 
+// ---- C5：投影层对历史遗留非法链接 fail closed ----
+//
+// 写入校验只管住新写入；早于它落库的 `javascript:` / scheme-relative / 裸主机值仍然在
+// 库里。投影必须丢掉**那一个**链接，而不是原样渲染成可点击 href，也不是因此让整个服务
+// 无法查看。拒绝 mailto/自定义 scheme/裸主机/scheme-relative 是有意的 V1 安全收紧。
+func TestLinksForIdentityFailsClosedOnUnsafeLegacyURLs(t *testing.T) {
+	identity := serviceobs.ServiceIdentity{ServiceID: "svc-1", EntityID: "entity-1"}
+	baseline := LinksForIdentity(identity)
+	if len(baseline) != 2 {
+		t.Fatalf("没有 Dashboard/Runbook 时应只有登记与实体两个入口, got %+v", baseline)
+	}
+
+	for _, unsafe := range []string{
+		"javascript:alert(1)", "JavaScript:alert(1)", "  javascript:alert(1)",
+		"data:text/html;base64,PHNjcmlwdD4=", "vbscript:msgbox(1)",
+		"mailto:sre@example.com", "firebreak://open/service",
+		"//evil.example.com/path", "grafana.example.com/d/abc", "runbooks/e2b",
+		`/\evil.example.com`, `\\evil.example.com`,
+		"/runbooks\nevil", "/runbooks\x00evil", "http://", "http:///runbooks",
+	} {
+		unsafeIdentity := identity
+		unsafeIdentity.DashboardURL = unsafe
+		unsafeIdentity.RunbookURL = unsafe
+		links := LinksForIdentity(unsafeIdentity)
+		for _, link := range links {
+			if link.Kind == model.LinkKindDashboard || link.Kind == model.LinkKindRunbook {
+				t.Fatalf("不安全链接 %q 不得进入 Page View: %+v", unsafe, link)
+			}
+			if link.Href == unsafe {
+				t.Fatalf("不安全链接 %q 不得出现在任何 href", unsafe)
+			}
+		}
+		// 其它入口必须保留：一个坏链接不能让整个服务不可查看。
+		if len(links) != len(baseline) {
+			t.Fatalf("不安全链接 %q 影响了其它入口: %+v", unsafe, links)
+		}
+	}
+
+	// 合法链接照常输出，并且只 trim 外层空白。
+	safeIdentity := identity
+	safeIdentity.DashboardURL = "  https://grafana.example.com/d/abc  "
+	safeIdentity.RunbookURL = "/runbooks/e2b"
+	links := LinksForIdentity(safeIdentity)
+	byKind := map[model.LinkKind]string{}
+	for _, link := range links {
+		byKind[link.Kind] = link.Href
+	}
+	if byKind[model.LinkKindDashboard] != "https://grafana.example.com/d/abc" {
+		t.Fatalf("合法 Dashboard 链接被改写: %q", byKind[model.LinkKindDashboard])
+	}
+	if byKind[model.LinkKindRunbook] != "/runbooks/e2b" {
+		t.Fatalf("合法 Runbook 链接被改写: %q", byKind[model.LinkKindRunbook])
+	}
+}
+
 func TestFormatSignalValueNeverFakesZero(t *testing.T) {
 	cases := []struct {
 		value *float64

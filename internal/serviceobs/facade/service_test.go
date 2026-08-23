@@ -2,6 +2,7 @@ package facade
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -917,3 +918,108 @@ var (
 	_ serviceobs.DomainReader       = (*fakeReaders)(nil)
 	_ serviceobs.CandidateScanner   = (*fakeCandidates)(nil)
 )
+
+// ---- C3：游标解码必须 fail closed ----
+
+// 游标是唯一由客户端回传、又参与分页位置判定的输入。表驱动覆盖"合法尾随空白"与各类
+// 拼接载荷：JSON decoder 是流式的，一次 Decode 只消费第一个值，没有 EOF 检查时
+// `{...}{"v":1}`、`{...}null`、`{...}0` 都会被静默接受。
+func TestDecodeCursorRejectsTrailingContentAndMalformedPayloads(t *testing.T) {
+	query := DirectoryQuery{Environment: "production", Limit: 2}
+	fingerprint := queryFingerprint(query)
+	valid, err := encodeCursor(view.DirectoryKey{
+		HealthRank: 1, ConfirmedImpacts: 2, ActiveFaults: 3, Tier: "tier-1",
+		Name: "Alpha", OwnerTeamName: "Platform SRE", DataRank: 1,
+		ObservedAtUnixMilli: factAnchor.UnixMilli(), ServiceID: "svc-a",
+	}, fingerprint)
+	if err != nil {
+		t.Fatalf("编码游标失败: %v", err)
+	}
+	rawPayload, err := base64.RawURLEncoding.DecodeString(valid)
+	if err != nil {
+		t.Fatalf("解码基准游标失败: %v", err)
+	}
+	payload := string(rawPayload)
+	reencode := func(body string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(body))
+	}
+
+	cases := []struct {
+		name    string
+		cursor  string
+		wantErr bool
+	}{
+		{"基准游标", valid, false},
+		// 值之间的空白由 decoder 跳过，这与"多带了一个 JSON 值"是两件事。
+		{"尾随空白合法", reencode(payload + "   "), false},
+		{"尾随换行与制表符合法", reencode(payload + "\n\t\r "), false},
+		{"前置空白合法", reencode("  " + payload), false},
+		{"拼接第二个对象", reencode(payload + payload), true},
+		{"拼接空对象", reencode(payload + "{}"), true},
+		{"拼接标量数字", reencode(payload + "0"), true},
+		{"拼接标量字符串", reencode(payload + `"x"`), true},
+		{"拼接 null", reencode(payload + "null"), true},
+		{"拼接 true", reencode(payload + "true"), true},
+		{"拼接数组", reencode(payload + "[1]"), true},
+		{"拼接非 JSON 字节", reencode(payload + "@"), true},
+		{"拼接注释", reencode(payload + "//x"), true},
+		{"未知字段", reencode(`{"v":1,"f":"` + fingerprint + `","s":"svc-a","zz":1}`), true},
+		{"非法 base64", "not*base64*at*all", true},
+		{"空游标", "", true},
+		{"超长游标", strings.Repeat("a", MaxCursorLength+1), true},
+		{"版本不符", reencode(`{"v":99,"f":"` + fingerprint + `","s":"svc-a"}`), true},
+		{"指纹不符", reencode(`{"v":1,"f":"other-fingerprint","s":"svc-a"}`), true},
+		{"缺少 service ID 锚点", reencode(`{"v":1,"f":"` + fingerprint + `","s":""}`), true},
+		{"载荷不是对象", reencode(`[1,2]`), true},
+		{"空字节串", reencode(""), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeCursor(tc.cursor, fingerprint)
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidCursor) {
+					t.Fatalf("应返回 ErrInvalidCursor，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("合法游标不应报错: %v", err)
+			}
+		})
+	}
+}
+
+// 拼接载荷必须在任何候选查询之前被拒绝：游标内容绝不能进入 SQL 路径。
+func TestDirectoryRejectsTrailingCursorContentBeforeQuerying(t *testing.T) {
+	items := []serviceobs.ServiceIdentity{
+		identity("svc-a", "Alpha", "Platform SRE", model.ServiceTier1),
+		identity("svc-b", "Bravo", "Platform SRE", model.ServiceTier1),
+	}
+	summaries := newFakeSummaries()
+	for _, item := range items {
+		summaries.entries[item.ServiceID] = summary(model.HealthCritical, model.DataStatePartial, 1, 1)
+	}
+	candidates := &fakeCandidates{items: items}
+	service := newService(t, candidates, summaries, &fakeReaders{}, fakeProfiles{})
+
+	first, err := service.Directory(context.Background(), DirectoryQuery{Limit: 1})
+	if err != nil {
+		t.Fatalf("第一页失败: %v", err)
+	}
+	rawPayload, err := base64.RawURLEncoding.DecodeString(*first.NextCursor)
+	if err != nil {
+		t.Fatalf("解码游标失败: %v", err)
+	}
+	tampered := base64.RawURLEncoding.EncodeToString(append(rawPayload, []byte(`{"v":1}`)...))
+
+	callsBefore := candidates.calls
+	if _, err := service.Directory(context.Background(), DirectoryQuery{
+		Limit: 1, Cursor: tampered,
+	}); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("拼接载荷应返回 ErrInvalidCursor，实际 %v", err)
+	}
+	if candidates.calls != callsBefore {
+		t.Fatalf("游标校验必须在任何候选查询之前完成，实际多发起了 %d 次扫描",
+			candidates.calls-callsBefore)
+	}
+}

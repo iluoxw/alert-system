@@ -122,6 +122,11 @@ function isRowSecondaryTarget(target: EventTarget | null): boolean {
 
 const emptySummary: DirectorySummary = { managed: 0, critical: 0, partial: 0, unconfigured: 0 }
 
+// directoryTimezone 是目录页唯一的显示时区。契约的 directoryView 没有 timezone 字段
+// （它是跨服务分诊视图，不属于任何一个服务的 scope），因此这里显式用 UTC，并且可见文本
+// 与 title 用同一个值。
+const directoryTimezone = 'UTC'
+
 export function ServiceDirectory() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -261,7 +266,8 @@ export function ServiceDirectory() {
         </div>
         {assembledAt && (
           <time className="service-last-updated" dateTime={assembledAt} title={`${assembledAt} · UTC`} tabIndex={0}>
-            目录更新于 {formatClock(assembledAt)}
+            {/* DirectoryView 没有 timezone 字段：目录显式按 UTC 渲染，与 title 一致。 */}
+            目录更新于 {formatClock(assembledAt, directoryTimezone)}
           </time>
         )}
       </header>

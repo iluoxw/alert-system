@@ -14,6 +14,7 @@ import (
 
 	"alert-system/internal/domain"
 	"alert-system/internal/pipeline"
+	"alert-system/internal/safelink"
 	"alert-system/internal/store"
 )
 
@@ -160,6 +161,17 @@ func (request serviceRequest) domain() (domain.ServiceRegistration, error) {
 	if err != nil {
 		return domain.ServiceRegistration{}, err
 	}
+	// Dashboard/Runbook 会被运营页面渲染成值班人直接点开的链接，因此写入时就按共享策略
+	// 收敛：只接受 alert-system 内部单斜杠路径或绝对 http(s) URL。空值仍然合法——
+	// 未配置 Dashboard/Runbook 是正常状态。
+	dashboardURL, err := validateServiceLink(request.DashboardURL, "dashboard_url")
+	if err != nil {
+		return domain.ServiceRegistration{}, err
+	}
+	runbookURL, err := validateServiceLink(request.RunbookURL, "runbook_url")
+	if err != nil {
+		return domain.ServiceRegistration{}, err
+	}
 	enabled := true
 	if request.Enabled != nil {
 		enabled = *request.Enabled
@@ -169,8 +181,8 @@ func (request serviceRequest) domain() (domain.ServiceRegistration, error) {
 			Managed: true, Kind: kind, Name: request.Name,
 			Environment: request.Environment, OwnerTeamID: request.OwnerTeamID, Labels: request.Labels},
 		OwnerTeamID: request.OwnerTeamID, Description: strings.TrimSpace(request.Description),
-		Tier: request.Tier, DashboardURL: strings.TrimSpace(request.DashboardURL),
-		RunbookURL: strings.TrimSpace(request.RunbookURL), Enabled: enabled,
+		Tier: request.Tier, DashboardURL: dashboardURL,
+		RunbookURL: runbookURL, Enabled: enabled,
 	}
 	seen := map[string]struct{}{}
 	for _, item := range request.Aliases {
@@ -208,6 +220,29 @@ func (request serviceRequest) domain() (domain.ServiceRegistration, error) {
 		})
 	}
 	return service, nil
+}
+
+// reasonServiceLinkInvalid 是 Dashboard/Runbook 链接非法的稳定机器码。create 与 update
+// 共用同一个 code，前端只需要一条分支。
+const reasonServiceLinkInvalid = "service_link_invalid"
+
+// validateServiceLink 按共享的 safelink 策略校验一个登记链接。
+//
+// 空值合法（未配置）；其余必须是 alert-system 内部单斜杠路径或绝对 http(s) URL。
+// 拒绝 javascript/data/vbscript/mailto/自定义 scheme、裸主机、scheme-relative、控制字符
+// 与反斜杠伪造 authority——这是对 V1"只 trim"口径的有意安全收紧，见 internal/safelink。
+func validateServiceLink(raw, field string) (string, error) {
+	value := safelink.Normalize(raw)
+	if value == "" {
+		return "", nil
+	}
+	if !safelink.IsSafe(value) {
+		return "", &reasonCodedError{
+			code:    reasonServiceLinkInvalid,
+			message: field + " 只支持 alert-system 内部路径（以 / 开头）或绝对 http(s) URL",
+		}
+	}
+	return value, nil
 }
 
 func (h *serviceCatalogHandlers) handleStoreError(c *gin.Context, err error) {

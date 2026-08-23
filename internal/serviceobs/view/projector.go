@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"alert-system/internal/safelink"
 	"alert-system/internal/serviceobs"
 	soctx "alert-system/internal/serviceobs/context"
 	"alert-system/internal/serviceobs/health"
@@ -443,14 +444,17 @@ func LinksForIdentity(identity serviceobs.ServiceIdentity) []model.Link {
 		Label: "canonical 实体",
 		Href:  "/infrastructure/entities/" + identity.EntityID,
 	}}
-	if identity.DashboardURL != "" {
+	// 历史遗留的非法登记值必须在投影层 fail closed：写入校验只管住新写入，早于它落库的
+	// `javascript:` / scheme-relative / 裸主机值仍然在库里。这里只丢掉**那一个**链接，
+	// 其余身份、责任与领域信息照常返回——不能因为一个坏链接就让整个服务无法查看。
+	if dashboard := safelink.SafeOrEmpty(identity.DashboardURL); dashboard != "" {
 		links = append(links, model.Link{
-			Kind: model.LinkKindDashboard, Label: "Dashboard", Href: identity.DashboardURL,
+			Kind: model.LinkKindDashboard, Label: "Dashboard", Href: dashboard,
 		})
 	}
-	if identity.RunbookURL != "" {
+	if runbook := safelink.SafeOrEmpty(identity.RunbookURL); runbook != "" {
 		links = append(links, model.Link{
-			Kind: model.LinkKindRunbook, Label: "Runbook", Href: identity.RunbookURL,
+			Kind: model.LinkKindRunbook, Label: "Runbook", Href: runbook,
 		})
 	}
 	sort.SliceStable(links, func(i, j int) bool { return links[i].Kind < links[j].Kind })

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -107,6 +108,16 @@ func decodeCursor(encoded, fingerprint string) (view.DirectoryKey, error) {
 	var payload cursorPayload
 	if err := decoder.Decode(&payload); err != nil {
 		return view.DirectoryKey{}, fmt.Errorf("%w: 载荷无法解析", ErrInvalidCursor)
+	}
+	// 必须再读一次并要求 io.EOF：json.Decoder 是流式的，一次 Decode 只消费**第一个**
+	// JSON 值。没有这一步，`{...}{"v":1}`、`{...}null`、`{...}[1]` 甚至 `{...}0` 都会被
+	// 当成合法游标——第一个对象解析成功，后面拼接的内容被静默忽略。游标是唯一由客户端
+	// 回传、又参与分页位置判定的输入，因此这里必须 fail closed。
+	//
+	// 尾随空白仍然合法：json.Decoder 会跳过值之间的空白，这与"多带了一个 JSON 值"是
+	// 两件事。
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return view.DirectoryKey{}, fmt.Errorf("%w: 载荷后存在多余内容", ErrInvalidCursor)
 	}
 	if payload.Version != CursorVersion {
 		return view.DirectoryKey{}, fmt.Errorf("%w: 版本 %d 不是当前版本 %d",

@@ -130,7 +130,9 @@ function signalDelta(signal: SignalValue): string | null {
   return null
 }
 
-export function GoldenLedger({ signals }: { signals: SignalValue[] }) {
+// GoldenLedger 的 timezone 必须由调用方显式给出：Directory/Overview 没有 scope，按 UTC
+// 渲染；Workspace 传 view.scope.timezone。默认值只是兜底，绝不静默切到某个地区时区。
+export function GoldenLedger({ signals, timezone = 'UTC' }: { signals: SignalValue[]; timezone?: string }) {
   return (
     <section className="golden-ledger" aria-label="Google 四大黄金信号">
       {signals.map((signal) => {
@@ -141,7 +143,7 @@ export function GoldenLedger({ signals }: { signals: SignalValue[] }) {
             key={signal.binding_key}
             className={`golden-ledger__item is-${signal.health}${unavailable ? ' is-unavailable' : ''}`}
             tabIndex={0}
-            title={signal.observed_at ? `${formatDateTime(signal.observed_at)}${signal.proxy_reason ? `；${signal.proxy_reason}` : ''}` : signal.unknown_reason}
+            title={signal.observed_at ? `${formatDateTime(signal.observed_at, timezone)}${signal.proxy_reason ? `；${signal.proxy_reason}` : ''}` : signal.unknown_reason}
           >
             <div className="golden-ledger__label">
               <span>{signalTitle(signal)}</span>

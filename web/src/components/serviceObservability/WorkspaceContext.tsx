@@ -18,6 +18,7 @@ import {
   stageProjection,
   unavailableEvidenceSources,
 } from '../../serviceObservability/workspaceModel'
+import { safeHref } from '../../serviceObservability/safeHref'
 import { contextTabs } from '../../serviceObservability/workspaceState'
 import type { ContextTab } from '../../serviceObservability/workspaceState'
 import type { EvidenceRef, ObservabilityWorkspaceView, TimelineEvent } from '../../serviceObservability/types'
@@ -35,16 +36,37 @@ function evidenceKindLabel(evidence: EvidenceRef): string {
   return humanizeIdentifier(evidence.kind)
 }
 
-function EvidenceRow({ evidence }: { evidence: EvidenceRef }) {
-  return (
-    <a className="workspace-evidence-row" href={evidence.locator.deep_link}>
+// EvidenceRow 渲染一条 EvidenceRef。
+//
+// deep_link 来自外部证据系统，是不可信输入：它必须过共享的 safeHref 策略。不安全或缺失
+// 的 locator 仍然展示摘要、可用性与观测时间（"权限拒绝/不可打开不等于没有证据"），但**不**
+// 渲染 anchor——空 href 会跳回当前页面，让"打不开"看起来像"点了没反应"。
+//
+// 时间一律用 Page View 的 scope.timezone 渲染，可见文本与 title 同一个时区。
+function EvidenceRow({ evidence, timezone }: { evidence: EvidenceRef; timezone: string }) {
+  const href = safeHref(evidence.locator.deep_link)
+  const body = (
+    <>
       <span className="workspace-evidence-icon">{evidence.kind === 'trace' ? <ApartmentOutlined /> : <FileSearchOutlined />}</span>
       <span>
         <strong>{evidenceKindLabel(evidence)} · {formatSourceName(evidence.source)}</strong>
         <small>{evidence.summary}</small>
-        <time dateTime={evidence.observed_at} title={formatDateTime(evidence.observed_at)} tabIndex={0}>{formatClock(evidence.observed_at)}</time>
+        <time dateTime={evidence.observed_at} title={formatDateTime(evidence.observed_at, timezone)} tabIndex={0}>{formatClock(evidence.observed_at, timezone)}</time>
       </span>
       <AvailabilityBadge state={evidence.availability} />
+    </>
+  )
+  if (!href) {
+    return (
+      <div className="workspace-evidence-row is-unopenable" aria-disabled="true">
+        {body}
+        <span className="workspace-evidence-unopenable">不可打开</span>
+      </div>
+    )
+  }
+  return (
+    <a className="workspace-evidence-row" href={href}>
+      {body}
       <ArrowRightOutlined />
     </a>
   )
@@ -164,7 +186,7 @@ export function WorkspaceContext({
             {(summaryEvidence.length > 0 || firstFault) && (
               <article className="diagnostic-supporting-facts">
                 <span className="diagnostic-summary__eyebrow">当前证据与领域状态</span>
-                {summaryEvidence.map((evidence) => <EvidenceRow key={evidence.evidence_id} evidence={evidence} />)}
+                {summaryEvidence.map((evidence) => <EvidenceRow key={evidence.evidence_id} evidence={evidence} timezone={view.scope.timezone} />)}
                 {firstFault && (
                   <Link className="diagnostic-fault-preview" to={`/faults/${firstFault.id}`}>
                     <ProfileOutlined />
@@ -221,7 +243,7 @@ export function WorkspaceContext({
                 <span>权限说明</span>
               </div>
             )}
-            {context.evidenceRefs.map((evidence) => <EvidenceRow key={evidence.evidence_id} evidence={evidence} />)}
+            {context.evidenceRefs.map((evidence) => <EvidenceRow key={evidence.evidence_id} evidence={evidence} timezone={view.scope.timezone} />)}
             {resourceGroups.map(({ node, signals }) => {
               const availability = signals.some((signal) => signal.availability === 'available') ? 'available' : 'unknown'
               return (
@@ -251,7 +273,10 @@ export function WorkspaceContext({
             {forbiddenLogs && <p className="evidence-disclaimer">受限日志不会参与当前诊断结论；已授权的 Trace、metrics 与领域证据仍可查看。</p>}
             {forbiddenLogs && (
               <div className="workspace-forbidden-actions">
-                {traceEvidence && <Button type="primary" href={traceEvidence.locator.deep_link}>查看可用 Trace</Button>}
+                {/* locator 不安全时省略整个动作：绝不渲染空 href 或原样外链。 */}
+                {traceEvidence && safeHref(traceEvidence.locator.deep_link) && (
+                  <Button type="primary" href={safeHref(traceEvidence.locator.deep_link)}>查看可用 Trace</Button>
+                )}
                 <details>
                   <summary>查看权限说明</summary>
                   <p>当前权限快照缺少 <code>logs.read</code>。日志正文、结果数和 deep link 均不会下发；Forbidden 不改变服务健康。</p>

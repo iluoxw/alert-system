@@ -168,3 +168,76 @@ func TestServiceRequest_ValidClassificationRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// ---- C5：Dashboard/Runbook 链接安全策略 ----
+//
+// 需要显式记录的口径：拒绝 mailto、自定义 scheme、裸主机与 scheme-relative 输入是对 V1
+// 写入口径的**有意安全收紧**。这些值此前可以写进登记并被渲染成运营页面的可点击链接，而
+// 值班人会在事故中直接点开它们。空值继续合法（未配置 Dashboard/Runbook 是正常状态）。
+func TestServiceRequest_RejectsUnsafeDashboardAndRunbookLinks(t *testing.T) {
+	unsafe := []string{
+		"javascript:alert(1)",
+		"JavaScript:alert(1)",
+		"  javascript:alert(1)",
+		"data:text/html;base64,PHNjcmlwdD4=",
+		"vbscript:msgbox(1)",
+		"mailto:sre@example.com",
+		"firebreak://open/service",
+		"//evil.example.com/path",
+		"grafana.example.com/d/abc",
+		"runbooks/e2b",
+		`/\evil.example.com`,
+		`\\evil.example.com`,
+		"/runbooks\nevil",
+		"/runbooks\x00evil",
+		"http://",
+		"http:///runbooks",
+	}
+	for _, href := range unsafe {
+		for _, field := range []string{"dashboard_url", "runbook_url"} {
+			request := decodeServiceRequest(t, validServiceBody)
+			if field == "dashboard_url" {
+				request.DashboardURL = href
+			} else {
+				request.RunbookURL = href
+			}
+			_, err := request.domain()
+			if err == nil {
+				t.Fatalf("%s=%q 应被拒绝", field, href)
+			}
+			if code := reasonCodeOf(err); code != reasonServiceLinkInvalid {
+				t.Fatalf("%s=%q reason_code=%q, want %q", field, href, code, reasonServiceLinkInvalid)
+			}
+		}
+	}
+}
+
+// 合法链接原样保留（只 trim 外层空白）；空值仍然合法。
+func TestServiceRequest_AcceptsInternalAndHTTPLinks(t *testing.T) {
+	cases := []struct {
+		href string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"/settings/services/svc-1", "/settings/services/svc-1"},
+		{"  /runbooks/e2b  ", "/runbooks/e2b"},
+		{"/alerts?service_id=svc-1", "/alerts?service_id=svc-1"},
+		{"https://grafana.example.com/d/abc", "https://grafana.example.com/d/abc"},
+		{"http://grafana.example.com:3000/d/abc", "http://grafana.example.com:3000/d/abc"},
+		{"HtTpS://grafana.example.com/d", "HtTpS://grafana.example.com/d"},
+	}
+	for _, tc := range cases {
+		request := decodeServiceRequest(t, validServiceBody)
+		request.DashboardURL = tc.href
+		request.RunbookURL = tc.href
+		service, err := request.domain()
+		if err != nil {
+			t.Fatalf("%q 应被接受: %v", tc.href, err)
+		}
+		if service.DashboardURL != tc.want || service.RunbookURL != tc.want {
+			t.Fatalf("%q 解析为 dashboard=%q runbook=%q, want %q",
+				tc.href, service.DashboardURL, service.RunbookURL, tc.want)
+		}
+	}
+}

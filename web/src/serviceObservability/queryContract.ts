@@ -353,9 +353,46 @@ export function validateWorkspaceScope(query: WorkspaceQueryInput): void {
     assertAbsoluteRFC3339(from)
     assertAbsoluteRFC3339(to)
   }
-  const timezone = scalar(query.timezone)
-  if (timezone !== '' && byteLength(timezone) > queryLimits.maxTimezoneBytes) {
+  validateTimezone(query.timezone)
+}
+
+// timezonePattern 与后端 internal/api/service_observability.go 的同名正则一致。
+//
+// 之前这里只校验长度，注释却声称校验"形状"：于是 `Asia Shanghai` 这类输入在 fixture 下
+// 通过、在 live 下 422。
+const timezonePattern = /^[A-Za-z][A-Za-z0-9_+/-]{0,63}$/
+
+/**
+ * validateTimezone 校验时区并返回 trim 后的值。
+ *
+ * 两道校验与后端一致：先形状与长度，再"这个时区是否真的存在"。运行时能力用
+ * `Intl.DateTimeFormat`——它对未知时区抛 RangeError，因此 `Mars/Olympus` 会被拒绝，
+ * 而 `UTC`、`Asia/Shanghai` 正常通过。
+ *
+ * 生产权威仍然是 Go 的 `time.LoadLocation`（见后端 parseTimezone）：这里的 Intl 判定只是
+ * 让显式 fixture 模式对同一批输入给出同样的 422，不是替代后端校验。两者的时区数据来源
+ * 不同（ICU vs IANA tzdata），极冷门的区名理论上可能判定不一致；真正的裁决权在后端。
+ */
+export function validateTimezone(timezone: string | undefined): string {
+  const value = scalar(timezone)
+  if (value === '') return ''
+  if (byteLength(value) > queryLimits.maxTimezoneBytes || !timezonePattern.test(value)) {
     reject(queryReasonCodes.invalidTimezone, 'timezone 格式非法')
+  }
+  if (!isLoadableTimezone(value)) {
+    reject(queryReasonCodes.invalidTimezone, 'timezone 不是可用的 IANA 时区')
+  }
+  return value
+}
+
+/** isLoadableTimezone 判断运行时能否真的用这个时区格式化时间。 */
+export function isLoadableTimezone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(0)
+    return true
+  } catch {
+    // RangeError：运行时不认识这个时区。形状对不代表它存在。
+    return false
   }
 }
 

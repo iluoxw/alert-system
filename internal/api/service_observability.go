@@ -8,6 +8,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	// time/tzdata 把 IANA 时区库编进二进制：parseTimezone 用 time.LoadLocation 判定
+	// "这个时区是否真的存在"，如果依赖运行镜像里的 /usr/share/zoneinfo，一个精简基础
+	// 镜像就会让**全部**合法 IANA 时区变成 422。空白导入是标准库提供的官方做法，
+	// 不需要改动任何 Docker/Kubernetes/OTel 配置。
+	_ "time/tzdata"
 
 	"github.com/gin-gonic/gin"
 
@@ -476,6 +481,16 @@ func parseAbsoluteTime(raw string) (time.Time, error) {
 	return parsed.UTC(), nil
 }
 
+// parseTimezone 解析 timezone。
+//
+// 两道校验缺一不可：
+//
+//  1. 形状与长度（挡住控制字符、超长串与明显不是时区标识的输入）；
+//  2. `time.LoadLocation` —— 形状合法但不存在的时区（例如 `Mars/Olympus`）必须 422
+//     `invalid_timezone`，而不是被当成成功响应然后在前端静默回落成另一个时区显示。
+//     "格式看起来对"不等于"这个时区真的存在"。
+//
+// timezone 仍然只影响显示，不改变 from/to 的查询边界。
 func parseTimezone(c *gin.Context) (string, error) {
 	timezone := strings.TrimSpace(c.Query("timezone"))
 	if timezone == "" {
@@ -483,6 +498,9 @@ func parseTimezone(c *gin.Context) (string, error) {
 	}
 	if len(timezone) > maxTimezoneLength || !timezonePattern.MatchString(timezone) {
 		return "", &reasonCodedError{code: reasonInvalidTimezone, message: "timezone 格式非法"}
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return "", &reasonCodedError{code: reasonInvalidTimezone, message: "timezone 不是可用的 IANA 时区"}
 	}
 	return timezone, nil
 }

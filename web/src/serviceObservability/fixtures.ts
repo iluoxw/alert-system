@@ -12,6 +12,7 @@ import {
   QueryValidationError,
   alignFocusIdentity,
   validateEnvironment,
+  validateTimezone,
   validateDirectoryQuery,
   validateOverviewQuery,
   validateWorkspaceFocus,
@@ -174,6 +175,25 @@ function isUsableServiceID(serviceId: string): boolean {
   return trimmed !== '' && new TextEncoder().encode(trimmed).length <= maxServiceIDBytes
 }
 
+// applyRequestedTimezone 把用户显式请求的时区反映到返回视图的 scope.timezone。
+//
+// 不这么做就会出现"URL 上写着 America/New_York、页面按 fixture 撰写的 Asia/Shanghai 显示"
+// 这种矛盾——而 timezone 恰恰是纯显示字段，fixture 完全有能力如实反映它。空值保留 fixture
+// 自己撰写的时区。它只改显示时区，不动 from/to 查询边界，也不改任何观测值。
+function applyRequestedTimezone(
+  view: ObservabilityWorkspaceView,
+  requested: string | undefined,
+): ObservabilityWorkspaceView {
+  let timezone = ''
+  try {
+    timezone = validateTimezone(requested)
+  } catch (error) {
+    asApiError(error)
+  }
+  if (timezone === '' || timezone === view.scope.timezone) return view
+  return { ...view, scope: { ...view.scope, timezone } }
+}
+
 // environmentMismatch 判断"显式请求的环境是否不属于这个 Page View"。
 //
 // 环境取自 Page View 自身的 scope，不是任何写死的服务 ID；空值表示未传，沿用该视图环境。
@@ -284,7 +304,10 @@ export function getWorkspaceFixture(
     // 事实端给另一个环境，那正是"统一 404、不泄露其它环境是否存在"要防的事。
     guardWorkspaceScope(query)
     if (environmentMismatch(query.environment, base)) return { view: null, scenario: null }
-    return { view: applyJsonPatch(base, scenario.patch), scenario }
+    return {
+      view: applyRequestedTimezone(applyJsonPatch(base, scenario.patch), query.timezone),
+      scenario,
+    }
   }
 
   // 正常路径与 live 同序。environment 必须在 focus **之前**判：live handler 是
@@ -303,7 +326,7 @@ export function getWorkspaceFixture(
   const requested = query.focusValue?.trim() ?? ''
   const baseFocusValue = base.focus?.value ?? ''
   if (requested === '' || requested === baseFocusValue) {
-    return { view: base, scenario: null }
+    return { view: applyRequestedTimezone(base, query.timezone), scenario: null }
   }
 
   // 合法但不同的 focus：一次成功查询、当前范围内没有匹配请求。Empty 不等于 Healthy——
@@ -311,7 +334,8 @@ export function getWorkspaceFixture(
   const emptyScenario = resolveWorkspaceScenario(workspaceScenarioAliases.empty)
   if (!emptyScenario) return { view: base, scenario: null }
   const emptyView = applyJsonPatch(base, emptyScenario.patch)
-  const aligned = alignFocusIdentity(emptyView, emptyView.focus?.value ?? '', requested)
+  const aligned = applyRequestedTimezone(
+    alignFocusIdentity(emptyView, emptyView.focus?.value ?? '', requested), query.timezone)
   // scenario 返回 null：这是"按请求 focus 得到的 Empty 结果"，不是用户选择的 QA 场景，
   // URL 不应因此被写上 scenario 参数。
   return { view: aligned, scenario: null }

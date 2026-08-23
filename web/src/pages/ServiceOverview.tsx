@@ -173,7 +173,7 @@ function OverviewContent({
         </section>
       )}
 
-      <GoldenLedger signals={view.golden_signals} />
+      <GoldenLedger signals={view.golden_signals} timezone={timezone} />
 
       <div className="service-overview-layout">
         <div className="service-overview-main">

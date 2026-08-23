@@ -249,7 +249,7 @@ function WorkspaceContent({
         </section>
       )}
 
-      <GoldenLedger signals={view.golden_signals} />
+      <GoldenLedger signals={view.golden_signals} timezone={view.scope.timezone} />
 
       <div className={`workspace-main-grid${contextInDrawer ? ' has-context-drawer' : ''}${compactJourney ? ' has-compact-journey' : ''}`}>
         <JourneyRail

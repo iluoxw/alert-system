@@ -1,4 +1,10 @@
-export function formatClock(value: string, timezone = 'Asia/Shanghai'): string {
+// 默认时区是 UTC，不是任何具体地区。
+//
+// 之前的默认值是 Asia/Shanghai：任何忘记传时区的调用点都会静默按东八区渲染，于是同一页
+// 上"标题写着 UTC、正文是东八区"这类漂移无法被发现。Service Observability 的所有调用点
+// 现在都显式传入 Page View 的 scope.timezone 或明确的 'UTC'；这个默认值只是最后一道
+// 兜底，且兜底成一个不会被误读为本地时间的值。
+export function formatClock(value: string, timezone = 'UTC'): string {
   try {
     return new Intl.DateTimeFormat('zh-CN', {
       timeZone: timezone,
@@ -12,7 +18,7 @@ export function formatClock(value: string, timezone = 'Asia/Shanghai'): string {
   }
 }
 
-export function formatDateTime(value: string, timezone = 'Asia/Shanghai'): string {
+export function formatDateTime(value: string, timezone = 'UTC'): string {
   try {
     return new Intl.DateTimeFormat('zh-CN', {
       timeZone: timezone,
