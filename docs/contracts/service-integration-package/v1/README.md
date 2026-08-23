@@ -6,9 +6,11 @@
 决定的 **Service Integration Package（SIP）** 机器契约，状态为 Draft。
 
 SIP 是**声明式接入单元**，不是动态执行插件：它是静态、可校验、可审查的 JSON 文档，
-在发布前由服务端 compiler 编译成使用真实 ID 的
-[Service Observability Profile v1](../../service-observability/v1/service-observability-profile.schema.json)。
-运行时只加载已编译的 v1 Profile，SIP 本身不参与请求路径。
+在发布前由服务端 compiler 原子编译成使用真实 ID 的
+[Service Observability Profile v1](../../service-observability/v1/service-observability-profile.schema.json)
+与 server-only `CompiledIntegration`。Profile 是唯一可进入 Page View/浏览器的契约；
+CompiledIntegration 只供受信 adapter 读取 typed provider bindings。运行时加载 manifest 配对的
+两份编译产物，SIP 原文不参与请求路径。
 
 本阶段不定义、也不实现 Agent、模型、Prompt、会话、写操作或通用 Tool Execute API。
 
@@ -20,7 +22,8 @@ DiagnosticContext、Page View、EvidenceRef、ToolDescriptor），它们与 `int
 两侧守护。SIP 是**编写与发布期**的产物，有自己的版本线（package 可以升级而不改 Profile v1），
 因此放在独立目录，避免与那五份运行时契约互相牵连。
 
-两者的关系是单向的：SIP → compiler → Profile v1。Profile v1 的字段语义不因 SIP 改变。
+两者的关系是单向的：SIP → compiler → `Profile v1 + CompiledIntegration`。Profile v1 的字段
+语义不因 SIP 改变，CompiledIntegration 不属于浏览器契约，也不得由 API 序列化。
 
 ## 文件
 
@@ -62,14 +65,19 @@ UUID**。UUID 每个环境都不同，写进 package 就不可移植；而运行
 - 每个 selector 必须在目标环境**唯一命中**；
 - 零命中或多命中一律 fail closed，不按名称猜、不做 entity_key fallback、也没有任何
   fixture ID 兜底路径；
-- 编译产物继续过一遍现有 Profile schema、结构校验与 Tool catalog 校验。
+- 编译出的 Profile 继续过现有 schema、结构、Tool catalog 与 resolver 校验；service/root 必须
+  同环境（或显式 global）且 root 从 service entity 有界可达；
+- CompiledIntegration 中只保留 resolved IDs、typed bindings、topology policy 与由受信 registry
+  推导的 source/capability/permission，不保留 entity-key fallback。
 
 ## draft 与 published
 
-package 的 `status` 决定编译产物的 Profile `status`：`draft` package 只能编出 `draft`
-Profile，因此**不可能**被 Profile Registry 选为某个服务的 active published Profile。
-只有全部 required binding 的 metric/label/stream 经运行时 discovery 确认、并拿到 owner
-对阈值与 proxy 的签字之后，package 才允许改为 `published`（Phase 3 Task 9 的发布 gate）。
+`draft` package 只能编出配对的 draft 产物，因此**不可能**被 Registry 选为 active published
+bundle。`status: published` 只是发布意图，不是自授权：在 Phase 3 Task 9 定义并验证 discovery
+digest 与 owner approval attestation 前，`Compiler.AllowPublished` 默认为 false，且不能由普通运行
+配置打开；compiler 因此拒绝 published package。只有全部 required
+binding 的 metric/label/stream 经 discovery 确认、owner 对 threshold/proxy 签字且发布 gate 显式
+授权后，才允许生成并原子激活 published bundle。
 
 两份 example 都是 `draft`：它们的 metric 名取自 OTel spanmetrics connector 与
 node_exporter 的上游默认形状，尚未经 discovery 确认，不是生产事实。
@@ -83,9 +91,28 @@ E2B package 刻意**不声明** USE Saturation 与 USE Errors：placement admiss
 
 ## Provider template 边界
 
-`telemetry_bindings[].template_ref` 只能引用服务端**受信 provider template registry**
-里已注册的模板。registry 持有每个模板的：适配器能力、必填/可选参数槽位与类型、以及可用的
-输出字段名。`signal_bindings[].output_field` 必须是所引用模板声明的输出字段之一。
+`provider_bindings[].template_ref` 只能引用服务端**受信 provider template registry**里已注册的
+模板。每条 binding 显式携带 `key`、`kind`、`target_ref`、`tool_key`、`template_ref` 与封闭的
+typed params；`kind` 仅允许：
+
+- `signal`：target 指向 `signal_bindings[].key`，每个 signal 恰好一个 provider binding；
+- `focus`：target 指向 `focus_kinds[].key`，同一 focus kind 至多一个；
+- `journey`：target 指向 `journeys[].key`，每个 journey 恰好一个；
+- `evidence`：target 指向用于参数化查询的 `focus_kinds[].key`，logs/traces/access class 由受信
+  template registry 推导。
+
+Observed topology hints 是 trace template 的声明输出，由 `topology_policy` 约束，不另设会重复同一
+trace 查询的 `topology` binding。请求 purpose 不属于 SIP；它只能由服务端路由选择。registry
+还声明 source capability、required permission、允许的 kind、参数槽位、主输出与固定 side outputs。
+Binding kind 只标识主要 target；focus、trace EvidenceRef、topology hints 等 side outputs 必须由
+adapter 在同一次有界读取中投影，package 不能自行增加，也不能为同一 trace 重复发起查询。compiler 必须
+验证 `tool_key` 已发布且属于 package `tool_refs`、template capability 等于 ToolDescriptor 的
+`source_adapter`、template permission 被 descriptor 覆盖；`signal_bindings[].output_field` 必须是
+对应模板声明的输出字段。
+
+编译结果的 `CompiledIntegration` 保存解析后的 target、typed params 与由 registry 推导的 source
+key/capability/permission，并与 Profile 通过 manifest 中的 `profile_digest` / `integration_digest`
+配对。缺任一产物、摘要错配或单独激活必须 quarantine 整对。
 
 模板对应的真实 PromQL/SQL 构造属于 Phase 3 Task 4/5 的 adapter，不在本契约内，也不会
 出现在 package 或浏览器里。
@@ -104,6 +131,11 @@ E2B package 刻意**不声明** USE Saturation 与 USE Errors：placement admiss
 | logs_by_focus.v1 | openobserve | 按 focus 取日志摘要 |
 | access_by_focus.v1 | openobserve | 按 focus 取 access 记录摘要 |
 
+`counter_ratio_percent.v1` 使用 `common_labels`、`numerator_labels`、`denominator_labels` 三组
+typed 等值条件。任一有效 selector 内 label 名重复，或 numerator/denominator 是同一 metric 且
+两边的有效 label selector 完全相同时，compiler 必须拒绝；否则会把任意非零样本恒算成 100%。E2B draft
+中的 error 判别 label 仅表达上游默认意图，真实字段尚未经 discovery 确认，不能宣称是真实错误率。
+
 ## 校验
 
 Go 侧：
@@ -112,5 +144,6 @@ Go 侧：
 go test ./internal/serviceobs/integration/...
 ```
 
-它覆盖 schema 与本目录的逐字节同步、两份 example 的编译、selector 零命中/多命中、未知
-template、参数错配、禁止键、自由 matcher 与 draft/published 门槛。
+它覆盖 schema 与本目录的逐字节同步、两份 example 的双产物确定性编译与 digest 配对、selector
+零命中/多命中/环境错配/不可达、provider target 与 capability/permission 错配、未知 template、
+ratio 退化、参数错配、禁止键、自由 matcher 与 draft-only 发布门槛。

@@ -114,8 +114,9 @@ API -> facade -> Context Assembler -> ObservationCoordinator
                                   |-> ToolInvocationAuditor
                                   `-> EvidenceBroker
 
-Service Integration Package -> compiler -> concrete v1 Profile
-                            `-> typed provider binding specs
+Service Integration Package -> compiler -> manifest-bound activation bundle
+                                      |-> concrete v1 Profile (Page View/browser boundary)
+                                      `-> server-only CompiledIntegration (typed provider bindings)
 Trusted provider registry   -> query AST/templates -> outbound HTTP clients
 ```
 
@@ -125,7 +126,37 @@ View 不出现 provider 分支。它可以扩展内部 `ObservationFacts`，但�
 
 ## 6. 关键设计裁决
 
-### 6.1 多来源不能折叠成一个 telemetry source
+### 6.1 SIP 必须原子产出 Profile 与 CompiledIntegration
+
+SIP 原文不能进入请求路径，provider 参数也不能塞进浏览器 Profile。Compiler 必须一次生成：
+
+- `Profile v1`：现有浏览器/Page View 契约，只含真实 ID、语义 binding 与 tool refs；
+- `CompiledIntegration v1`：server-only 运行时产物，保存 package/profile 元数据、environment、
+  resolved service/entity/relation IDs、`signal|focus|journey|evidence` provider bindings、typed params、
+  topology policy，以及由受信 registry 推导的 source key/capability/required permission；
+- `CompileManifest`：分别记录 `profile_digest` 与 `integration_digest`，把两份产物绑定为唯一激活、
+  回滚与 quarantine 单元。
+
+CompiledIntegration 继续禁止 raw query、endpoint、header、secret，不得由 `view/context/api/web` 导入
+或序列化。Adapter 不能重读 SIP，也不能在摘要不匹配时混用旧的一半。同一输入重复编译必须产生
+逐字节相同的两份规范化产物和摘要。当前 runtime 尚未接线，因此 contract/model 可直接从
+`telemetry_bindings` 收敛为 `provider_bindings`，不保留平行兼容字段。
+
+`provider_bindings[].kind` 仅允许：
+
+- `signal`：target_ref 命中 signal binding，每个 signal 恰好一个；
+- `focus`：target_ref 命中 focus kind，同一 focus kind 至多一个；
+- `journey`：target_ref 命中 journey，每个 journey 恰好一个；
+- `evidence`：target_ref 命中查询所依赖的 focus kind，logs/traces/access class 由 template 推导。
+
+Observed topology hints 是 trace template 的声明输出，由 topology policy 约束，不新增会重复 trace
+查询的 `topology` kind。请求 purpose 继续由服务端路由选择，绝不成为 package 编译事实；source
+key/capability/permission 则由受信 registry 推导后固化到 CompiledIntegration。
+Binding kind 只标识主要 target；template registry 可声明固定的 focus、trace EvidenceRef 与 topology
+hints side outputs，adapter 必须用同一次有界读取投影，不能为 journey/evidence/topology 重复同一
+trace 查询，package 也不能自行增加 side output。
+
+### 6.2 多来源不能折叠成一个 telemetry source
 
 新增稳定 source keys：
 
@@ -139,7 +170,7 @@ openobserve_access
 `alert_system_registration/topology/domain` 保持不变。来源状态分别进入 `data_status.sources`；
 OpenObserve logs Forbidden 不得把 traces 标成 Forbidden，Prometheus timeout 不得抹掉 observed path。
 
-### 6.2 保持一个 Page View 装配入口，内部拆成 source-specific ports
+### 6.3 保持一个 Page View 装配入口，内部拆成 source-specific ports
 
 建议新增内部端口：
 
@@ -177,7 +208,13 @@ limit)`，来源独立取消。单来源 deadline 转为该来源的最小范围
 HTTP request 必须立即终止并向上返回 `context.Canceled`/`DeadlineExceeded`，不能把已断开的请求
 伪装成一个可返回的 Partial，也不能遗留 goroutine。
 
-### 6.3 ObservationFacts 的兼容扩展
+每个 source task 显式声明 `affectsFocus`：signals 为 false，traces/logs/access 为 true。只有
+`affectsFocus && request.Focus != nil` 的 failed/not_connected/Forbidden 才报告 Focus Unknown；
+Prometheus 失败不得污染 focus。Focus 合并顺序固定为 `matched > unknown > empty`：已确认命中是
+正事实；没有命中时，任一已请求来源不知道就不能宣称 Empty；只有全部已请求的 focus 来源成功
+确认无记录才是 Empty；请求没有 focus 时恒为 NotRequested。
+
+### 6.4 ObservationFacts 的兼容扩展
 
 内部事实至少需要新增：
 
@@ -198,7 +235,7 @@ Assembler 把唯一解析的 hints 合并进已有 `TopologyFacts`：
 - overlay 超 TTL：relation Stale/Unknown，declared 底图仍在；
 - bounds 达限：保留已确认 facts，Data Partial，禁止静默截断。
 
-### 6.4 Journey 状态只能来自 observed facts
+### 6.5 Journey 状态只能来自 observed facts
 
 Profile 只声明 stage 顺序与 canonical refs。状态规则：
 
@@ -212,9 +249,11 @@ Profile 只声明 stage 顺序与 canonical refs。状态规则：
 Phase 3 不从“没看到事件”推导 `skipped`；该枚举只为未来由受信 adapter 返回的显式、Profile
 可验证的 not-applicable 事实保留。本阶段没有这种事实时一律 `unknown`，不得假跳过。
 
-### 6.5 SIP 不携带自由查询
+### 6.6 SIP 不携带自由查询
 
-SIP binding 只允许选择受信模板和类型化参数。Prometheus 首批模板建议：
+SIP provider binding 只允许选择受信模板和类型化参数。Compiler 必须验证 `tool_key` 属于 package
+`tool_refs` 且已发布、template capability 等于 ToolDescriptor `source_adapter`、template 的
+required permission 被 descriptor 覆盖、kind/target/template 互相兼容。Prometheus 首批模板建议：
 
 - `counter_rate.v1`；
 - `counter_ratio_percent.v1`；
@@ -233,7 +272,12 @@ Metric/label/stream/field 必须满足 identifier allowlist；label 参数只允
 否定、集合与自由 matcher；focus value 只能作为严格转义后的值，不能改变 identifier、SELECT 列、
 ORDER BY 或 LIMIT。所有 templates 由 alert-system 代码/embedded registry 持有并过 golden tests。
 
-### 6.6 权限与上游错误必须区分
+`counter_ratio_percent.v1` 的 label 槽位拆为 `common_labels`、`numerator_labels` 与
+`denominator_labels`。任一有效 selector 内同名 label 重复必须拒绝；numerator/denominator 使用
+同一 metric 且两边有效 selector 完全相同时也必须拒绝，防止非零数据恒算为 100%。E2B draft 中
+的 error label 只是上游默认形状，未经 discovery 前不能宣称真实错误率。
+
+### 6.7 权限与上游错误必须区分
 
 - 当前用户缺少 ToolDescriptor permission：不调用上游；最小 Evidence/section Forbidden；
 - upstream service account 401/403：source Unavailable + `upstream_auth_failed`，不是用户 Forbidden；
@@ -256,7 +300,7 @@ visibility policy，沿用已登录用户可见服务的现状，缺省矩阵固
 自报 roles/permissions 继续无效；以后引入 team/service policy 必须只会收紧该矩阵并更新
 `PolicyVersion`，不能静默放宽。
 
-### 6.7 Evidence broker 不信任客户端 locator
+### 6.8 Evidence broker 不信任客户端 locator
 
 Adapter 返回内部 locator；Page View 对外只给最小摘要、hash/record id 与 alert-system broker link。
 Broker 打开时：
@@ -280,11 +324,14 @@ snapshot 只用于审计漂移，绝不能替代打开时的实时鉴权。不�
 attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上游剩余 retention 的最小值；过期、
 撤权或绑定不一致显示 Expired/Unavailable，不能绕过鉴权或回退到客户端 locator。
 
-### 6.8 Outbound HTTP 安全基线
+### 6.9 Outbound HTTP 与 secret 配置安全基线
 
 - endpoint 只来自服务端配置；禁止 URL userinfo、fragment、任意 query、非 http(s) scheme；
 - production 默认 HTTPS；测试只允许 loopback `httptest` HTTP；
-- credentials 只在 request header 注入，配置 String/log 永远脱敏；
+- auth mode 显式为 `none|basic|bearer`；Basic username/password 与 Bearer token 分离，env/file
+  secret ref 二选一，文件必须是常规文件且有界读取（最大 4 KiB）；模式、必填项或来源冲突启动失败；
+- credentials 只在 request header 注入，配置的 `%v|%+v|%#v|JSON|slog` 永远脱敏，错误只写配置项
+  名，不回显 secret、env 值、文件路径、organization 或 endpoint path；
 - 禁止自动跨 host redirect；限制 response body bytes；
 - 使用共享 Transport，但每次 request 都绑定 context deadline；
 - 错误消息不带完整 URL query、Authorization、SQL/PromQL、原始 response body；
@@ -299,16 +346,28 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 
 - 新增 `internal/serviceobs/integration/`：manifest/model/schema/compiler/registry；
 - 新增 docs 下的 SIP v1 schema、README 与 E2B draft package fixture；
-- compiler 将 service/entity selectors 唯一解析为现有 v1 Profile 的真实 ID；
-- provider template registry 校验 template ref、参数 schema、输出字段和 adapter capability；
-- 编译清单包含 package/profile version、目标环境、resolved IDs、content digest；不含凭据；
-- 回滚通过重新激活上一份不可变编译产物，不修改 v1 Profile ID 语义。
+- `telemetry_bindings` 收敛为通用 `provider_bindings`，kind/target/tool/template/typed params 完整进入
+  server-only CompiledIntegration，不允许编译后丢失或由 adapter 重读 SIP；
+- compiler 将 service/entity/relation selectors 唯一解析为真实 ID，同时显式检查 service/entity
+  environment，并调用现有 `profile.ValidateReferences` 验证 root 同环境/global 且有界可达；
+- provider template registry 校验 target、参数 schema、输出字段、allowed kind、adapter capability 与
+  required permission；ToolDescriptor lookup 是必填依赖；
+- manifest 包含 package/profile/compiler version、目标环境、resolved IDs、content/profile/integration
+  digest；Profile 与 CompiledIntegration 只能原子激活/回滚，任一缺失或摘要错配整对 quarantine；
+- CompiledIntegration 再走禁止键扫描，不含 query/endpoint/header/secret，也不暴露给浏览器；
+- `Compiler.AllowPublished` 默认 false 且不接普通运行配置；Task 9 的发布 gate 尚未提供 attestation
+  前，只允许编译 draft。
 
 **测试**
 
-- 合法 E2B draft package 编译后通过现有 Profile validator；
-- selector 0/2+ 命中、未知 template、版本不兼容、禁止字段、raw query/secret/executable key
-  全部 fail closed；
+- 合法 E2B draft package 原子编译两份确定性产物，Profile 通过现有 document/tool/reference validator，
+  同一输入两次编译的字节与摘要完全一致；
+- 缺一半、篡改或错配 profile/integration digest 一律拒绝加载；
+- selector 0/2+ 命中、环境错配、root 不可达、resolver infra error 分类、未知 template、版本不兼容、
+  禁止字段、raw query/secret/executable key 全部 fail closed；
+- provider binding 未知 kind、悬空 target、重复 kind+target、signal/journey 缺失或多绑定、evidence
+  指向未知 focus、template/tool capability 或 permission 不一致全部用稳定 reason 拒绝；
+- `status=published` 且无显式发布 gate 授权时拒绝；
 - compiler 不接受 fixture service ID 作为 production fallback；
 - 第二个结构不同的最小 package fixture 能通过 contract，但不算 Phase 4 产品验收。
 
@@ -321,6 +380,8 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - ObservationRequest 携带服务端 Subject 与 purpose；coordinator 只并行调用当前 purpose、Profile 和
   权限共同选中的来源，并按稳定 source key 合并；
 - 单来源 panic/error/timeout/cancel 不拖垮其它来源；
+- source task 显式携带 `affectsFocus`，focus 合并使用 matched > unknown > empty，未请求恒
+  NotRequested；目录 summary 的 binding keys 只解析一次并同时传给 reader 与 merge，禁止两套推导；
 - 没有配置任何 provider 时保持 Phase 2 精确语义 `telemetry_not_connected`；部分配置时，当前
   purpose 已选择但未连接的 source 必须显式 Unavailable（如 `openobserve_not_connected`），不能
   省略；当前 purpose 根本未请求的 source 才不出现在结果中。
@@ -328,7 +389,10 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 **测试**
 
 - Prometheus success + OpenObserve timeout；反向组合；两者 timeout；logs Forbidden + traces success；
+- traces matched + Prometheus timeout / logs unavailable 仍 matched；traces empty + logs Forbidden 为
+  unknown；全部 focus 来源未连接且已请求为 unknown；没有 focus 恒 not_requested；
 - Prometheus-only、OpenObserve-only、完全未配置，以及 directory summary 不触发 evidence calls；
+- 注入自定义 `SummaryBindingKeys` 时，上游请求集与 merge 的 Unknown 补齐集逐项一致；
 - parent cancellation 传播，goroutine 可回收；
 - duplicate/missing binding 不覆盖其它 binding；
 - source status、sections、Data/Health 真值表保持最小范围 Unknown；
@@ -342,13 +406,20 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - Prometheus/OpenObserve 分别拥有 timeout、response bytes、并发与 provider limits；
 - evidence grant TTL、audit retention days、grant cleanup batch 与 background refresh 最小间隔都为
   bounded server config；非法关系启动失败，不允许请求参数覆盖；
-- secret 从服务端 env/file provider 读取，不进入 YAML 示例明文、日志或 stats；
+- auth mode 固定为 `none|basic|bearer`；Basic username/password 与 Bearer token 分离，从服务端
+  env/file secret ref 二选一读取，文件最大 4 KiB、trim 且必须是常规文件；
+- secret 不进入 YAML 示例明文、日志或 stats；错误不回显 env 值、文件路径、organization 或
+  endpoint path；应用不得 source `~/.zshrc`，本地使用 gitignored `.env.serviceobs.local` 或
+  secret manager/file provider；
 - 统一 outbound client 禁止跨 host redirect、限制 body、保留 context cancellation；
 - 启动日志只记录 enabled/capability/limit，不记录 endpoint path、org、stream、用户名或 secret。
 
 **测试**
 
-- 非法 scheme/userinfo/redirect/response-too-large/timeout/secret String 全部覆盖；
+- 非法 scheme/userinfo/redirect/response-too-large/timeout 与 none/basic/bearer 的缺项、冲突、文件
+  越界/非普通文件全部覆盖；
+- `provider.Secret` 编译期满足 `slog.LogValuer`；`%v|%+v|%#v|%q`、JSON、slog text/json 均不
+  泄露；Endpoint/Provider config 的 GoString 不泄露 internal URL、organization 或 secret path；
 - 未配置 provider 启动成功并显式 Unknown；显式错误配置启动失败；
 - production 与 test HTTP policy 分离，不能靠 caller 自报环境绕过。
 
@@ -358,17 +429,20 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 
 - 使用官方 `/api/v1/query` / `query_range`，POST form 编码；provider `limit` 只有 capability
   discovery 明确支持时才发送，alert-system 自身 bounds 始终执行；
-- 解析 scalar/vector/matrix 与 warnings，拒绝 NaN/Inf、未知 result type 和超 cardinality；
+- 解析 scalar/vector/matrix 与 warnings，拒绝 NaN/Inf、未知 result type 和超 cardinality；查询成功
+  但零 series 显式为 Empty/`no_series`，不得填 0、不得改判 Stale；
 - 从 typed template 构造 rate/ratio/histogram/gauge 查询；
 - 每个 binding 独立 availability/freshness/observed_at/source key；
 - discovery 只读列出受限 metric/series/labels，并输出可审计 manifest；
-- HugePages 使用率固定为 `(Total-Free)/Total`，Total<=0 为 Unknown；
+- HugePages 使用率固定为 `(Total-Free)/Total`，每个 Total<=0 成员局部 Unknown，worst-of 只在
+  有效成员取值，不能把 Unknown 节点当 0%/Healthy；
 - Traffic/Rate 无方向 threshold 时 neutral；Saturation 缺直接指标时 Unknown。
 
 **测试**
 
 - `httptest` 覆盖成功、empty、warning、422、503、timeout、malformed、oversize、cardinality；
-- P95 histogram、rate、error ratio、HugePages 公式的 golden tests；
+- P95 histogram、rate、差异化 numerator/denominator label 的 error ratio、HugePages 逐成员公式的
+  golden tests；同 metric 同 selector 的退化 ratio 与重复 label 名拒绝；
 - metric/label 参数注入、动态 focus label、高基数选择器被拒绝；
 - missing/stale binding 不复用旧值，不填 wall clock observed_at；
 - 兼容 Prometheus JSON envelope，不依赖产品特定 UI。
@@ -391,6 +465,8 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - focus matched/empty/unknown；stage ok/failed/pending/unknown；本阶段不得凭缺失事实生成 skipped；
 - logs Forbidden 不调用 upstream 且不泄露 count；traces 仍成功；
 - upstream 401/403 与用户 Forbidden 区分；
+- 只有已建立连接后的 401/403 才是 upstream auth failure；HTTP000/连接超时只映射 upstream
+  unavailable/timeout，永不映射 auth、用户 Forbidden、Empty 或 Stale；
 - timeout/cancel/rate-limit/parse/oversize/row bound 映射稳定 reason；
 - 原始 log/span attributes 不进入 Page View、audit 或错误文本。
 
@@ -405,11 +481,18 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - overlay-only relation 使用长度小于 128 的 `obs_<sha256-prefix>` context-local deterministic ID，
   hash 输入包含 service/profile/canonical endpoints/kind，不写 `dependency_edges`；
 - E2B component node 与 instance inventory 分离，instance count 进入 fleet/summary；
+- logical component 由 declared skeleton 版本化维护，discovered instance inventory 可随副本数量变化；
+  inventory 增减不自动改写 component/dependency，也不猜测新节点角色；
+- `dc`、`datacenter`、`consul_datacenter`、`zone`、`environment` 等不同来源字段保留各自 alias
+  namespace，只有显式 reconciliation policy 才能合并；
 - reconciliation issues 可审计但不泄露原始高敏 identity。
 
 **测试**
 
 - declared-only、observed-only、both、stale、not-found、conflict、bounds；
+- frozen 15 hosts 与 discovered 17 hosts（仅部分重合）的 fixture：logical component 不变、inventory
+  正确增删、未知 alias 为 `alias_not_found`，不自动建 canonical entity；
+- 同一节点 `dc=guangzhou`、`datacenter=dc1`、target environment 不一致时不静默归一；
 - caller -> callee 方向不反转；Fault blast-radius 领域遍历不受影响；
 - topology adapter 失败不扩大 domain boundary；
 - 两个 service 的 alias/overlay 不能串线；
@@ -435,7 +518,7 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
   使用固定 system actor、只调用 summary 必需 tools、受 refresh concurrency/最小间隔限制，仍逐调用
   留一条 audit row，不用 start+completion 两行制造双倍写放大；
 - PostgreSQL bounded Evidence grant store 在最终投影后按单视图硬上限 100 批量单事务创建；TTL、
-  keyed focus/window digest 与 broker open endpoint 遵循 §6.7；
+  keyed focus/window digest 与 broker open endpoint 遵循 §6.8；
 - 复用现有 `retention_sweep` handler，新增 audit retention 与 expired grant 的 bounded batch 删除；
   不注册一个无人处理的新 timer kind；
 - broker 再鉴权、allowlist redirect、过期/撤权 fail closed。
@@ -484,23 +567,36 @@ attributes、查询、凭据或上游 Authorization。TTL 取配置上限与上�
 - 只读 endpoint/credential 已由用户或部署环境提供；
 - 不在终端输出 secret、完整 Authorization、日志正文或个人数据；
 - 网络不可达不是理由去修改 Kubernetes/OTel 配置。
+- 2026-08-23 probe 只证明 Prometheus-compatible host 数据可读；OpenObserve 是 Basic 凭据形态但
+  连接超时，两个 UAT endpoint 均为 HTTP。生产 client 仍要求 HTTPS；TLS、网络可达性与严格字段
+  形状是外部发布 blocker，不能通过本仓库环境开关绕过。
 
 **步骤**
 
-1. 运行 discovery，保存脱敏 manifest：metric names/types/labels、stream schema/time bounds、hash；
+1. 运行 discovery，保存脱敏 manifest：metric names/types/labels、stream schema/time bounds、动态
+   instance inventory、source namespace 与 hash；
 2. 固化 E2B typed bindings，只使用确认后的名称与逐条 `sandbox_id`；
 3. 验证 RED histogram buckets 与 labels 能计算 P95；
-4. 验证 HugePages Total/Free、host alias/IP 映射；
+4. 验证 HugePages Total/Free、host alias/IP 映射；Total<=0 的成员局部 Unknown，不能填 0；
 5. 验证 placement rejection metric/log 语义；直接 saturation 不存在时保持 Unknown；
 6. replay 一个已有 UAT `sandbox_id`，不创建新 Sandbox、不注入故障；
 7. 比对 journey、API -> Orchestrator RED、host USE、EvidenceRef、domain deep link；
 8. 记录 retention、observed_at、timezone、freshness 与 threshold approval 状态；
-9. 只有全部 required binding 与 owner gate 完成后，E2B SIP/Profile 才标为 published。
+9. 核对成功但零 series 的 app RED/Golden 来源为 Empty，不写 0、不改判 Stale；host up 只说明
+   inventory source 可用，不能推出服务整体 Healthy；
+10. 严格检查 normalized record 的 `sandbox_id`；当前 Vector 把字段改为 `sandboxID` 的分支不能
+    通过 gate，ClickHouse 分支的恢复也不能代替 OpenObserve 逐条证据；
+11. 只有全部 required binding、HTTPS/可达性与 owner gate 完成后，Task 9 才能携 discovery digest
+    与 owner attestation 显式打开 published compiler gate，并把证据摘要写入 manifest；
+12. fixture 的 91% 故障叙事不得复制为生产事实；本次 probe 的有效节点最大约 19.72%，也不作为
+    固定阈值或长期事实写入 package。
 
 **验收**
 
 - discovery/replay 命令退出 0，输出无 secret/raw evidence；
 - 任一 required 事实未确认时发布命令 fail closed，并明确缺口；
+- published compiler gate 默认关闭；缺 discovery digest、owner attestation、HTTPS 或逐条
+  `sandbox_id` 时，即使 package 写了 `status: published` 也必须拒绝；
 - UAT source 暂不可达时，本地 contract/adapters 仍可完成，但 Phase 3 状态必须标记“实现完成、
   生产发布未验收”，不能宣称整个 Phase 完成。
 
@@ -566,6 +662,27 @@ SIP/schema/compiler/registry；A2 再完成 Task 2–3 的 ports/coordinator/con
 checkpoint 独立 commit 并先跑自己的 focused tests，A1 失败不得进入 A2；最终一起 push，Codex 只在
 Batch 完成后跑 contract、focused unit/race/build，不增加 GUI 往返，也不做浏览器全量 QA。
 
+Batch A 在 `1b51441f59b687ef79f6e672fb15bcd55c138321` 通过了实现门禁与 Codex 本地 full
+unit/integration-race，但不能直接接受：独立审查发现 provider params 在编译后丢失、非 signal
+OpenObserve templates 不可达。固定 Cursor Cloud 会话中的 Fable 5 High 已对 exact SHA 做只读
+delta review，确认两个 P0 诊断与本节修订；这不是重开整轮 Phase 评审。
+
+### Opus 5 High Batch A Correction：双产物与最小语义闭环
+
+在开始 Task 4 前，使用同一固定 Cursor Cloud 会话和 Opus 5 High 完成一个 correction commit：
+
+- 实现 Profile + CompiledIntegration + manifest digest 的原子编译与 draft-only 硬门；
+- 把 SIP 改为通用 provider bindings，补 target/capability/permission/reference 交叉校验；
+- 修复 coordinator `affectsFocus`/focus 优先级与 summary binding key 单点解析；
+- 补 none/basic/bearer、env/file secret provider、真实 slog/GoString 脱敏；
+- 修复 ratio label 组与退化 selector；
+- 同步两份 draft example、SIP README、负例与 deterministic/digest tests。
+
+Correction 不实现 Task 4–10 adapter/runtime wiring，不修改 web/migrations/Kubernetes/OTel，不连接
+UAT。`ObservationFacts.ReadAt` 当前无消费者，避免在 merge 层制造假时间锚；记录为 Task 4/5 在
+adapter 回填 per-source ReadAt、coordinator 只透传的后续项。Correction 通过 Codex 独立全量门禁
+后才允许进入 Batch B。
+
 ### Opus 5 High Batch B：Task 4–6
 
 Prometheus/OpenObserve/alias-overlay。完成后一次 push，Codex 跑 provider `httptest`、projection、
@@ -603,14 +720,20 @@ Grok 不参与开发。每个 Phase 只在候选 SHA 上集中 code review 一�
 
 只有下列证据全部成立，Phase 3 才能标记完成：
 
-- [ ] SIP contract/compiler 能生成真实 ID 的合法 v1 Profile，禁止代码/query/secret；
+- [ ] SIP contract/compiler 原子生成真实 ID 的合法 v1 Profile 与 server-only CompiledIntegration；
+  manifest digest 配对、缺半/错配 quarantine、运行时不重读 SIP，且两份产物均禁止代码/query/secret；
+- [ ] provider bindings 覆盖 signal/focus/journey/evidence，无 E2B 特判；tool/template
+  capability/permission、environment/reachability 与 draft-only 发布硬门均 fail closed；
 - [ ] Prometheus 与 OpenObserve adapter 使用受信 typed templates，全部 hermetic tests 通过；
 - [ ] E2B main path 能从真实只读 sources 投影 Golden/RED/USE、journey、overlay 与 EvidenceRef；
 - [ ] `sandbox_id` 是逐条关联字段，`sandboxid` 被拒绝；
 - [ ] metric names/labels/stream fields/retention 已 discovery 并记录 digest；
 - [ ] HugePages 公式与 host aliases 验证；直接 saturation 缺失时仍 Unknown；
+- [ ] Total<=0 的 HugePages 成员局部 Unknown，零 series 保持 Empty，host inventory healthy 不上推
+  服务整体 Healthy；
 - [ ] logs Forbidden、provider timeout、focus Empty、stale overlay、alias conflict 均最小降级；
 - [ ] current-user Forbidden 与 upstream credential failure 不混淆；
+- [ ] none/basic/bearer 与 env/file secret provider 通过泄露负例；生产 HTTPS 无 UAT bypass；
 - [ ] Evidence broker 再鉴权、grant 绑定、redirect allowlist 与 audit 通过；
 - [ ] audit 每次 tool 调用恰好一行，provider 位于事务外；background summary refresh 不读取
   evidence 且受 system-actor 写预算约束；grant 单视图不超过 100 并由 `retention_sweep` 清理；
@@ -621,7 +744,8 @@ Grok 不参与开发。每个 Phase 只在候选 SHA 上集中 code review 一�
 - [ ] Kubernetes/OTel 三个 hold path 零改动；
 - [ ] Agent 运行代码、API、UI、表和 worker 均不存在；
 - [ ] E2B SLO threshold/proxy 发布 gate 有 owner 审核证据；
-- [ ] 生产 E2B SIP/Profile 已发布或明确因外部 gate 未满足而保持未完成，不能降格验收。
+- [ ] 生产 E2B Profile/CompiledIntegration bundle 已带 discovery/owner attestation 原子发布，或明确因
+  HTTPS、OpenObserve 可达性、逐条 `sandbox_id` 等外部 gate 未满足而保持未完成，不能降格验收。
 
 ## 11. Phase 4 输入
 

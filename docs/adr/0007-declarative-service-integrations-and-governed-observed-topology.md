@@ -68,7 +68,7 @@ Phase 3 只实现只读解析、overlay 与 reconciliation 结果；不新增自
 service-integrations/<package-key>/
   manifest.json                 # 版本、兼容范围、服务选择器、依赖能力
   profile.template.json         # 编译为现有 v1 Profile
-  telemetry-bindings.json       # 只含类型化 template ref 与参数
+  provider-bindings.json        # 类型化 source binding、目标引用、template ref 与参数
   topology-policy.json          # roots、alias namespaces、discovery/overlay 规则
   testdata/                     # discovery 输入与期望规范化输出
 ```
@@ -77,7 +77,8 @@ Package 可以声明：
 
 - 目标 service 的稳定选择器与环境约束；
 - Profile 的 focus、journey、renderer、signal binding、limits 与 tool refs；
-- provider-neutral 的 query template ref、严格类型参数和输出字段映射；
+- provider-neutral 的 `signal|focus|journey|evidence` binding、query template ref、严格类型参数、
+  输出字段映射与目标引用；
 - discovery identity 字段到受控 alias namespace 的映射；
 - fixtures、兼容版本和发布元数据。
 
@@ -95,19 +96,33 @@ focus field 和 stage mapping。label 名必须来自 identifier allowlist，值
 字面值；SIP 禁止 regex、否定、集合选择器和任何自由 matcher 表达式。PromQL/SQL 由 adapter
 从类型化模板构造，服务方不能提交自由文本。
 
-### 4. SIP 发布前编译为现有 v1 Profile，不改变 ID 语义
+### 4. SIP 原子编译为 Profile 与 server-only Integration，不改变 ID 语义
 
 Package compiler 在发布前完成：
 
 1. 校验 package schema、兼容版本、引用完整性和禁止字段；
 2. 解析目标 Service Registration 与 root selector；
 3. 要求每个 selector 在目标环境唯一命中；零匹配或冲突 fail closed；
-4. 生成使用真实 `service_registrations.id` / `resource_nodes.id` 的 v1 Profile；
-5. 让生成物继续经过现有 Profile schema、Tool catalog 和 resolver 校验；
-6. 输出不可变的编译清单、内容摘要和回滚所需上一版本引用。
+4. 原子生成两份不可变产物：使用真实 `service_registrations.id` / `resource_nodes.id` 的 v1
+   Profile，以及只供服务端 adapter 读取的 `CompiledIntegration`；
+5. 让 Profile 继续经过现有 schema、Tool catalog 和 resolver 校验，并让每条 provider binding
+   经过 target、template capability、ToolDescriptor source adapter 与 required permission 交叉校验；
+6. 对 Profile 与 CompiledIntegration 分别生成规范化字节和摘要，输出把两者配成一个激活单元的
+   不可变 manifest，以及回滚所需上一版本引用。
 
-运行时仍只加载已编译的 v1 Profile。SIP 不绕过现有 Registry，也不让 v1 字段产生
-entity-key fallback。Phase 3 先提供离线/启动前编译与验证能力，不修改 Kubernetes 发布配置。
+Profile 继续是唯一可进入 Page View/浏览器的接入契约；`CompiledIntegration` 只含已解析 ID、
+`signal|focus|journey|evidence` binding、受信 template ref、类型化参数、由受信 registry 推导的
+source key/permission/capability 与 topology policy 快照。它禁止 raw query、endpoint、header、
+secret，也不得被 API 或前端序列化。Observed topology hints 由 trace binding 的声明输出产生，
+不另设会重复同一 trace 查询的空泛 `topology` binding；未来出现非 trace discovery 来源时再扩展。
+Binding kind 只标识主要 target；受信 template registry 可以声明 focus、trace EvidenceRef 或 topology
+hints 等固定 side outputs，adapter 必须在同一次有界读取中投影它们，不能因同一 trace 同时服务
+journey/evidence/topology 就重复查询。Package 不能自行增加 side output。
+
+运行时以 manifest 为激活/回滚单位：Profile Registry 加载 Profile，受信 adapter 只从配对的
+CompiledIntegration 读取运行时 binding；缺任一半、摘要错配或单独激活均 quarantine 整对，不能
+静默混用旧版本。SIP 不参与请求路径、不绕过现有 Registry，也不让 v1 字段产生 entity-key
+fallback。Phase 3 先提供离线/启动前编译与验证能力，不修改 Kubernetes 发布配置。
 
 ### 5. 遥测 adapter 由平台受信实现，SIP 只配置能力
 
@@ -123,17 +138,37 @@ Prometheus-compatible、OpenObserve、alert-system domain 与 topology adapter �
 失败只把它负责的 binding、journey stage、overlay 或 EvidenceRef 降级为 Unknown/Unavailable；
 不得清空 declared topology、其它来源或 alert-system domain facts。
 
+SIP 不能声明请求 purpose 或权限。`directory_summary|overview|focused_workspace` 仍由服务端路由
+选择；compiled binding 的 source key、capability 与 required permission 只能由受信 registry
+推导。Focus 聚合遵循 `matched > unknown > empty`：任何已确认命中不被另一个来源失败抹掉；
+没有命中时，只要一个已请求的 focus 来源失败、未连接或 Forbidden 就是 Unknown；只有全部成功
+确认无记录才是 Empty；请求没有 focus 时恒为 NotRequested。
+
+Provider 认证显式区分 `none|basic|bearer`。Basic 的 username/password 与 Bearer token 只能从
+有界的 env/file secret provider 读取，配置互斥且默认拒绝；错误与日志不得回显 secret、env 值、
+文件路径、organization 或 endpoint path。生产 HTTPS 是固定不变量，UAT HTTP 不通过增加绕过开关
+解决。
+
 ### 6. 运行时 discovery 先产出清单，再发布生产绑定
 
 Prometheus metric name/labels 与 OpenObserve stream schema/retention 必须通过只读 discovery
 确认。Discovery 输出只包含名称、类型、时间边界、基数摘要和内容 hash，不复制样本、日志正文
-或凭据。生产 E2B Package 只有在以下条件满足后才能从 draft 进入 published：
+或凭据。`status: published` 只是发布意图，不是自授权：在 Task 9 的 discovery/owner approval
+attestation 尚未定义并验证前，compiler 默认必须拒绝 published package；不得仅凭 package 字段
+编出可激活的 published Profile。生产 E2B Package 只有在以下条件满足后才能从 draft 进入
+published：
 
 - 所有 required signal binding 的 metric/label 唯一匹配且单位可验证；
 - `sandbox_id` 字段在 logs/traces/access 的逐条记录上存在，拒绝以 `sandboxid` 代替；
 - trace service/operation identity 可唯一映射到 canonical aliases；
 - retention、freshness TTL、HugePages 公式、placement rejection 语义和阈值均有审计记录；
 - 未确认的 USE Saturation 继续为 Unknown，不能复用 utilization。
+
+2026-08-23 的只读 UAT 核对进一步固定以下发布约束：查询成功但零 series 是 Empty，不是 0 或
+Stale；HugePages `Total<=0` 的成员局部 Unknown；当前 frozen 15 hosts 与实时 17 hosts 的漂移按
+“固定逻辑组件 + 动态实例清单”处理；`dc`、`zone`、`environment` 不同语义必须分 namespace 并显式
+reconcile；网络超时/HTTP000 不是 auth、Forbidden、Empty 或 Stale；`sandboxID` 不能替代逐条
+`sandbox_id`；UAT 仅 HTTP 是基础设施发布 blocker；17/17 host up 也不能推出整个 E2B Healthy。
 
 ### 7. Agent 未来按 Agent-as-a-Service 设计，但本阶段零实现
 
