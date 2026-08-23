@@ -1,0 +1,14 @@
+{
+  "hits": [
+    {
+      "_timestamp": 1751444644327758,
+      "sandbox_id": "sbx-123",
+      "level": "error",
+      "log": "secret payload must not appear in evidence"
+    }
+  ],
+  "total": 1,
+  "from": 0,
+  "size": 10,
+  "took": 5
+}

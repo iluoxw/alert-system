@@ -1,0 +1,18 @@
+{
+  "hits": [
+    {
+      "_timestamp": 1751444644327758,
+      "sandbox_id": "sbx-123",
+      "operation_name": "SandboxCreate",
+      "span_status": "OK",
+      "service_name": "orchestrator",
+      "peer_service": "firecracker",
+      "trace_id": "trace-001",
+      "span_id": "span-001"
+    }
+  ],
+  "total": 1,
+  "from": 0,
+  "size": 25,
+  "took": 8
+}

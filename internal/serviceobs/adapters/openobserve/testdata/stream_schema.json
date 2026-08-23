@@ -1,0 +1,7 @@
+{
+  "schema": [
+    {"name": "sandbox_id", "type": "Utf8"},
+    {"name": "level", "type": "Utf8"},
+    {"name": "_timestamp", "type": "Int64"}
+  ]
+}
