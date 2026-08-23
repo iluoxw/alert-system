@@ -705,6 +705,13 @@ e2e，以及全量 integration-race。包含事实同步的最终候选
 `096174c2c2136a9113c0393de5e52c774b2352a7` 又通过 Grok exact-SHA review，结论为
 `PASS / no P0-P2 / no PR`；该 SHA 是 Batch B 唯一基线。
 
+**Batch B 实现状态（2026-08-23）：** Prometheus/OpenObserve/alias-overlay adapter 与 compiled
+runtime binding planner 已在代码库完成并通过 hermetic tests；`CompiledIntegration` schema 1.1、
+封闭 stage/status/identity mappings 与 journey stage targets 已收紧。这不等于 production
+connected/published——Task 8 才接 API/runtime bundle，Task 9 才做 discovery attestation 与 E2B
+production SIP。当前 live 数据仍约 52.4h stale，access focus、journey mapping、retention 与 fresh
+replay 仍 blocked；E2B SIP 保持 draft。Agent 零实现。
+
 ### Opus 5 High Batch B：Task 4–6
 
 Prometheus/OpenObserve/alias-overlay。完成后一次 push，Codex 跑 provider `httptest`、projection、

@@ -278,6 +278,22 @@ renderer/assembler 重新出现服务特例。
 拒绝。生产遥测、权限、证据和 topology identity 尚未完成前，Agent 只会放大不稳定边界。当前
 只记录 Agent-as-a-Service 方向，另开 ADR 决策运行时。
 
+## Batch B 实现状态（2026-08-23）
+
+Batch B 已在 alert-system 代码库落地 Prometheus-compatible signal adapter、OpenObserve
+focus/log/trace/access adapter、alias batch lookup 与 context-local observed overlay
+reconciler；来源执行计划完全来自 `CompiledIntegration` bindings，`CompiledIntegration`
+schema 升至 1.1 并拒绝 1.0 artifact。
+
+**不等于 production connected/published：** adapter 能力与 fixtures/`httptest` 验收已完成，
+但 Task 8/9 才接 runtime bundle registry 与 production publish gate。2026-08-23 实测仍显示
+OpenObserve 数据约 52.4h stale；access focus 字段、journey stage mapping、retention 与 fresh
+current data 仍 blocked。E2B SIP 继续 `draft`；live discovery 只作为发布 gate，fixtures 才是
+当前产品验收事实。Agent-as-a-Service 零实现。
+
+Topology 继续是 declared skeleton + context-local observed overlay + dynamic instance inventory；
+overlay 不写 canonical `dependency_edges`。
+
 ## References
 
 - [ADR-0006：Service Observability Workspace 与可选 Agent 端口](0006-service-observability-workspaces-and-optional-agent-port.md)
