@@ -230,6 +230,12 @@ type AssemblySnapshot struct {
 	// UnresolvedBindings 是 scope.refs 缺省、为空或悬空，因而挂不到 bounded topology
 	// 的 binding key（升序）。它们仍然完整保留在 Evaluation 与 Context.Signals 里。
 	UnresolvedBindings []string
+	// AggregateOnlyBindings 是 scope 解析到多个 canonical 对象的 binding key（升序）。
+	//
+	// 它们的数值是跨对象聚合值，而 Page View v1 的 signalValue.scope_ref 是单值，
+	// 没有无损的逐对象展示位置。这类 binding 不做逐对象展示（否则就是伪造逐对象测量），
+	// 但健康意见仍逐对象生效，完整判定仍保留在 Evaluation 与 Context.Signals 里。
+	AggregateOnlyBindings []string
 	// NodeHealth / RelationHealth 由 health.AggregateObjectHealth 从挂上的 signal 算出。
 	// 没有条目表示该对象没有任何 signal，健康只能是 Unknown。
 	NodeHealth     map[string]model.Health
@@ -345,29 +351,64 @@ func (a *Assembler) Assemble(ctx stdcontext.Context, req Request) (*AssemblySnap
 	return snapshot, nil
 }
 
-// SignalPlacement 记录一个非 Golden binding 挂到了哪个 bounded topology 对象上。
+// SignalPlacement 记录一个非 Golden binding 解析到的全部 bounded topology 挂载目标。
+//
+// Profile schema 允许 scope.refs 最多 100 项，所以一个 binding 可以合法地指向多个对象。
+// 这里保留**全部**可解析目标：只留最后一个会静默丢掉前面的 ref，而且结果会取决于 ref 与
+// 拓扑的遍历顺序。两个列表都按 ID 升序去重，因此输出顺序不影响任何结论。
 type SignalPlacement struct {
 	BindingKey string
-	// NodeID 与 RelationID 至多一个非空。两个都空表示这个 binding 没有可挂载的对象。
-	NodeID     string
-	RelationID string
+	// NodeIDs 是解析到的 canonical 实体 ID（升序去重）。
+	NodeIDs []string
+	// RelationIDs 是解析到的 canonical 关系 ID（升序去重）。
+	//
+	// 多个 ref 指向同一条 canonical 关系（例如同时写了 canonical ID 与被折叠的成员 ID）
+	// 时只保留一次：归一化后它们本来就是同一个对象。
+	RelationIDs []string
 }
 
-// resolvePlacements 解析每个非 Golden binding 的归属，并算出各对象的健康。
+// AttachmentCount 返回解析到的 canonical 对象总数。
+func (p SignalPlacement) AttachmentCount() int { return len(p.NodeIDs) + len(p.RelationIDs) }
+
+// Resolved 表示这个 binding 至少解析到一个 canonical 对象。
+func (p SignalPlacement) Resolved() bool { return p.AttachmentCount() > 0 }
+
+// SingleTarget 在且仅在恰好解析到一个 canonical 对象时返回该对象。
 //
-// 三条硬约束：
+// 只有这种情况下数值才明确属于该对象，逐对象展示才是无损的。解析到多个对象时数值是跨对象
+// 聚合值，把它复制到每个对象上就是伪造逐对象测量，因此这里返回 false。
+func (p SignalPlacement) SingleTarget() (nodeID, relationID string, ok bool) {
+	if p.AttachmentCount() != 1 {
+		return "", "", false
+	}
+	if len(p.NodeIDs) == 1 {
+		return p.NodeIDs[0], "", true
+	}
+	return "", p.RelationIDs[0], true
+}
+
+// resolvePlacements 解析每个非 Golden binding 的全部归属，并算出各对象的健康。
 //
-//  1. scope.refs 缺省、为空或悬空时不发明 node/relation，也不扩大查询边界，更不会把
-//     binding 硬挂到 service 节点上冒充节点观测——它只是没有可挂载的位置；
-//  2. 这类 binding 仍然完整保留在 evaluator 结果与 Context.Signals 里，缺口通过
-//     UnresolvedBindings（进而 section 与 incomplete 摘要）表达；
-//  3. Golden 恒在顶层 golden_signals，不参与拓扑挂载。
+// 五条硬约束：
+//
+//  1. 保留**全部**可解析的挂载目标。Profile 允许 scope.refs 最多 100 项，只留最后一个
+//     会静默丢掉前面的 ref，而且结果会取决于遍历顺序；两个列表都升序去重，因此输出顺序
+//     不影响任何结论。
+//  2. 指向同一条 canonical 关系的多个 ref（canonical ID 与被折叠的成员 ID）只算一个对象：
+//     归一化之后它们本来就是同一个对象。健康意见因此是"每 binding 每 canonical 对象一次"，
+//     不会被重复计票。
+//  3. scope.refs 缺省、为空或悬空时不发明 node/relation，也不扩大查询边界，更不会把
+//     binding 硬挂到 service 节点上冒充节点观测——它只是没有可挂载的位置。
+//  4. 这类 binding 仍然完整保留在 evaluator 结果与 Context.Signals 里，缺口通过
+//     UnresolvedBindings / AggregateOnlyBindings（进而 section 与 incomplete 摘要）表达。
+//  5. Golden 恒在顶层 golden_signals，不参与拓扑挂载。
 //
 // relation 引用同时接受 canonical ID 与被折叠的成员 ID：canonical 归一化不能让原本有效的
 // scope refs 变成悬空引用。
 func resolvePlacements(snapshot *AssemblySnapshot) {
 	snapshot.Placements = []SignalPlacement{}
 	snapshot.UnresolvedBindings = []string{}
+	snapshot.AggregateOnlyBindings = []string{}
 	snapshot.NodeHealth = map[string]model.Health{}
 	snapshot.RelationHealth = map[string]model.Health{}
 	if snapshot.Profile == nil {
@@ -386,32 +427,64 @@ func resolvePlacements(snapshot *AssemblySnapshot) {
 		if binding.Family == model.SignalFamilyGolden {
 			continue
 		}
-		placement := SignalPlacement{BindingKey: binding.Key}
+		placement := SignalPlacement{
+			BindingKey:  binding.Key,
+			NodeIDs:     []string{},
+			RelationIDs: []string{},
+		}
+		seenNodes := map[string]struct{}{}
+		seenRelations := map[string]struct{}{}
 		for _, ref := range binding.Scope.Refs {
 			switch binding.Scope.Kind {
 			case model.ScopeKindRelation:
 				for _, relation := range snapshot.TopologyFacts.Relations {
-					if relation.ResolvesRelationRef(ref) {
-						placement.RelationID = relation.RelationID
-						relationHealths[relation.RelationID] = append(
-							relationHealths[relation.RelationID], evaluation.Health)
+					if !relation.ResolvesRelationRef(ref) {
+						continue
 					}
+					// 一个 ref 至多属于一条 canonical 关系（ID 是数据库主键，每行只属于
+					// 一个归一化组），命中即停。
+					if _, duplicate := seenRelations[relation.RelationID]; !duplicate {
+						seenRelations[relation.RelationID] = struct{}{}
+						placement.RelationIDs = append(placement.RelationIDs, relation.RelationID)
+					}
+					break
 				}
 			case model.ScopeKindEntity, model.ScopeKindResource:
-				if _, ok := nodeIDs[ref]; ok {
-					placement.NodeID = ref
-					nodeHealths[ref] = append(nodeHealths[ref], evaluation.Health)
+				if _, ok := nodeIDs[ref]; !ok {
+					continue
+				}
+				if _, duplicate := seenNodes[ref]; !duplicate {
+					seenNodes[ref] = struct{}{}
+					placement.NodeIDs = append(placement.NodeIDs, ref)
 				}
 			case model.ScopeKindService:
 				// service 级的非 Golden binding 没有拓扑挂载位置。
 			}
 		}
-		if placement.NodeID == "" && placement.RelationID == "" {
+		sort.Strings(placement.NodeIDs)
+		sort.Strings(placement.RelationIDs)
+
+		// 健康意见按"每个 binding、每个 canonical 对象一次"投递：去重后的列表保证同一条
+		// binding 不会因为写了两个指向同一对象的 ref 而被重复计票。
+		for _, id := range placement.NodeIDs {
+			nodeHealths[id] = append(nodeHealths[id], evaluation.Health)
+		}
+		for _, id := range placement.RelationIDs {
+			relationHealths[id] = append(relationHealths[id], evaluation.Health)
+		}
+
+		switch {
+		case !placement.Resolved():
 			snapshot.UnresolvedBindings = append(snapshot.UnresolvedBindings, binding.Key)
+		case placement.AttachmentCount() > 1:
+			// 数值是跨对象聚合值，逐对象展示会伪造测量。完整判定仍保留在 evaluator 与
+			// DiagnosticContext 里，缺口由稳定 reason 表达。
+			snapshot.AggregateOnlyBindings = append(snapshot.AggregateOnlyBindings, binding.Key)
 		}
 		snapshot.Placements = append(snapshot.Placements, placement)
 	}
 	sort.Strings(snapshot.UnresolvedBindings)
+	sort.Strings(snapshot.AggregateOnlyBindings)
 	sort.Slice(snapshot.Placements, func(i, j int) bool {
 		return snapshot.Placements[i].BindingKey < snapshot.Placements[j].BindingKey
 	})

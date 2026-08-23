@@ -62,11 +62,18 @@ func ProjectWorkspace(snapshot *soctx.AssemblySnapshot) model.WorkspaceView {
 // 错误挂到 service 节点，而是用一个稳定 section 把局部缺口显式暴露出来。
 func workspaceSections(snapshot *soctx.AssemblySnapshot, attached attachment) []model.SectionStatus {
 	sections := []model.SectionStatus{}
-	if len(attached.unresolved) > 0 {
+	if len(attached.unresolved) > 0 || len(attached.aggregateOnly) > 0 {
+		// 两类缺口共用同一个 section（它们都是"signal 挂不到可展示位置"），reason 取更
+		// 严重的那一类：悬空引用是配置问题，聚合值只是展示位置受限。逐 binding 的具体原因
+		// 在 diagnostic_summary.missing_requirements 里。
+		reason := serviceobs.ReasonSignalScopeAggregateNotProjectable
+		if len(attached.unresolved) > 0 {
+			reason = serviceobs.ReasonSignalScopeUnresolved
+		}
 		sections = append(sections, model.SectionStatus{
 			SectionKey: SectionKeySignalScope,
 			State:      model.AvailabilityUnknown,
-			ReasonCode: serviceobs.ReasonSignalScopeUnresolved,
+			ReasonCode: reason,
 			Retryable:  false,
 		})
 	}
@@ -296,6 +303,9 @@ func missingRequirements(snapshot *soctx.AssemblySnapshot, attached attachment) 
 	}
 	for _, key := range attached.unresolved {
 		missing = append(missing, serviceobs.ReasonSignalScopeUnresolved+":"+key)
+	}
+	for _, key := range attached.aggregateOnly {
+		missing = append(missing, serviceobs.ReasonSignalScopeAggregateNotProjectable+":"+key)
 	}
 	sort.Strings(missing)
 	return missing

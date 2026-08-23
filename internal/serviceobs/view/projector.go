@@ -221,6 +221,9 @@ type attachment struct {
 	relationSignals map[string][]model.SignalValue
 	// unresolved 是无法挂到 bounded topology 的 non-golden binding key，按 key 排序。
 	unresolved []string
+	// aggregateOnly 是 scope 解析到多个 canonical 对象、因此没有无损逐对象展示位置的
+	// binding key，按 key 排序。
+	aggregateOnly []string
 }
 
 // attachSignals 按 assembler 已解析好的归属把非 Golden signal 投影到拓扑对象上。
@@ -230,17 +233,22 @@ type attachment struct {
 // "context 说这个节点 Unknown、页面说它 Critical"的漂移，而这类漂移正是 Page View 不得
 // 重算 Health 这条约束要防的。
 //
-// 三条硬约束仍然成立，只是判定来自共享结果：
+// 四条硬约束仍然成立，只是判定来自共享结果：
 //
 //  1. scope.refs 缺省、为空或悬空时不发明 node/relation，也不扩大查询边界；
 //  2. 不把这些 binding 错误挂到 service 节点上冒充"有观测"；
-//  3. 该 binding 仍然完整保留在 evaluator 结果与 DiagnosticContext 的 signals 里，
-//     只是没有可挂载的显示位置，缺口通过 section 与 missing_requirements 表达。
+//  3. scope 解析到多个 canonical 对象时**不做逐对象展示**。那种 binding 的数值是跨对象
+//     聚合值（例如 max over hosts），而 v1 的 signalValue.scope_ref 是单值：把同一个数值
+//     复制到每个对象上，会把"这一组里最坏的是 91%"显示成"这个对象是 91%"，那是伪造逐对象
+//     测量。健康意见仍然逐对象生效（由 assembler 投递），只有数值展示被留空；
+//  4. 上述两类 binding 都仍然完整保留在 evaluator 结果与 DiagnosticContext 的 signals 里，
+//     缺口通过稳定 section 与 missing_requirements 表达。
 func attachSignals(snapshot *soctx.AssemblySnapshot) attachment {
 	result := attachment{
 		nodeSignals:     map[string][]model.SignalValue{},
 		relationSignals: map[string][]model.SignalValue{},
 		unresolved:      cloneStrings(snapshot.UnresolvedBindings),
+		aggregateOnly:   cloneStrings(snapshot.AggregateOnlyBindings),
 	}
 	if snapshot.Profile == nil {
 		return result
@@ -252,20 +260,25 @@ func attachSignals(snapshot *soctx.AssemblySnapshot) attachment {
 			continue
 		}
 		placement, ok := snapshot.PlacementFor(binding.Key)
-		if !ok || (placement.NodeID == "" && placement.RelationID == "") {
+		if !ok {
+			continue
+		}
+		// 只有恰好一个挂载目标时数值才明确属于该对象，逐对象展示才是无损的。
+		nodeID, relationID, single := placement.SingleTarget()
+		if !single {
 			continue
 		}
 		signal := ProjectSignal(evaluation, snapshot.Identity.ServiceID,
 			snapshot.WindowSeconds, snapshot.FactAnchor)
-		if placement.NodeID != "" {
-			result.nodeSignals[placement.NodeID] = append(result.nodeSignals[placement.NodeID], signal)
+		if nodeID != "" {
+			result.nodeSignals[nodeID] = append(result.nodeSignals[nodeID], signal)
 		}
-		if placement.RelationID != "" {
-			result.relationSignals[placement.RelationID] = append(
-				result.relationSignals[placement.RelationID], signal)
+		if relationID != "" {
+			result.relationSignals[relationID] = append(result.relationSignals[relationID], signal)
 		}
 	}
 	sort.Strings(result.unresolved)
+	sort.Strings(result.aggregateOnly)
 	return result
 }
 

@@ -978,6 +978,169 @@ func TestMergedRelationKeepsProfileScopeRefResolvable(t *testing.T) {
 	}
 }
 
+func TestMultiRefAggregateIsNotFabricatedPerObject(t *testing.T) {
+	// scope 解析到多个 canonical 对象时数值是跨对象聚合值（max over hosts）。v1 的
+	// signalValue.scope_ref 是单值，把同一个数值复制到每个对象上会把"这一组里最坏的是
+	// 99%"显示成"这个对象是 99%"——那是伪造逐对象测量。契约安全的做法是：不做逐对象展示，
+	// 保留完整判定，用稳定的局部诊断暴露缺口；健康意见仍逐对象生效。
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+
+	// 取 fixture 拓扑里两个真实节点作为多 ref 目标。
+	if len(readers.topology.Nodes) < 2 {
+		t.Fatal("fixture 拓扑应至少有两个节点")
+	}
+	firstID := readers.topology.Nodes[0].EntityID
+	secondID := readers.topology.Nodes[1].EntityID
+	published.SignalBindings = append(published.SignalBindings, model.SignalBinding{
+		Key: "use_fleet_worst_saturation", Label: "机群最坏饱和度", Family: model.SignalFamilyUSE,
+		Semantic: model.SemanticSaturation,
+		Scope:    model.SignalBindingScope{Kind: model.ScopeKindResource, Refs: []string{firstID, secondID}},
+		ToolKey:  "metrics.query_semantic_signal.v1", OutputField: "series.pressure",
+		Unit: "percent", Aggregation: model.AggregationMax,
+		Thresholds: &model.SignalThresholds{
+			Mode: model.ThresholdModeAbsolute, Direction: model.ThresholdDirectionAbove,
+			Degraded: 85, Critical: 95,
+		},
+	})
+	// 给这个聚合 binding 一个越过 critical 阈值的观测。
+	value := 99.0
+	readers.observations.Signals = append(readers.observations.Signals, health.SignalObservation{
+		BindingKey: "use_fleet_worst_saturation", Availability: model.SignalAvailabilityAvailable,
+		Value: &value, ObservedAt: fixtureNow.Add(-10 * time.Second),
+		SourceKey: "prometheus_e2b_uat",
+	})
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	if err := newValidator(t).ValidateValue(contract.KindPageView, workspace); err != nil {
+		t.Fatalf("多 ref 聚合场景仍必须过 schema: %v", err)
+	}
+
+	// 两个 ref 都被保留为挂载目标。
+	placement, ok := snapshot.PlacementFor("use_fleet_worst_saturation")
+	if !ok || len(placement.NodeIDs) != 2 {
+		t.Fatalf("两个 ref 都必须保留: %+v", placement)
+	}
+	// 绝不把聚合数值复制到任何一个对象上。
+	for _, node := range workspace.Topology.Nodes {
+		for _, signal := range node.Signals {
+			if signal.BindingKey == "use_fleet_worst_saturation" {
+				t.Fatalf("跨对象聚合值不得伪装成节点 %q 的逐对象测量: %+v", node.EntityID, signal)
+			}
+		}
+	}
+	// 健康意见仍逐对象生效：知道最坏值越了阈值，就不能声称其中任何一个健康。
+	for _, id := range []string{firstID, secondID} {
+		if got := snapshot.ObjectHealth(id, ""); got != model.HealthCritical {
+			t.Fatalf("对象 %s 应收到 critical 意见，实际 %q", id, got)
+		}
+		for _, node := range workspace.Topology.Nodes {
+			if node.EntityID == id && node.Health != model.HealthCritical {
+				t.Fatalf("页面节点 %s 健康应与共享聚合一致，实际 %q", id, node.Health)
+			}
+		}
+	}
+	// 完整判定仍保留在 DiagnosticContext 里，不是被丢弃。
+	if !containsBindingKey(snapshot.Context.Signals, "use_fleet_worst_saturation") {
+		t.Fatal("DiagnosticContext 必须保留完整判定")
+	}
+	// 缺口用稳定的局部诊断暴露。
+	section := findSection(workspace.Sections, SectionKeySignalScope)
+	if section == nil || section.State != model.AvailabilityUnknown {
+		t.Fatalf("必须有稳定的 signal_scope 局部诊断: %+v", section)
+	}
+	if !containsString(workspace.DiagnosticSummary.MissingRequirements,
+		serviceobs.ReasonSignalScopeAggregateNotProjectable+":use_fleet_worst_saturation") {
+		t.Fatalf("missing_requirements 应列出聚合缺口: %v",
+			workspace.DiagnosticSummary.MissingRequirements)
+	}
+	if workspace.DiagnosticSummary.Level != model.DiagnosticLevelIncomplete {
+		t.Fatalf("存在局部缺口时摘要必须 incomplete，实际 %q", workspace.DiagnosticSummary.Level)
+	}
+	// 它绝不是"悬空"：悬空 reason 不应出现在这个 binding 上。
+	if containsString(workspace.DiagnosticSummary.MissingRequirements,
+		serviceobs.ReasonSignalScopeUnresolved+":use_fleet_worst_saturation") {
+		t.Fatal("多目标聚合不是悬空引用")
+	}
+}
+
+func TestSingleRefAfterMemberDedupStillProjectsPerObject(t *testing.T) {
+	// canonical ID 与被折叠成员 ID 同时出现时去重成一个目标，因此仍然是无损的逐对象展示，
+	// 不应被误判成多目标聚合而丢掉数值。
+	published := loadCanonicalProfile(t)
+	fixture := loadCanonicalContext(t)
+	identity := loadCanonicalIdentity(t)
+	readers := buildFixtureReaders(t, fixture, identity)
+
+	const canonicalID = "rel_canonical_edge"
+	const memberID = "rel_api_orchestrator"
+	replaced := false
+	for i := range readers.topology.Relations {
+		if readers.topology.Relations[i].RelationID != memberID {
+			continue
+		}
+		readers.topology.Relations[i].RelationID = canonicalID
+		readers.topology.Relations[i].Provenance = model.ProvenanceDeclaredAndObserved
+		readers.topology.Relations[i].MergedRelationIDs = []string{canonicalID, memberID}
+		replaced = true
+	}
+	if !replaced {
+		t.Fatalf("fixture 应包含关系 %q", memberID)
+	}
+	// 让一个 RED binding 同时引用 canonical 与成员 ID。
+	patched := false
+	for i := range published.SignalBindings {
+		binding := &published.SignalBindings[i]
+		if binding.Family != model.SignalFamilyRED {
+			continue
+		}
+		binding.Scope.Refs = []string{memberID, canonicalID}
+		patched = true
+	}
+	if !patched {
+		t.Fatal("fixture Profile 应包含 RED binding")
+	}
+
+	snapshot := assembleFixture(t, soctx.KindWorkspace, readers, &published, fixture.Focus)
+	workspace := ProjectWorkspace(snapshot)
+	if err := newValidator(t).ValidateValue(contract.KindPageView, workspace); err != nil {
+		t.Fatalf("去重场景仍必须过 schema: %v", err)
+	}
+
+	var canonical *model.TopologyRelationView
+	for i := range workspace.Topology.Relations {
+		if workspace.Topology.Relations[i].RelationID == canonicalID {
+			canonical = &workspace.Topology.Relations[i]
+		}
+	}
+	if canonical == nil {
+		t.Fatalf("应存在 canonical 关系 %q", canonicalID)
+	}
+	// 去重后是单目标，因此 RED 数值必须照常逐对象展示。
+	if len(canonical.Signals) == 0 {
+		t.Fatal("去重成单目标后必须保留逐对象数值展示")
+	}
+	for _, key := range snapshot.AggregateOnlyBindings {
+		if strings.HasPrefix(key, "red_") {
+			t.Fatalf("指向同一 canonical 关系的多个 ref 去重后不是聚合: %v",
+				snapshot.AggregateOnlyBindings)
+		}
+	}
+	// 每条 RED binding 只出现一次，不因为写了两个 ref 而重复展示。
+	seen := map[string]int{}
+	for _, signal := range canonical.Signals {
+		seen[signal.BindingKey]++
+	}
+	for key, count := range seen {
+		if count != 1 {
+			t.Fatalf("binding %q 在同一对象上重复展示 %d 次", key, count)
+		}
+	}
+}
+
 func TestProjectionIsDeterministic(t *testing.T) {
 	published := loadCanonicalProfile(t)
 	fixture := loadCanonicalContext(t)

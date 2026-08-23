@@ -55,6 +55,14 @@ const (
 	// 悬空，无法挂到 bounded topology 上的任何 node/relation。它是局部缺口，不是
 	// "这个 binding 不存在"——evaluator 仍保留该 binding 的 Unknown 结果。
 	ReasonSignalScopeUnresolved = "signal_scope_unresolved"
+	// ReasonSignalScopeAggregateNotProjectable 表示某个 binding 的 scope 解析到多个
+	// canonical 对象，因此它的数值是跨对象聚合值（例如 max over hosts）。
+	//
+	// Page View v1 的 signalValue.scope_ref 是单值，把同一个聚合数值复制到每个对象上会
+	// 把"这一组里最坏的是 91%"伪装成"这个对象是 91%"。所以这类 binding 不做逐对象展示，
+	// 完整判定保留在 evaluator 与 DiagnosticContext 里，缺口用这个稳定 reason 表达。
+	// 注意健康意见仍然逐对象生效：知道一组里最坏值越了阈值，就不能声称其中任何一个健康。
+	ReasonSignalScopeAggregateNotProjectable = "signal_scope_aggregate_not_projectable"
 	// ReasonProfileUnconfigured 表示该服务没有 active published Profile。
 	ReasonProfileUnconfigured = "profile_unconfigured"
 	// ReasonFocusNotObserved 表示 focus 查询成功但当前边界内没有匹配事实。

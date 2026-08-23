@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1038,11 +1039,155 @@ func TestContextNodeHealthComesFromSharedScopedAggregate(t *testing.T) {
 	}
 	// 归属解析结果必须可见且不把 binding 丢掉。
 	placement, ok := snapshot.PlacementFor("use_peer_saturation")
-	if !ok || placement.NodeID != testPeerID {
+	if !ok || len(placement.NodeIDs) != 1 || placement.NodeIDs[0] != testPeerID {
 		t.Fatalf("归属解析结果不符: %+v", placement)
+	}
+	nodeID, relationID, single := placement.SingleTarget()
+	if !single || nodeID != testPeerID || relationID != "" {
+		t.Fatalf("单一挂载目标解析不符: %q/%q/%v", nodeID, relationID, single)
 	}
 	if len(snapshot.UnresolvedBindings) != 0 {
 		t.Fatalf("scope 可解析时不应有悬空 binding: %v", snapshot.UnresolvedBindings)
+	}
+	if len(snapshot.AggregateOnlyBindings) != 0 {
+		t.Fatalf("单目标 binding 不应进聚合列表: %v", snapshot.AggregateOnlyBindings)
+	}
+}
+
+func TestResolvePlacementsKeepsEveryDistinctAttachment(t *testing.T) {
+	// Profile schema 允许 scope.refs 最多 100 项。此前实现在循环里覆盖单个 NodeID/
+	// RelationID，只留最后一个 ref，前面的全部被静默丢弃，而且结果取决于遍历顺序。
+	published := testProfile()
+	published.SignalBindings = append(published.SignalBindings, model.SignalBinding{
+		Key: "use_fleet_saturation", Label: "机群饱和度", Family: model.SignalFamilyUSE,
+		Semantic: model.SemanticSaturation,
+		// 两个实体 ref，都在 bounded topology 内。
+		Scope:   model.SignalBindingScope{Kind: model.ScopeKindResource, Refs: []string{testPeerID, testEntityID}},
+		ToolKey: "metrics.query_semantic_signal.v1", OutputField: "series.pressure",
+		Unit: "percent", Aggregation: model.AggregationMax,
+		Thresholds: &model.SignalThresholds{
+			Mode: model.ThresholdModeAbsolute, Direction: model.ThresholdDirectionAbove,
+			Degraded: 85, Critical: 95,
+		},
+	})
+
+	assembler, _, _, _ := newAssembler(t, &published)
+	assembler.TelemetryConnected = true
+	assembler.Observations = singleCriticalObservation{
+		bindingKey: "use_fleet_saturation", value: 99, observedAt: testNow.Add(-5 * time.Second),
+	}
+
+	snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+		Kind: KindWorkspace, ServiceID: testServiceID,
+	})
+	if err != nil {
+		t.Fatalf("Assemble 失败: %v", err)
+	}
+
+	placement, ok := snapshot.PlacementFor("use_fleet_saturation")
+	if !ok {
+		t.Fatal("binding 必须有归属记录")
+	}
+	// 两个 ref 都要保留，不能只剩最后一个。
+	if len(placement.NodeIDs) != 2 {
+		t.Fatalf("两个可解析 ref 都必须保留，实际 %v", placement.NodeIDs)
+	}
+	// 升序去重，因此结果不依赖 Profile 里 ref 的书写顺序或拓扑遍历顺序。
+	if !sort.StringsAreSorted(placement.NodeIDs) {
+		t.Fatalf("挂载目标必须升序稳定，实际 %v", placement.NodeIDs)
+	}
+	for _, want := range []string{testEntityID, testPeerID} {
+		if !containsString(placement.NodeIDs, want) {
+			t.Fatalf("缺少挂载目标 %s: %v", want, placement.NodeIDs)
+		}
+	}
+	// 健康意见必须逐对象生效：知道一组里最坏值越了阈值，就不能声称其中任何一个健康。
+	for _, id := range []string{testEntityID, testPeerID} {
+		if got := snapshot.ObjectHealth(id, ""); got != model.HealthCritical {
+			t.Fatalf("对象 %s 应收到 critical 意见，实际 %q", id, got)
+		}
+	}
+	// 多目标聚合值没有无损的逐对象展示位置，必须进 AggregateOnlyBindings。
+	if !containsString(snapshot.AggregateOnlyBindings, "use_fleet_saturation") {
+		t.Fatalf("多目标 binding 必须记入聚合列表: %v", snapshot.AggregateOnlyBindings)
+	}
+	// 它绝不是"悬空"：判定仍然完整保留。
+	if containsString(snapshot.UnresolvedBindings, "use_fleet_saturation") {
+		t.Fatal("多目标 binding 不是悬空引用")
+	}
+	if !containsBindingKey(snapshot.Context.Signals, "use_fleet_saturation") {
+		t.Fatal("DiagnosticContext 必须保留完整判定")
+	}
+}
+
+func TestResolvePlacementsDeduplicatesMergedRelationMembers(t *testing.T) {
+	// canonical 关系归一化后，Profile 可能同时写了 canonical ID 与被折叠的成员 ID。
+	// 它们指向同一个对象，因此只能算一个挂载目标、只投递一次健康意见。
+	const canonicalID = "rel-canonical"
+	const memberID = "rel-merged-member"
+	published := testProfile()
+	published.SignalBindings = append(published.SignalBindings, model.SignalBinding{
+		Key: "red_edge_errors", Label: "边错误率", Family: model.SignalFamilyRED,
+		Semantic: model.SemanticErrors,
+		Scope: model.SignalBindingScope{
+			Kind: model.ScopeKindRelation,
+			// 两个 ref 指向同一条 canonical 关系。
+			Refs: []string{memberID, canonicalID},
+		},
+		ToolKey: "metrics.query_semantic_signal.v1", OutputField: "series.error_percent",
+		Unit: "percent", Aggregation: model.AggregationAvg,
+		Thresholds: &model.SignalThresholds{
+			Mode: model.ThresholdModeAbsolute, Direction: model.ThresholdDirectionAbove,
+			Degraded: 2, Critical: 5,
+		},
+	})
+
+	assembler, _, topology, _ := newAssembler(t, &published)
+	merged := testTopologyFacts()
+	merged.Relations = []serviceobs.TopologyRelation{{
+		RelationID: canonicalID, SourceEntityID: testEntityID, TargetEntityID: testPeerID,
+		Kind: "depends_on", Provenance: model.ProvenanceDeclaredAndObserved,
+		ObservedAt:        testFactAnchor,
+		MergedRelationIDs: []string{canonicalID, memberID},
+	}}
+	topology.facts = merged
+	assembler.TelemetryConnected = true
+	assembler.Observations = singleCriticalObservation{
+		bindingKey: "red_edge_errors", value: 9, observedAt: testNow.Add(-5 * time.Second),
+	}
+
+	snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+		Kind: KindWorkspace, ServiceID: testServiceID,
+	})
+	if err != nil {
+		t.Fatalf("Assemble 失败: %v", err)
+	}
+
+	placement, ok := snapshot.PlacementFor("red_edge_errors")
+	if !ok {
+		t.Fatal("binding 必须有归属记录")
+	}
+	// 两个 ref 归一到同一个 canonical 对象，只算一个挂载目标。
+	if len(placement.RelationIDs) != 1 || placement.RelationIDs[0] != canonicalID {
+		t.Fatalf("指向同一 canonical 关系的多个 ref 必须去重: %v", placement.RelationIDs)
+	}
+	if placement.AttachmentCount() != 1 {
+		t.Fatalf("挂载目标数应为 1，实际 %d", placement.AttachmentCount())
+	}
+	// 去重后仍是单目标，因此可以无损逐对象展示。
+	_, relationID, single := placement.SingleTarget()
+	if !single || relationID != canonicalID {
+		t.Fatalf("去重后应是单一挂载目标: %q/%v", relationID, single)
+	}
+	if containsString(snapshot.AggregateOnlyBindings, "red_edge_errors") {
+		t.Fatalf("去重后不是多目标聚合: %v", snapshot.AggregateOnlyBindings)
+	}
+	if got := snapshot.ObjectHealth("", canonicalID); got != model.HealthCritical {
+		t.Fatalf("关系应收到 critical 意见，实际 %q", got)
+	}
+	// 健康意见只投递一次：重复计票在优先级聚合下结果相同，但语义上必须是每对象一次。
+	if len(snapshot.RelationHealth) != 1 {
+		t.Fatalf("只应有一个关系收到意见: %+v", snapshot.RelationHealth)
 	}
 }
 
@@ -1105,4 +1250,22 @@ func TestAssembleSurfacesProfileDiagnostic(t *testing.T) {
 	if snapshot.Profile != nil || snapshot.Evaluation.Data.State != model.DataStateUnconfigured {
 		t.Fatal("被隔离的 Profile 不进 active registry，Data 仍是 Unconfigured")
 	}
+}
+
+func containsString(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBindingKey(signals []model.Signal, key string) bool {
+	for _, signal := range signals {
+		if signal.BindingKey == key {
+			return true
+		}
+	}
+	return false
 }
