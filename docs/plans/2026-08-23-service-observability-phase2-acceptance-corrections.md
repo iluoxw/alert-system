@@ -1,6 +1,8 @@
 # Service Observability Phase 2 Acceptance Corrections Plan
 
 > **Owner:** Codex 负责计划、调度与本地验收；Cursor Cloud Fable 5 High 只审计划；Cursor Cloud Claude Opus 5 High 编码；Grok Bot `alert-system` 在最终 exact SHA 上做对抗性 code review。
+>
+> **固定 Cursor 入口：** 所有 Fable 计划审查与 Opus 编码 follow-up 都必须在同一个 Cursor Cloud Agent 会话 `https://cursor.com/agents/bc-5a993b86-e20a-46b1-b033-028118eced93` 内完成；不得新建 Cursor 会话，也不得使用本地 Cursor 客户端。
 
 ## 1. 目标
 
@@ -26,6 +28,7 @@
   - `docs/plans/2026-08-13-e2b-otel-prometheus-remote-write-demo.md`
 - 不伪造 sparkline、节点运行数字、事件或 observed relation；视觉修正只能重排/强化合同已经提供的事实。
 - 当前分支串行修改；不与其它编码 Agent 并发写共享文件。
+- Cursor 的模型可以按回合在固定 Cloud 会话内切换，但任务上下文、目标分支与审查记录不得拆到其它会话。
 
 ## 3. 已验证问题与处置
 
@@ -193,7 +196,7 @@
 
 - C7 的五张 1536 比较与 1180/900/390 响应式证据完成；console 0 warning/0 error；所有后端/前端门禁全绿。
 
-三个 correction slice 串行执行。每个 slice 完成后 Cursor Cloud 必须提交并 push 当前远端分支，Codex 在本地 fast-forward、验收、记录 exact SHA 后才派下一 slice。
+三个 correction slice 串行执行。Fable review 与 R1–R3 的所有 Opus follow-up 均复用本计划顶部记录的固定 Cursor Cloud 会话。每个 slice 完成后 Cursor Cloud 必须提交并 push 当前远端分支，Codex 在本地 fast-forward、验收、记录 exact SHA 后才派下一 slice。
 
 ## 6. 测试与验收
 
