@@ -19,7 +19,7 @@ func compiledFixture() integration.CompiledIntegration {
 			{
 				Key: "journey_sandbox_create", Kind: integration.KindJourney,
 				TargetRef: "sandbox_create", FocusKind: "sandbox_id",
-				SourceKey: serviceobs.SourceKeyOpenObserveTraces,
+				SourceKey:   serviceobs.SourceKeyOpenObserveTraces,
 				SideOutputs: []integration.SideOutput{integration.SideOutputFocus},
 			},
 			{
@@ -58,7 +58,7 @@ func TestPlanSourcesIgnoresRendererWhenCompiledHasTracesOnly(t *testing.T) {
 	compiled := integration.CompiledIntegration{
 		Bindings: []integration.CompiledBinding{
 			{Key: "traces", Kind: integration.KindEvidence, TargetRef: "sandbox_id",
-				SourceKey: serviceobs.SourceKeyOpenObserveTraces,
+				SourceKey:   serviceobs.SourceKeyOpenObserveTraces,
 				SideOutputs: []integration.SideOutput{integration.SideOutputFocus}},
 		},
 	}
@@ -103,7 +103,7 @@ func TestPlanSourcesFocusKindFilter(t *testing.T) {
 	compiled := integration.CompiledIntegration{
 		Bindings: []integration.CompiledBinding{
 			{Key: "logs", Kind: integration.KindEvidence, TargetRef: "trace_id",
-				SourceKey: serviceobs.SourceKeyOpenObserveLogs,
+				SourceKey:   serviceobs.SourceKeyOpenObserveLogs,
 				SideOutputs: []integration.SideOutput{integration.SideOutputFocus}},
 		},
 	}

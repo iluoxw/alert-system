@@ -24,8 +24,8 @@ type runtimeSourcePlan struct {
 }
 
 const (
-	sourcePrometheus      = serviceobs.SourceKeyPrometheus
-	sourceOpenObserveLogs = serviceobs.SourceKeyOpenObserveLogs
+	sourcePrometheus        = serviceobs.SourceKeyPrometheus
+	sourceOpenObserveLogs   = serviceobs.SourceKeyOpenObserveLogs
 	sourceOpenObserveTraces = serviceobs.SourceKeyOpenObserveTraces
 	sourceOpenObserveAccess = serviceobs.SourceKeyOpenObserveAccess
 )
