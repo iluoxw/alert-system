@@ -1355,6 +1355,8 @@ func TestLinksForIdentityFailsClosedOnUnsafeLegacyURLs(t *testing.T) {
 		"https://user@/path", "https://:443/path", "https://user@?x",
 		"http:///evil.example.com", "https://?x=1", "https://#x",
 		"https://[::1", "https://exa mple.com", "https://evil.example:bad/path",
+		// 端口超出 16 位：net/url 解析得过，但浏览器打不开。
+		"https://example.com:65536/path", "https://example.com:99999/path",
 	} {
 		unsafeIdentity := identity
 		unsafeIdentity.DashboardURL = unsafe
@@ -1379,6 +1381,7 @@ func TestLinksForIdentityFailsClosedOnUnsafeLegacyURLs(t *testing.T) {
 		"https://user@grafana.example.com/d", "https://user:pass@grafana.example.com/d",
 		"https://grafana.example.com:3000/d", "https://[::1]:8080/d",
 		"http://10.60.199.160:9090/graph", "HtTpS://grafana.example.com/d",
+		"https://grafana.example.com:65535/d", "https://grafana.example.com:0/d",
 	} {
 		hostBearing := identity
 		hostBearing.DashboardURL = safe

@@ -12,6 +12,9 @@
     { "name": "http URL", "href": "http://grafana.example.com/d/abc", "safe": true },
     { "name": "混合大小写 scheme", "href": "HtTpS://grafana.example.com/d/abc", "safe": true },
     { "name": "带端口", "href": "https://grafana.example.com:3000/d/abc", "safe": true },
+    { "name": "端口上界 65535", "href": "https://example.com:65535/path", "safe": true },
+    { "name": "端口 0", "href": "https://example.com:0/path", "safe": true },
+    { "name": "冒号后无端口等于用默认端口", "href": "https://example.com:/path", "safe": true },
     { "name": "带 userinfo 且 host 真实", "href": "https://user@grafana.example.com/d", "safe": true },
     { "name": "带 userinfo 与密码且 host 真实", "href": "https://user:pass@grafana.example.com/d", "safe": true },
     { "name": "括号 IPv6", "href": "https://[::1]/d", "safe": true },
@@ -30,6 +33,8 @@
     { "name": "malformed：IPv6 括号未闭合", "href": "https://[::1", "safe": false },
     { "name": "malformed：host 含空格", "href": "https://exa mple.com", "safe": false },
     { "name": "malformed：端口不是数字", "href": "https://evil.example:bad/path", "safe": false },
+    { "name": "malformed：端口超出 16 位", "href": "https://example.com:65536/path", "safe": false },
+    { "name": "malformed：端口远超 16 位", "href": "https://example.com:99999/path", "safe": false },
 
     { "name": "javascript", "href": "javascript:alert(1)", "safe": false },
     { "name": "javascript 大写", "href": "JavaScript:alert(1)", "safe": false },

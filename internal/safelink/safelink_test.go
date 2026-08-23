@@ -88,6 +88,36 @@ func TestAbsoluteHTTPRequiresRealHostname(t *testing.T) {
 	}
 }
 
+// 端口必须落在浏览器真的能用的范围内。
+//
+// net/url 只要求端口是数字，所以 :65536 / :99999 都能解析成功，而 WHATWG URL 对它们抛
+// TypeError。少了上界检查，这类值就会在后端被判为安全、只在前端 fail closed。
+func TestAbsoluteHTTPRejectsOutOfRangePorts(t *testing.T) {
+	for _, href := range []string{
+		"https://example.com:65536/path", "https://example.com:99999/path",
+		"http://example.com:70000/", "https://[::1]:65536/d",
+	} {
+		if IsSafe(href) {
+			t.Fatalf("%q 的端口超出 16 位，不应被接受", href)
+		}
+	}
+	// 反向控制：上界内的端口、端口 0、冒号后不写端口（等于用 scheme 默认端口）以及
+	// 括号 IPv6 带端口都必须继续可用。
+	for _, href := range []string{
+		"https://example.com:65535/path", "https://example.com:0/path",
+		"https://example.com:/path", "https://example.com:3000/path",
+		"https://[::1]:65535/d", "http://10.60.199.160:9090/graph",
+	} {
+		if !IsSafe(href) {
+			t.Fatalf("%q 的端口可用，应被接受", href)
+		}
+	}
+	// 非数字端口在 url.Parse 阶段就已失败，行为不变。
+	if IsSafe("https://evil.example:bad/path") {
+		t.Fatal("非数字端口不应被接受")
+	}
+}
+
 // SafeOrEmpty 是投影层的 fail closed 入口：不安全时返回空串，安全时返回 trim 后的值。
 // 它绝不"修正"一个不安全的链接——猜一个 URL 比不给链接更危险。
 func TestSafeOrEmpty(t *testing.T) {

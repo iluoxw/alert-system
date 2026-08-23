@@ -1071,7 +1071,7 @@ const safeHrefModule = require(safeHrefModulePath)
 const linkPolicyTable = JSON.parse(await readFile(
   path.join(repoRoot, 'internal/safelink/testdata/link_policy_cases.json'), 'utf8',
 ))
-assert.ok(linkPolicyTable.cases.length >= 50, 'the shared link policy table must stay comprehensive')
+assert.ok(linkPolicyTable.cases.length >= 55, 'the shared link policy table must stay comprehensive')
 let hostBearingPositives = 0
 let hostlessNegatives = 0
 for (const { name, href, safe } of linkPolicyTable.cases) {
@@ -1097,7 +1097,7 @@ assert.ok(
   'the TS absolute branch must parse the URL and require a non-empty hostname',
 )
 assert.ok(
-  /url\.Parse\(value\)/.test(goSafeLinkSource) && /parsed\.Hostname\(\) != ""/.test(goSafeLinkSource),
+  /url\.Parse\(value\)/.test(goSafeLinkSource) && /parsed\.Hostname\(\) == ""/.test(goSafeLinkSource),
   'the Go absolute branch must parse the URL and require a non-empty hostname',
 )
 // 空 authority 必须显式拒绝：WHATWG 会把 `http:///x` 规范化成外站主机 `x`，而 Go 认为
@@ -1106,6 +1106,32 @@ assert.ok(
   tsSafeHrefSource.includes('emptyAuthorityPattern'),
   'the TS policy must explicitly reject an empty authority to stay aligned with Go',
 )
+// 端口上界：net/url 只要求端口是数字，WHATWG 则对超出 16 位的端口抛 TypeError。Go 侧
+// 必须自己补这道上界检查，否则越界端口会在写入/投影侧通过、只在前端 fail closed。
+assert.ok(
+  /number <= maxPort/.test(goSafeLinkSource) && /maxPort = 65535/.test(goSafeLinkSource),
+  'the Go policy must bound a present port to the browser-usable range',
+)
+// 这些用例必须留在**共享表**里，而不是只在两侧各自断言一次：共享表才是"Go 与 TS 在同
+// 一个值上结论相同"的证明载体。
+const expectedPortCases = [
+  ['https://example.com:65536/path', false],
+  ['https://example.com:99999/path', false],
+  ['https://example.com:65535/path', true],
+  ['https://example.com:0/path', true],
+]
+for (const [href, safe] of expectedPortCases) {
+  const shared = linkPolicyTable.cases.find((entry) => entry.href === href)
+  assert.ok(shared, `the shared link policy table must keep the port boundary case ${href}`)
+  assert.equal(shared.safe, safe, `the shared table must expect safe=${safe} for ${href}`)
+  assert.equal(safeHrefModule.isSafeHref(href), safe, `TS must agree with the shared table on ${href}`)
+  // 顺带把"浏览器到底能不能用这个端口"固定成可执行事实，而不是注释里的断言。
+  if (safe) {
+    assert.doesNotThrow(() => new URL(href), `${href} must stay usable in a browser`)
+  } else {
+    assert.throws(() => new URL(href), TypeError, `${href} must be unusable in a browser`)
+  }
+}
 
 // 契约 fixture 里现有的链接必须全部仍然安全（不得因为收紧而破坏既有 demo）。
 for (const item of directory.items) {

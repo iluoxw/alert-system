@@ -553,7 +553,12 @@ func TestWorkspaceTimezoneRequiresLoadableIANAZone(t *testing.T) {
 		{name: "local 小写同样被拒绝", timezone: "local"},
 		{name: "形状合法但不存在", timezone: "Mars/Olympus"},
 		{name: "形状合法但不存在的深层路径", timezone: "Asia/Atlantis"},
-		{name: "大小写不匹配的真实区名", timezone: "asia/shanghai"},
+		// 刻意不断言"大小写不匹配的真实区名"（如 asia/shanghai）：LoadLocation 的解析结果
+		// 依赖平台。macOS 的系统 zoneinfo 目录大小写不敏感，会把它解析成真实时区；Linux
+		// 的目录查找与内嵌 tzdata zip 则大小写敏感，会报 unknown time zone。验收契约只承诺
+		// "非空候选先过形状闸门、再交给 time.LoadLocation，并显式拒绝 Local"，并没有承诺
+		// 一套与平台无关的大小写策略，因此这里只覆盖两个平台上都无歧义的输入，也不引入
+		// 任何规范化注册表去扩大 API 表面。
 		{name: "形状非法：空格", timezone: "Asia Shanghai"},
 		// 换行/空格属于空白，后端先 TrimSpace，因此 " UTC " 是合法的 UTC，并且下传的是
 		// 已 trim 的值；真正的控制字符（非空白）才会被形状校验拒绝。

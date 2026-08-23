@@ -30,6 +30,7 @@ package safelink
 
 import (
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -93,6 +94,7 @@ func SafeOrEmpty(raw string) string {
 //	https://[::1                  IPv6 括号未闭合
 //	https://exa mple.com          host 里有空格
 //	https://evil.example:bad/path 端口不是数字
+//	https://example.com:65536/    端口超出 16 位
 //
 // 于是 UI 会渲染出一个点开后行为未定义的链接。这里用 net/url.Parse 之后**同时**要求：
 // 解析成功、绝对 URL、scheme 是 http/https（大小写不敏感）、并且 Hostname() 非空。
@@ -114,8 +116,35 @@ func isAbsoluteHTTP(value string) bool {
 	if !isHTTPScheme(parsed.Scheme) {
 		return false
 	}
-	return parsed.Hostname() != ""
+	if parsed.Hostname() == "" {
+		return false
+	}
+	return hasUsablePort(parsed)
 }
+
+// hasUsablePort 要求"如果写了端口，它必须落在浏览器真的能用的 0..65535 内"。
+//
+// net/url 只要求端口是数字，因此 `https://example.com:65536/path` 与
+// `https://example.com:99999/path` 都能解析成功；而浏览器的 WHATWG URL 对超出 16 位的
+// 端口直接抛 TypeError。少了这道检查，这类值就能写进 dashboard_url/runbook_url、被投影
+// 出来，最后只在前端 fail closed——即后端认为安全、前端却打不开。
+//
+// 非数字端口（`:bad`）在更早的 url.Parse 阶段就已经失败，行为不变；没写端口或写成
+// `host:`（Port() 返回空）同样不变，交给 scheme 默认端口。
+func hasUsablePort(parsed *url.URL) bool {
+	port := parsed.Port()
+	if port == "" {
+		return true
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+	return number >= 0 && number <= maxPort
+}
+
+// maxPort 是 16 位端口上界，与浏览器 URL 解析一致。
+const maxPort = 65535
 
 func isHTTPScheme(scheme string) bool {
 	for _, allowed := range httpSchemes {
