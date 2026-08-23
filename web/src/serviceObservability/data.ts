@@ -67,7 +67,9 @@ export function useServiceDirectoryPages(query: ServiceDirectoryQuery) {
     queryFn: async ({ pageParam }): Promise<ServiceDirectoryView> => {
       if (serviceObservabilityFixtureMode) {
         const { getDirectoryFixture } = await fixtureModule()
-        return getDirectoryFixture()
+        // fixture 也要吃同一份 query：非法 sort/direction/enum 必须抛出与 live 一致的
+        // 422，否则 QA 在 fixture 下永远看不到那个错误页。
+        return getDirectoryFixture({ ...query, cursor: pageParam })
       }
       return getServiceDirectory({ ...query, cursor: pageParam })
     },
@@ -83,7 +85,7 @@ export function useServiceOverview(serviceId: string, query: ServiceOverviewQuer
     queryFn: async () => {
       if (serviceObservabilityFixtureMode) {
         const { getOverviewFixture } = await fixtureModule()
-        const fixture = getOverviewFixture(serviceId)
+        const fixture = getOverviewFixture(serviceId, query)
         if (!fixture) throw new FixtureNotFoundError(serviceId)
         return fixture
       }
@@ -113,7 +115,7 @@ export function useServiceWorkspace(
     queryFn: async (): Promise<WorkspaceResult> => {
       if (serviceObservabilityFixtureMode) {
         const { getWorkspaceFixture } = await fixtureModule()
-        const fixture = getWorkspaceFixture(serviceId, fixtureScenario)
+        const fixture = getWorkspaceFixture(serviceId, fixtureScenario, query)
         if (!fixture.view) throw new FixtureNotFoundError(serviceId)
         return { view: fixture.view, scenario: fixture.scenario }
       }

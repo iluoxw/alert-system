@@ -79,14 +79,28 @@ export function patchWorkspaceSearchParams(current: URLSearchParams, patch: Work
   return next
 }
 
+/**
+ * canonicalWorkspaceSearchParams 把 URL 规范化到当前视图。
+ *
+ * preferViewFocus 为 true 时（显式 QA `scenario=`），focus 以视图为准并覆盖 URL 上的
+ * 旧值：场景视图自带确定的 focus，保留一个互相矛盾的 focus 参数会让"URL 写着 A、
+ * Journey 显示 B"这类矛盾重新出现。其余情况仍以 URL 为事实源。
+ */
 export function canonicalWorkspaceSearchParams(
   current: URLSearchParams,
   view: ObservabilityWorkspaceView,
   state: WorkspaceViewState,
+  preferViewFocus = false,
 ): URLSearchParams {
+  const focusKind = preferViewFocus
+    ? view.focus?.kind ?? current.get('focus_kind')
+    : current.get('focus_kind') ?? view.focus?.kind
+  const focusValue = preferViewFocus
+    ? view.focus?.value ?? current.get('focus_value')
+    : current.get('focus_value') ?? view.focus?.value
   return patchWorkspaceSearchParams(current, {
-    focus_kind: current.get('focus_kind') ?? view.focus?.kind ?? null,
-    focus_value: current.get('focus_value') ?? view.focus?.value ?? null,
+    focus_kind: focusKind ?? null,
+    focus_value: focusValue ?? null,
     from: current.get('from') ?? view.scope.from,
     to: current.get('to') ?? view.scope.to,
     tab: state.activeTab,

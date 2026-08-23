@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Button, Empty, Input, Result, Select, Skeleton } from 'antd'
 import {
@@ -23,15 +24,18 @@ import {
 } from '../serviceObservability/data'
 import { formatClock } from '../serviceObservability/format'
 import {
+  directoryDataStatusFilters,
+  directoryHealthFilters,
   directorySearchStorageKey,
   formatRelativeObservedAt,
   isDirectorySortKey,
+  serviceTierFilters,
   signalDisclosure,
   sortDirectoryItems,
 } from '../serviceObservability/directory'
 import type { DirectorySortKey, SortDirection } from '../serviceObservability/directory'
 import type { DirectoryItem, DirectorySummary, SignalValue } from '../serviceObservability/types'
-import { ApiError } from '../api/client'
+import { ApiError, listTeamsLite } from '../api/client'
 import '../serviceObservability/serviceObservability.css'
 
 const scrollStorageKey = 'firebreak.service-directory.scroll-y'
@@ -117,8 +121,10 @@ export function ServiceDirectory() {
   const direction: SortDirection = searchParams.get('direction') === 'desc' ? 'desc' : 'asc'
   const q = searchParams.get('q') ?? ''
 
-  // 服务端查询参数完全来自 URL：URL 因此仍是可分享的筛选事实源。React Query key 包含
-  // 这个对象的每一项，换筛选不会命中上一次的缓存。
+  // 服务端查询参数完全来自 URL，并且**原样**下传：URL 是可分享的筛选事实源，非法值必须
+  // 换回服务端的稳定 422，而不是被这里悄悄归一化成一个用户没请求过的成功查询。
+  // 上面的 activeSort/direction 只用于排序图标等 UI 呈现，不参与请求构造。
+  // React Query key 包含这个对象的每一项，换筛选不会命中上一次的缓存。
   const serverQuery = useMemo(() => ({
     environment: searchParams.get('environment') ?? undefined,
     teamId: searchParams.get('team') ?? undefined,
@@ -126,9 +132,10 @@ export function ServiceDirectory() {
     health: searchParams.get('health') ? [searchParams.get('health') as string] : undefined,
     dataStatus: searchParams.get('data') ? [searchParams.get('data') as string] : undefined,
     q: q.trim() || undefined,
-    sort: activeSort,
-    direction: activeSort ? direction : undefined,
-  }), [activeSort, direction, q, searchParams])
+    sort: searchParams.get('sort') ?? undefined,
+    direction: searchParams.get('direction') ?? undefined,
+    limit: searchParams.get('limit') ?? undefined,
+  }), [q, searchParams])
 
   const directoryQuery = useServiceDirectoryPages(serverQuery)
   // 目录不是单个服务，顶栏不显示服务名。
@@ -186,10 +193,29 @@ export function ServiceDirectory() {
     setSearchParams(next)
   }
 
-  const teamOptions = Array.from(new Map(loadedItems.map((item) => [
-    item.service.owner_team_id,
-    { value: item.service.owner_team_id, label: item.service.owner_team_name },
-  ])).values())
+  // 团队下拉的完整选项来自 member-readable 的团队目录，而不是"已加载的分页"——否则还没
+  // 翻到的团队在 UI 里根本选不出来（手工改 URL 却能查）。fixture 模式继续只用 fixture
+  // rows，不引入 live 依赖。
+  const teamsQuery = useQuery({
+    queryKey: ['teams-lite', 'service-directory'],
+    queryFn: () => listTeamsLite(500),
+    enabled: !serviceObservabilityFixtureMode,
+  })
+  const selectedTeam = searchParams.get('team') ?? undefined
+  const teamOptions = useMemo(() => {
+    const byID = new Map<string, string>()
+    // 已加载行里的团队名是稳定的兜底：团队目录查询失败时下拉仍然可用。
+    for (const item of loadedItems) byID.set(item.service.owner_team_id, item.service.owner_team_name)
+    if (!serviceObservabilityFixtureMode) {
+      for (const team of teamsQuery.data?.teams ?? []) byID.set(team.id, team.name)
+    }
+    // URL 里已选的团队必须始终有一个稳定 label，即使它既不在团队目录里也不在当前分页里，
+    // 否则筛选看起来像"自己消失了"。
+    if (selectedTeam && !byID.has(selectedTeam)) byID.set(selectedTeam, `团队 ${selectedTeam}`)
+    return Array.from(byID.entries())
+      .map(([value, label]) => ({ value, label }))
+      .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+  }, [loadedItems, selectedTeam, teamsQuery.data])
 
   if (directoryQuery.isPending) {
     return (
@@ -257,10 +283,11 @@ export function ServiceDirectory() {
           />
           <Select
             allowClear
-            value={searchParams.get('team') || undefined}
+            value={selectedTeam}
             onChange={(value) => updateFilter('team', value)}
-            placeholder="全部团队"
+            placeholder={teamsQuery.isError ? '团队目录不可用' : '全部团队'}
             options={teamOptions}
+            loading={teamsQuery.isFetching}
             aria-label="按团队筛选"
           />
           <Select
@@ -268,7 +295,7 @@ export function ServiceDirectory() {
             value={searchParams.get('tier') || undefined}
             onChange={(value) => updateFilter('tier', value)}
             placeholder="全部 Tier"
-            options={['tier-0', 'tier-1', 'tier-2', 'tier-3'].map((value) => ({ value, label: value.toUpperCase() }))}
+            options={serviceTierFilters.map((value) => ({ value, label: value.toUpperCase() }))}
             aria-label="按服务等级筛选"
           />
           <Select
@@ -276,7 +303,7 @@ export function ServiceDirectory() {
             value={searchParams.get('health') || undefined}
             onChange={(value) => updateFilter('health', value)}
             placeholder="全部健康状态"
-            options={['critical', 'degraded', 'unknown', 'healthy'].map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))}
+            options={directoryHealthFilters.map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))}
             aria-label="按健康状态筛选"
           />
           <Select
@@ -284,7 +311,7 @@ export function ServiceDirectory() {
             value={searchParams.get('data') || undefined}
             onChange={(value) => updateFilter('data', value)}
             placeholder="全部数据状态"
-            options={['complete', 'partial', 'stale', 'unconfigured'].map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))}
+            options={directoryDataStatusFilters.map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))}
             aria-label="按数据状态筛选"
           />
           {serviceObservabilityFixtureMode && (

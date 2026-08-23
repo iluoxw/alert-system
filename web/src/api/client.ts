@@ -1512,6 +1512,11 @@ export function applyRunbook(incidentId: string, planRunId: string, confirmPlanS
 //
 // health/dataStatus 是 CSV 枚举；cursor 是 opaque 游标（前端既不解析也不构造它，
 // 只把上一页返回的 next_cursor 原样回传）。
+//
+// 字段类型刻意保持宽松（`string` 而不是 `'asc' | 'desc'` 这类窄 union）：URL 是筛选的
+// 可分享事实源，非法值必须**原样**送到服务端换回稳定的 422 reason code。用窄类型会迫使
+// 调用方先把非法值吞掉或归一化，于是用户带着 `direction=sideways` 打开链接却看到一个
+// 成功的默认页面——那正是 C1 要修掉的静默改写。
 export interface ServiceDirectoryQuery {
   environment?: string
   teamId?: string
@@ -1520,14 +1525,16 @@ export interface ServiceDirectoryQuery {
   dataStatus?: string[]
   q?: string
   sort?: string
-  direction?: 'asc' | 'desc'
+  direction?: string
   cursor?: string
-  limit?: number
+  limit?: number | string
 }
 
 export interface ServiceOverviewQuery {
   environment?: string
-  windowSeconds?: number
+  // windowSeconds 同样接受原始字符串：`window_seconds=0`、负数或非数字都必须由服务端
+  // 判成 422 invalid_window，而不是被前端替换成缺省窗口。
+  windowSeconds?: number | string
 }
 
 export interface ServiceWorkspaceQuery {

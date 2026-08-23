@@ -45,10 +45,19 @@ export function ServiceOverview() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const environment = searchParams.get('environment') ?? undefined
-  const windowParam = Number(searchParams.get('window_seconds'))
-  const windowSeconds = Number.isInteger(windowParam) && windowParam > 0 ? windowParam : undefined
+  // window_seconds **原样**下传：`0`、负数或非数字必须由服务端判成 422 invalid_window。
+  // 以前这里归一成 undefined，于是非法链接会安静地展示一个缺省窗口的成功页面。
+  const rawWindowSeconds = searchParams.get('window_seconds') ?? undefined
+  const parsedWindowSeconds = Number(rawWindowSeconds)
+  // 仅供显示（诊断启动器的时间范围）：非法值不参与请求，也不冒充服务端窗口。
+  const displayWindowSeconds = Number.isInteger(parsedWindowSeconds) && parsedWindowSeconds > 0
+    ? parsedWindowSeconds
+    : undefined
 
-  const overviewQuery = useServiceOverview(serviceId, { environment, windowSeconds })
+  const overviewQuery = useServiceOverview(serviceId, {
+    environment,
+    windowSeconds: rawWindowSeconds,
+  })
   const view = overviewQuery.data
   usePublishServiceLabel(view?.service.name)
 
@@ -73,7 +82,7 @@ export function ServiceOverview() {
     <OverviewContent
       view={view}
       environment={environment}
-      windowSeconds={windowSeconds ?? defaultWindowSeconds}
+      windowSeconds={displayWindowSeconds ?? defaultWindowSeconds}
     />
   )
 }

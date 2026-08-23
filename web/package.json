@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:service-observability": "node scripts/verify-service-observability.mjs"
+    "test:service-observability": "node scripts/verify-service-observability.mjs && npm run test:fixture-provider",
+    "test:fixture-provider": "vite build --ssr scripts/fixture-provider-check.ts --outDir node_modules/.tmp/fixture-provider-check --minify false --logLevel warn && node node_modules/.tmp/fixture-provider-check/fixture-provider-check.js"
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",

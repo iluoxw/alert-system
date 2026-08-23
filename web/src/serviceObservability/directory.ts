@@ -1,7 +1,21 @@
 import type { DataState, DirectoryItem, HealthState, SignalValue } from './types'
 
-export type DirectorySortKey = 'service' | 'owner' | 'tier' | 'health' | 'fault' | 'data' | 'observed'
-export type SortDirection = 'asc' | 'desc'
+// 目录查询 allowlist 的**唯一**常量来源。
+//
+// 页面的下拉选项、显式 fixture 模式的 query 校验与静态验证器都从这里派生：三处各写一份
+// 字面量数组，迟早会出现"页面能选、fixture 说非法"或"新增枚举只加了一半"的漂移。
+// 后端 internal/api/service_observability.go 的白名单是同一套取值，两侧任何一侧扩展都必须
+// 同时更新——静态验证器会断言这些常量存在且被复用。
+//
+// 顺序即展示顺序（分诊优先：先要立刻判断的状态），校验本身与顺序无关。
+export const directorySortKeys = ['service', 'owner', 'tier', 'health', 'fault', 'data', 'observed'] as const
+export const sortDirections = ['asc', 'desc'] as const
+export const directoryHealthFilters = ['critical', 'degraded', 'unknown', 'healthy'] as const
+export const directoryDataStatusFilters = ['complete', 'partial', 'stale', 'unconfigured'] as const
+export const serviceTierFilters = ['tier-0', 'tier-1', 'tier-2', 'tier-3'] as const
+
+export type DirectorySortKey = typeof directorySortKeys[number]
+export type SortDirection = typeof sortDirections[number]
 
 export const directorySearchStorageKey = 'firebreak.service-directory.search'
 
@@ -72,7 +86,26 @@ export function sortDirectoryItems(
 }
 
 export function isDirectorySortKey(value: string | null): value is DirectorySortKey {
-  return value !== null && ['service', 'owner', 'tier', 'health', 'fault', 'data', 'observed'].includes(value)
+  return value !== null && (directorySortKeys as readonly string[]).includes(value)
+}
+
+export function isSortDirection(value: string | null): value is SortDirection {
+  return value !== null && (sortDirections as readonly string[]).includes(value)
+}
+
+/** isDirectoryHealthFilter 判断一个 health 筛选值是否在 allowlist 内。 */
+export function isDirectoryHealthFilter(value: string): boolean {
+  return (directoryHealthFilters as readonly string[]).includes(value)
+}
+
+/** isDirectoryDataStatusFilter 判断一个 data_status 筛选值是否在 allowlist 内。 */
+export function isDirectoryDataStatusFilter(value: string): boolean {
+  return (directoryDataStatusFilters as readonly string[]).includes(value)
+}
+
+/** isServiceTierFilter 判断 tier 是否在 allowlist 内。 */
+export function isServiceTierFilter(value: string): boolean {
+  return (serviceTierFilters as readonly string[]).includes(value)
 }
 
 export function formatRelativeObservedAt(observedAt: string, assembledAt: string): string {

@@ -114,9 +114,10 @@ function WorkspaceContent({
   const mobileWorkspace = useMediaQuery('(max-width: 900px)')
 
   useEffect(() => {
-    const canonical = canonicalWorkspaceSearchParams(searchParams, view, viewState)
+    // 显式 QA 场景下 focus 以场景视图为准：URL 不保留与视图矛盾的旧 focus。
+    const canonical = canonicalWorkspaceSearchParams(searchParams, view, viewState, Boolean(scenario))
     if (!sameSearchParams(searchParams, canonical)) setSearchParams(canonical, { replace: true })
-  }, [searchParams, setSearchParams, view, viewState])
+  }, [scenario, searchParams, setSearchParams, view, viewState])
 
   useEffect(() => {
     setFocusValue(searchParams.get('focus_value') ?? view.focus?.value ?? '')
@@ -139,10 +140,16 @@ function WorkspaceContent({
   const runDiagnosis = () => {
     const value = focusValue.trim()
     if (!value || !focusKind) return
-    // 只改 URL：新的 focus 由服务端重新装配一次，前端不猜结果也不改 scenario。
+    // 只改 URL：新的 focus 由服务端（fixture 模式下由 query-aware provider）重新装配一次，
+    // 前端不猜结果。
+    //
+    // fixture 模式必须同时清掉 QA `scenario`：留着它就等于"锁死一张固定截图"，于是输入框
+    // 和 URL 是新 focus、Journey 卡还显示旧场景的 ID。live 模式没有 scenario 概念，
+    // 这里的 null 是无害的幂等清理。
     updateQuery({
       focus_kind: focusKind,
       focus_value: value,
+      scenario: null,
       stage: null,
       selected: null,
       cursor: null,
@@ -282,7 +289,12 @@ function WorkspaceContent({
       </Drawer>
 
       <span className="workspace-live-region" aria-live="polite">
-        {scenario ? `已加载场景：${scenario.label}` : '已加载服务端聚合视图'}；当前选择 {viewState.selectedObject ?? '无'}；拓扑范围 {viewState.topologyScope}；当前页签 {viewState.activeTab}
+        {/* fixture 主视图绝不能自称"服务端聚合视图"：那会让 QA 以为看到的是 live 数据。 */}
+        {scenario
+          ? `已加载 fixture 场景：${scenario.label}`
+          : serviceObservabilityFixtureMode
+            ? '已加载 fixture 主视图'
+            : '已加载服务端聚合视图'}；当前选择 {viewState.selectedObject ?? '无'}；拓扑范围 {viewState.topologyScope}；当前页签 {viewState.activeTab}
       </span>
     </main>
   )
