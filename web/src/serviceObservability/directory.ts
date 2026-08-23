@@ -8,6 +8,16 @@ import type { DataState, DirectoryItem, HealthState, SignalValue } from './types
 // 同时更新——静态验证器会断言这些常量存在且被复用。
 //
 // 顺序即展示顺序（分诊优先：先要立刻判断的状态），校验本身与顺序无关。
+// directoryQueryKeys 是目录页会写进 URL 的全部查询键。
+//
+// 它是"清除筛选/从 422 恢复"的唯一依据：只清 filter 却留下 sort/direction/limit，会让
+// 一个非法 sort 的 422 页面点了"清除筛选"之后又回到同一个 422，用户被永久锁死在错误页。
+// 因此凡是会进入服务端查询或影响 fixture 本地筛选的键都必须列在这里。
+export const directoryQueryKeys = [
+  'q', 'team', 'tier', 'health', 'data', 'layer', 'profile',
+  'environment', 'sort', 'direction', 'limit',
+] as const
+
 export const directorySortKeys = ['service', 'owner', 'tier', 'health', 'fault', 'data', 'observed'] as const
 export const sortDirections = ['asc', 'desc'] as const
 export const directoryHealthFilters = ['critical', 'degraded', 'unknown', 'healthy'] as const

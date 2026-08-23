@@ -572,6 +572,117 @@ assert.ok(
   'fixture live region must announce fixture data instead of claiming live server data',
 )
 
+// ---- R1 复审缺口 2：422 恢复必须清掉全部目录查询键 ----
+
+assert.ok(
+  directoryModuleSource.includes('export const directoryQueryKeys ='),
+  'directory module must own the single list of directory query keys',
+)
+const queryKeyList = directoryModuleSource
+  .slice(directoryModuleSource.indexOf('export const directoryQueryKeys ='))
+  .split(']')[0]
+for (const key of ['sort', 'direction', 'limit', 'health', 'data', 'tier', 'team', 'q', 'environment']) {
+  assert.ok(
+    queryKeyList.includes(`'${key}'`),
+    `directoryQueryKeys must include ${key} so a 422 caused by it is recoverable`,
+  )
+}
+const clearFiltersBody = functionBody(directoryPage, 'const clearFilters = () => {')
+assert.ok(
+  clearFiltersBody.includes('for (const key of directoryQueryKeys)'),
+  'clearFilters must clear every directory query key, otherwise an invalid sort/direction/limit loops on the same 422',
+)
+assert.ok(
+  !/for \(const key of \['q', 'team'/.test(directoryPage),
+  'clearFilters must not keep its own partial literal key list',
+)
+// 422 恢复动作必须真的走 clearFilters。
+assert.ok(
+  /onClearFilters=\{clearFilters\}/.test(directoryPage) && directoryPage.includes('onClearFilters'),
+  'the directory 422 state must recover through clearFilters',
+)
+
+// ---- R1 复审缺口 3：fixture 口径必须与 Go HTTP 边界一致 ----
+
+const queryContractSource = await readFile(
+  path.join(repoRoot, 'web/src/serviceObservability/queryContract.ts'), 'utf8',
+)
+assert.ok(
+  queryContractSource.includes('decimalIntegerPattern'),
+  'fixture limit/window parsing must use strict decimal integer syntax like Go strconv.Atoi',
+)
+assert.ok(
+  queryContractSource.includes('rfc3339Pattern'),
+  'fixture from/to parsing must require RFC3339 with Z or an offset like Go time.Parse',
+)
+assert.ok(
+  queryContractSource.includes('parseCSVMembers') && queryContractSource.includes('maxCSVValues'),
+  'fixture CSV parsing must mirror the Go splitCSV allowlist, dedupe and cap',
+)
+// Go 的 CSV 上限与页面上界必须同值。
+const goCSVCap = /maxCSVValues\s+=\s+(\d+)/.exec(goAPISource)
+assert.ok(goCSVCap, 'cannot read the Go CSV cap')
+const tsCSVCap = /maxCSVValues:\s*(\d+)/.exec(queryContractSource)
+assert.ok(tsCSVCap, 'cannot read the TS CSV cap')
+assert.equal(tsCSVCap[1], goCSVCap[1], 'TS and Go CSV caps must match')
+// fixture 本地筛选也要按 CSV 匹配，否则合法多值 URL 会筛出空集。
+assert.ok(
+  directoryPage.includes('csvMatches(searchParams.get(\'health\')')
+    && directoryPage.includes('csvMatches(searchParams.get(\'data\')'),
+  'fixture-local filtering must treat health/data as CSV member sets',
+)
+
+// 可执行断言：整数语法、CSV 与 RFC3339 都跑真实实现。
+for (const limit of ['0x10', '1e2', '5.0', 'Infinity']) {
+  expectReason(
+    () => queryContract.validateDirectoryQuery({ limit }),
+    'invalid_limit', `limit=${limit} must be rejected by decimal integer syntax`,
+  )
+}
+queryContract.validateDirectoryQuery({ limit: '+50' })
+queryContract.validateDirectoryQuery({ sort: ' health ', direction: ' desc ', tier: ' tier-1 ' })
+queryContract.validateDirectoryQuery({ health: ['critical', 'degraded'] })
+queryContract.validateDirectoryQuery({ health: ['critical', 'critical'] })
+expectReason(
+  () => queryContract.validateDirectoryQuery({ health: ['critical', ''] }),
+  'invalid_filter', 'empty CSV member',
+)
+expectReason(
+  () => queryContract.validateDirectoryQuery({ health: Array.from({ length: 9 }, () => 'critical') }),
+  'invalid_filter', 'too many CSV members',
+)
+for (const bound of ['2026-08-22', '2026-08-22T02:04:22']) {
+  expectReason(
+    () => queryContract.validateWorkspaceScope({ from: bound, to: '2026-08-22T02:09:22Z' }),
+    'invalid_time_range', `from=${bound} must require an explicit timezone`,
+  )
+}
+queryContract.validateWorkspaceScope({
+  from: '2026-08-22T10:04:22+08:00', to: '2026-08-22T10:09:22+08:00',
+})
+// focus 与非 focus 校验必须可分开调用：显式场景只校验后者。
+assert.equal(typeof queryContract.validateWorkspaceFocus, 'function')
+assert.equal(typeof queryContract.validateWorkspaceScope, 'function')
+// 只看 getWorkspaceFixture 的函数体：`guardWorkspaceFocus(` 的**声明**出现在更靠前的
+// 位置，用整文件比较位置会把顺序判反。
+const workspaceProviderBody = stripComments(
+  fixtureProviderSource.slice(fixtureProviderSource.indexOf('export function getWorkspaceFixture(')),
+)
+const scenarioAt = workspaceProviderBody.indexOf('resolveWorkspaceScenario(scenarioValue)')
+const focusGuardAt = workspaceProviderBody.indexOf('guardWorkspaceFocus(query)')
+const baseLookupAt = workspaceProviderBody.indexOf('getBaseWorkspaceFixture(serviceId)')
+assert.ok(scenarioAt !== -1 && focusGuardAt !== -1 && baseLookupAt !== -1, 'provider body markers missing')
+assert.ok(
+  baseLookupAt < scenarioAt && scenarioAt < focusGuardAt,
+  'the fixture provider must resolve service and scenario before validating focus',
+)
+// 显式场景分支仍要校验非 focus 字段。
+const scenarioBranch = workspaceProviderBody.slice(scenarioAt, focusGuardAt)
+assert.ok(
+  scenarioBranch.includes('guardWorkspaceScope(query)'),
+  'the explicit scenario branch must still validate the non-focus query fields',
+)
+
 // ---- C6：团队筛选来自团队目录，而不是已加载分页 ----
 
 assert.ok(

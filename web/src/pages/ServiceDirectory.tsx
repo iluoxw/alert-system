@@ -26,6 +26,7 @@ import { formatClock } from '../serviceObservability/format'
 import {
   directoryDataStatusFilters,
   directoryHealthFilters,
+  directoryQueryKeys,
   directorySearchStorageKey,
   formatRelativeObservedAt,
   isDirectorySortKey,
@@ -57,20 +58,28 @@ function signalLabel(signal: SignalValue): string {
 
 // itemMatches 只在显式 fixture 模式使用：live 模式的筛选、排序与分页全部由服务端负责，
 // 前端不再重算一遍（否则摘要分母与当前页会互相矛盾）。
+// csvMatches 按 CSV 成员集合匹配。服务端把 `health=critical,degraded` 当成"任一命中"，
+// fixture 本地筛选必须同口径——否则一个合法的多值 URL 在 fixture 下筛出空集，
+// 看起来像"没有这样的服务"。
+function csvMatches(raw: string | null, actual: string): boolean {
+  if (!raw) return true
+  const members = raw.split(',').map((value) => value.trim()).filter(Boolean)
+  if (members.length === 0) return true
+  return members.includes(actual)
+}
+
 function itemMatches(item: DirectoryItem, searchParams: URLSearchParams): boolean {
   const query = searchParams.get('q')?.trim().toLowerCase() ?? ''
-  const team = searchParams.get('team')
-  const tier = searchParams.get('tier')
-  const health = searchParams.get('health')
-  const data = searchParams.get('data')
-  const layer = searchParams.get('layer')
-  const profile = searchParams.get('profile')
+  const team = searchParams.get('team')?.trim()
+  const tier = searchParams.get('tier')?.trim()
+  const layer = searchParams.get('layer')?.trim()
+  const profile = searchParams.get('profile')?.trim()
   const haystack = `${item.service.name} ${item.service.entity_key} ${item.service.description} ${item.service.owner_team_name}`.toLowerCase()
   return (!query || haystack.includes(query))
     && (!team || item.service.owner_team_id === team)
     && (!tier || item.service.tier === tier)
-    && (!health || item.health.status === health)
-    && (!data || item.data_status.state === data)
+    && csvMatches(searchParams.get('health'), item.health.status)
+    && csvMatches(searchParams.get('data'), item.data_status.state)
     && (!layer || item.service.layer === layer)
     && (!profile || (profile === 'published' ? item.profile?.status === 'published' : item.profile === null))
 }
@@ -129,8 +138,10 @@ export function ServiceDirectory() {
     environment: searchParams.get('environment') ?? undefined,
     teamId: searchParams.get('team') ?? undefined,
     tier: searchParams.get('tier') ?? undefined,
-    health: searchParams.get('health') ? [searchParams.get('health') as string] : undefined,
-    dataStatus: searchParams.get('data') ? [searchParams.get('data') as string] : undefined,
+    // CSV 按 ',' 拆开传下去，client 再 join 回同一个原文（含 `critical,` 这类末尾空成员），
+    // 因此既保持了 URL 原样下传，也让多值筛选在两种模式下语义一致。
+    health: searchParams.get('health')?.split(',') ?? undefined,
+    dataStatus: searchParams.get('data')?.split(',') ?? undefined,
     q: q.trim() || undefined,
     sort: searchParams.get('sort') ?? undefined,
     direction: searchParams.get('direction') ?? undefined,
@@ -178,9 +189,11 @@ export function ServiceDirectory() {
     setSearchParams(next, { replace: true })
   }
 
+  // 清除筛选必须覆盖**全部**目录查询键。只清 filter 会让"非法 sort/direction/limit"的
+  // 422 页面点完按钮又回到同一个 422：错误页自己把恢复路径堵住了。
   const clearFilters = () => {
     const next = new URLSearchParams(searchParams)
-    for (const key of ['q', 'team', 'tier', 'health', 'data', 'layer', 'profile', 'environment']) next.delete(key)
+    for (const key of directoryQueryKeys) next.delete(key)
     setSearchParams(next, { replace: true })
   }
 

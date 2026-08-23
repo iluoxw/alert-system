@@ -127,6 +127,72 @@ async function main(): Promise<void> {
   equal('Forbidden 场景禁用日志能力', forbidden.view?.capabilities.view_logs, false)
   equal('Forbidden 场景保留 traces 能力', forbidden.view?.capabilities.view_traces, true)
 
+  // ---- 显式场景必须战胜过期/非法的 URL focus（Codex R1 复审缺口 1）----
+
+  const staleInvalidFocus = { focusKind: primaryFocus.key, focusValue: 'not-a-sandbox' }
+  const partialWithStaleFocus = fixtures.getWorkspaceFixture(serviceId, 'partial', staleInvalidFocus)
+  equal('非法旧 focus 不阻挡显式场景', partialWithStaleFocus.scenario?.key, 'telemetry_bundle_timeout_partial_unknown')
+  equal('显式场景的 focus 回到场景视图', partialWithStaleFocus.view?.focus?.value, baseFocusValue)
+  equal('Partial 场景仍是 partial', partialWithStaleFocus.view?.data_status.state, 'partial')
+  check(
+    'Partial 场景的 Golden 全为 Unknown（不假绿）',
+    (partialWithStaleFocus.view?.golden_signals ?? []).every(
+      (signal) => signal.value === null && signal.health === 'unknown',
+    ),
+  )
+  // 未声明的 focus kind 同样不能挡住场景。
+  const staleUnknownKind = { focusKind: 'not_declared', focusValue: 'whatever' }
+  equal(
+    '未声明 focus kind 不阻挡显式场景',
+    fixtures.getWorkspaceFixture(serviceId, 'stale', staleUnknownKind).scenario?.key,
+    'observed_relation_stale',
+  )
+  // 但非 focus 字段仍然要校验：场景不是"绕过一切校验"的后门。
+  await expectApiError('显式场景仍校验时间窗配对', 'invalid_time_range', () =>
+    fixtures.getWorkspaceFixture(serviceId, 'partial', { from: base.scope.from }))
+  await expectApiError('显式场景仍校验绝对时间', 'invalid_time_range', () =>
+    fixtures.getWorkspaceFixture(serviceId, 'partial', { from: '2026-08-22', to: '2026-08-23' }))
+  // 未知 service 是 404，不该被非法 focus 抢先判成 422。
+  equal(
+    '未知服务优先于非法 focus',
+    fixtures.getWorkspaceFixture('svc_unknown', null, staleInvalidFocus).view,
+    null,
+  )
+
+  // ---- 与 Go HTTP 边界的口径对齐（Codex R1 复审缺口 3）----
+
+  // trim：`?sort=%20health%20` 在 live 是合法的 health。
+  check('标量参数按 Go 口径 trim', fixtures.getDirectoryFixture({
+    sort: ' health ', direction: ' desc ', tier: ' tier-1 ',
+  }).items.length > 0)
+  // CSV：合法多值必须通过；空成员/未知值/超过 8 个成员必须 422。
+  check('合法 CSV health 通过', fixtures.getDirectoryFixture({ health: ['critical', 'degraded'] }).items.length > 0)
+  check('CSV 重复值静默去重', fixtures.getDirectoryFixture({ health: ['critical', 'critical'] }).items.length > 0)
+  await expectApiError('CSV 空成员', 'invalid_filter', () => fixtures.getDirectoryFixture({ health: ['critical', ''] }))
+  await expectApiError('CSV 成员过多', 'invalid_filter', () =>
+    fixtures.getDirectoryFixture({ health: Array.from({ length: 9 }, () => 'critical') }))
+  // 整数语法：JS 的 Number 会接受 0x10 / 1e2 / 5.0，Go 的 Atoi 不会。
+  for (const limit of ['0x10', '1e2', '5.0', ' 5 5', 'Infinity']) {
+    await expectApiError(`limit=${limit} 必须按整数语法拒绝`, 'invalid_limit', () =>
+      fixtures.getDirectoryFixture({ limit }))
+  }
+  check('limit 允许带正号', fixtures.getDirectoryFixture({ limit: '+50' }).items.length > 0)
+  for (const windowSeconds of ['0x10', '1e2', '2.5']) {
+    await expectApiError(`window_seconds=${windowSeconds} 必须按整数语法拒绝`, 'invalid_window', () =>
+      fixtures.getOverviewFixture(serviceId, { windowSeconds }))
+  }
+  // RFC3339：日期或无时区时间戳必须拒绝（Date.parse 会接受它们）。
+  for (const bound of ['2026-08-22', '2026-08-22T02:04:22', '2026/08/22 02:04:22']) {
+    await expectApiError(`from=${bound} 必须按 RFC3339 拒绝`, 'invalid_time_range', () =>
+      fixtures.getWorkspaceFixture(serviceId, null, { from: bound, to: base.scope.to }))
+  }
+  check('带偏移量的 RFC3339 通过', Boolean(fixtures.getWorkspaceFixture(serviceId, null, {
+    from: '2026-08-22T10:04:22+08:00', to: '2026-08-22T10:09:22+08:00',
+  }).view))
+  // timezone 形状上界不放宽（真正的 IANA 加载属于 R2 C4）。
+  await expectApiError('超长 timezone', 'invalid_timezone', () =>
+    fixtures.getWorkspaceFixture(serviceId, null, { timezone: 'z'.repeat(65) }))
+
   // 未知服务返回 null，让页面走统一 404 状态。
   equal('未知服务的工作区为 null', fixtures.getWorkspaceFixture('svc_unknown', null, {}).view, null)
   equal('未知服务的总览为 null', fixtures.getOverviewFixture('svc_unknown'), null)

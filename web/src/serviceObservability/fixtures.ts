@@ -13,7 +13,8 @@ import {
   alignFocusIdentity,
   validateDirectoryQuery,
   validateOverviewQuery,
-  validateWorkspaceQuery,
+  validateWorkspaceFocus,
+  validateWorkspaceScope,
 } from './queryContract'
 import type {
   JsonPatchOperation,
@@ -133,11 +134,23 @@ function guardOverviewQuery(query: ServiceOverviewQuery): void {
   }
 }
 
-function guardWorkspaceQuery(query: ServiceWorkspaceQuery): void {
+// guardWorkspaceScope 只校验非 focus 字段（时间窗配对、绝对时间、时区形状）。
+//
+// 显式 QA 场景走这一条：场景视图自带权威 focus，URL 上可能还留着上一次的旧 focus，
+// 用它把场景判成 422 会让确定性的五态 QA 状态变得不可达。
+function guardWorkspaceScope(query: ServiceWorkspaceQuery): void {
   try {
-    // focus 合法性以该服务已发布 Profile 投影出的 focus_kinds 为准：provider 不认识
-    // 任何具体 focus kind 或服务专属 ID 字面量。
-    validateWorkspaceQuery(overviewFixture.focus_kinds, query)
+    validateWorkspaceScope(query)
+  } catch (error) {
+    asApiError(error)
+  }
+}
+
+// guardWorkspaceFocus 校验 focus。focus 合法性以该服务已发布 Profile 投影出的
+// focus_kinds 为准：provider 不认识任何具体 focus kind 或服务专属 ID 字面量。
+function guardWorkspaceFocus(query: ServiceWorkspaceQuery): void {
+  try {
+    validateWorkspaceFocus(overviewFixture.focus_kinds, query)
   } catch (error) {
     asApiError(error)
   }
@@ -182,6 +195,11 @@ export function resolveWorkspaceScenario(value: string | null): WorkspaceScenari
  *   3. 合法但不同的 focus -> 应用既有 Empty 场景，并把 focus 身份对齐到请求值，
  *      于是 URL、输入框、Journey 与诊断结论互相一致；
  *   4. focus 非法 -> 抛 422 invalid_focus（与 live 同一 reason code）。
+ *
+ * 顺序很关键：**先解析 service 与 scenario，再校验 focus**。反过来会让"带着上一次的旧
+ * focus 打开 `scenario=partial`"变成 422，于是确定性 QA 状态不可达；而未知 service 也
+ * 应该是 404（view=null）而不是被一个非法 focus 抢先判成 422。非 focus 字段（时间窗、
+ * 时区形状）两条路径都要校验。
  */
 export function getWorkspaceFixture(
   serviceId: string,
@@ -191,14 +209,19 @@ export function getWorkspaceFixture(
   view: ObservabilityWorkspaceView | null
   scenario: WorkspaceScenarioFixture | null
 } {
-  guardWorkspaceQuery(query)
   const base = getBaseWorkspaceFixture(serviceId)
   if (!base) return { view: null, scenario: null }
 
   const scenario = resolveWorkspaceScenario(scenarioValue)
   if (scenario) {
+    guardWorkspaceScope(query)
+    // focus 以场景视图为准：调用方（页面）据此把 URL 规范化，旧 focus 不会被保留，
+    // 也不会因为它非法而挡住这个 QA 状态。
     return { view: applyJsonPatch(base, scenario.patch), scenario }
   }
+
+  guardWorkspaceScope(query)
+  guardWorkspaceFocus(query)
 
   const requested = query.focusValue?.trim() ?? ''
   const baseFocusValue = base.focus?.value ?? ''
