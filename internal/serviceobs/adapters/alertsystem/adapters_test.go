@@ -54,9 +54,10 @@ type fakeReader struct {
 	neighborhoodQuery store.NeighborhoodQuery
 	neighborhoodErr   error
 
-	boundary      []string
-	boundaryArgs  boundaryCall
-	boundaryErr   error
+	boundary          []string
+	boundaryTruncated bool
+	boundaryArgs      boundaryCall
+	boundaryErr       error
 	reachable     map[string]struct{}
 	reachableErr  error
 	serviceResRow store.ServiceResolutionRow
@@ -132,10 +133,10 @@ func (f *fakeReader) ListCanonicalNeighborhood(_ context.Context, query store.Ne
 	return f.neighborhood, f.neighborhoodErr
 }
 
-func (f *fakeReader) ServiceBoundaryEntityIDs(_ context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, error) {
+func (f *fakeReader) ServiceBoundaryEntityIDs(_ context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, bool, error) {
 	f.record("ServiceBoundaryEntityIDs")
 	f.boundaryArgs = boundaryCall{serviceEntityID, rootEntityIDs, maxDepth, maxEntities}
-	return f.boundary, f.boundaryErr
+	return f.boundary, f.boundaryTruncated, f.boundaryErr
 }
 
 func (f *fakeReader) DeclaredReachableEntityIDs(_ context.Context, _ string, _ int) (map[string]struct{}, error) {
@@ -973,6 +974,27 @@ func domainRows() store.DomainFactsRows {
 		}},
 		Counts:       store.DomainCountRow{ActiveFaults: 1, ConfirmedImpacts: 1, ActiveIncidents: 1},
 		LatestFactAt: fixedNow.Add(-30 * time.Second),
+	}
+}
+
+func TestReadDomainMarksPartialWhenBoundaryTruncated(t *testing.T) {
+	reader := newFakeReader()
+	reader.boundary = []string{entityUUID, rootUUID}
+	reader.boundaryTruncated = true
+	reader.domainRows = domainRows()
+	adapter := NewDomainAdapter(newRunner(reader), Limits{}, fixedClock)
+
+	facts, err := adapter.ReadDomain(context.Background(), serviceobs.DomainRequest{
+		ServiceEntityID: entityUUID, RootEntityIDs: []string{rootUUID},
+	})
+	if err != nil {
+		t.Fatalf("ReadDomain 失败: %v", err)
+	}
+	if !facts.BoundaryTruncated {
+		t.Fatal("达到 entity 上限必须显式 BoundaryTruncated，不能静默截断")
+	}
+	if len(facts.Faults) != 1 {
+		t.Fatalf("截断不得丢弃已返回的领域事实: %+v", facts.Faults)
 	}
 }
 

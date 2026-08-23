@@ -37,7 +37,7 @@ type Reader interface {
 	GetServiceIdentity(ctx context.Context, serviceID string) (store.ServiceIdentityRow, error)
 	ListDeclaredDependencies(ctx context.Context, entityID string, limit int) ([]store.DeclaredEdgeRow, error)
 	ListCanonicalNeighborhood(ctx context.Context, query store.NeighborhoodQuery) (store.NeighborhoodRows, error)
-	ServiceBoundaryEntityIDs(ctx context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, error)
+	ServiceBoundaryEntityIDs(ctx context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, bool, error)
 	DeclaredReachableEntityIDs(ctx context.Context, serviceEntityID string, maxDepth int) (map[string]struct{}, error)
 	ResolveServiceByID(ctx context.Context, serviceID string) (store.ServiceResolutionRow, error)
 	ResolveEntityByID(ctx context.Context, entityID string) (store.EntityResolutionRow, error)
@@ -177,7 +177,7 @@ func (t *txReader) ListCanonicalNeighborhood(ctx context.Context, query store.Ne
 	return t.repo.ListCanonicalNeighborhood(ctx, t.tx, query)
 }
 
-func (t *txReader) ServiceBoundaryEntityIDs(ctx context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, error) {
+func (t *txReader) ServiceBoundaryEntityIDs(ctx context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, bool, error) {
 	return t.repo.ServiceBoundaryEntityIDs(ctx, t.tx, serviceEntityID, rootEntityIDs, maxDepth, maxEntities)
 }
 
