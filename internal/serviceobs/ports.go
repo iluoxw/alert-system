@@ -51,6 +51,8 @@ const (
 	ReasonDomainReadFailed = "domain_read_failed"
 	// ReasonTopologyBoundsReached 表示达到 max nodes/relations 上限而显式截断。
 	ReasonTopologyBoundsReached = "topology_bounds_reached"
+	// ReasonDomainBoundsReached 表示达到 max boundary entities 上限而显式截断。
+	ReasonDomainBoundsReached = "domain_bounds_reached"
 	// ReasonSignalScopeUnresolved 表示某个已声明 binding 的 scope.refs 缺省、为空或
 	// 悬空，无法挂到 bounded topology 上的任何 node/relation。它是局部缺口，不是
 	// "这个 binding 不存在"——evaluator 仍保留该 binding 的 Unknown 结果。
@@ -371,6 +373,8 @@ type DomainIncident struct {
 type DomainFacts struct {
 	// BoundaryEntityIDs 是本次使用的稳定实体边界，按 ID 稳定排序，便于审计与测试。
 	BoundaryEntityIDs []string
+	// BoundaryTruncated 为 true 表示实体边界因 max boundary entities 上限被截断。
+	BoundaryTruncated bool
 	Alerts            []DomainAlert
 	Faults            []DomainFault
 	Impacts           []DomainImpact

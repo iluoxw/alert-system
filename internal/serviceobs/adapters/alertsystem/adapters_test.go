@@ -48,6 +48,7 @@ type fakeReader struct {
 	neighborhoodErr   error
 
 	boundary      []string
+	boundaryTrunc bool
 	boundaryArgs  boundaryCall
 	boundaryErr   error
 	reachable     map[string]struct{}
@@ -99,10 +100,10 @@ func (f *fakeReader) ListCanonicalNeighborhood(_ context.Context, query store.Ne
 	return f.neighborhood, f.neighborhoodErr
 }
 
-func (f *fakeReader) ServiceBoundaryEntityIDs(_ context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, error) {
+func (f *fakeReader) ServiceBoundaryEntityIDs(_ context.Context, serviceEntityID string, rootEntityIDs []string, maxDepth, maxEntities int) ([]string, bool, error) {
 	f.record("ServiceBoundaryEntityIDs")
 	f.boundaryArgs = boundaryCall{serviceEntityID, rootEntityIDs, maxDepth, maxEntities}
-	return f.boundary, f.boundaryErr
+	return f.boundary, f.boundaryTrunc, f.boundaryErr
 }
 
 func (f *fakeReader) DeclaredReachableEntityIDs(_ context.Context, _ string, _ int) (map[string]struct{}, error) {
@@ -920,6 +921,33 @@ func TestReadDomainEmptyBoundarySkipsQuery(t *testing.T) {
 	}
 	if len(facts.Faults) != 0 || facts.Counts.ActiveFaults != 0 {
 		t.Fatalf("边界为空时必须返回空事实: %+v", facts)
+	}
+}
+
+func TestReadDomainBoundaryTruncationPropagatesFlag(t *testing.T) {
+	reader := newFakeReader()
+	reader.boundary = make([]string, 201)
+	for i := range reader.boundary {
+		reader.boundary[i] = entityUUID
+	}
+	reader.boundaryTrunc = true
+	reader.domainRows = domainRows()
+	adapter := NewDomainAdapter(newRunner(reader), Limits{MaxBoundaryEntities: 200}, fixedClock)
+
+	facts, err := adapter.ReadDomain(context.Background(), serviceobs.DomainRequest{
+		ServiceEntityID: entityUUID,
+	})
+	if err != nil {
+		t.Fatalf("ReadDomain 失败: %v", err)
+	}
+	if !facts.BoundaryTruncated {
+		t.Fatal("store 截断标记必须传到 DomainFacts")
+	}
+	if len(facts.BoundaryEntityIDs) != 201 {
+		t.Fatalf("截断不得丢弃已返回的边界 ID: len=%d", len(facts.BoundaryEntityIDs))
+	}
+	if len(facts.Faults) != 1 {
+		t.Fatal("截断不得丢弃已返回的领域事实")
 	}
 }
 
