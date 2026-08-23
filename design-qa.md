@@ -171,3 +171,70 @@
 9. 最终五张 1536×1024 合并图及 1180/900/390px 响应式证据重新生成；未发现 P0、P1 或 P2 视觉、交互、语义问题。
 
 final result: passed
+
+---
+
+## Phase 2 验收纠正 Slice R3：画稿对齐与视觉可读性复验
+
+> 只追加本轮证据，不改写上方 Phase 1 记录。基线 SHA `85a8019c403dbfc4a3d5770010e4db995cfc8034`。
+> 批准视觉基线：`service-directory-v1`、`e2b-service-overview-v1`、
+> `e2b-workspace-focused-failure-v2`、`e2b-workspace-partial-unknown-v1`、
+> `e2b-workspace-forbidden-logs-v2`（`focused-failure-v1` / `forbidden-logs-v1` 未使用）。
+
+### P1（已修）中央请求路径/依赖面板可读性低于画稿
+
+1536×1024 实测：主路径节点名 8px、关系名 7px、RED 值 8px、依赖卡节点名 9px 且
+`PostgreSQL`/`OpenObserve` 被省略号截断，次要 metadata 7px。用户需要放大才能完成一次扫描。
+现在节点名/关系名/信号值统一到 11–11.5px，次要 metadata 9–9.5px，两个关键实体名完整可读。
+
+### P1（已修）路径带溢出后左端不可达
+
+原实现 `justify-content: center` + `overflow-x: auto`。字号提高后必然溢出，而居中会把左端
+推到负偏移、`scrollLeft` 到不了。改为 `flex-start` + 首/末子元素 auto margin：富余时仍居中，
+溢出时滚动范围完整（实测 `754 > 636`、`maxScrollLeft 118`、左端可达）。
+
+### P1（已修）右栏摘要首屏挤掉主动作
+
+原实测 `scrollHeight 571 > clientHeight 518`，"仍需验证"与主动作 `fullyVisible: false`。
+现固定为 当前选择 → 定位结果 → 合并支持事实（evidence+fault 合计 ≤ 2）→ 仍需验证 → 主动作，
+"不可用数据来源"下移到主动作之后；五段全部 `fullyVisible: true`。
+
+### P2（已修）信息优先级与信号层级
+
+拓扑三层顺序改为 主请求与运行路径 > 运行资源依赖 > declared 数据与证据依赖，改的是 JSX
+顺序而非 CSS `order`（实测 DOM 顺序 == 视觉顺序，无非 0 `order`），避免键盘顺序与视觉分叉。
+另修正原实现中反了的信号层级：标签原为粗体 11px、读数只有 9.5px，现改为标签 9.5px、
+读数 11.5px。
+
+### 五张同输入比较 + Empty/Stale
+
+Directory、Overview、Complete、Partial、Forbidden 五张 1536×1024 全部通过；Empty
+（`focus_empty_valid_query`）与 Stale（`observed_relation_stale`）按合同场景通过：Empty 保留
+declared topology 且未被说成 Healthy，Stale 显示过期且错误/容量压力仍在。画稿归一化四条
+（`18 req/s`、Golden/RED/USE 来自 prometheus_compatible、资源节点"使用率 91%"与 Golden
+"容量压力 proxy 91%"、Partial 是 telemetry bundle 整体超时）全部保持。
+
+### 响应式
+
+| 宽度 | 结论 |
+|---|---|
+| 1180 | Context Drawer 入口存在且真实打开（4 页签 + 摘要）；`scrollWidth 1180 == clientWidth`，严格排除内部滚动容器后 0 溢出 |
+| 900 | 同上；`900 == 900`，0 溢出 |
+| 390 | 同上；`390 == 390`，0 溢出；`.topology-graph` `566 > 342` 可内部横向浏览、左端可达；关系列表入口可见 |
+
+三个宽度下 Directory / Overview / Workspace 三条路由都单独验证。
+
+### 交互与 console
+
+stage / node / relation / evidence / timeline 选择、table ↔ canvas、focus(8/7) ↔ 全量(10/10)、
+浏览器后退前进、Partial 局部重试、Forbidden 无全局重试、关系列表行键盘可达，13/13 通过；
+每个入口都验证了"可见 + 命中测试通过 + 点击有效果"，没有被 CSS 隐藏的功能。
+七个页面状态与全部交互过程中 Browser console **0 warning、0 error**。
+
+### 有意保留的画稿差异（合同无事实，禁止造数）
+
+无 sparkline（无 timeseries samples）、运行资源依赖只有一条（fixture 只声明 Host Fleet）、
+时间线只有 3 条事件、主路径 4 个节点、数据带位于主路径下方（遵循书面优先级而非画稿摆放）、
+摘要首屏 2 条合并支持事实（完整列表在证据页签）、右栏信号标签省略号（关系全名在上方标题）。
+
+final result: passed

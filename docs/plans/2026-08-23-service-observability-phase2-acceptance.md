@@ -286,3 +286,147 @@ Phase 1 视觉证据没有任何改写；Phase 2 的 live 证据集中在本文�
   不入库、不是生产 Profile。
 - Agent 继续不实现。`DiagnosticContext + ToolDescriptor + EvidenceRef` 已经是稳定的
   未来输入边界。
+
+---
+
+## 9. 验收纠正 Slice R3：画稿对齐、视觉可读性与响应式交互
+
+> 执行者：同一固定 Cursor Cloud 会话 / Claude Opus 5 High。本节只追加，不改写前八节。
+
+### 9.1 SHA 与范围
+
+| 项 | 值 |
+|---|---|
+| R3 派发基线（远端 HEAD） | `85a8019c403dbfc4a3d5770010e4db995cfc8034` |
+| R3 提交 `fix(web): raise service observability readability and path scrolling` | 本提交 |
+| 改动文件 | `web/src/serviceObservability/serviceObservability.css`、`web/src/components/serviceObservability/TopologyExplorer.tsx`、`web/src/components/serviceObservability/WorkspaceContext.tsx` |
+
+preflight 的分支、HEAD、worktree、远端四项全部匹配 `85a8019`；全程没有 reset / rebase /
+amend / force push / 切分支。两个 `.tsx` 只改语义顺序与首屏取舍，没有触碰 Page View 合同、
+Go 后端、fixtures 数据、查询契约、安全链接策略或依赖清单。
+
+唯一批准的视觉基线是 `service-directory-v1`、`e2b-service-overview-v1`、
+`e2b-workspace-focused-failure-v2`、`e2b-workspace-partial-unknown-v1`、
+`e2b-workspace-forbidden-logs-v2`；`focused-failure-v1` 与 `forbidden-logs-v1` 未作为基线。
+
+### 9.2 修正项与实测度量
+
+度量方式：headless Chrome 固定 1536×1024 视口，读 `getComputedStyle` 与
+`scrollWidth/clientWidth`，不靠目测估字号。
+
+| 项 | 修正前实测 | 修正后实测 |
+|---|---|---|
+| 主路径节点名 | 8px | 11.5px |
+| 主路径关系名 | 7px | 11px |
+| 主路径 RED 值 | 8px | 11.5px |
+| 依赖卡节点名 | 9px（`PostgreSQL`/`OpenObserve` 被省略号截断） | 11.5px（两者完整可读） |
+| 依赖卡关系名 | 7px | 11px |
+| 依赖卡信号值 | 8px | 11.5px |
+| 补充声明关系 | 7px | 11px |
+| 画布摘要 / 语义图例 | 9px / 8px | 11px / 10px |
+| 次要 metadata（kind、信号标签、freshness） | 7px | 9–9.5px |
+
+中央路径带此前是 `justify-content: center` + `overflow-x: auto`。字号提高后内容必然超宽，
+而居中会把左端内容推到负偏移、`scrollLeft` 到不了，最左入口永久不可达。改为
+`justify-content: flex-start` 配合首/末子元素 `margin: auto`：空间富余时仍视觉居中，溢出时
+auto margin 归零、滚动范围完整。实测 `scrollWidth 754 > clientWidth 636`、
+`maxScrollLeft 118`、左端可达。刻意不用 `justify-content: center` + auto margin 的写法——
+实测那种组合只能滚到一半范围（`maxScrollLeft 80` vs 应有的 `160`）。
+
+信息优先级按计划 §3 C7-2 固定为 **主请求与运行路径 > 运行资源依赖 > declared 数据与证据
+依赖**，并且是改 `TopologyExplorer.tsx` 的 JSX 顺序而不是 CSS `order`：用 `order` 会让视觉
+顺序与 DOM/Tab 顺序分叉，键盘用户拿到的是另一套顺序。实测 DOM 顺序 == 视觉顺序，
+且没有任何 section 带非 `0` 的 `order`。层级另用呈现权重表达：主路径实边加投影、
+declared 数据带用更浅底色与虚边。这里与画稿的空间摆放（数据带在路径上方）有意不同，
+遵循的是计划里写明的优先级顺序。
+
+右栏摘要首屏此前止于"仍需验证"，主动作被完全挤出可视区（`scrollHeight 571 >
+clientHeight 518`，主动作 `fullyVisible: false`）。现在固定为 **当前选择 → 定位结果 →
+合并支持事实（evidence + fault 合计最多 2 条）→ 仍需验证 → 主动作**，"不可用数据来源"
+明细移到主动作之后。实测五段全部 `fullyVisible: true`。合并上限只影响摘要首屏取舍：
+完整证据列表仍在"证据"页签，主动作"查看证据"就是入口，没有丢弃任何合同事实。
+
+修正过程中我自己引入并修掉了三处回归，都是实测发现的：`auto-fit` 按 `minmax` 的**最大值**
+算列数，`minmax(198px, 236px)` 只排两列，把最低优先级的 declared 数据带整段推出面板可视区
+（已收敛到 `minmax(178px, 202px)`，三列一行）；三列面板 570px 装不下放大后的内容
+（利用时间线下方约 40px 真实空档提到 606px）；信号列在 `align-items: flex-start` 下宽度按
+`max-content` 算，标签溢出列宽互相压字（已加 `max-width: 100%`）。另外发现原实现的信号
+层级是反的——标签粗体 11px、真正的读数只有 9.5px，现已交换。
+
+### 9.3 五张 1536×1024 同输入比较 + Empty/Stale
+
+| 视图 | 结论 |
+|---|---|
+| Directory | 通过。E2B Critical + 真实 Golden；其余行 `Golden Unknown · 未配置 Profile`，Health 与 Data 保持正交，没有假 Healthy |
+| Overview | 通过。四大黄金信号、当前 Fault、按 `group_key` 分组的 9 条关键依赖、最近事件、右栏运行状态/开始诊断/责任入口齐备 |
+| Complete | 通过。焦点 8 节点 / 7 关系，`18 req/s · 7.2% · P95 3.48s` 位于服务边，HugePages 使用率 91% 位于资源节点 |
+| Partial | 通过。Golden/RED/USE 全部 Unknown（无旧值、无 0、无绿色），PLACE 状态未知，declared 拓扑与 FLT-5F437252 保留，主动作只重试失败数据 |
+| Forbidden | 通过。仅日志行 Forbidden（无结果数、无正文、无 deep link），Trace/host USE/Fault 仍可查看，服务健康不变，无全局重试 |
+| Empty（`focus_empty_valid_query`） | 通过。横幅"查询成功，但没有匹配该 Sandbox ID 的请求"，保留 declared topology，不发明 journey；Empty 未被说成 Healthy |
+| Stale（`observed_relation_stale`） | 通过。横幅"Observed path 已过新鲜度 TTL"，错误与容量压力仍在，observed 边转虚线 |
+
+画稿归一化四条规则全部保持：`18 req/s`（不是 rpm）、Golden/RED/USE 来自
+`prometheus_compatible`（OpenObserve 只负责 logs/traces/access Evidence）、资源节点称
+"使用率 91%" 而 Golden 卡称"容量压力 proxy 91%"、Partial 横幅是 telemetry bundle 整体超时。
+没有补造 sparkline、节点数字、第四条跨窗口事件、跨服务条目、额外节点或健康状态。
+
+### 9.4 响应式（实测数值）
+
+| 宽度 | Context Drawer | 页面级横向溢出 | 其它 |
+|---|---|---|---|
+| 1180 | 抽屉入口存在，点击后抽屉内 4 个页签与摘要真实渲染；行内上下文面板不再并列 | `scrollWidth 1180 == clientWidth 1180`，严格排除内部滚动容器后 0 个溢出元素 | — |
+| 900 | 同上 | `900 == 900`，0 个溢出元素 | — |
+| 390 | 同上 | `390 == 390`，0 个溢出元素 | `.topology-graph` `scrollWidth 566 > clientWidth 342`、左端可达、`maxScrollLeft 224`；关系列表入口可见且完整落在视口内 |
+
+三个宽度下 Directory / Overview / Workspace 三条路由都单独测过，均无页面级横向溢出。
+
+### 9.5 交互实测（13/13 通过）
+
+journey stage 选中并写入 `stage=`；path node 选中驱动右栏"当前节点"；relation 选中驱动
+"当前关系"；证据页签 4 行可见可点；timeline 事件选中并写入 `cursor=`；关系列表 ↔ 拓扑双向
+切换（关系列表 7 行）；focus ↔ 全量在 `8 节点 · 7 关系` 与 `10 节点 · 10 关系` 之间切换；
+浏览器后退/前进正确恢复 scope；Partial 的"重试失败数据"回到主视图且 RED 恢复；Forbidden
+不出现全局重试；关系列表行 `tabIndex >= 0` 且可 focus + Enter；DOM 顺序 == 视觉顺序。
+没有任何功能是被 CSS 隐藏的——每个入口都同时验证了"可见 + 命中测试通过 + 点击有效果"。
+
+### 9.6 命令与真实结果
+
+```bash
+git diff --check                                              # 无输出
+python3 docs/contracts/service-observability/v1/verify_examples.py  # PASS 5 schemas + 全部 fixture + 4 个 scenario
+gofmt -l internal/ cmd/                                       # 无输出
+go build ./... && go vet ./... && go vet -tags=integration ./...   # 全部通过
+go test -race -count=1 ./internal/serviceobs/... ./internal/api ./internal/app \
+  ./internal/store ./internal/config ./cmd/server             # 全部 ok
+go test -count=1 ./...                                        # 仅 test/e2e 失败（缺 Docker）
+cd web && npx oxlint && npx tsc -b                            # 通过
+npm run test:service-observability                            # verifier 通过；fixture provider 140 项
+npm run build                                                 # 通过
+```
+
+- **Docker 缺失是真实限制**：本机 `docker` 不在 PATH，`go test -tags=integration ./... -race`
+  报 `rootless Docker not found`，`test/e2e` 的 `TestMain` 报"启动 docker compose 失败"。
+  这两项在本轮**未执行成功**，不能算通过。R3 只改前端样式与两处前端语义顺序，不触碰
+  store/迁移/HTTP 契约，因此该缺口与本切片改动无关，但仍需在有 Docker 的环境补跑。
+- 生产 bundle 对 17 个 fixture ID / scenario key / DEV-only 符号零命中。
+- `npm run build` 仍有既有的 chunk 体积提示（主应用 bundle > 500 kB 默认阈值），与本切片无关。
+- 三个 hold path 从 `6e4eddd..HEAD`、R3 基线 `85a8019` 与工作区三个维度都零 diff；
+  没有 Docker / Kubernetes / OTel / 迁移 / 契约 / fixtures 改动；Agent 关键词扫描为 0。
+
+### 9.7 因"合同无事实、禁止造数"而有意保留的画稿差异
+
+1. **没有 sparkline**：画稿的 Golden 卡带趋势曲线，合同没有 timeseries samples，
+   契约 §"Phase 1 的 fixture"明确规定无 samples 不得绘制。保留差异。
+2. **运行资源依赖只有一张卡**：画稿底部有 ClickHouse、OpenObserve 等多个运行资源，
+   当前 fixture 只声明一条到 Host Fleet 的资源依赖。那一行因此留白，不补节点。
+3. **事件时间线只有 3 条事件**：画稿有第四条跨窗口事件，合同窗口内只有三条。不补。
+4. **主路径是 4 个节点**（Traefik → API/Client Proxy → Orchestrator Pool → Sandbox Pool），
+   画稿画了 5 个（含 SDK/Envd）。节点集合由 bounded observed projection 决定，不补。
+5. **数据带在主路径下方**：画稿把 PostgreSQL/Redis/JuiceFS 摆在主路径上方。计划 §3 C7-2
+   规定的优先级是"主请求路径 > 运行资源 > declared 数据/证据"，本实现遵循书面优先级，
+   spatial 摆放因此与画稿不同。
+6. **右栏摘要首屏只显示 2 条合并支持事实**：画稿的证据列表有 3 行。首屏必须让"仍需验证"
+   和主动作可见，完整列表在"证据"页签（4 行，实测可见可点）。
+7. **右栏信号列的标签会省略号**：`API 到 Orchestrator 请求率` 在 113px 列宽下放不下。
+   标签属次要 metadata（9.5px），读数是 11.5px；关系全名在紧邻上方的标题里已经完整给出。
+8. **摘要面板里的证据摘要单行省略**：证据页签有纵向空间，同一组件在那里折两行完整显示。

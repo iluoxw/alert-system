@@ -441,22 +441,6 @@ export function TopologyExplorer({
             </div>
           ) : (
             <div className="topology-graph" role="group" aria-label={`${scope === 'focus' ? '焦点请求路径' : '全部服务依赖'}拓扑`}>
-              {network.dataDependencies.length > 0 && (
-                <section className="topology-network-band is-data" aria-label="数据与证据依赖">
-                  <header><span>数据与证据依赖</span><small>declared 保留 · 缺少机器信号保持 Unknown</small></header>
-                  <div className="topology-network-band__grid">
-                    {network.dataDependencies.map((dependency) => (
-                      <NetworkDependencyCard
-                        key={dependency.relation.relation_id}
-                        dependency={dependency}
-                        dimmed={relationDimmed(dependency.relation)}
-                        selectedObject={selectedObject}
-                        onSelectObject={onSelectObject}
-                      />
-                    ))}
-                  </div>
-                </section>
-              )}
               {network.pathRelations.length > 0 && (
                 <section className="topology-network-path" aria-label="主请求与运行路径">
                   <header><span>主请求与运行路径</span><small>observed 边显示 RED · declared 边不假定健康</small></header>
@@ -488,6 +472,22 @@ export function TopologyExplorer({
                   <header><span>运行资源依赖</span><small>资源节点显示 USE · 关系边不复用节点信号</small></header>
                   <div className="topology-network-band__grid">
                     {network.resourceDependencies.map((dependency) => (
+                      <NetworkDependencyCard
+                        key={dependency.relation.relation_id}
+                        dependency={dependency}
+                        dimmed={relationDimmed(dependency.relation)}
+                        selectedObject={selectedObject}
+                        onSelectObject={onSelectObject}
+                      />
+                    ))}
+                  </div>
+                </section>
+              )}
+              {network.dataDependencies.length > 0 && (
+                <section className="topology-network-band is-data" aria-label="数据与证据依赖">
+                  <header><span>数据与证据依赖</span><small>declared 保留 · 缺少机器信号保持 Unknown</small></header>
+                  <div className="topology-network-band__grid">
+                    {network.dataDependencies.map((dependency) => (
                       <NetworkDependencyCard
                         key={dependency.relation.relation_id}
                         dependency={dependency}

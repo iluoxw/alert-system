@@ -154,7 +154,10 @@ export function WorkspaceContext({
   ))
   const firstFault = view.domain_state.faults[0]
   const traceEvidence = view.evidence_refs.find((evidence) => evidence.kind === 'trace')
-  const summaryEvidence = context.evidenceRefs.slice(0, 2)
+  // 摘要首屏的"支持事实"是 evidence 与 fault **合计**最多两条：首屏必须让"仍需验证"和
+  // 主动作可见，而不是被支持事实挤到滚动区外面。完整证据列表仍在"证据"页签，主动作
+  // "查看证据"就是通往那里的入口，因此这里只做首屏取舍，不丢弃任何合同事实。
+  const summaryEvidence = context.evidenceRefs.slice(0, firstFault ? 1 : 2)
   const unavailableSources = view.data_status.sources.filter((source) => source.state === 'unavailable')
 
   return (
@@ -196,6 +199,19 @@ export function WorkspaceContext({
                 )}
               </article>
             )}
+            {view.diagnostic_summary.missing_requirements.length > 0 && (
+              <article>
+                <span className="diagnostic-summary__eyebrow">仍需验证</span>
+                <ul>{view.diagnostic_summary.missing_requirements.map((item) => <li key={item}>{item}</li>)}</ul>
+              </article>
+            )}
+            <div className="diagnostic-next-actions">
+              <Button type="primary" onClick={() => onTabChange('evidence')}>查看证据</Button>
+              {firstFault && <Link className="ant-btn css-var-root ant-btn-default" to={`/faults/${firstFault.id}`}>进入 Fault 工作区</Link>}
+            </div>
+            {/* 不可用来源明细排在主动作之后：它解释"为什么是 Unknown"，但不是下一步动作。
+                Partial 场景下这一段最长，放在前面会把"仍需验证"和主动作顶出首屏。
+                页面横幅与各对象的 Unknown 标记仍然承担"数据不完整"的即时提示。 */}
             {unavailableSources.length > 0 && (
               <article className="diagnostic-source-status">
                 <span className="diagnostic-summary__eyebrow">不可用数据来源</span>
@@ -207,16 +223,6 @@ export function WorkspaceContext({
                 ))}
               </article>
             )}
-            {view.diagnostic_summary.missing_requirements.length > 0 && (
-              <article>
-                <span className="diagnostic-summary__eyebrow">仍需验证</span>
-                <ul>{view.diagnostic_summary.missing_requirements.map((item) => <li key={item}>{item}</li>)}</ul>
-              </article>
-            )}
-            <div className="diagnostic-next-actions">
-              <Button type="primary" onClick={() => onTabChange('evidence')}>查看证据</Button>
-              {firstFault && <Link className="ant-btn css-var-root ant-btn-default" to={`/faults/${firstFault.id}`}>进入 Fault 工作区</Link>}
-            </div>
           </div>
         )}
 
