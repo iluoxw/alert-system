@@ -105,6 +105,11 @@ typed params；`kind` 仅允许：
 Observed topology hints 是 trace template 的声明输出，由 `topology_policy` 约束，不另设会重复同一
 trace 查询的 `topology` binding。请求 purpose 不属于 SIP；它只能由服务端路由选择。registry
 还声明 source capability、required permission、允许的 kind、参数槽位、主输出与固定 side outputs。
+
+多个来源各自报告 focus 结论是**正常**的：coordinator 按 `matched > unknown > empty` 合并它们，
+因此 logs 与 traces 都带 focus side output 不冲突。真正被拒绝的是**显式** `kind=focus` binding
+与任何 side output 提供者共存——那是同一判定的第三次查询。同理，如果 journey 已经用一次 trace
+读取顺带产出 trace EvidenceRef，再显式绑一条同 focus 的 traces evidence 也会被拒绝。
 Binding kind 只标识主要 target；focus、trace EvidenceRef、topology hints 等 side outputs 必须由
 adapter 在同一次有界读取中投影，package 不能自行增加，也不能为同一 trace 重复发起查询。compiler 必须
 验证 `tool_key` 已发布且属于 package `tool_refs`、template capability 等于 ToolDescriptor 的
@@ -136,6 +141,17 @@ key/capability/permission，并与 Profile 通过 manifest 中的 `profile_diges
 typed 等值条件。任一有效 selector 内 label 名重复，或 numerator/denominator 是同一 metric 且
 两边的有效 label selector 完全相同时，compiler 必须拒绝；否则会把任意非零样本恒算成 100%。E2B draft
 中的 error 判别 label 仅表达上游默认意图，真实字段尚未经 discovery 确认，不能宣称是真实错误率。
+
+## 认证与 secret 边界
+
+Provider 认证模式显式为 `none|basic|bearer`（OpenObserve 实测是 Basic `user:password`，
+因此不能只提供 bearer token）。配置里只写**引用**——env 名或文件路径，两者互斥；凭据值由被引用
+的 env 或文件提供，文件必须是常规文件且不超过 4 KiB。endpoint 未配置却声明凭据会让启动失败。
+
+配置结构的 `String`/`GoString`/`MarshalJSON`/`LogValue` 全部只输出安全表示：连 username 与
+organization 都不输出，因此把整份配置打进日志或做一次 `json.Marshal` 都不会泄露。生产仍然只接受
+HTTPS，没有任何 YAML 或环境变量开关能切换到明文；UAT 仅 HTTP 是外部发布 blocker，不在本仓库
+加绕过。
 
 ## 校验
 

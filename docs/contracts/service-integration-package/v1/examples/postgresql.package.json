@@ -3,15 +3,21 @@
   "package_key": "postgresql_core",
   "package_version": 1,
   "status": "draft",
-  "description": "结构与 E2B 明显不同的最小 package：实例级 focus、没有任何 journey、只用 Golden 与 USE、不声明 request_journey/dependency_topology renderer。它存在的唯一目的是证明同一份 SIP 契约与 compiler 能表达非请求旅程型服务，核心 renderer/assembler 不需要新增分支。它不是 Phase 4 的产品验收物。",
+  "description": "结构与 E2B 明显不同的最小 package：实例级 focus、没有任何 journey、只用 Golden 与 USE、不声明 request_journey/dependency_topology renderer。它同时证明 kind=focus 在没有 journey 的服务上可独立可达，focus 判定不必来自 trace 读取的 side output。metric、stream 与字段形状同样未经 discovery，是 draft，不是 Phase 4 的产品验收物。",
   "compatibility": {
     "profile_schema_version": "1.0",
     "min_compiler_version": 1
   },
   "target": {
     "environment": "production",
-    "service_selector": { "entity_key": "infrastructure:postgresql-core" },
-    "root_selectors": [{ "entity_key": "infrastructure:postgresql-core:primary" }]
+    "service_selector": {
+      "entity_key": "infrastructure:postgresql-core"
+    },
+    "root_selectors": [
+      {
+        "entity_key": "infrastructure:postgresql-core:primary"
+      }
+    ]
   },
   "profile_template": {
     "profile_key": "postgresql_core",
@@ -37,22 +43,30 @@
           "golden_query_errors",
           "golden_connection_saturation"
         ],
-        "tool_refs": ["metrics.query_semantic_signal.v1"]
+        "tool_refs": [
+          "metrics.query_semantic_signal.v1"
+        ]
       },
       {
         "key": "instance_capacity",
         "renderer": "resource_fleet",
         "title": "实例资源",
         "order": 20,
-        "signal_refs": ["use_connection_utilization"],
-        "tool_refs": ["metrics.query_semantic_signal.v1"]
+        "signal_refs": [
+          "use_connection_utilization"
+        ],
+        "tool_refs": [
+          "metrics.query_semantic_signal.v1"
+        ]
       },
       {
         "key": "timeline",
         "renderer": "domain_timeline",
         "title": "事件时间线",
         "order": 30,
-        "tool_refs": ["domain.list_service_faults.v1"]
+        "tool_refs": [
+          "domain.list_service_faults.v1"
+        ]
       }
     ],
     "signal_bindings": [
@@ -61,19 +75,28 @@
         "label": "语句延迟 P95",
         "family": "golden",
         "semantic": "latency",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.quantile_value",
         "unit": "ms",
         "aggregation": "p95",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 200, "critical": 1000 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 200,
+          "critical": 1000
+        }
       },
       {
         "key": "golden_query_traffic",
         "label": "语句吞吐",
         "family": "golden",
         "semantic": "traffic",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.rate_per_second",
         "unit": "req/s",
@@ -84,24 +107,38 @@
         "label": "语句错误率",
         "family": "golden",
         "semantic": "errors",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "avg",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 1, "critical": 5 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 1,
+          "critical": 5
+        }
       },
       {
         "key": "golden_connection_saturation",
         "label": "连接数饱和度",
         "family": "golden",
         "semantic": "saturation",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "max",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 80, "critical": 95 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 80,
+          "critical": 95
+        }
       },
       {
         "key": "use_connection_utilization",
@@ -110,16 +147,29 @@
         "semantic": "utilization",
         "scope": {
           "kind": "resource",
-          "entity_selectors": [{ "entity_key": "infrastructure:postgresql-core:primary" }]
+          "entity_selectors": [
+            {
+              "entity_key": "infrastructure:postgresql-core:primary"
+            }
+          ]
         },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "max",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 80, "critical": 95 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 80,
+          "critical": 95
+        }
       }
     ],
-    "tool_refs": ["metrics.query_semantic_signal.v1", "domain.list_service_faults.v1"],
+    "tool_refs": [
+      "metrics.query_semantic_signal.v1",
+      "evidence.search_logs.v1",
+      "domain.list_service_faults.v1"
+    ],
     "limits": {
       "default_window_seconds": 300,
       "max_window_seconds": 86400,
@@ -130,64 +180,126 @@
       "freshness_ttl_seconds": 120
     }
   },
-  "telemetry_bindings": [
-    {
-      "binding_key": "golden_query_latency",
-      "template_ref": "histogram_quantile_rate.v1",
-      "params": {
-        "bucket_metric": "pg_stat_statements_exec_time_bucket",
-        "labels": [{ "name": "job", "value": "postgres-exporter" }],
-        "quantile": 0.95,
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_query_traffic",
-      "template_ref": "counter_rate.v1",
-      "params": {
-        "metric": "pg_stat_database_xact_commit_total",
-        "labels": [{ "name": "job", "value": "postgres-exporter" }],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_query_errors",
-      "template_ref": "counter_ratio_percent.v1",
-      "params": {
-        "numerator_metric": "pg_stat_database_xact_rollback_total",
-        "denominator_metric": "pg_stat_database_xact_commit_total",
-        "labels": [{ "name": "job", "value": "postgres-exporter" }],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_connection_saturation",
-      "template_ref": "gauge_ratio_percent.v1",
-      "params": {
-        "total_metric": "pg_settings_max_connections",
-        "free_metric": "pg_stat_database_numbackends",
-        "labels": [{ "name": "job", "value": "postgres-exporter" }]
-      }
-    },
-    {
-      "binding_key": "use_connection_utilization",
-      "template_ref": "gauge_ratio_percent.v1",
-      "params": {
-        "total_metric": "pg_settings_max_connections",
-        "free_metric": "pg_stat_database_numbackends",
-        "labels": [{ "name": "job", "value": "postgres-exporter" }],
-        "group_by": ["instance"]
-      }
-    }
-  ],
   "topology_policy": {
-    "alias_namespaces": ["pg_instance"],
+    "alias_namespaces": [
+      "pg_instance"
+    ],
     "discovery": {
-      "identity_fields": ["instance"],
+      "identity_fields": [
+        "instance"
+      ],
       "instance_role": "component"
     },
     "overlay": {
       "stale_after_seconds": 600
     }
-  }
+  },
+  "provider_bindings": [
+    {
+      "key": "signal_golden_query_latency",
+      "kind": "signal",
+      "target_ref": "golden_query_latency",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "histogram_quantile_rate.v1",
+      "params": {
+        "bucket_metric": "pg_stat_statements_exec_time_bucket",
+        "labels": [
+          {
+            "name": "job",
+            "value": "postgres-exporter"
+          }
+        ],
+        "quantile": 0.95,
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_golden_query_traffic",
+      "kind": "signal",
+      "target_ref": "golden_query_traffic",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_rate.v1",
+      "params": {
+        "metric": "pg_stat_database_xact_commit_total",
+        "labels": [
+          {
+            "name": "job",
+            "value": "postgres-exporter"
+          }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_golden_query_errors",
+      "kind": "signal",
+      "target_ref": "golden_query_errors",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_ratio_percent.v1",
+      "params": {
+        "numerator_metric": "pg_stat_database_xact_rollback_total",
+        "denominator_metric": "pg_stat_database_xact_commit_total",
+        "range_seconds": 300,
+        "common_labels": [
+          {
+            "name": "job",
+            "value": "postgres-exporter"
+          }
+        ]
+      }
+    },
+    {
+      "key": "signal_golden_connection_saturation",
+      "kind": "signal",
+      "target_ref": "golden_connection_saturation",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "pg_settings_max_connections",
+        "free_metric": "pg_stat_database_numbackends",
+        "labels": [
+          {
+            "name": "job",
+            "value": "postgres-exporter"
+          }
+        ]
+      }
+    },
+    {
+      "key": "signal_use_connection_utilization",
+      "kind": "signal",
+      "target_ref": "use_connection_utilization",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "pg_settings_max_connections",
+        "free_metric": "pg_stat_database_numbackends",
+        "labels": [
+          {
+            "name": "job",
+            "value": "postgres-exporter"
+          }
+        ],
+        "group_by": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "key": "focus_database_records",
+      "kind": "focus",
+      "target_ref": "database_name",
+      "tool_key": "evidence.search_logs.v1",
+      "template_ref": "focus_records.v1",
+      "params": {
+        "stream": "pg_statement_log",
+        "focus_field": "database_name",
+        "select_fields": [
+          "database_name",
+          "query_id"
+        ],
+        "row_limit": 100
+      }
+    }
+  ]
 }

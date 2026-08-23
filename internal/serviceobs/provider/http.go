@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,7 +65,13 @@ func (s Secret) GoString() string { return "provider.Secret(" + mask(s.value) + 
 func (s Secret) MarshalText() ([]byte, error) { return []byte(mask(s.value)), nil }
 
 // LogValue 让 slog 的结构化输出也走掩码。
-func (s Secret) LogValue() string { return mask(s.value) }
+//
+// 返回类型必须是 slog.Value：早先写成 string 时它**并没有**实现 slog.LogValuer，
+// 掩码其实是靠 MarshalText 侥幸成立的——换一个不走 TextMarshaler 的 handler 就会泄露。
+func (s Secret) LogValue() slog.Value { return slog.StringValue(mask(s.value)) }
+
+// 编译期断言：签名一旦被改回 string，这里立刻编译失败。
+var _ slog.LogValuer = Secret{}
 
 func mask(value string) string {
 	if value == "" {
@@ -170,6 +177,17 @@ func (e Endpoint) String() string {
 	}
 	return e.base.Scheme + "://" + e.base.Host
 }
+
+// GoString 让 %#v 也走安全表示。
+//
+// 没有它时 %#v 会反射打印内部的 *url.URL，把 path（可能含 org/stream 这类部署拓扑）
+// 一起吐出来——String 的收敛就被绕过了。
+func (e Endpoint) GoString() string { return "provider.Endpoint(" + e.String() + ")" }
+
+// LogValue 让 slog 的结构化输出使用同一份安全表示。
+func (e Endpoint) LogValue() slog.Value { return slog.StringValue(e.String()) }
+
+var _ slog.LogValuer = Endpoint{}
 
 // resolve 拼出目标 URL。path 必须是服务端代码里的常量路径。
 func (e Endpoint) resolve(path string) (*url.URL, error) {

@@ -42,14 +42,14 @@ func TestForbiddenKeysAreRejectedBySchema(t *testing.T) {
 		{
 			"params 里塞 sql",
 			func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				bindings[0].(map[string]any)["params"].(map[string]any)["sql"] = "SELECT 1"
 			},
 		},
 		{
 			"params 里塞 matcher",
 			func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				bindings[0].(map[string]any)["params"].(map[string]any)["matcher"] = `{job=~".*"}`
 			},
 		},
@@ -69,7 +69,7 @@ func TestForbiddenKeysAreRejectedBySchema(t *testing.T) {
 		{
 			"label 项里塞 regex",
 			func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				labels := bindings[0].(map[string]any)["params"].(map[string]any)["labels"].([]any)
 				labels[0].(map[string]any)["regex"] = ".*"
 			},
@@ -98,7 +98,7 @@ func TestForbiddenKeyScannerIsSecondGate(t *testing.T) {
 	}{
 		{"顶层", `{"query":"up"}`, "/query"},
 		{"嵌套对象", `{"target":{"secret":"x"}}`, "/target/secret"},
-		{"数组元素内", `{"telemetry_bindings":[{"params":{"promql":"x"}}]}`, "/telemetry_bindings/0/params/promql"},
+		{"数组元素内", `{"provider_bindings":[{"params":{"promql":"x"}}]}`, "/provider_bindings/0/params/promql"},
 		{"大小写不敏感", `{"Authorization":"Bearer x"}`, "/Authorization"},
 		{"深层 endpoint", `{"a":{"b":{"c":{"endpoint":"http://x"}}}}`, "/a/b/c/endpoint"},
 	}
@@ -151,7 +151,7 @@ func TestLabelValuesCannotExpressMatchers(t *testing.T) {
 	for _, value := range hostile {
 		t.Run(strings.ReplaceAll(value, "\n", "\\n"), func(t *testing.T) {
 			err := compileMutated(t, func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				labels := bindings[0].(map[string]any)["params"].(map[string]any)["labels"].([]any)
 				labels[0].(map[string]any)["value"] = value
 			})
@@ -165,7 +165,7 @@ func TestLabelValuesCannotExpressMatchers(t *testing.T) {
 	for _, value := range []string{"e2b-api", "prod.example.com", "job:name", "a/b", "v1+2", "svc@host", "10.60.199.160"} {
 		t.Run("accept "+value, func(t *testing.T) {
 			err := compileMutated(t, func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				labels := bindings[0].(map[string]any)["params"].(map[string]any)["labels"].([]any)
 				labels[0].(map[string]any)["value"] = value
 			})
@@ -191,7 +191,7 @@ func TestMetricSlotsRejectExpressions(t *testing.T) {
 	for _, value := range hostile {
 		t.Run(strings.ReplaceAll(value, "\n", "\\n"), func(t *testing.T) {
 			err := compileMutated(t, func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
+				bindings := doc["provider_bindings"].([]any)
 				for _, item := range bindings {
 					binding := item.(map[string]any)
 					if binding["template_ref"] == "counter_rate.v1" {
@@ -299,7 +299,7 @@ func TestUnknownFieldLeaksOnlyFieldName(t *testing.T) {
 // 校验错误只输出稳定位置，不回显文档正文。
 func TestSchemaErrorDoesNotEchoDocument(t *testing.T) {
 	err := compileMutated(t, func(doc map[string]any) {
-		bindings := doc["telemetry_bindings"].([]any)
+		bindings := doc["provider_bindings"].([]any)
 		labels := bindings[0].(map[string]any)["params"].(map[string]any)["labels"].([]any)
 		labels[0].(map[string]any)["value"] = "leak-me-please .*"
 	})

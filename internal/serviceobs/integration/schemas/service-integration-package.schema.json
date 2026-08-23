@@ -13,7 +13,7 @@
     "compatibility",
     "target",
     "profile_template",
-    "telemetry_bindings",
+    "provider_bindings",
     "topology_policy"
   ],
   "properties": {
@@ -25,11 +25,11 @@
     "compatibility": { "$ref": "#/$defs/compatibility" },
     "target": { "$ref": "#/$defs/target" },
     "profile_template": { "$ref": "#/$defs/profileTemplate" },
-    "telemetry_bindings": {
+    "provider_bindings": {
       "type": "array",
       "minItems": 1,
       "maxItems": 200,
-      "items": { "$ref": "#/$defs/telemetryBinding" }
+      "items": { "$ref": "#/$defs/providerBinding" }
     },
     "topology_policy": { "$ref": "#/$defs/topologyPolicy" }
   },
@@ -327,13 +327,19 @@
       "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"
     },
 
-    "telemetryBinding": {
-      "description": "把一个 signal binding 绑到一个受信 provider template 上。package 只能给出 template ref 与类型化参数；PromQL/SQL 由服务端 adapter 从模板构造，package 永远提交不了查询文本。",
+    "providerBinding": {
+      "description": "把 Profile 里的一个目标绑到一个受信 provider template 上。package 只能给出 kind、target、tool、template ref 与类型化参数；PromQL/SQL 由服务端 adapter 从模板构造，package 永远提交不了查询文本。kind 只标识**主要**目标：focus、trace EvidenceRef、topology hints 这类固定 side output 由受信 template registry 声明，package 既不能自行增加，也不能为同一次 trace 读取重复建 binding。",
       "type": "object",
       "additionalProperties": false,
-      "required": ["binding_key", "template_ref", "params"],
+      "required": ["key", "kind", "target_ref", "tool_key", "template_ref", "params"],
       "properties": {
-        "binding_key": { "$ref": "#/$defs/objectKey" },
+        "key": { "$ref": "#/$defs/objectKey" },
+        "kind": {
+          "description": "signal 指向 signal_bindings[].key；focus 与 evidence 指向 focus_kinds[].key；journey 指向 journeys[].key。刻意没有 topology：observed topology hints 是 trace template 的声明输出，单独的 topology kind 只会让同一次 trace 查询被重复发起。",
+          "enum": ["signal", "focus", "journey", "evidence"]
+        },
+        "target_ref": { "$ref": "#/$defs/objectKey" },
+        "tool_key": { "$ref": "#/$defs/toolKey" },
         "template_ref": { "$ref": "#/$defs/templateRef" },
         "params": { "$ref": "#/$defs/templateParams" }
       }
@@ -356,6 +362,9 @@
         "total_metric": { "$ref": "#/$defs/metricIdentifier" },
         "free_metric": { "$ref": "#/$defs/metricIdentifier" },
         "labels": { "$ref": "#/$defs/labelEqualitySet" },
+        "common_labels": { "$ref": "#/$defs/labelEqualitySet" },
+        "numerator_labels": { "$ref": "#/$defs/labelEqualitySet" },
+        "denominator_labels": { "$ref": "#/$defs/labelEqualitySet" },
         "group_by": {
           "type": "array",
           "maxItems": 10,

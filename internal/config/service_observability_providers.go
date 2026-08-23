@@ -1,7 +1,9 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -41,8 +43,8 @@ type ServiceObservabilityProvidersConfig struct {
 type ProviderEndpointConfig struct {
 	// Endpoint 已经过安全校验。零值表示未连接。
 	Endpoint provider.Endpoint
-	// Token 是服务账号凭据，只在 request header 注入。
-	Token provider.Secret
+	// Auth 是显式认证配置：none/basic/bearer。凭据只在 request header 注入。
+	Auth ProviderAuthConfig
 	// Organization 是 OpenObserve 这类多租户 provider 的 org 标识。它不是凭据，但也不该
 	// 进日志：org 名会泄露部署拓扑。
 	Organization     string
@@ -59,10 +61,29 @@ func (p ProviderEndpointConfig) Connected() bool { return !p.Endpoint.IsZero() }
 // String 只输出连接性与限额，绝不输出 endpoint 路径、org、用户名或凭据。
 func (p ProviderEndpointConfig) String() string {
 	return fmt.Sprintf(
-		"ProviderEndpointConfig{Connected:%t, Host:%q, Token:%s, Timeout:%s, MaxResponseBytes:%d, MaxConcurrent:%d, MaxRows:%d, MaxSeries:%d}",
-		p.Connected(), p.Endpoint.Host(), p.Token, p.Timeout,
+		"ProviderEndpointConfig{Connected:%t, Host:%q, Auth:%s, HasOrganization:%t, Timeout:%s, MaxResponseBytes:%d, MaxConcurrent:%d, MaxRows:%d, MaxSeries:%d}",
+		p.Connected(), p.Endpoint.Host(), p.Auth, p.Organization != "", p.Timeout,
 		p.MaxResponseBytes, p.MaxConcurrent, p.MaxRows, p.MaxSeries)
 }
+
+// GoString 让 %#v 也走安全表示：否则反射会把 organization 与 endpoint 内部字段打出来。
+func (p ProviderEndpointConfig) GoString() string { return "config." + p.String() }
+
+// MarshalJSON 让 JSON 序列化也只输出安全表示。
+//
+// 这一条是必须的：Password/Token 各自有掩码，但 Username 与 Organization 是普通字符串，
+// 一次 json.Marshal(整个配置) 就会把上游账号与 org 名写进去。实测正是这样漏的。
+func (p ProviderEndpointConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.String())
+}
+
+// LogValue 让 slog 的结构化输出走同一份安全表示。
+func (p ProviderEndpointConfig) LogValue() slog.Value { return slog.StringValue(p.String()) }
+
+var (
+	_ slog.LogValuer = ProviderEndpointConfig{}
+	_ json.Marshaler = ProviderEndpointConfig{}
+)
 
 // String 同样只输出可安全记录的项。
 func (c ServiceObservabilityProvidersConfig) String() string {
@@ -72,14 +93,31 @@ func (c ServiceObservabilityProvidersConfig) String() string {
 		c.GrantCleanupBatch, c.BackgroundRefreshMinInterval)
 }
 
+// GoString / MarshalJSON / LogValue 让整份 provider 配置在任何输出路径上都只暴露安全表示。
+func (c ServiceObservabilityProvidersConfig) GoString() string { return "config." + c.String() }
+
+func (c ServiceObservabilityProvidersConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.String())
+}
+
+func (c ServiceObservabilityProvidersConfig) LogValue() slog.Value {
+	return slog.StringValue(c.String())
+}
+
+var (
+	_ slog.LogValuer = ServiceObservabilityProvidersConfig{}
+	_ json.Marshaler = ServiceObservabilityProvidersConfig{}
+)
+
 type fileProviderEndpointConfig struct {
-	Endpoint         string `yaml:"endpoint"`
-	Organization     string `yaml:"organization"`
-	Timeout          string `yaml:"timeout"`
-	MaxResponseBytes int64  `yaml:"max_response_bytes"`
-	MaxConcurrent    int    `yaml:"max_concurrent"`
-	MaxRows          int    `yaml:"max_rows"`
-	MaxSeries        int    `yaml:"max_series"`
+	Endpoint         string                 `yaml:"endpoint"`
+	Organization     string                 `yaml:"organization"`
+	Timeout          string                 `yaml:"timeout"`
+	MaxResponseBytes int64                  `yaml:"max_response_bytes"`
+	MaxConcurrent    int                    `yaml:"max_concurrent"`
+	MaxRows          int                    `yaml:"max_rows"`
+	MaxSeries        int                    `yaml:"max_series"`
+	Auth             fileProviderAuthConfig `yaml:"auth"`
 }
 
 type fileServiceObservabilityProvidersConfig struct {
@@ -141,8 +179,6 @@ func normalizeServiceObservabilityProviders(
 	if err != nil {
 		return ServiceObservabilityProvidersConfig{}, err
 	}
-	prometheus.Token = provider.NewSecret(strings.TrimSpace(os.Getenv("SERVICE_OBSERVABILITY_PROMETHEUS_TOKEN")))
-	openObserve.Token = provider.NewSecret(strings.TrimSpace(os.Getenv("SERVICE_OBSERVABILITY_OPENOBSERVE_TOKEN")))
 
 	grantTTL, err := time.ParseDuration(fc.EvidenceGrantTTL)
 	if err != nil {
@@ -195,6 +231,10 @@ func normalizeProviderEndpoint(
 		return ProviderEndpointConfig{}, fmt.Errorf(
 			"invalid service_observability.providers.%s.endpoint: %w", name, err)
 	}
+	auth, err := normalizeProviderAuth(name, fc.Auth, !endpoint.IsZero())
+	if err != nil {
+		return ProviderEndpointConfig{}, err
+	}
 	timeout, err := time.ParseDuration(fc.Timeout)
 	if err != nil {
 		return ProviderEndpointConfig{}, fmt.Errorf(
@@ -225,6 +265,7 @@ func normalizeProviderEndpoint(
 	}
 	return ProviderEndpointConfig{
 		Endpoint:         endpoint,
+		Auth:             auth,
 		Organization:     strings.TrimSpace(fc.Organization),
 		Timeout:          timeout,
 		MaxResponseBytes: fc.MaxResponseBytes,
@@ -278,6 +319,7 @@ func applyProviderEnv(prefix string, target *fileProviderEndpointConfig) {
 	if v := os.Getenv(base + "MAX_SERIES"); v != "" {
 		target.MaxSeries = invalidIfNotInteger(v)
 	}
+	applyProviderAuthEnvOverrides(prefix, &target.Auth)
 }
 
 // invalidIfNotInteger64 与 invalidIfNotInteger 同口径：非法值映射成必然被拒绝的 0。

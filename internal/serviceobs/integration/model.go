@@ -22,16 +22,16 @@ package integration
 // target 解析与 package 元数据生成，package 作者写不出真实 ID，也无法自行把 draft 提成
 // published Profile。
 type Package struct {
-	SchemaVersion   string             `json:"schema_version"`
-	PackageKey      string             `json:"package_key"`
-	PackageVersion  int                `json:"package_version"`
-	Status          Status             `json:"status"`
-	Description     string             `json:"description,omitempty"`
-	Compatibility   Compatibility      `json:"compatibility"`
-	Target          Target             `json:"target"`
-	ProfileTemplate ProfileTemplate    `json:"profile_template"`
-	Telemetry       []TelemetryBinding `json:"telemetry_bindings"`
-	TopologyPolicy  TopologyPolicy     `json:"topology_policy"`
+	SchemaVersion   string            `json:"schema_version"`
+	PackageKey      string            `json:"package_key"`
+	PackageVersion  int               `json:"package_version"`
+	Status          Status            `json:"status"`
+	Description     string            `json:"description,omitempty"`
+	Compatibility   Compatibility     `json:"compatibility"`
+	Target          Target            `json:"target"`
+	ProfileTemplate ProfileTemplate   `json:"profile_template"`
+	Bindings        []ProviderBinding `json:"provider_bindings"`
+	TopologyPolicy  TopologyPolicy    `json:"topology_policy"`
 }
 
 // Status 是 package 的发布状态。它决定编译产物的 Profile status，因此 draft package
@@ -156,9 +156,45 @@ type TemplateLimits struct {
 	FreshnessTTLSeconds  int `json:"freshness_ttl_seconds"`
 }
 
-// TelemetryBinding 把一个 signal binding 绑到一个受信 provider template。
-type TelemetryBinding struct {
-	BindingKey  string         `json:"binding_key"`
+// BindingKind 是 provider binding 的主要目标类型。
+//
+// 刻意没有 topology：observed topology hints 是 trace template 的**声明输出**，由 topology
+// policy 约束。单独给它一个 kind 只会让同一次 trace 读取被 journey、evidence、topology 三条
+// binding 重复发起——那既浪费上游预算，也让三份结果的时间窗可能不一致。
+type BindingKind string
+
+const (
+	// KindSignal 指向 profile_template.signal_bindings[].key。
+	KindSignal BindingKind = "signal"
+	// KindFocus 指向 profile_template.focus_kinds[].key：回答"这个 focus 值命中了吗"。
+	KindFocus BindingKind = "focus"
+	// KindJourney 指向 profile_template.journeys[].key。
+	KindJourney BindingKind = "journey"
+	// KindEvidence 指向查询所依赖的 focus kind；logs/traces/access class 由受信 template
+	// registry 推导，package 不能自报 class。
+	KindEvidence BindingKind = "evidence"
+)
+
+// IsValid 判断是否是已知 kind。零值不合法：package 必须显式声明目标类型。
+func (k BindingKind) IsValid() bool {
+	switch k {
+	case KindSignal, KindFocus, KindJourney, KindEvidence:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProviderBinding 把 Profile 里的一个目标绑到一个受信 provider template。
+//
+// Kind 只标识**主要**目标。focus、trace EvidenceRef、topology hints 这类固定 side output 由
+// template registry 声明，adapter 必须在同一次有界读取里投影它们；package 既不能自行增加
+// side output，也不能为同一次 trace 读取再建一条 binding。
+type ProviderBinding struct {
+	Key         string         `json:"key"`
+	Kind        BindingKind    `json:"kind"`
+	TargetRef   string         `json:"target_ref"`
+	ToolKey     string         `json:"tool_key"`
 	TemplateRef string         `json:"template_ref"`
 	Params      TemplateParams `json:"params"`
 }
@@ -175,6 +211,14 @@ type TemplateParams struct {
 	TotalMetric       string          `json:"total_metric,omitempty"`
 	FreeMetric        string          `json:"free_metric,omitempty"`
 	Labels            []LabelEquality `json:"labels,omitempty"`
+	// CommonLabels/NumeratorLabels/DenominatorLabels 是比率模板的三组 typed 选择器。
+	//
+	// 拆成三组是因为"分子与分母用同一组 label"必然算出恒 100%：E2B 的 error ratio 就踩过
+	// 这个坑——numerator 与 denominator 是同一个 counter、同一组 label，任何非零样本都会
+	// 算成 100% 错误率。compiler 因此拒绝"同 metric 且两侧有效选择器完全相同"。
+	CommonLabels      []LabelEquality `json:"common_labels,omitempty"`
+	NumeratorLabels   []LabelEquality `json:"numerator_labels,omitempty"`
+	DenominatorLabels []LabelEquality `json:"denominator_labels,omitempty"`
 	GroupBy           []string        `json:"group_by,omitempty"`
 	Quantile          *float64        `json:"quantile,omitempty"`
 	RangeSeconds      *int            `json:"range_seconds,omitempty"`

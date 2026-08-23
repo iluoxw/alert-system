@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -712,8 +713,13 @@ func TestNoGoroutineLeakAfterCancellation(t *testing.T) {
 
 // ---- 合并语义 ----
 
-// focus 结论取最坏：traces 说命中、logs 说不知道，整体必须是不知道。
-func TestFocusMergeTakesWorstResult(t *testing.T) {
+// focus 合并顺序是 matched > unknown > empty。
+//
+// 这与本文件早先的断言相反：那一版按"最坏优先"把 matched + unknown 判成 unknown。
+// 已确认命中是**正事实**——一个来源真的看到了这次请求，它就发生过，另一个来源超时或没权限
+// 都不能把它抹掉。反过来没有命中时，只要有一个已请求来源不知道就不能宣称 Empty，
+// 否则会把"查不到"说成"没发生"。
+func TestFocusMergeFollowsMatchedUnknownEmptyPriority(t *testing.T) {
 	cases := []struct {
 		name       string
 		traceFocus serviceobs.FocusResult
@@ -721,8 +727,9 @@ func TestFocusMergeTakesWorstResult(t *testing.T) {
 		want       serviceobs.FocusResult
 	}{
 		{"都命中", serviceobs.FocusMatched, serviceobs.FocusMatched, serviceobs.FocusMatched},
-		{"一个不知道", serviceobs.FocusMatched, serviceobs.FocusUnknown, serviceobs.FocusUnknown},
+		{"命中优先于不知道", serviceobs.FocusMatched, serviceobs.FocusUnknown, serviceobs.FocusMatched},
 		{"命中优先于空", serviceobs.FocusMatched, serviceobs.FocusEmpty, serviceobs.FocusMatched},
+		{"没有命中时不知道优先于空", serviceobs.FocusUnknown, serviceobs.FocusEmpty, serviceobs.FocusUnknown},
 		{"都空", serviceobs.FocusEmpty, serviceobs.FocusEmpty, serviceobs.FocusEmpty},
 	}
 	for _, tc := range cases {
@@ -914,5 +921,187 @@ func TestCoordinatorSatisfiesPhase2Port(t *testing.T) {
 	var reader serviceobs.ObservationReader = New(Options{})
 	if reader == nil {
 		t.Fatal("Coordinator 应满足 ObservationReader")
+	}
+}
+
+// ---- correction：focus 只被"参与 focus 判定的来源"影响 ----
+
+// 修复前所有失败来源都无条件报 FocusUnknown，于是一次 Prometheus 超时就能把 traces 已经
+// 确认命中的 focus 降级成 Unknown。focus 语义因此必须由 affectsFocus 决定。
+func TestFocusIsNotPollutedByNonFocusSources(t *testing.T) {
+	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
+	matchedTraces := func() *fakeTraces {
+		return &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusMatched}}
+	}
+
+	cases := []struct {
+		name    string
+		readers Readers
+		focus   *model.Focus
+		want    serviceobs.FocusResult
+	}{
+		{
+			name: "traces matched + Prometheus timeout => matched",
+			readers: Readers{
+				Signals: &fakeSignals{err: errors.New("prometheus timeout")},
+				Traces:  matchedTraces(), Logs: &fakeLogs{}, Access: &fakeAccess{},
+			},
+			focus: &focusValue,
+			want:  serviceobs.FocusMatched,
+		},
+		{
+			name: "traces matched + logs unavailable => matched",
+			readers: Readers{
+				Signals: &fakeSignals{}, Traces: matchedTraces(),
+				Logs: &fakeLogs{err: ErrUpstreamRateLimited}, Access: &fakeAccess{},
+			},
+			focus: &focusValue,
+			want:  serviceobs.FocusMatched,
+		},
+		{
+			name: "traces empty + logs Forbidden => unknown",
+			readers: Readers{
+				Signals: &fakeSignals{},
+				Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusEmpty}},
+				Logs:    &fakeLogs{}, Access: &fakeAccess{},
+			},
+			focus: &focusValue,
+			want:  serviceobs.FocusUnknown,
+		},
+		{
+			name: "全部 focus 来源未连接且已请求 focus => unknown",
+			// 只配 Prometheus：traces/logs/access 都被请求但未连接。
+			readers: Readers{Signals: &fakeSignals{}},
+			focus:   &focusValue,
+			want:    serviceobs.FocusUnknown,
+		},
+		{
+			name: "没有 focus 且全部来源失败 => not_requested",
+			readers: Readers{
+				Signals: &fakeSignals{err: errors.New("boom")},
+				Traces:  &fakeTraces{err: errors.New("boom")},
+				Logs:    &fakeLogs{err: errors.New("boom")},
+				Access:  &fakeAccess{},
+			},
+			focus: nil,
+			want:  serviceobs.FocusNotRequested,
+		},
+		{
+			name: "全部 focus 来源确认无记录 => empty",
+			readers: Readers{
+				Signals: &fakeSignals{},
+				Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusEmpty}},
+				Logs:    &fakeLogs{facts: serviceobs.LogFacts{Focus: serviceobs.FocusEmpty}},
+				Access:  &fakeAccess{facts: serviceobs.AccessFacts{Focus: serviceobs.FocusEmpty}},
+			},
+			focus: &focusValue,
+			want:  serviceobs.FocusEmpty,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// logs Forbidden 的用例需要一个不给 logs.read 的权限集。
+			permissions := allPermissions()
+			if strings.Contains(tc.name, "logs Forbidden") {
+				permissions = &fakePermissions{granted: []serviceobs.Permission{
+					serviceobs.PermissionMetricsRead, serviceobs.PermissionTracesRead,
+				}}
+			}
+			coordinator := New(Options{Readers: tc.readers, Permissions: permissions})
+			req := workspaceRequest()
+			req.Focus = tc.focus
+			facts, err := coordinator.ReadObservations(context.Background(), req)
+			if err != nil {
+				t.Fatalf("ReadObservations 失败: %v", err)
+			}
+			if facts.Focus != tc.want {
+				t.Fatalf("Focus=%q，want %q", facts.Focus, tc.want)
+			}
+		})
+	}
+}
+
+// signal 来源失败在没有 focus 时也不该报告 focus 结论。
+func TestSignalFailureNeverReportsFocus(t *testing.T) {
+	focusValue := model.Focus{Kind: "sandbox_id", Value: "sbx_hp16c3"}
+	coordinator := New(Options{
+		Readers: Readers{
+			Signals: &fakeSignals{err: errors.New("boom")},
+			Traces:  &fakeTraces{facts: serviceobs.TraceFacts{Focus: serviceobs.FocusEmpty}},
+			Logs:    &fakeLogs{facts: serviceobs.LogFacts{Focus: serviceobs.FocusEmpty}},
+			Access:  &fakeAccess{facts: serviceobs.AccessFacts{Focus: serviceobs.FocusEmpty}},
+		},
+		Permissions: allPermissions(),
+	})
+	req := workspaceRequest()
+	req.Focus = &focusValue
+	facts, err := coordinator.ReadObservations(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	// 三个 focus 来源都确认无记录，signal 失败不参与 focus：结论必须是 Empty 而不是 Unknown。
+	if facts.Focus != serviceobs.FocusEmpty {
+		t.Fatalf("Focus=%q，signal 失败不应污染 focus", facts.Focus)
+	}
+}
+
+// ---- correction：summary binding keys 单点解析 ----
+
+// 注入自定义 SummaryBindingKeys 时，"上游请求集"与"merge 的 Unknown 补齐集"必须逐项一致。
+//
+// 修复前是两套推导：runSources 用注入的函数，merge 又硬编码 GoldenBindings，于是自定义
+// 摘要 key 会让页面少几条本该显式 Unknown 的信号。
+func TestCustomSummaryBindingKeysAreUsedForBothRequestAndBackfill(t *testing.T) {
+	custom := []string{"golden_latency", "red_rate"}
+	signals := &fakeSignals{}
+	coordinator := New(Options{
+		Readers:            Readers{Signals: signals},
+		Permissions:        allPermissions(),
+		SummaryBindingKeys: func(model.Profile) []string { return custom },
+	})
+	req := workspaceRequest()
+	req.Purpose = serviceobs.PurposeDirectorySummary
+	facts, err := coordinator.ReadObservations(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+
+	requested := signals.request().BindingKeys
+	if len(requested) != len(custom) {
+		t.Fatalf("请求集=%v，want %v", requested, custom)
+	}
+	backfilled := make([]string, 0, len(facts.Signals))
+	for _, signal := range facts.Signals {
+		backfilled = append(backfilled, signal.BindingKey)
+	}
+	if len(backfilled) != len(custom) {
+		t.Fatalf("补齐集=%v，want %v（不能回落到 GoldenBindings）", backfilled, custom)
+	}
+	wanted := map[string]struct{}{}
+	for _, key := range custom {
+		wanted[key] = struct{}{}
+	}
+	for _, key := range backfilled {
+		if _, ok := wanted[key]; !ok {
+			t.Fatalf("补齐了未被请求的 binding %s", key)
+		}
+	}
+}
+
+// 完全未配置时也走同一份 key 解析。
+func TestNotConnectedUsesSameBindingKeyResolution(t *testing.T) {
+	custom := []string{"only_one"}
+	coordinator := New(Options{
+		Permissions:        allPermissions(),
+		SummaryBindingKeys: func(model.Profile) []string { return custom },
+	})
+	req := workspaceRequest()
+	req.Purpose = serviceobs.PurposeDirectorySummary
+	facts, err := coordinator.ReadObservations(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ReadObservations 失败: %v", err)
+	}
+	if len(facts.Signals) != 1 || facts.Signals[0].BindingKey != "only_one" {
+		t.Fatalf("signals=%+v，应只补自定义摘要 key", facts.Signals)
 	}
 }

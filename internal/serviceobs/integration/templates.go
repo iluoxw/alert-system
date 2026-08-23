@@ -38,6 +38,9 @@ const (
 	SlotTotalMetric       ParamSlot = "total_metric"
 	SlotFreeMetric        ParamSlot = "free_metric"
 	SlotLabels            ParamSlot = "labels"
+	SlotCommonLabels      ParamSlot = "common_labels"
+	SlotNumeratorLabels   ParamSlot = "numerator_labels"
+	SlotDenominatorLabels ParamSlot = "denominator_labels"
 	SlotGroupBy           ParamSlot = "group_by"
 	SlotQuantile          ParamSlot = "quantile"
 	SlotRangeSeconds      ParamSlot = "range_seconds"
@@ -49,10 +52,41 @@ const (
 	SlotRowLimit          ParamSlot = "row_limit"
 )
 
+// EvidenceClass 是 evidence binding 的证据类别。它由受信 registry 推导，package 不能自报。
+type EvidenceClass string
+
+const (
+	EvidenceClassLogs   EvidenceClass = "logs"
+	EvidenceClassTraces EvidenceClass = "traces"
+	EvidenceClassAccess EvidenceClass = "access"
+)
+
+// SideOutput 是模板在同一次有界读取里必然额外投影的产物。
+//
+// 它存在的目的正是**防止重复查询**：一次 trace 读取本来就能同时给出 journey 阶段、focus
+// 结论、trace EvidenceRef 与 observed topology hints，没有理由让 package 为每一项各建一条
+// binding。compiler 因此把 side output 也算进"谁提供了这个东西"的唯一性判定。
+type SideOutput string
+
+const (
+	SideOutputFocus         SideOutput = "focus"
+	SideOutputTraceEvidence SideOutput = "trace_evidence"
+	SideOutputTopologyHints SideOutput = "topology_hints"
+)
+
 // Template 是一个受信 provider 查询模板的**契约描述**。
 type Template struct {
 	Ref        string
 	Capability Capability
+	// AllowedKinds 是该模板可以充当的主要 binding kind。空集是配置错误。
+	AllowedKinds []BindingKind
+	// SourceKey 是该模板读取时归属的稳定 source key。它进 CompiledIntegration，
+	// 让 coordinator 与 adapter 不必再从 capability 猜。
+	SourceKey string
+	// EvidenceClass 只在模板可充当 evidence 时有意义。
+	EvidenceClass EvidenceClass
+	// SideOutputs 是固定的额外产物。package 不能增删。
+	SideOutputs []SideOutput
 	// Required 是必须出现的槽位；Optional 是允许出现的槽位。两者之外的槽位一律拒绝，
 	// 因此"给 gauge 模板传 quantile"这种错配不会被静默忽略。
 	Required []ParamSlot
@@ -64,6 +98,16 @@ type Template struct {
 	RequiredPermission string
 	Summary            string
 }
+
+// source key 与 serviceobs 的稳定 source key 逐字一致。这里重复声明而不是 import
+// serviceobs：integration 是编写/发布期包，不该依赖运行时 ports；两侧的一致性由
+// TestTemplateSourceKeysMatchRuntime 守护。
+const (
+	SourceKeyPrometheus        = "prometheus_compatible"
+	SourceKeyOpenObserveLogs   = "openobserve_logs"
+	SourceKeyOpenObserveTraces = "openobserve_traces"
+	SourceKeyOpenObserveAccess = "openobserve_access"
+)
 
 // 权限 key 与设计交接稿 §14 一致：metrics/logs/traces/faults 分离。
 const (
@@ -78,6 +122,8 @@ var registry = func() map[string]Template {
 		{
 			Ref:                "counter_rate.v1",
 			Capability:         CapabilityPrometheus,
+			AllowedKinds:       []BindingKind{KindSignal},
+			SourceKey:          SourceKeyPrometheus,
 			Required:           []ParamSlot{SlotMetric, SlotRangeSeconds},
 			Optional:           []ParamSlot{SlotLabels, SlotGroupBy},
 			Outputs:            []string{"series.rate_per_second"},
@@ -85,10 +131,14 @@ var registry = func() map[string]Template {
 			Summary:            "counter 的区间速率",
 		},
 		{
-			Ref:                "counter_ratio_percent.v1",
-			Capability:         CapabilityPrometheus,
-			Required:           []ParamSlot{SlotNumeratorMetric, SlotDenominatorMetric, SlotRangeSeconds},
-			Optional:           []ParamSlot{SlotLabels, SlotGroupBy},
+			Ref:          "counter_ratio_percent.v1",
+			Capability:   CapabilityPrometheus,
+			AllowedKinds: []BindingKind{KindSignal},
+			SourceKey:    SourceKeyPrometheus,
+			Required:     []ParamSlot{SlotNumeratorMetric, SlotDenominatorMetric, SlotRangeSeconds},
+			// 三组 label 分开：common 施加到两侧，numerator/denominator 各自附加。
+			// 只用一组 label 会让"同 metric 的错误率"恒等于 100%。
+			Optional:           []ParamSlot{SlotCommonLabels, SlotNumeratorLabels, SlotDenominatorLabels, SlotGroupBy},
 			Outputs:            []string{"series.ratio_percent"},
 			RequiredPermission: PermissionMetricsRead,
 			Summary:            "两个 counter 的百分比",
@@ -96,6 +146,8 @@ var registry = func() map[string]Template {
 		{
 			Ref:                "histogram_quantile_rate.v1",
 			Capability:         CapabilityPrometheus,
+			AllowedKinds:       []BindingKind{KindSignal},
+			SourceKey:          SourceKeyPrometheus,
 			Required:           []ParamSlot{SlotBucketMetric, SlotQuantile, SlotRangeSeconds},
 			Optional:           []ParamSlot{SlotLabels, SlotGroupBy},
 			Outputs:            []string{"series.quantile_value"},
@@ -105,6 +157,8 @@ var registry = func() map[string]Template {
 		{
 			Ref:                "gauge_ratio_percent.v1",
 			Capability:         CapabilityPrometheus,
+			AllowedKinds:       []BindingKind{KindSignal},
+			SourceKey:          SourceKeyPrometheus,
 			Required:           []ParamSlot{SlotTotalMetric, SlotFreeMetric},
 			Optional:           []ParamSlot{SlotLabels, SlotGroupBy},
 			Outputs:            []string{"series.ratio_percent"},
@@ -114,6 +168,8 @@ var registry = func() map[string]Template {
 		{
 			Ref:                "gauge_max.v1",
 			Capability:         CapabilityPrometheus,
+			AllowedKinds:       []BindingKind{KindSignal},
+			SourceKey:          SourceKeyPrometheus,
 			Required:           []ParamSlot{SlotMetric},
 			Optional:           []ParamSlot{SlotLabels, SlotGroupBy},
 			Outputs:            []string{"series.max_value"},
@@ -121,17 +177,30 @@ var registry = func() map[string]Template {
 			Summary:            "gauge 的最坏值",
 		},
 		{
+			// 逐条 focus 记录搜索。E2B 的逐条关联字段在 logs 流（e2b_logs）上，因此它的
+			// source 与权限都是 logs 一侧，不借 traces.read 放行。
 			Ref:                "focus_records.v1",
 			Capability:         CapabilityOpenObserve,
+			AllowedKinds:       []BindingKind{KindFocus},
+			SourceKey:          SourceKeyOpenObserveLogs,
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotSelectFields, SlotRowLimit},
 			Optional:           []ParamSlot{SlotStageField, SlotStatusField},
 			Outputs:            []string{"records.count", "records.first_observed_at", "records.last_observed_at"},
-			RequiredPermission: PermissionTracesRead,
+			RequiredPermission: PermissionLogsRead,
 			Summary:            "按 focus 逐条取记录",
 		},
 		{
-			Ref:                "trace_by_focus.v1",
-			Capability:         CapabilityOpenObserve,
+			// 一次 trace 读取同时给出 journey 阶段（主）、focus 结论、trace EvidenceRef 与
+			// observed topology hints（三个 side output）。这正是为什么不存在 topology kind：
+			// 那会让同一次读取被重复发起三遍。
+			Ref:           "trace_by_focus.v1",
+			Capability:    CapabilityOpenObserve,
+			AllowedKinds:  []BindingKind{KindJourney, KindEvidence},
+			SourceKey:     SourceKeyOpenObserveTraces,
+			EvidenceClass: EvidenceClassTraces,
+			SideOutputs: []SideOutput{
+				SideOutputFocus, SideOutputTraceEvidence, SideOutputTopologyHints,
+			},
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
 			Optional:           []ParamSlot{SlotSelectFields, SlotStageField},
 			Outputs:            []string{"traces.count", "traces.last_observed_at"},
@@ -141,6 +210,10 @@ var registry = func() map[string]Template {
 		{
 			Ref:                "logs_by_focus.v1",
 			Capability:         CapabilityOpenObserve,
+			AllowedKinds:       []BindingKind{KindEvidence},
+			SourceKey:          SourceKeyOpenObserveLogs,
+			EvidenceClass:      EvidenceClassLogs,
+			SideOutputs:        []SideOutput{SideOutputFocus},
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
 			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField},
 			Outputs:            []string{"logs.count", "logs.last_observed_at"},
@@ -152,6 +225,10 @@ var registry = func() map[string]Template {
 			// payload，否则必须按 logs.read 从严要求，而不是借 traces.read 放行。
 			Ref:                "access_by_focus.v1",
 			Capability:         CapabilityOpenObserve,
+			AllowedKinds:       []BindingKind{KindEvidence},
+			SourceKey:          SourceKeyOpenObserveAccess,
+			EvidenceClass:      EvidenceClassAccess,
+			SideOutputs:        []SideOutput{SideOutputFocus},
 			Required:           []ParamSlot{SlotStream, SlotFocusField, SlotRowLimit},
 			Optional:           []ParamSlot{SlotSelectFields, SlotStatusField},
 			Outputs:            []string{"access.count", "access.last_observed_at"},
@@ -180,6 +257,26 @@ func TemplateRefs() []string {
 	}
 	sort.Strings(refs)
 	return refs
+}
+
+// AllowsKind 判断该模板能否充当某个主要 binding kind。
+func (t Template) AllowsKind(kind BindingKind) bool {
+	for _, allowed := range t.AllowedKinds {
+		if allowed == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// ProvidesSideOutput 判断该模板是否必然额外投影某个产物。
+func (t Template) ProvidesSideOutput(output SideOutput) bool {
+	for _, side := range t.SideOutputs {
+		if side == output {
+			return true
+		}
+	}
+	return false
 }
 
 // allowsOutput 判断 output_field 是否是该模板真的会产出的字段。
@@ -243,7 +340,7 @@ func (t Template) validateParams(bindingKey string, params TemplateParams) error
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return failf(ReasonTemplateParamInvalid,
-			"telemetry_bindings[%s] 模板 %s 缺少必填参数 %v", bindingKey, t.Ref, missing)
+			"provider_bindings[%s] 模板 %s 缺少必填参数 %v", bindingKey, t.Ref, missing)
 	}
 
 	unexpected := make([]string, 0, len(present))
@@ -255,7 +352,7 @@ func (t Template) validateParams(bindingKey string, params TemplateParams) error
 	if len(unexpected) > 0 {
 		sort.Strings(unexpected)
 		return failf(ReasonTemplateParamInvalid,
-			"telemetry_bindings[%s] 模板 %s 不接受参数 %v", bindingKey, t.Ref, unexpected)
+			"provider_bindings[%s] 模板 %s 不接受参数 %v", bindingKey, t.Ref, unexpected)
 	}
 	return nil
 }

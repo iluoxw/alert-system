@@ -116,6 +116,14 @@ func postgresResolver() *fakeResolver {
 	}
 }
 
+// resolverOf 把接口还原成具体替身，便于按已知实体构造可达集合。
+func resolverOf(resolver SelectorResolver) *fakeResolver {
+	if fake, ok := resolver.(*fakeResolver); ok {
+		return fake
+	}
+	return &fakeResolver{}
+}
+
 func newCompiler(t *testing.T, resolver SelectorResolver) *Compiler {
 	t.Helper()
 	validator, err := NewValidator()
@@ -135,11 +143,99 @@ func newCompiler(t *testing.T, resolver SelectorResolver) *Compiler {
 		t.Fatalf("构造 Profile document validator 失败: %v", err)
 	}
 	return &Compiler{
-		Validator: validator,
-		Profiles:  documents,
-		Resolver:  resolver,
-		Now:       func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
+		Validator:         validator,
+		Profiles:          documents,
+		Tools:             catalogDescriptors{catalog},
+		Resolver:          resolver,
+		ProfileReferences: profileRefResolver{reachable: reachableFrom(resolverOf(resolver))},
+		Now:               func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
 	}
+}
+
+// catalogDescriptors 把真实 tools.Catalog 适配成 compiler 需要的最小 descriptor 源。
+type catalogDescriptors struct{ catalog *tools.Catalog }
+
+func (c catalogDescriptors) Get(key string) (ToolDescriptor, error) {
+	descriptor, err := c.catalog.Get(key)
+	if err != nil {
+		return ToolDescriptor{}, err
+	}
+	return ToolDescriptor{
+		Key:                 descriptor.Key,
+		SourceAdapter:       descriptor.SourceAdapter,
+		RequiredPermissions: descriptor.RequiredPermissions,
+	}, nil
+}
+
+// profileRefResolver 是 profile.Resolver 的替身：让生成出来的 Profile 引用可解析、同环境、可达。
+//
+// 它刻意**不**替 compiler 做环境过滤：SIP selector 的环境断言是 compiler 自己的职责，
+// TestEntityEnvironmentMismatchFailsClosed 用一个会返回别的环境的 SIP resolver 来验证那一点。
+// 这里模拟的是 Registry 侧的引用校验（root 同环境/global + 有界可达）。
+type profileRefResolver struct {
+	environment string
+	// reachable 是从 service entity 出发可达的实体 ID 集合。
+	reachable map[string]struct{}
+	// rootEnvironment 非空时覆盖 root entity 的环境，用于构造环境不一致。
+	rootEnvironment string
+	fatal           error
+}
+
+func (r profileRefResolver) env() string {
+	if r.environment == "" {
+		return "production"
+	}
+	return r.environment
+}
+
+func (r profileRefResolver) ResolveService(
+	_ context.Context, _ string,
+) (profile.ServiceResolution, error) {
+	if r.fatal != nil {
+		return profile.ServiceResolution{}, r.fatal
+	}
+	return profile.ServiceResolution{
+		State: profile.ResolutionFound, EntityID: "service-entity", Environment: r.env(),
+	}, nil
+}
+
+func (r profileRefResolver) ResolveEntity(
+	_ context.Context, _ string,
+) (profile.EntityResolution, error) {
+	if r.fatal != nil {
+		return profile.EntityResolution{}, r.fatal
+	}
+	environment := r.env()
+	if r.rootEnvironment != "" {
+		environment = r.rootEnvironment
+	}
+	return profile.EntityResolution{State: profile.ResolutionFound, Environment: environment}, nil
+}
+
+func (r profileRefResolver) DeclaredReachableEntityIDs(
+	_ context.Context, _ string, _ int,
+) (map[string]struct{}, error) {
+	if r.fatal != nil {
+		return nil, r.fatal
+	}
+	if r.reachable == nil {
+		return map[string]struct{}{}, nil
+	}
+	return r.reachable, nil
+}
+
+// reachableFrom 把 SIP fake resolver 已知的全部实体 ID 当成可达集合。
+//
+// 这样"root 可达"在正向用例里是**由构造保证**的事实，而不是靠测试里另写一份可达规则；
+// 不可达用例则显式给一个空集合。
+func reachableFrom(resolver *fakeResolver) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, entity := range resolver.entities {
+		if entity.EntityID != "" {
+			out[entity.EntityID] = struct{}{}
+		}
+	}
+	return out
 }
 
 func readPackage(t *testing.T, name string) []byte {
@@ -363,14 +459,83 @@ func TestResolverInfrastructureErrorIsNotAPackageFailure(t *testing.T) {
 
 // target.environment 与 registration 真实环境不一致时必须失败：否则会把另一个环境编进来。
 func TestEnvironmentMismatchFailsClosed(t *testing.T) {
-	resolver := e2bResolver()
-	resolver.services["platform:e2b"] = ServiceSelectorResolution{
-		State: ResolutionFound, ServiceID: "svc", EntityID: "ent", Environment: "staging",
-	}
-	_, err := newCompiler(t, resolver).Compile(context.Background(), CompileRequest{Raw: readPackage(t, "e2b.package.json")})
-	if code := ReasonCodeOf(err); code != ReasonSelectorNotFound {
-		t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonSelectorNotFound)
-	}
+	raw := readPackage(t, "e2b.package.json")
+
+	t.Run("service 环境不一致", func(t *testing.T) {
+		resolver := e2bResolver()
+		resolver.services["platform:e2b"] = ServiceSelectorResolution{
+			State: ResolutionFound, ServiceID: "svc", EntityID: "ent", Environment: "staging",
+		}
+		_, err := newCompiler(t, resolver).Compile(context.Background(), CompileRequest{Raw: raw})
+		if code := ReasonCodeOf(err); code != ReasonSelectorEnvironmentMismatch {
+			t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonSelectorEnvironmentMismatch)
+		}
+	})
+
+	// 直接 entity selector 的环境断言必须在 compiler 侧：resolver 是可替换适配器，
+	// 如果它按 entity_key 全局查找，一个 staging 实体会被编进 production Profile。
+	t.Run("entity 环境不一致", func(t *testing.T) {
+		resolver := e2bResolver()
+		resolver.entities["infrastructure:e2b:host-fleet"] = EntitySelectorResolution{
+			State: ResolutionFound, EntityID: "66666666-6666-4666-8666-666666666666",
+			Environment: "staging",
+		}
+		_, err := newCompiler(t, resolver).Compile(context.Background(), CompileRequest{Raw: raw})
+		if code := ReasonCodeOf(err); code != ReasonSelectorEnvironmentMismatch {
+			t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonSelectorEnvironmentMismatch)
+		}
+	})
+
+	// global 是显式的跨环境共享实体，必须被接受。
+	t.Run("entity 环境为 global 被接受", func(t *testing.T) {
+		resolver := e2bResolver()
+		resolver.entities["infrastructure:e2b:host-fleet"] = EntitySelectorResolution{
+			State: ResolutionFound, EntityID: "66666666-6666-4666-8666-666666666666",
+			Environment: "global",
+		}
+		if _, err := newCompiler(t, resolver).Compile(context.Background(), CompileRequest{Raw: raw}); err != nil {
+			t.Fatalf("global 实体应被接受: %v", err)
+		}
+	})
+}
+
+// Profile 引用校验必须真的被调用：root 不可达是 package 配置错误，
+// resolver 基础设施错误则不能被伪装成配置错误。
+func TestProfileReferenceValidationIsEnforced(t *testing.T) {
+	raw := readPackage(t, "e2b.package.json")
+
+	t.Run("root 不可达", func(t *testing.T) {
+		compiler := newCompiler(t, e2bResolver())
+		compiler.ProfileReferences = profileRefResolver{reachable: map[string]struct{}{}}
+		_, err := compiler.Compile(context.Background(), CompileRequest{Raw: raw})
+		if code := ReasonCodeOf(err); code != ReasonCompiledProfileInvalid {
+			t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonCompiledProfileInvalid)
+		}
+	})
+
+	t.Run("root 环境不一致", func(t *testing.T) {
+		compiler := newCompiler(t, e2bResolver())
+		compiler.ProfileReferences = profileRefResolver{
+			reachable: reachableFrom(e2bResolver()), rootEnvironment: "staging",
+		}
+		_, err := compiler.Compile(context.Background(), CompileRequest{Raw: raw})
+		if code := ReasonCodeOf(err); code != ReasonCompiledProfileInvalid {
+			t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonCompiledProfileInvalid)
+		}
+	})
+
+	t.Run("引用解析基础设施错误不伪装成配置错误", func(t *testing.T) {
+		sentinel := errors.New("topology store down")
+		compiler := newCompiler(t, e2bResolver())
+		compiler.ProfileReferences = profileRefResolver{fatal: sentinel}
+		_, err := compiler.Compile(context.Background(), CompileRequest{Raw: raw})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err=%v，应包装原始错误", err)
+		}
+		if code := ReasonCodeOf(err); code != "" {
+			t.Fatalf("基础设施错误不应带 package reason code，得到 %q", code)
+		}
+	})
 }
 
 // resolver 声称 found 但没给真实 ID 是实现 bug，必须当基础设施错误上抛而不是编出空 ID。
@@ -441,87 +606,247 @@ func TestVersionGates(t *testing.T) {
 	}
 }
 
+// bindingAt 按 key 前缀定位一条 provider binding，避免依赖数组下标。
+func bindingAt(t *testing.T, doc map[string]any, predicate func(map[string]any) bool) map[string]any {
+	t.Helper()
+	for _, item := range doc["provider_bindings"].([]any) {
+		binding := item.(map[string]any)
+		if predicate(binding) {
+			return binding
+		}
+	}
+	t.Fatal("fixture 里找不到匹配的 provider binding")
+	return nil
+}
+
+func byTemplate(ref string) func(map[string]any) bool {
+	return func(binding map[string]any) bool { return binding["template_ref"] == ref }
+}
+
+func byKind(kind string) func(map[string]any) bool {
+	return func(binding map[string]any) bool { return binding["kind"] == kind }
+}
+
 func TestTemplateAndParamFailures(t *testing.T) {
 	raw := readPackage(t, "e2b.package.json")
 	cases := []struct {
 		name  string
-		apply func(map[string]any)
+		apply func(*testing.T, map[string]any)
 		want  string
 	}{
 		{
 			name: "未知 template ref",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				bindings[0].(map[string]any)["template_ref"] = "not_registered.v1"
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byTemplate("counter_rate.v1"))["template_ref"] = "not_registered.v1"
 			},
 			want: ReasonUnknownTemplate,
 		},
 		{
 			name: "缺少必填参数",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				params := bindings[0].(map[string]any)["params"].(map[string]any)
-				delete(params, "quantile")
+			apply: func(t *testing.T, doc map[string]any) {
+				binding := bindingAt(t, doc, byTemplate("histogram_quantile_rate.v1"))
+				delete(binding["params"].(map[string]any), "quantile")
 			},
 			want: ReasonTemplateParamInvalid,
 		},
 		{
 			name: "多传模板不接受的参数",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				// counter_rate.v1 不接受 quantile。
-				for _, item := range bindings {
-					binding := item.(map[string]any)
-					if binding["template_ref"] == "counter_rate.v1" {
-						binding["params"].(map[string]any)["quantile"] = 0.9
-						return
-					}
-				}
-				t.Fatal("fixture 里应存在 counter_rate.v1 binding")
+			apply: func(t *testing.T, doc map[string]any) {
+				binding := bindingAt(t, doc, byTemplate("counter_rate.v1"))
+				binding["params"].(map[string]any)["quantile"] = 0.9
 			},
 			want: ReasonTemplateParamInvalid,
 		},
 		{
 			name: "output_field 不是模板声明的输出",
-			apply: func(doc map[string]any) {
+			apply: func(t *testing.T, doc map[string]any) {
 				bindings := profileTemplate(doc)["signal_bindings"].([]any)
 				bindings[0].(map[string]any)["output_field"] = "series.made_up_field"
 			},
 			want: ReasonTemplateOutputUnknown,
 		},
 		{
-			name: "telemetry binding 没有对应 signal binding",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				bindings[0].(map[string]any)["binding_key"] = "not_a_signal"
+			name: "未知 kind",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byKind("signal"))["kind"] = "topology"
 			},
-			want: ReasonBindingOrphan,
+			// schema 的 enum 先拦下来，因此这里是 schema_invalid。
+			want: ReasonSchemaInvalid,
 		},
 		{
-			name: "signal binding 没有 telemetry binding",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				doc["telemetry_bindings"] = bindings[1:]
+			name: "signal target 悬空",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byKind("signal"))["target_ref"] = "not_a_signal"
+			},
+			want: ReasonDanglingRef,
+		},
+		{
+			name: "journey target 悬空",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byKind("journey"))["target_ref"] = "no_such_journey"
+			},
+			want: ReasonDanglingRef,
+		},
+		{
+			name: "evidence target 不是已声明的 focus kind",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byKind("evidence"))["target_ref"] = "no_such_focus"
+			},
+			want: ReasonDanglingRef,
+		},
+		{
+			name: "signal 少一条 binding",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindings := doc["provider_bindings"].([]any)
+				doc["provider_bindings"] = bindings[1:]
 			},
 			want: ReasonBindingNotBound,
 		},
 		{
-			name: "telemetry binding 重复",
-			apply: func(doc map[string]any) {
-				bindings := doc["telemetry_bindings"].([]any)
-				doc["telemetry_bindings"] = append(bindings, bindings[0])
+			name: "journey 缺 binding",
+			apply: func(t *testing.T, doc map[string]any) {
+				kept := make([]any, 0)
+				for _, item := range doc["provider_bindings"].([]any) {
+					if item.(map[string]any)["kind"] == "journey" {
+						continue
+					}
+					kept = append(kept, item)
+				}
+				doc["provider_bindings"] = kept
+			},
+			want: ReasonBindingNotBound,
+		},
+		{
+			name: "同一 signal 被绑两次",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindings := doc["provider_bindings"].([]any)
+				original := bindingAt(t, doc, byKind("signal"))
+				duplicate := map[string]any{}
+				for key, value := range original {
+					duplicate[key] = value
+				}
+				duplicate["key"] = "signal_duplicate"
+				doc["provider_bindings"] = append(bindings, duplicate)
+			},
+			want: ReasonDuplicateBindingTarget,
+		},
+		{
+			name: "binding key 重复",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindings := doc["provider_bindings"].([]any)
+				doc["provider_bindings"] = append(bindings, bindings[0])
 			},
 			want: ReasonDuplicateKey,
+		},
+		{
+			name: "provider tool 与 signal 声明的 tool 不一致",
+			apply: func(t *testing.T, doc map[string]any) {
+				bindingAt(t, doc, byKind("signal"))["tool_key"] = "evidence.search_logs.v1"
+			},
+			// 先撞 capability：prometheus 模板配 openobserve 工具。
+			want: ReasonTemplateCapability,
+		},
+		{
+			name: "kind 与 template 不兼容：signal 绑 trace 模板",
+			apply: func(t *testing.T, doc map[string]any) {
+				binding := bindingAt(t, doc, byKind("signal"))
+				binding["template_ref"] = "trace_by_focus.v1"
+			},
+			want: ReasonTemplateKindMismatch,
+		},
+		{
+			name: "kind 与 template 不兼容：journey 绑 prometheus 模板",
+			apply: func(t *testing.T, doc map[string]any) {
+				binding := bindingAt(t, doc, byKind("journey"))
+				binding["template_ref"] = "counter_rate.v1"
+			},
+			want: ReasonTemplateKindMismatch,
+		},
+		{
+			name: "tool 未在 tool_refs 中声明",
+			apply: func(t *testing.T, doc map[string]any) {
+				template := profileTemplate(doc)
+				refs := make([]any, 0)
+				for _, ref := range template["tool_refs"].([]any) {
+					if ref == "evidence.search_logs.v1" {
+						continue
+					}
+					refs = append(refs, ref)
+				}
+				template["tool_refs"] = refs
+			},
+			want: ReasonDanglingRef,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mutated := mutate(t, raw, tc.apply)
+			mutated := mutate(t, raw, func(doc map[string]any) { tc.apply(t, doc) })
 			_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: mutated})
 			if code := ReasonCodeOf(err); code != tc.want {
 				t.Fatalf("reason=%q err=%v，want %s", code, err, tc.want)
 			}
 		})
+	}
+}
+
+// 同一 focus 的 logs 与 traces 证据必须能共存：只有相同 (target, class) 才算重复。
+// 这条曾经被简单的 kind+target 去重错误地阻断过。
+func TestDistinctEvidenceClassesCoexist(t *testing.T) {
+	raw := readPackage(t, "e2b.package.json")
+	// E2B 的 journey binding 已经用 trace 读取顺带提供 traces 证据，因此再显式加一条
+	// traces evidence 必须被判成重复；换成 access class 则应通过（若有可用 tool）。
+	mutated := mutate(t, raw, func(doc map[string]any) {
+		bindings := doc["provider_bindings"].([]any)
+		doc["provider_bindings"] = append(bindings, map[string]any{
+			"key":          "evidence_sandbox_traces",
+			"kind":         "evidence",
+			"target_ref":   "sandbox_id",
+			"tool_key":     "evidence.search_traces.v1",
+			"template_ref": "trace_by_focus.v1",
+			"params": map[string]any{
+				"stream": "default", "focus_field": "sandbox_id", "row_limit": float64(100),
+			},
+		})
+	})
+	_, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: mutated})
+	if code := ReasonCodeOf(err); code != ReasonDuplicateBindingTarget {
+		t.Fatalf("reason=%q err=%v，journey 的 trace side output 已提供 traces 证据，重复绑定应被拒绝", code, err)
+	}
+
+	// 反向控制：把 journey binding 去掉之后，显式 traces evidence 应该合法（journey 也随之
+	// 不再声明，因此不会触发 journey 缺绑定）。
+	rebuilt := mutate(t, raw, func(doc map[string]any) {
+		template := profileTemplate(doc)
+		template["journeys"] = []any{}
+		views := make([]any, 0)
+		for _, item := range template["views"].([]any) {
+			view := item.(map[string]any)
+			if view["renderer"] == "request_journey" {
+				continue
+			}
+			views = append(views, view)
+		}
+		template["views"] = views
+		kept := make([]any, 0)
+		for _, item := range doc["provider_bindings"].([]any) {
+			if item.(map[string]any)["kind"] == "journey" {
+				continue
+			}
+			kept = append(kept, item)
+		}
+		doc["provider_bindings"] = append(kept, map[string]any{
+			"key":          "evidence_sandbox_traces",
+			"kind":         "evidence",
+			"target_ref":   "sandbox_id",
+			"tool_key":     "evidence.search_traces.v1",
+			"template_ref": "trace_by_focus.v1",
+			"params": map[string]any{
+				"stream": "default", "focus_field": "sandbox_id", "row_limit": float64(100),
+			},
+		})
+	})
+	if _, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: rebuilt}); err != nil {
+		t.Fatalf("logs + traces 两个不同 class 应能共存: %v", err)
 	}
 }
 
@@ -612,15 +937,15 @@ func TestCompiledProfileMustPassExistingProfileValidation(t *testing.T) {
 		}
 		template["signal_bindings"] = kept
 		// 同步移除对应的 telemetry binding 与 view 引用，让失败原因只剩 golden 数量。
-		telemetry := doc["telemetry_bindings"].([]any)
+		telemetry := doc["provider_bindings"].([]any)
 		keptTelemetry := make([]any, 0, len(telemetry))
 		for _, item := range telemetry {
-			if item.(map[string]any)["binding_key"] == removedKey {
+			if item.(map[string]any)["target_ref"] == removedKey {
 				continue
 			}
 			keptTelemetry = append(keptTelemetry, item)
 		}
-		doc["telemetry_bindings"] = keptTelemetry
+		doc["provider_bindings"] = keptTelemetry
 		views := template["views"].([]any)
 		overview := views[0].(map[string]any)
 		refs := overview["signal_refs"].([]any)
@@ -639,18 +964,46 @@ func TestCompiledProfileMustPassExistingProfileValidation(t *testing.T) {
 	}
 }
 
-// published package 编出 published Profile：门槛在"改 status"这一个显式动作上，
-// 而不是在 compiler 里偷偷提升。
-func TestPublishedPackageProducesPublishedProfile(t *testing.T) {
+// `status: published` 只是发布意图，不是自授权。
+//
+// 默认必须被拒绝：一个只改了 status 字段的 package 不该能激活未经 discovery 与 owner
+// attestation 的绑定。只有 Task 9 的发布 gate 才有资格显式打开这道门。
+func TestPublishedPackageRequiresExplicitAuthorization(t *testing.T) {
 	raw := readPackage(t, "e2b.package.json")
 	mutated := mutate(t, raw, func(doc map[string]any) { doc["status"] = "published" })
-	compiled, err := newCompiler(t, e2bResolver()).Compile(context.Background(), CompileRequest{Raw: mutated})
-	if err != nil {
-		t.Fatalf("编译失败: %v", err)
-	}
-	if compiled.Profile.Status != model.ProfileStatusPublished {
-		t.Fatalf("status=%q，published package 应编出 published Profile", compiled.Profile.Status)
-	}
+
+	t.Run("默认拒绝", func(t *testing.T) {
+		compiler := newCompiler(t, e2bResolver())
+		if compiler.AllowPublished {
+			t.Fatal("AllowPublished 默认必须是 false")
+		}
+		_, err := compiler.Compile(context.Background(), CompileRequest{Raw: mutated})
+		if code := ReasonCodeOf(err); code != ReasonPublishNotAuthorized {
+			t.Fatalf("reason=%q err=%v，want %s", code, err, ReasonPublishNotAuthorized)
+		}
+	})
+
+	t.Run("显式授权后才能编出 published", func(t *testing.T) {
+		compiler := newCompiler(t, e2bResolver())
+		compiler.AllowPublished = true
+		compiled, err := compiler.Compile(context.Background(), CompileRequest{Raw: mutated})
+		if err != nil {
+			t.Fatalf("编译失败: %v", err)
+		}
+		if compiled.Profile.Status != model.ProfileStatusPublished {
+			t.Fatalf("status=%q，授权后应编出 published Profile", compiled.Profile.Status)
+		}
+		if compiled.Integration.PackageStatus != StatusPublished {
+			t.Fatalf("CompiledIntegration 的 status=%q", compiled.Integration.PackageStatus)
+		}
+	})
+
+	t.Run("draft 不受门槛影响", func(t *testing.T) {
+		if _, err := newCompiler(t, e2bResolver()).Compile(
+			context.Background(), CompileRequest{Raw: raw}); err != nil {
+			t.Fatalf("draft package 应正常编译: %v", err)
+		}
+	})
 }
 
 // 装配缺依赖是编程错误，必须显式失败而不是"尽力编译"。

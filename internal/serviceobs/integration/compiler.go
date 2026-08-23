@@ -33,8 +33,26 @@ type Compiler struct {
 	// Profiles 校验编译产物，必填。它就是 Profile Registry 用的那套校验，因此"编译产物
 	// 一定是合法 v1 Profile"不是靠 compiler 自己重写一份规则。
 	Profiles *profile.DocumentValidator
-	// Resolver 解析 selector，必填。
+	// Tools 提供 ToolDescriptor 查询，必填。没有它就无法校验 capability 与权限，
+	// 一条 binding 可以用 Prometheus 的工具去执行 OpenObserve 模板。
+	Tools ToolDescriptorSource
+	// Resolver 解析 SIP selector，必填。
 	Resolver SelectorResolver
+	// ProfileReferences 是 Profile Registry 用的引用解析器，必填。
+	//
+	// 它与 Resolver 是两件事：Resolver 把 entity_key 解析成 ID；ProfileReferences 校验
+	// 生成出来的 Profile 在**同一套 Registry 规则**下是否可加载（root 同环境或 global、
+	// 从 service entity 有界可达）。少了它，compiler 会编出一份 Registry 随后会
+	// quarantine 的 Profile。
+	ProfileReferences profile.Resolver
+	// MaxReachableDepth 为 0 时使用 profile.DefaultMaxReachableDepth。
+	MaxReachableDepth int
+	// AllowPublished 默认 false：compiler 拒绝 status=published 的 package。
+	//
+	// `status: published` 只是发布意图，不是自授权。Task 9 的发布 gate 在拿到 discovery
+	// digest、owner attestation、HTTPS 与逐条 sandbox_id 证据之后才是唯一有资格把它置 true
+	// 的调用方；它刻意不接任何普通运行配置，避免一个 YAML 开关就能激活未验证的绑定。
+	AllowPublished bool
 	// Now 为 nil 时使用 time.Now；显式注入以便测试固定时钟。
 	Now func() time.Time
 }
@@ -43,8 +61,10 @@ type Compiler struct {
 type CompileRequest struct {
 	// Raw 是 package 文档原始字节。ContentDigest 对它取摘要——被审查的就是这份字节。
 	Raw []byte
-	// PreviousProfileDigest 是上一份已发布编译产物的摘要，用于回滚引用。可为空。
-	PreviousProfileDigest string
+	// PreviousProfileDigest / PreviousIntegrationDigest 是上一**对**已发布产物的摘要，
+	// 用于回滚引用。可为空（首个版本）。
+	PreviousProfileDigest     string
+	PreviousIntegrationDigest string
 }
 
 // CompileManifest 是不可变编译清单。
@@ -64,18 +84,34 @@ type CompileManifest struct {
 	TemplateRefs    []string `json:"template_refs"`
 	ContentDigest   string   `json:"content_digest"`
 	ProfileDigest   string   `json:"profile_digest"`
-	// PreviousProfileDigest 为空表示这是首个版本。回滚就是重新激活上一份不可变产物，
-	// 而不是就地修改 Profile 或改变 v1 的 ID 语义。
-	PreviousProfileDigest string    `json:"previous_profile_digest,omitempty"`
-	CompiledAt            time.Time `json:"compiled_at"`
+	// IntegrationDigest 与 ProfileDigest 一起构成唯一激活单元。加载器必须同时校验两者：
+	// 只认一个摘要就无法发现"两半来自不同版本"。
+	IntegrationDigest string `json:"integration_digest"`
+	// PreviousProfileDigest / PreviousIntegrationDigest 为空表示这是首个版本。回滚是重新
+	// 激活上一**对**不可变产物，而不是就地修改 Profile 或只回退一半。
+	PreviousProfileDigest     string    `json:"previous_profile_digest,omitempty"`
+	PreviousIntegrationDigest string    `json:"previous_integration_digest,omitempty"`
+	CompiledAt                time.Time `json:"compiled_at"`
 }
 
 // CompiledPackage 是一次成功编译的全部产物。
+//
+// 两份产物是**原子**的：调用方要么同时得到它们，要么什么都得不到。Bundle() 把它们与
+// manifest 打包成唯一激活单元，加载前必须过 ValidateBundle。
 type CompiledPackage struct {
 	Manifest CompileManifest
 	Profile  model.Profile
-	// ProfileJSON 是编译产物的规范化字节，写盘/入库与摘要都用它，保证摘要与落盘内容一致。
+	// ProfileJSON 是浏览器契约产物的规范化字节，写盘/入库与摘要都用它。
 	ProfileJSON []byte
+	// Integration 是 server-only 运行时产物：typed provider bindings 与已解析 ID。
+	Integration CompiledIntegration
+	// IntegrationJSON 是它的规范化字节，摘要与落盘内容因此一致。
+	IntegrationJSON []byte
+}
+
+// Bundle 返回可直接交给加载器的激活单元。
+func (c CompiledPackage) Bundle() Bundle {
+	return Bundle{Manifest: c.Manifest, Profile: c.ProfileJSON, Integration: c.IntegrationJSON}
 }
 
 var (
@@ -83,6 +119,8 @@ var (
 	ErrValidatorRequired        = fmt.Errorf("integration: 必须注入 SIP validator")
 	ErrProfileValidatorRequired = fmt.Errorf("integration: 必须注入 Profile document validator")
 	ErrResolverRequired         = fmt.Errorf("integration: 必须注入 selector resolver")
+	ErrToolSourceRequired       = fmt.Errorf("integration: 必须注入 ToolDescriptor source")
+	ErrProfileResolverRequired  = fmt.Errorf("integration: 必须注入 Profile 引用解析器")
 )
 
 // Compile 执行完整编译。
@@ -97,22 +135,35 @@ func (c *Compiler) Compile(ctx context.Context, req CompileRequest) (CompiledPac
 	if c.Profiles == nil {
 		return CompiledPackage{}, ErrProfileValidatorRequired
 	}
+	if c.Tools == nil {
+		return CompiledPackage{}, ErrToolSourceRequired
+	}
 	if c.Resolver == nil {
 		return CompiledPackage{}, ErrResolverRequired
+	}
+	if c.ProfileReferences == nil {
+		return CompiledPackage{}, ErrProfileResolverRequired
 	}
 
 	pkg, err := c.Validator.Decode(req.Raw)
 	if err != nil {
 		return CompiledPackage{}, err
 	}
-	if err := validateStructure(pkg); err != nil {
-		return CompiledPackage{}, err
+	// draft-only 硬门：`status: published` 只是发布意图，不是自授权。
+	if pkg.Status == StatusPublished && !c.AllowPublished {
+		return CompiledPackage{}, failf(ReasonPublishNotAuthorized,
+			"package status=published，但发布 gate 未授权；Task 9 需先提供 discovery digest 与 owner attestation")
 	}
-	if err := validateTelemetryBindings(pkg); err != nil {
+	if err := validateStructure(pkg); err != nil {
 		return CompiledPackage{}, err
 	}
 	if err := c.Profiles.ValidateToolKeys(pkg.ProfileTemplate.ToolRefs); err != nil {
 		return CompiledPackage{}, failf(ReasonToolNotPublished, "%s", err.Error())
+	}
+	// provider binding 的 target/kind/多重性/capability/permission 交叉校验。
+	bindings, err := validateProviderBindings(pkg, c.Tools)
+	if err != nil {
+		return CompiledPackage{}, err
 	}
 
 	resolved, err := c.resolveSelectors(ctx, pkg)
@@ -123,39 +174,82 @@ func (c *Compiler) Compile(ctx context.Context, req CompileRequest) (CompiledPac
 	generated := buildProfile(pkg, resolved)
 	profileJSON, err := marshalCanonical(generated)
 	if err != nil {
-		return CompiledPackage{}, fmt.Errorf("integration: 序列化编译产物失败: %w", err)
+		return CompiledPackage{}, fmt.Errorf("integration: 序列化 Profile 产物失败: %w", err)
 	}
 	// 关键一步：编译产物必须过**现有**的 Profile 校验链，而不是 compiler 自证合法。
 	if err := c.Profiles.ValidateDocument(profileJSON); err != nil {
 		return CompiledPackage{}, failf(ReasonCompiledProfileInvalid,
 			"编译产物未通过现有 Profile 校验: %s", err.Error())
 	}
+	// 再走一遍 Registry 的引用解析：root 必须同环境（或 global）且从 service entity 有界可达。
+	// 少了这一步，compiler 会编出一份 Registry 随后会 quarantine 的 Profile。
+	configErr, fatal := profile.ValidateReferences(ctx, c.ProfileReferences, generated, c.MaxReachableDepth)
+	if fatal != nil {
+		return CompiledPackage{}, fmt.Errorf(
+			"integration: 校验 Profile 引用失败（基础设施错误，不能当成 package 非法）: %w", fatal)
+	}
+	if configErr != nil {
+		return CompiledPackage{}, failf(ReasonCompiledProfileInvalid,
+			"编译产物的引用不可加载: %s", configErr.Error())
+	}
+
+	profileDigest := digest(profileJSON)
+	integration := buildCompiledIntegration(
+		pkg, resolved, bindings, generated.ProfileKey, generated.ProfileVersion, profileDigest)
+	integrationJSON, err := marshalCanonical(integration)
+	if err != nil {
+		return CompiledPackage{}, fmt.Errorf("integration: 序列化 CompiledIntegration 失败: %w", err)
+	}
 
 	now := time.Now
 	if c.Now != nil {
 		now = c.Now
 	}
-	return CompiledPackage{
+	compiled := CompiledPackage{
 		Manifest: CompileManifest{
-			PackageKey:            pkg.PackageKey,
-			PackageVersion:        pkg.PackageVersion,
-			PackageStatus:         pkg.Status,
-			CompilerVersion:       CompilerVersion,
-			ProfileKey:            generated.ProfileKey,
-			ProfileVersion:        generated.ProfileVersion,
-			Environment:           pkg.Target.Environment,
-			ServiceID:             resolved.ServiceID,
-			ServiceEntityID:       resolved.ServiceEntityID,
-			RootEntityIDs:         resolved.RootEntityIDs,
-			TemplateRefs:          templateRefsOf(pkg),
-			ContentDigest:         digest(req.Raw),
-			ProfileDigest:         digest(profileJSON),
-			PreviousProfileDigest: req.PreviousProfileDigest,
-			CompiledAt:            now().UTC(),
+			PackageKey:                pkg.PackageKey,
+			PackageVersion:            pkg.PackageVersion,
+			PackageStatus:             pkg.Status,
+			CompilerVersion:           CompilerVersion,
+			ProfileKey:                generated.ProfileKey,
+			ProfileVersion:            generated.ProfileVersion,
+			Environment:               pkg.Target.Environment,
+			ServiceID:                 resolved.ServiceID,
+			ServiceEntityID:           resolved.ServiceEntityID,
+			RootEntityIDs:             resolved.RootEntityIDs,
+			TemplateRefs:              templateRefsOf(pkg),
+			ContentDigest:             digest(req.Raw),
+			ProfileDigest:             profileDigest,
+			IntegrationDigest:         digest(integrationJSON),
+			PreviousProfileDigest:     req.PreviousProfileDigest,
+			PreviousIntegrationDigest: req.PreviousIntegrationDigest,
+			CompiledAt:                now().UTC(),
 		},
-		Profile:     generated,
-		ProfileJSON: profileJSON,
-	}, nil
+		Profile:         generated,
+		ProfileJSON:     profileJSON,
+		Integration:     integration,
+		IntegrationJSON: integrationJSON,
+	}
+	// 自检：编译器自己产出的激活单元必须能过加载器的配对校验。这条断言把"生成路径与加载
+	// 路径对同一份产物看法不一致"变成编译期失败，而不是部署时才发现。
+	if err := ValidateBundle(compiled.Bundle()); err != nil {
+		return CompiledPackage{}, fmt.Errorf("integration: 编译产物未通过激活单元自检: %w", err)
+	}
+	return compiled, nil
+}
+
+// globalEnvironment 是跨环境共享实体的环境标记，与 Profile Registry 的口径逐字一致。
+const globalEnvironment = "global"
+
+// redactEnvironment 只保留"是否为空"这一点信息。
+//
+// 环境名本身不算高敏，但它属于部署拓扑；错误信息会进日志与编译报告，因此只输出一个
+// 稳定占位而不是原文。
+func redactEnvironment(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "<empty>"
+	}
+	return "<other>"
 }
 
 // resolution 是全部 selector 解析结果的集合。
@@ -200,8 +294,8 @@ func (c *Compiler) resolveSelectors(ctx context.Context, pkg Package) (resolutio
 	}
 	// target 声明的环境必须与 registration 的真实环境一致：否则会把另一个环境的服务编进来。
 	if service.Environment != environment {
-		return resolution{}, failf(ReasonSelectorNotFound,
-			"target.environment=%s 与 service 真实环境不一致", environment)
+		return resolution{}, failf(ReasonSelectorEnvironmentMismatch,
+			"target.service_selector 解析到的服务不属于目标环境")
 	}
 	out.ServiceID = service.ServiceID
 	out.ServiceEntityID = service.EntityID
@@ -248,6 +342,16 @@ func (c *Compiler) resolveSelectors(ctx context.Context, pkg Package) (resolutio
 		}
 		if entity.EntityID == "" {
 			return resolution{}, fmt.Errorf("integration: resolver 返回 found 但缺少真实 entity ID")
+		}
+		// entity 的环境必须是目标环境，或显式 "global"（跨环境共享实体）。
+		//
+		// 这一条不能只靠 resolver 自觉过滤：resolver 是可替换的适配器，如果它按 entity_key
+		// 全局查找，一个 staging 的实体就会被编进 production Profile。环境断言必须在
+		// compiler 侧，与 Registry 的 root 环境校验同一口径。
+		if entity.Environment != environment && entity.Environment != globalEnvironment {
+			return resolution{}, failf(ReasonSelectorEnvironmentMismatch,
+				"entity selector 解析到环境 %q，既不是目标环境也不是 global",
+				redactEnvironment(entity.Environment))
 		}
 		out.entities[key] = entity.EntityID
 	}
@@ -472,62 +576,10 @@ func validateStructure(pkg Package) error {
 	return nil
 }
 
-// validateTelemetryBindings 校验 signal binding 与 provider template 的双向完整性。
-//
-// 双向都要查：只查一边会留下两个漏洞——一个没有 provider binding 的 signal 会永久 Unknown
-// （"配了但永远看不到"），一个没有对应 signal 的 telemetry binding 则是死配置，
-// 下一次有人复用这个 key 时会拿到意料之外的模板。
-func validateTelemetryBindings(pkg Package) error {
-	bindingByKey := map[string]SignalBinding{}
-	for _, binding := range pkg.ProfileTemplate.SignalBindings {
-		bindingByKey[binding.Key] = binding
-	}
-
-	bound := map[string]struct{}{}
-	for _, telemetry := range pkg.Telemetry {
-		if _, exists := bound[telemetry.BindingKey]; exists {
-			return failf(ReasonDuplicateKey, "telemetry_bindings[%s] 重复", telemetry.BindingKey)
-		}
-		bound[telemetry.BindingKey] = struct{}{}
-
-		binding, ok := bindingByKey[telemetry.BindingKey]
-		if !ok {
-			return failf(ReasonBindingOrphan,
-				"telemetry_bindings[%s] 没有对应的 signal binding", telemetry.BindingKey)
-		}
-		template, ok := LookupTemplate(telemetry.TemplateRef)
-		if !ok {
-			return failf(ReasonUnknownTemplate,
-				"telemetry_bindings[%s] 引用未注册的 template %s", telemetry.BindingKey, telemetry.TemplateRef)
-		}
-		if err := template.validateParams(telemetry.BindingKey, telemetry.Params); err != nil {
-			return err
-		}
-		if !template.allowsOutput(binding.OutputField) {
-			return failf(ReasonTemplateOutputUnknown,
-				"signal_bindings[%s].output_field=%s 不是 template %s 声明的输出字段",
-				binding.Key, binding.OutputField, template.Ref)
-		}
-	}
-
-	unbound := make([]string, 0)
-	for _, binding := range pkg.ProfileTemplate.SignalBindings {
-		if _, ok := bound[binding.Key]; !ok {
-			unbound = append(unbound, binding.Key)
-		}
-	}
-	if len(unbound) > 0 {
-		sort.Strings(unbound)
-		return failf(ReasonBindingNotBound,
-			"signal_bindings %v 没有 telemetry binding，会永久 Unknown", unbound)
-	}
-	return nil
-}
-
 func templateRefsOf(pkg Package) []string {
 	seen := map[string]struct{}{}
-	for _, telemetry := range pkg.Telemetry {
-		seen[telemetry.TemplateRef] = struct{}{}
+	for _, binding := range pkg.Bindings {
+		seen[binding.TemplateRef] = struct{}{}
 	}
 	return sortedKeys(seen)
 }

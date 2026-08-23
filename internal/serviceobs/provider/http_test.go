@@ -460,3 +460,67 @@ func TestDefaultTransportIgnoresEnvironmentProxy(t *testing.T) {
 		t.Fatal("默认 Transport 必须限制每 host 连接数")
 	}
 }
+
+// Secret 必须**真的**实现 slog.LogValuer。
+//
+// 早先 LogValue 返回 string，因此它并没有满足接口：掩码其实是靠 MarshalText 侥幸成立的。
+// 换一个不走 TextMarshaler 的 handler 就会泄露，所以这里同时断言接口与两种 handler。
+func TestSecretImplementsLogValuer(t *testing.T) {
+	var _ slog.LogValuer = Secret{}
+
+	const plaintext = "slog-secret-value"
+	secret := NewSecret(plaintext)
+	value := secret.LogValue()
+	if value.Kind() != slog.KindString {
+		t.Fatalf("LogValue kind=%v", value.Kind())
+	}
+	if strings.Contains(value.String(), plaintext) {
+		t.Fatalf("LogValue 泄露明文: %s", value.String())
+	}
+
+	for name, newHandler := range map[string]func(*strings.Builder) slog.Handler{
+		"text": func(b *strings.Builder) slog.Handler { return slog.NewTextHandler(b, nil) },
+		"json": func(b *strings.Builder) slog.Handler { return slog.NewJSONHandler(b, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var builder strings.Builder
+			slog.New(newHandler(&builder)).Info("cfg", "token", secret,
+				"nested", struct{ Token Secret }{Token: secret})
+			if strings.Contains(builder.String(), plaintext) {
+				t.Fatalf("%s handler 泄露明文: %s", name, builder.String())
+			}
+		})
+	}
+}
+
+// Endpoint 的 %#v 与 slog 也不得泄露 path：它可能含 org/stream 这类部署拓扑。
+func TestEndpointGoStringAndLogValueHidePath(t *testing.T) {
+	var _ slog.LogValuer = Endpoint{}
+
+	endpoint, err := ParseEndpoint("https://metrics.internal/prometheus/org-secret", ModeProduction)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	renderings := []string{
+		endpoint.String(),
+		endpoint.GoString(),
+		fmt.Sprintf("%v", endpoint),
+		fmt.Sprintf("%+v", endpoint),
+		fmt.Sprintf("%#v", endpoint),
+		endpoint.LogValue().String(),
+	}
+	var builder strings.Builder
+	slog.New(slog.NewJSONHandler(&builder, nil)).Info("cfg", "endpoint", endpoint)
+	renderings = append(renderings, builder.String())
+
+	for i, text := range renderings {
+		for _, leak := range []string{"prometheus", "org-secret"} {
+			if strings.Contains(text, leak) {
+				t.Fatalf("渲染 %d 泄露了 %q: %s", i, leak, text)
+			}
+		}
+		if !strings.Contains(text, "metrics.internal") {
+			t.Fatalf("渲染 %d 应保留 host 以便排障: %s", i, text)
+		}
+	}
+}

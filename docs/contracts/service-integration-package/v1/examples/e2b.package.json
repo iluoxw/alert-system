@@ -3,17 +3,23 @@
   "package_key": "e2b",
   "package_version": 1,
   "status": "draft",
-  "description": "E2B 首个 Service Integration Package（draft）。metric 名与 label 取 OTel spanmetrics connector 与 node_exporter 的上游默认形状，尚未经运行时 discovery 确认，因此 status 保持 draft，编译产物也只能是 draft Profile。USE Saturation 与 USE Errors 刻意不声明：placement admission wait/queue 的直接指标尚未确认存在，宁可让该槽位缺席并保持 Unknown，也不复用 utilization 冒充 saturation。",
+  "description": "E2B 首个 Service Integration Package（draft）。metric、label、stream 与字段形状取上游默认，未经 discovery 确认；error ratio 的分子用上游默认 status_code 区分错误 span，只表达 draft 意图。刻意不声明 USE Saturation/Errors：placement wait/queue 直接指标未确认，缺席保持 Unknown 比复用 utilization 更诚实。journey 用一次 trace 读取同时给出阶段、focus 判定、trace 证据与 topology hints（受信 side outputs），因此不再单独绑 focus 或 trace 证据。access 证据不绑：catalog 尚无 access 专用 tool，不伪造。",
   "compatibility": {
     "profile_schema_version": "1.0",
     "min_compiler_version": 1
   },
   "target": {
     "environment": "production",
-    "service_selector": { "entity_key": "platform:e2b" },
+    "service_selector": {
+      "entity_key": "platform:e2b"
+    },
     "root_selectors": [
-      { "entity_key": "platform:e2b:api" },
-      { "entity_key": "platform:e2b:orchestrator" }
+      {
+        "entity_key": "platform:e2b:api"
+      },
+      {
+        "entity_key": "platform:e2b:orchestrator"
+      }
     ]
   },
   "profile_template": {
@@ -43,12 +49,20 @@
           {
             "key": "accept",
             "label": "ACCEPT",
-            "entity_selectors": [{ "entity_key": "platform:e2b:api" }]
+            "entity_selectors": [
+              {
+                "entity_key": "platform:e2b:api"
+              }
+            ]
           },
           {
             "key": "place",
             "label": "PLACE",
-            "entity_selectors": [{ "entity_key": "platform:e2b:orchestrator" }],
+            "entity_selectors": [
+              {
+                "entity_key": "platform:e2b:orchestrator"
+              }
+            ],
             "relation_selectors": [
               {
                 "from_entity_key": "platform:e2b:api",
@@ -60,17 +74,29 @@
           {
             "key": "fc_start",
             "label": "FC START",
-            "entity_selectors": [{ "entity_key": "infrastructure:e2b:sandbox-pool" }]
+            "entity_selectors": [
+              {
+                "entity_key": "infrastructure:e2b:sandbox-pool"
+              }
+            ]
           },
           {
             "key": "envd_ready",
             "label": "ENVD READY",
-            "entity_selectors": [{ "entity_key": "infrastructure:e2b:sandbox-pool" }]
+            "entity_selectors": [
+              {
+                "entity_key": "infrastructure:e2b:sandbox-pool"
+              }
+            ]
           },
           {
             "key": "routed",
             "label": "ROUTED",
-            "entity_selectors": [{ "entity_key": "platform:e2b:api" }]
+            "entity_selectors": [
+              {
+                "entity_key": "platform:e2b:api"
+              }
+            ]
           }
         ]
       }
@@ -87,7 +113,9 @@
           "golden_create_errors",
           "golden_capacity_saturation"
         ],
-        "tool_refs": ["metrics.query_semantic_signal.v1"]
+        "tool_refs": [
+          "metrics.query_semantic_signal.v1"
+        ]
       },
       {
         "key": "create_journey",
@@ -95,7 +123,10 @@
         "title": "Sandbox 创建阶段",
         "order": 20,
         "journey_ref": "sandbox_create",
-        "tool_refs": ["context.resolve_focus.v1", "evidence.search_traces.v1"]
+        "tool_refs": [
+          "context.resolve_focus.v1",
+          "evidence.search_traces.v1"
+        ]
       },
       {
         "key": "request_topology",
@@ -107,29 +138,41 @@
           "red_api_orchestrator_errors",
           "red_api_orchestrator_duration"
         ],
-        "tool_refs": ["topology.expand_neighbors.v1", "metrics.query_semantic_signal.v1"]
+        "tool_refs": [
+          "topology.expand_neighbors.v1",
+          "metrics.query_semantic_signal.v1"
+        ]
       },
       {
         "key": "host_capacity",
         "renderer": "resource_fleet",
         "title": "宿主机与资源池",
         "order": 40,
-        "signal_refs": ["use_host_hugepages_utilization"],
-        "tool_refs": ["metrics.query_semantic_signal.v1"]
+        "signal_refs": [
+          "use_host_hugepages_utilization"
+        ],
+        "tool_refs": [
+          "metrics.query_semantic_signal.v1"
+        ]
       },
       {
         "key": "evidence",
         "renderer": "evidence_list",
         "title": "证据",
         "order": 50,
-        "tool_refs": ["evidence.search_logs.v1", "evidence.search_traces.v1"]
+        "tool_refs": [
+          "evidence.search_logs.v1",
+          "evidence.search_traces.v1"
+        ]
       },
       {
         "key": "timeline",
         "renderer": "domain_timeline",
         "title": "事件时间线",
         "order": 60,
-        "tool_refs": ["domain.list_service_faults.v1"]
+        "tool_refs": [
+          "domain.list_service_faults.v1"
+        ]
       }
     ],
     "signal_bindings": [
@@ -138,19 +181,28 @@
         "label": "创建延迟 P95",
         "family": "golden",
         "semantic": "latency",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.quantile_value",
         "unit": "ms",
         "aggregation": "p95",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 3000, "critical": 8000 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 3000,
+          "critical": 8000
+        }
       },
       {
         "key": "golden_create_traffic",
         "label": "创建流量",
         "family": "golden",
         "semantic": "traffic",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.rate_per_second",
         "unit": "req/s",
@@ -161,26 +213,40 @@
         "label": "创建错误率",
         "family": "golden",
         "semantic": "errors",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "avg",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 5, "critical": 15 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 5,
+          "critical": 15
+        }
       },
       {
         "key": "golden_capacity_saturation",
         "label": "最坏容量压力 proxy",
         "family": "golden",
         "semantic": "saturation",
-        "scope": { "kind": "service" },
+        "scope": {
+          "kind": "service"
+        },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "max",
         "measurement_role": "proxy",
         "proxy_reason": "placement admission wait/queue 的直接指标尚未确认存在；这里用宿主 HugePages 使用率作为容量压力 proxy，页面必须显式标注 proxy，不得称为真实 saturation。",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 85, "critical": 95 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 85,
+          "critical": 95
+        }
       },
       {
         "key": "red_api_orchestrator_rate",
@@ -221,7 +287,12 @@
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "avg",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 2, "critical": 5 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 2,
+          "critical": 5
+        }
       },
       {
         "key": "red_api_orchestrator_duration",
@@ -242,7 +313,12 @@
         "output_field": "series.quantile_value",
         "unit": "ms",
         "aggregation": "p95",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 1000, "critical": 3000 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 1000,
+          "critical": 3000
+        }
       },
       {
         "key": "use_host_hugepages_utilization",
@@ -251,13 +327,22 @@
         "semantic": "utilization",
         "scope": {
           "kind": "resource",
-          "entity_selectors": [{ "entity_key": "infrastructure:e2b:host-fleet" }]
+          "entity_selectors": [
+            {
+              "entity_key": "infrastructure:e2b:host-fleet"
+            }
+          ]
         },
         "tool_key": "metrics.query_semantic_signal.v1",
         "output_field": "series.ratio_percent",
         "unit": "%",
         "aggregation": "max",
-        "thresholds": { "mode": "absolute", "direction": "above", "degraded": 85, "critical": 95 }
+        "thresholds": {
+          "mode": "absolute",
+          "direction": "above",
+          "degraded": 85,
+          "critical": 95
+        }
       }
     ],
     "tool_refs": [
@@ -278,113 +363,233 @@
       "freshness_ttl_seconds": 60
     }
   },
-  "telemetry_bindings": [
-    {
-      "binding_key": "golden_create_latency",
-      "template_ref": "histogram_quantile_rate.v1",
-      "params": {
-        "bucket_metric": "traces_spanmetrics_latency_bucket",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "span_name", "value": "SandboxCreate" }
-        ],
-        "quantile": 0.95,
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_create_traffic",
-      "template_ref": "counter_rate.v1",
-      "params": {
-        "metric": "traces_spanmetrics_calls_total",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "span_name", "value": "SandboxCreate" }
-        ],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_create_errors",
-      "template_ref": "counter_ratio_percent.v1",
-      "params": {
-        "numerator_metric": "traces_spanmetrics_calls_total",
-        "denominator_metric": "traces_spanmetrics_calls_total",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "span_name", "value": "SandboxCreate" }
-        ],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "golden_capacity_saturation",
-      "template_ref": "gauge_ratio_percent.v1",
-      "params": {
-        "total_metric": "node_memory_HugePages_Total",
-        "free_metric": "node_memory_HugePages_Free",
-        "labels": [{ "name": "job", "value": "node-exporter" }],
-        "group_by": ["instance"]
-      }
-    },
-    {
-      "binding_key": "red_api_orchestrator_rate",
-      "template_ref": "counter_rate.v1",
-      "params": {
-        "metric": "traces_spanmetrics_calls_total",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "peer_service", "value": "e2b-orchestrator" }
-        ],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "red_api_orchestrator_errors",
-      "template_ref": "counter_ratio_percent.v1",
-      "params": {
-        "numerator_metric": "traces_spanmetrics_calls_total",
-        "denominator_metric": "traces_spanmetrics_calls_total",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "peer_service", "value": "e2b-orchestrator" }
-        ],
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "red_api_orchestrator_duration",
-      "template_ref": "histogram_quantile_rate.v1",
-      "params": {
-        "bucket_metric": "traces_spanmetrics_latency_bucket",
-        "labels": [
-          { "name": "service_name", "value": "e2b-api" },
-          { "name": "peer_service", "value": "e2b-orchestrator" }
-        ],
-        "quantile": 0.95,
-        "range_seconds": 300
-      }
-    },
-    {
-      "binding_key": "use_host_hugepages_utilization",
-      "template_ref": "gauge_ratio_percent.v1",
-      "params": {
-        "total_metric": "node_memory_HugePages_Total",
-        "free_metric": "node_memory_HugePages_Free",
-        "labels": [{ "name": "job", "value": "node-exporter" }],
-        "group_by": ["instance"]
-      }
-    }
-  ],
   "topology_policy": {
-    "alias_namespaces": ["otel_service", "host_instance", "sandbox_pool"],
+    "alias_namespaces": [
+      "otel_service",
+      "host_instance",
+      "sandbox_pool"
+    ],
     "discovery": {
-      "identity_fields": ["service_name", "peer_service", "instance"],
+      "identity_fields": [
+        "service_name",
+        "peer_service",
+        "instance"
+      ],
       "instance_role": "instance"
     },
     "overlay": {
       "stale_after_seconds": 300,
       "max_hints": 200
     }
-  }
+  },
+  "provider_bindings": [
+    {
+      "key": "signal_golden_create_latency",
+      "kind": "signal",
+      "target_ref": "golden_create_latency",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "histogram_quantile_rate.v1",
+      "params": {
+        "bucket_metric": "traces_spanmetrics_latency_bucket",
+        "labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "span_name",
+            "value": "SandboxCreate"
+          }
+        ],
+        "quantile": 0.95,
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_golden_create_traffic",
+      "kind": "signal",
+      "target_ref": "golden_create_traffic",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_rate.v1",
+      "params": {
+        "metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "span_name",
+            "value": "SandboxCreate"
+          }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_golden_create_errors",
+      "kind": "signal",
+      "target_ref": "golden_create_errors",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_ratio_percent.v1",
+      "params": {
+        "numerator_metric": "traces_spanmetrics_calls_total",
+        "denominator_metric": "traces_spanmetrics_calls_total",
+        "range_seconds": 300,
+        "common_labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "span_name",
+            "value": "SandboxCreate"
+          }
+        ],
+        "numerator_labels": [
+          {
+            "name": "status_code",
+            "value": "STATUS_CODE_ERROR"
+          }
+        ]
+      }
+    },
+    {
+      "key": "signal_golden_capacity_saturation",
+      "kind": "signal",
+      "target_ref": "golden_capacity_saturation",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "node_memory_HugePages_Total",
+        "free_metric": "node_memory_HugePages_Free",
+        "labels": [
+          {
+            "name": "job",
+            "value": "node-exporter"
+          }
+        ],
+        "group_by": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "key": "signal_red_api_orchestrator_rate",
+      "kind": "signal",
+      "target_ref": "red_api_orchestrator_rate",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_rate.v1",
+      "params": {
+        "metric": "traces_spanmetrics_calls_total",
+        "labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "peer_service",
+            "value": "e2b-orchestrator"
+          }
+        ],
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_red_api_orchestrator_errors",
+      "kind": "signal",
+      "target_ref": "red_api_orchestrator_errors",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "counter_ratio_percent.v1",
+      "params": {
+        "numerator_metric": "traces_spanmetrics_calls_total",
+        "denominator_metric": "traces_spanmetrics_calls_total",
+        "range_seconds": 300,
+        "common_labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "peer_service",
+            "value": "e2b-orchestrator"
+          }
+        ],
+        "numerator_labels": [
+          {
+            "name": "status_code",
+            "value": "STATUS_CODE_ERROR"
+          }
+        ]
+      }
+    },
+    {
+      "key": "signal_red_api_orchestrator_duration",
+      "kind": "signal",
+      "target_ref": "red_api_orchestrator_duration",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "histogram_quantile_rate.v1",
+      "params": {
+        "bucket_metric": "traces_spanmetrics_latency_bucket",
+        "labels": [
+          {
+            "name": "service_name",
+            "value": "e2b-api"
+          },
+          {
+            "name": "peer_service",
+            "value": "e2b-orchestrator"
+          }
+        ],
+        "quantile": 0.95,
+        "range_seconds": 300
+      }
+    },
+    {
+      "key": "signal_use_host_hugepages_utilization",
+      "kind": "signal",
+      "target_ref": "use_host_hugepages_utilization",
+      "tool_key": "metrics.query_semantic_signal.v1",
+      "template_ref": "gauge_ratio_percent.v1",
+      "params": {
+        "total_metric": "node_memory_HugePages_Total",
+        "free_metric": "node_memory_HugePages_Free",
+        "labels": [
+          {
+            "name": "job",
+            "value": "node-exporter"
+          }
+        ],
+        "group_by": [
+          "instance"
+        ]
+      }
+    },
+    {
+      "key": "journey_sandbox_create",
+      "kind": "journey",
+      "target_ref": "sandbox_create",
+      "tool_key": "evidence.search_traces.v1",
+      "template_ref": "trace_by_focus.v1",
+      "params": {
+        "stream": "default",
+        "focus_field": "sandbox_id",
+        "row_limit": 200,
+        "stage_field": "span_name"
+      }
+    },
+    {
+      "key": "evidence_sandbox_logs",
+      "kind": "evidence",
+      "target_ref": "sandbox_id",
+      "tool_key": "evidence.search_logs.v1",
+      "template_ref": "logs_by_focus.v1",
+      "params": {
+        "stream": "e2b_logs",
+        "focus_field": "sandbox_id",
+        "row_limit": 200,
+        "status_field": "level"
+      }
+    }
+  ]
 }

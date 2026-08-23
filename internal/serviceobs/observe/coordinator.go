@@ -210,7 +210,7 @@ func (c *Coordinator) ReadObservations(
 
 	// 完全没有配置任何 provider：逐字保留 Phase 2 语义。
 	if !c.readers.AnyConfigured() {
-		return c.notConnectedFacts(req), nil
+		return c.notConnectedFacts(c.requestedBindingKeys(req)), nil
 	}
 
 	permissions, err := c.resolvePermissions(ctx, req)
@@ -218,15 +218,22 @@ func (c *Coordinator) ReadObservations(
 		return serviceobs.ObservationFacts{}, err
 	}
 
+	// binding key 只在这里解析一次，然后同时交给 reader 与 merge。
+	//
+	// 修复前有两套推导：runSources 用 c.summaryKeys（可注入），merge 里又硬编码一遍
+	// GoldenBindings。注入自定义 SummaryBindingKeys 时，"请求了哪些 binding"与"给哪些
+	// binding 补 Unknown"就会不一致——页面于是缺几条本该显式 Unknown 的信号。
+	bindingKeys := c.requestedBindingKeys(req)
+
 	plan := planSources(req.Purpose, req.Profile)
-	outcomes := c.runSources(ctx, req, plan, permissions)
+	outcomes := c.runSources(ctx, req, plan, permissions, bindingKeys)
 
 	// 父 context 取消/超时必须向上返回，而不是把一堆"因为断开所以 Unknown"的来源当成
 	// 一个可展示的 Partial 返回给用户。
 	if err := ctx.Err(); err != nil {
 		return serviceobs.ObservationFacts{}, err
 	}
-	return mergeOutcomes(req, outcomes), nil
+	return mergeOutcomes(bindingKeys, outcomes), nil
 }
 
 // resolvePermissions 现算权限。resolver 为 nil 时返回空集合（拒绝一切），而不是放行。
@@ -245,13 +252,13 @@ func (c *Coordinator) resolvePermissions(
 }
 
 // notConnectedFacts 构造 Phase 2 的"遥测完全未接入"事实。
-func (c *Coordinator) notConnectedFacts(req serviceobs.ObservationRequest) serviceobs.ObservationFacts {
+func (c *Coordinator) notConnectedFacts(bindingKeys []string) serviceobs.ObservationFacts {
 	facts := serviceobs.ObservationFacts{
-		Signals:      make([]health.SignalObservation, 0, len(req.Profile.SignalBindings)),
+		Signals:      make([]health.SignalObservation, 0, len(bindingKeys)),
 		EvidenceRefs: []model.EvidenceRef{},
 		Focus:        serviceobs.FocusNotRequested,
 	}
-	for _, key := range c.requestedBindingKeys(req) {
+	for _, key := range bindingKeys {
 		facts.Signals = append(facts.Signals, health.SignalObservation{
 			BindingKey:    key,
 			Availability:  model.SignalAvailabilityUnavailable,
@@ -294,6 +301,7 @@ func (c *Coordinator) runSources(
 	req serviceobs.ObservationRequest,
 	plan sourcePlan,
 	permissions serviceobs.Permissions,
+	bindingKeys []string,
 ) []sourceOutcome {
 	type task struct {
 		sourceKey  string
@@ -302,16 +310,24 @@ func (c *Coordinator) runSources(
 		run        func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error)
 		configured bool
 		notConnect string
+		// affectsFocus 表示该来源是否参与 focus 判定。
+		//
+		// signals 是 false：Prometheus 超时说明"指标不知道"，与"这个 sandbox_id 有没有被
+		// 观测到"完全无关。修复前所有失败来源都无条件报 FocusUnknown，于是一次 Prometheus
+		// 超时就能把 traces 已经确认命中的 focus 降级成 Unknown——那正是"最小范围 Unknown"
+		// 要防的越界降级。
+		affectsFocus bool
 	}
 
 	tasks := make([]task, 0, 4)
 	if plan.signals {
 		tasks = append(tasks, task{
-			sourceKey:  serviceobs.SourceKeyPrometheus,
-			permission: serviceobs.PermissionMetricsRead,
-			limits:     clampToProfile(withLimitDefaults(c.limits.Signals), req.Profile),
-			configured: c.readers.Signals != nil,
-			notConnect: serviceobs.ReasonPrometheusNotConnected,
+			sourceKey:    serviceobs.SourceKeyPrometheus,
+			permission:   serviceobs.PermissionMetricsRead,
+			limits:       clampToProfile(withLimitDefaults(c.limits.Signals), req.Profile),
+			configured:   c.readers.Signals != nil,
+			notConnect:   serviceobs.ReasonPrometheusNotConnected,
+			affectsFocus: false,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
 				facts, err := c.readers.Signals.ReadSignals(ctx, serviceobs.SignalRequest{
 					Subject:       req.Subject,
@@ -319,7 +335,7 @@ func (c *Coordinator) runSources(
 					Profile:       req.Profile,
 					ServiceID:     req.ServiceID,
 					Environment:   req.Environment,
-					BindingKeys:   c.requestedBindingKeys(req),
+					BindingKeys:   bindingKeys,
 					WindowSeconds: req.WindowSeconds,
 					From:          req.From,
 					To:            req.To,
@@ -347,11 +363,12 @@ func (c *Coordinator) runSources(
 	}
 	if plan.traces {
 		tasks = append(tasks, task{
-			sourceKey:  serviceobs.SourceKeyOpenObserveTraces,
-			permission: serviceobs.PermissionTracesRead,
-			limits:     clampToProfile(withLimitDefaults(c.limits.Traces), req.Profile),
-			configured: c.readers.Traces != nil,
-			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			sourceKey:    serviceobs.SourceKeyOpenObserveTraces,
+			permission:   serviceobs.PermissionTracesRead,
+			limits:       clampToProfile(withLimitDefaults(c.limits.Traces), req.Profile),
+			configured:   c.readers.Traces != nil,
+			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
+			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
 				facts, err := c.readers.Traces.ReadTraces(ctx, focusRequest(limits))
 				if err != nil {
@@ -367,11 +384,12 @@ func (c *Coordinator) runSources(
 	}
 	if plan.logs {
 		tasks = append(tasks, task{
-			sourceKey:  serviceobs.SourceKeyOpenObserveLogs,
-			permission: serviceobs.PermissionLogsRead,
-			limits:     clampToProfile(withLimitDefaults(c.limits.Logs), req.Profile),
-			configured: c.readers.Logs != nil,
-			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			sourceKey:    serviceobs.SourceKeyOpenObserveLogs,
+			permission:   serviceobs.PermissionLogsRead,
+			limits:       clampToProfile(withLimitDefaults(c.limits.Logs), req.Profile),
+			configured:   c.readers.Logs != nil,
+			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
+			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
 				facts, err := c.readers.Logs.ReadLogs(ctx, focusRequest(limits))
 				if err != nil {
@@ -389,10 +407,11 @@ func (c *Coordinator) runSources(
 			sourceKey: serviceobs.SourceKeyOpenObserveAccess,
 			// access 记录可能带 request/response 片段，因此按 logs.read 从严要求，
 			// 不借 traces.read 放行。
-			permission: serviceobs.PermissionLogsRead,
-			limits:     clampToProfile(withLimitDefaults(c.limits.Access), req.Profile),
-			configured: c.readers.Access != nil,
-			notConnect: serviceobs.ReasonOpenObserveNotConnected,
+			permission:   serviceobs.PermissionLogsRead,
+			limits:       clampToProfile(withLimitDefaults(c.limits.Access), req.Profile),
+			configured:   c.readers.Access != nil,
+			notConnect:   serviceobs.ReasonOpenObserveNotConnected,
+			affectsFocus: true,
 			run: func(ctx context.Context, limits serviceobs.SourceLimits) (sourceOutcome, error) {
 				facts, err := c.readers.Access.ReadAccess(ctx, focusRequest(limits))
 				if err != nil {
@@ -411,19 +430,23 @@ func (c *Coordinator) runSources(
 	for i := range tasks {
 		current := tasks[i]
 		index := i
+		// focusRequested 决定占位结果是否携带 focus 结论：只有"参与 focus 判定的来源"且
+		// "这次真的请求了 focus"时，它的失败才意味着 focus 不知道。
+		focusRequested := current.affectsFocus && req.Focus != nil
+
 		// 未连接与未授权都不启 goroutine：前者没有实现可调，后者必须保证上游调用次数为 0。
 		if !current.configured {
-			outcomes[index] = notConnectedOutcome(current.sourceKey, current.notConnect)
+			outcomes[index] = notConnectedOutcome(current.sourceKey, current.notConnect, focusRequested)
 			continue
 		}
 		if !permissions.Allows(current.permission) {
-			outcomes[index] = forbiddenOutcome(current.sourceKey)
+			outcomes[index] = forbiddenOutcome(current.sourceKey, focusRequested)
 			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			outcomes[index] = runOne(ctx, current.sourceKey, current.limits, current.run)
+			outcomes[index] = runOne(ctx, current.sourceKey, current.limits, focusRequested, current.run)
 		}()
 	}
 	wg.Wait()
@@ -435,12 +458,13 @@ func runOne(
 	parent context.Context,
 	sourceKey string,
 	limits serviceobs.SourceLimits,
+	focusRequested bool,
 	run func(context.Context, serviceobs.SourceLimits) (sourceOutcome, error),
 ) (outcome sourceOutcome) {
 	// panic 隔离：一个 adapter 崩溃不能带走整个请求，也不能让别的来源丢结果。
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			outcome = failedOutcome(sourceKey, serviceobs.ReasonSourceInternalError, false)
+			outcome = failedOutcome(sourceKey, serviceobs.ReasonSourceInternalError, false, focusRequested)
 		}
 	}()
 
@@ -458,12 +482,12 @@ func runOne(
 	// 父 context 断开：这不是"这个来源坏了"，而是整个请求没了。仍然给一个 Unknown 占位，
 	// 由 ReadObservations 统一改成向上返回 context 错误。
 	if parent.Err() != nil {
-		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true)
+		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true, focusRequested)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true)
+		return failedOutcome(sourceKey, serviceobs.ReasonSourceTimeout, true, focusRequested)
 	}
-	return failedOutcome(sourceKey, reasonForError(err), retryableForError(err))
+	return failedOutcome(sourceKey, reasonForError(err), retryableForError(err), focusRequested)
 }
 
 // reasonForError 把 adapter 的 typed 错误映射成稳定 reason code。
@@ -509,29 +533,29 @@ var (
 	ErrAuditUnavailable    = errors.New("observe: 审计不可写，结果不得返回")
 )
 
-func notConnectedOutcome(sourceKey, reason string) sourceOutcome {
-	return sourceOutcome{source: health.SourceObservation{
+func notConnectedOutcome(sourceKey, reason string, focusRequested bool) sourceOutcome {
+	return withFocusPlaceholder(sourceOutcome{source: health.SourceObservation{
 		SourceKey:  sourceKey,
 		State:      model.AvailabilityUnavailable,
 		Freshness:  model.FreshnessUnknown,
 		ReasonCode: reason,
 		Retryable:  false,
-	}}
+	}}, focusRequested)
 }
 
-func forbiddenOutcome(sourceKey string) sourceOutcome {
-	return sourceOutcome{source: health.SourceObservation{
+func forbiddenOutcome(sourceKey string, focusRequested bool) sourceOutcome {
+	return withFocusPlaceholder(sourceOutcome{source: health.SourceObservation{
 		SourceKey:  sourceKey,
 		State:      model.AvailabilityForbidden,
 		Freshness:  model.FreshnessUnknown,
 		ReasonCode: serviceobs.ReasonPermissionDenied,
 		// 重试不会给用户补上权限。
 		Retryable: false,
-	}}
+	}}, focusRequested)
 }
 
-func failedOutcome(sourceKey, reason string, retryable bool) sourceOutcome {
-	return sourceOutcome{
+func failedOutcome(sourceKey, reason string, retryable bool, focusRequested bool) sourceOutcome {
+	return withFocusPlaceholder(sourceOutcome{
 		source: health.SourceObservation{
 			SourceKey:  sourceKey,
 			State:      model.AvailabilityUnavailable,
@@ -539,9 +563,20 @@ func failedOutcome(sourceKey, reason string, retryable bool) sourceOutcome {
 			ReasonCode: reason,
 			Retryable:  retryable,
 		},
-		focus:         serviceobs.FocusUnknown,
-		focusReported: true,
+	}, focusRequested)
+}
+
+// withFocusPlaceholder 只在"该来源参与 focus 判定且本次确实请求了 focus"时报 FocusUnknown。
+//
+// 不满足条件时 focusReported 保持 false，因此这条失败完全不参与 focus 合并：一个不读 focus
+// 的来源失败，不该让页面对"这个请求有没有被观测到"改变结论。
+func withFocusPlaceholder(outcome sourceOutcome, focusRequested bool) sourceOutcome {
+	if !focusRequested {
+		return outcome
 	}
+	outcome.focus = serviceobs.FocusUnknown
+	outcome.focusReported = true
+	return outcome
 }
 
 // mergeOutcomes 按稳定 source key 合并结果。
@@ -551,7 +586,7 @@ func failedOutcome(sourceKey, reason string, retryable bool) sourceOutcome {
 //     返回，但重复时不能让后面的覆盖前面的，否则结果依赖 map 遍历顺序）；
 //   - 缺失的 binding 补一条显式 Unknown，绝不静默消失；
 //   - focus 结论取"最坏"：任一来源 unknown 就是 unknown，否则任一 matched 就是 matched。
-func mergeOutcomes(req serviceobs.ObservationRequest, outcomes []sourceOutcome) serviceobs.ObservationFacts {
+func mergeOutcomes(bindingKeys []string, outcomes []sourceOutcome) serviceobs.ObservationFacts {
 	facts := serviceobs.ObservationFacts{
 		Signals:      []health.SignalObservation{},
 		Sources:      []health.SourceObservation{},
@@ -577,9 +612,10 @@ func mergeOutcomes(req serviceobs.ObservationRequest, outcomes []sourceOutcome) 
 		facts.Issues = append(facts.Issues, outcome.issues...)
 	}
 
-	// 被请求但没有回值的 binding 必须显式 Unknown。
+	// 被请求但没有回值的 binding 必须显式 Unknown。补齐用的就是 ReadObservations 解析出来
+	// 的同一份 key 列表，因此"请求集"与"补齐集"不可能不一致。
 	signalReason := signalUnknownReason(outcomes)
-	for _, key := range requestedKeys(req, outcomes) {
+	for _, key := range bindingKeys {
 		if _, exists := seenBinding[key]; exists {
 			continue
 		}
@@ -603,26 +639,6 @@ func mergeOutcomes(req serviceobs.ObservationRequest, outcomes []sourceOutcome) 
 	return facts
 }
 
-// requestedKeys 从 request 与已返回结果推断本次被请求的 binding 集合。
-func requestedKeys(req serviceobs.ObservationRequest, outcomes []sourceOutcome) []string {
-	if len(req.BindingKeys) > 0 {
-		return req.BindingKeys
-	}
-	if req.Purpose == serviceobs.PurposeDirectorySummary {
-		bindings := req.Profile.GoldenBindings()
-		keys := make([]string, 0, len(bindings))
-		for _, binding := range bindings {
-			keys = append(keys, binding.Key)
-		}
-		return keys
-	}
-	keys := make([]string, 0, len(req.Profile.SignalBindings))
-	for _, binding := range req.Profile.SignalBindings {
-		keys = append(keys, binding.Key)
-	}
-	return keys
-}
-
 // signalUnknownReason 为补齐的 Unknown binding 选一个稳定 reason。
 //
 // 它取 signal 来源自己的 reason code，因此"Prometheus 超时"与"Prometheus 未连接"在
@@ -639,26 +655,36 @@ func signalUnknownReason(outcomes []sourceOutcome) string {
 	return serviceobs.ReasonSourceReadFailed
 }
 
-// mergeFocus 取最坏 focus 结论。
+// mergeFocus 按 matched > unknown > empty 合并 focus 结论。
 //
-// unknown 优先于 matched，matched 优先于 empty：如果 traces 说命中、logs 说不知道，
-// 整体结论必须是"不知道"，否则页面会用一个不完整的证据集去解释一次请求。
+// 优先级的理由是"已确认命中是正事实"：只要有一个来源真的看到了这次请求，它就发生过，
+// 另一个来源超时或没权限都不能把它抹掉。反过来，没有任何命中时，只要有一个已请求的来源
+// 不知道，就不能宣称 Empty——那会把"查不到"说成"没发生"。只有全部已请求来源都成功确认
+// 没有记录，才是 Empty。
+//
+// 请求本身没有 focus 时恒为 NotRequested：此时没有任何来源会报告 focus 结论。
 func mergeFocus(outcomes []sourceOutcome) serviceobs.FocusResult {
-	result := serviceobs.FocusNotRequested
+	sawUnknown := false
+	sawEmpty := false
 	for _, outcome := range outcomes {
 		if !outcome.focusReported {
 			continue
 		}
 		switch outcome.focus {
-		case serviceobs.FocusUnknown:
-			return serviceobs.FocusUnknown
 		case serviceobs.FocusMatched:
-			result = serviceobs.FocusMatched
+			return serviceobs.FocusMatched
+		case serviceobs.FocusUnknown:
+			sawUnknown = true
 		case serviceobs.FocusEmpty:
-			if result != serviceobs.FocusMatched {
-				result = serviceobs.FocusEmpty
-			}
+			sawEmpty = true
 		}
 	}
-	return result
+	switch {
+	case sawUnknown:
+		return serviceobs.FocusUnknown
+	case sawEmpty:
+		return serviceobs.FocusEmpty
+	default:
+		return serviceobs.FocusNotRequested
+	}
 }
