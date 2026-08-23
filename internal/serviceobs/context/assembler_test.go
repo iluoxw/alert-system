@@ -485,6 +485,22 @@ func TestAssembleWindowValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("缺省窗口 default 大于 max 时取 min 而不 422", func(t *testing.T) {
+		wideDefault := testProfile()
+		wideDefault.Limits.DefaultWindowSeconds = 7200
+		wideDefault.Limits.MaxWindowSeconds = 3600
+		assembler, _, _, _ := newAssembler(t, &wideDefault)
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+		})
+		if err != nil {
+			t.Fatalf("合成缺省窗口不得 ErrScopeTooBroad，实际 %v", err)
+		}
+		if snapshot.WindowSeconds != 3600 {
+			t.Fatalf("缺省窗口应 clamp 到 max=3600，实际 %d", snapshot.WindowSeconds)
+		}
+	})
+
 	t.Run("顺序颠倒必须拒绝", func(t *testing.T) {
 		assembler, _, _, _ := newAssembler(t, &published)
 		_, err := assembler.Assemble(stdcontext.Background(), Request{
@@ -757,6 +773,58 @@ func (a availableObservations) ReadObservations(
 		Freshness: model.FreshnessFresh, ObservedAt: a.observedAt, Retryable: true,
 	}}
 	return facts, nil
+}
+
+func TestAssembleDomainBoundsMakeDataPartialWithoutLosingFacts(t *testing.T) {
+	published := testProfile()
+	assembler, _, _, domain := newAssembler(t, &published)
+	assembler.Observations = availableObservations{observedAt: testNow.Add(-10 * time.Second)}
+	assembler.TelemetryConnected = true
+
+	t.Run("边界截断时 Data Partial 且事实保留", func(t *testing.T) {
+		bounded := testDomainFacts()
+		bounded.BoundaryTruncated = true
+		domain.facts = bounded
+
+		snapshot, err := assembler.Assemble(stdcontext.Background(), Request{
+			Kind: KindOverview, ServiceID: testServiceID,
+		})
+		if err != nil {
+			t.Fatalf("Assemble 失败: %v", err)
+		}
+		if snapshot.Evaluation.Data.State != model.DataStatePartial {
+			t.Fatalf("domain 边界截断必须让 Data Partial，实际 %q", snapshot.Evaluation.Data.State)
+		}
+		if len(snapshot.DomainFacts.Faults) != 1 {
+			t.Fatalf("截断不得丢弃已返回的领域事实: %+v", snapshot.DomainFacts.Faults)
+		}
+		if !snapshot.DomainFacts.BoundaryTruncated {
+			t.Fatal("BoundaryTruncated 必须保留")
+		}
+		section, _ := snapshot.SectionState(serviceobs.SectionKeyDomain)
+		if section.State != model.AvailabilityUnknown {
+			t.Fatalf("domain section 应为 unknown，实际 %q", section.State)
+		}
+		if section.ReasonCode != serviceobs.ReasonDomainBoundsReached {
+			t.Fatalf("reason 必须稳定，实际 %q", section.ReasonCode)
+		}
+		var found bool
+		for _, source := range snapshot.Evaluation.Data.Sources {
+			if source.SourceKey != serviceobs.SourceKeyDomain {
+				continue
+			}
+			found = true
+			if source.State != model.AvailabilityUnknown {
+				t.Fatalf("domain source 应为 unknown，实际 %q", source.State)
+			}
+			if source.ReasonCode != serviceobs.ReasonDomainBoundsReached {
+				t.Fatalf("source reason 必须稳定，实际 %q", source.ReasonCode)
+			}
+		}
+		if !found {
+			t.Fatal("必须有 domain source 状态")
+		}
+	})
 }
 
 func TestAssembleTopologyBoundsMakeDataPartialWithoutLosingFacts(t *testing.T) {

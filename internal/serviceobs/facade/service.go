@@ -434,12 +434,46 @@ func (s *Service) explicitWindow(windowSeconds int) (time.Time, time.Time) {
 	return to.Add(-time.Duration(windowSeconds) * time.Second), to
 }
 
-// windowFor 返回该 Profile 的默认聚合窗口，它是 cache key 的一个维度。
+// windowFor 返回该 Profile 的有效默认聚合窗口，它是 cache key 的一个维度。
+// 当 Profile default 大于有效 max 时 clamp 到 min(default, max)，与 assembler 合成
+// 缺省窗口口径一致。
 func (s *Service) windowFor(published *model.Profile) int {
+	defaultWindow := s.limits.DefaultWindowSeconds
 	if published != nil && published.Limits.DefaultWindowSeconds > 0 {
-		return published.Limits.DefaultWindowSeconds
+		defaultWindow = published.Limits.DefaultWindowSeconds
 	}
-	return s.limits.DefaultWindowSeconds
+	maxWindow := s.limits.MaxWindowSeconds
+	if maxWindow < minFacadeWindowSeconds {
+		maxWindow = defaultFacadeMaxWindowSeconds
+	}
+	if published != nil && published.Limits.MaxWindowSeconds > 0 {
+		maxWindow = minInt(maxWindow, published.Limits.MaxWindowSeconds)
+	}
+	if maxWindow < minFacadeWindowSeconds {
+		maxWindow = minFacadeWindowSeconds
+	}
+	if defaultWindow > maxWindow {
+		defaultWindow = maxWindow
+	}
+	return defaultWindow
+}
+
+const (
+	minFacadeWindowSeconds      = 60
+	defaultFacadeMaxWindowSeconds = 86400
+)
+
+func minInt(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Service) publishedProfile(serviceID string) (model.Profile, bool) {
