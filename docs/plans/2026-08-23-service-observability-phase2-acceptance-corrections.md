@@ -44,8 +44,8 @@
 
 1. 把 URL 原始 `sort`、`direction`、`window_seconds` 传到 live API；客户端类型不得用过窄 union 迫使调用方先吞掉非法值。
 2. UI 的排序图标/窗口展示可以只解析合法值，但不得改变送往服务器的原始请求。
-3. fixture provider 实现与后端同口径的轻量 query validation，并抛出 `ApiError(422, ..., reason_code)`，使 fixture/live 的错误页面一致。
-4. 补回归：非法 sort、direction、window、health/data enum 都显示明确错误；合法 URL 与前进/后退恢复不退化。
+3. fixture provider 实现与后端同口径的轻量 query validation，并抛出 `ApiError(422, ..., reason_code)`，使 fixture/live 的错误页面一致；TS 侧的 sort/direction/enum allowlist 必须从单一常量来源派生，不能在页面与 provider 各复制一份。
+4. 补回归：非法 sort、direction、window、health/data enum 都显示明确错误；合法 URL 与前进/后退恢复不退化；special verifier 覆盖 TS allowlist，防止页面与 fixture provider 漂移。
 
 ### C2：fixture focus 重新查询后出现 URL 与视图矛盾
 
@@ -86,6 +86,8 @@
 1. 在 API 边界对非空 timezone 调用 `time.LoadLocation`；未知 zone 返回 422 `invalid_timezone`。
 2. `UTC` 与有效 IANA timezone 保持通过；timezone 仍只影响显示，不改变 from/to 查询边界。
 3. `WorkspaceContext` 的 Evidence 时间必须使用 `view.scope.timezone`，消除局部仍固定 Asia/Shanghai 的显示漂移。
+4. 后端通过空白导入标准库 `time/tzdata` 使合法 IANA zone 不依赖运行镜像的 zoneinfo；不得为此修改 Docker、Kubernetes 或 OTel 配置。
+5. 审计 Service Observability 路由内所有无参 `formatClock` 调用：必须显式传入 Page View timezone 或明确的 `UTC`，并保证可见文本与 `title` 时区一致。
 
 ### C5：登记 URL 可进入不安全 href
 
@@ -101,6 +103,7 @@
 3. projector 对历史遗留非法值 fail closed：不输出该链接，不能仅依赖新写入校验。
 4. 前端 EvidenceRef deep link 同样通过共享的安全 href 展示 helper；不安全 locator 显示摘要与不可打开状态，不生成可点击 URL。
 5. 覆盖大小写/前后空白/编码边界与合法内部、HTTP(S) URL。
+6. acceptance 明确记录：拒绝 `mailto:`、自定义 scheme、裸主机和 scheme-relative URL 是对 V1 写入口径的有意安全收紧；历史遗留值只在投影时最小范围 fail closed，不阻断其它服务信息。
 
 ### C6：live 目录团队筛选只看已加载页
 
@@ -206,7 +209,7 @@
 python3 docs/contracts/service-observability/v1/verify_examples.py
 go test -race -count=1 ./internal/serviceobs/... ./internal/api ./internal/app ./internal/store ./internal/config ./cmd/server
 go vet ./...
-go vet -tags=integration ./internal/store
+go vet -tags=integration ./...
 go test -tags=integration ./... -race -count=1
 go test -count=1 ./...
 cd web
@@ -236,6 +239,7 @@ git diff --name-only 6e4eddddd8e13ee505639ddadd6619d7afa1ecee...HEAD -- \
 
 ## 7. 退出条件
 
+- 固定 Cursor Cloud 会话中的 Fable 5 High 已对 exact SHA `3c9ef226a60ba560a0db2ec8027b4830402b67ef` 给出 `APPROVE`；本计划吸收其 tzdata、时间显示、安全兼容记录与全仓 integration vet 建议，未采纳放宽 route console 0 warning/0 error 的建议。
 - Fable 5 High 对本计划给出 `APPROVE`，或所有 blocking comment 已由 Codex 修订并再次确认。
 - Opus 5 High 完成 R1–R3，所有 slice 均有 exact SHA、push 与本地门禁证据。
 - Grok Bot `alert-system` 对最终 exact SHA review；真实问题由 Grok 提窄 PR，Codex/Opus 复验后合入。
