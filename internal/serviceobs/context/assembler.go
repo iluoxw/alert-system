@@ -669,7 +669,10 @@ func (a *Assembler) readDomain(
 
 	state := model.AvailabilityAvailable
 	reason := ""
-	if len(facts.Alerts) == 0 && len(facts.Faults) == 0 &&
+	if facts.BoundaryTruncated {
+		state = model.AvailabilityUnknown
+		reason = serviceobs.ReasonDomainBoundsReached
+	} else if len(facts.Alerts) == 0 && len(facts.Faults) == 0 &&
 		len(facts.Impacts) == 0 && len(facts.Incidents) == 0 {
 		state = model.AvailabilityEmpty
 		if facts.FocusApplied {
@@ -925,7 +928,13 @@ func resolveScope(
 	case from.IsZero() && to.IsZero():
 		// 服务端只取一次 now，保证 from/to 一致。
 		to = now
-		from = to.Add(-time.Duration(defaultWindow) * time.Second)
+		window := defaultWindow
+		if maxWindow > 0 && window > maxWindow {
+			// Profile schema 允许 default_window 独立于 max_window 配置；
+			// 缺省窗口取 min(default, max)，避免合法 Profile 自我 422。
+			window = maxWindow
+		}
+		from = to.Add(-time.Duration(window) * time.Second)
 	case from.IsZero() || to.IsZero():
 		return model.ContextScope{}, 0, fmt.Errorf("%w: from 与 to 必须同时出现", ErrInvalidTimeRange)
 	}

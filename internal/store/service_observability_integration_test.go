@@ -355,7 +355,7 @@ func TestServiceObservabilityBoundaryIsolatesSecondService(t *testing.T) {
 	var facts DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		boundary, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -430,7 +430,7 @@ func TestServiceObservabilityFocusOnlyNarrowsDomainRefs(t *testing.T) {
 
 	var unfocused, focused, missFocus DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
-		boundary, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -502,7 +502,7 @@ func TestServiceObservabilityDomainBoundaryIndependentOfTopology(t *testing.T) {
 	var facts DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		boundary, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -679,7 +679,7 @@ func TestServiceObservabilityQueriesAreReadOnly(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		boundary, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err

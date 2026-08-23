@@ -395,15 +395,18 @@ func (r *ServiceObservabilityRepo) ListCanonicalNeighborhood(
 // 边界 = service entity ∪ Profile roots ∪ 沿 declared 边有界可达的提供者。它完全不
 // 依赖 topology adapter 的返回：topology 失败时 domain 仍按同一边界返回事实。
 // seed 为空时返回空集合，绝不放宽成全库。
+//
+// 第二个返回值为 true 表示还有更多实体被 maxEntities 截断（内部多取一行判断）。
 func (r *ServiceObservabilityRepo) ServiceBoundaryEntityIDs(
 	ctx context.Context, tx pgx.Tx, serviceEntityID string, rootEntityIDs []string,
 	maxDepth, maxEntities int,
-) ([]string, error) {
+) ([]string, bool, error) {
 	seeds := normalizeUUIDSet(append([]string{serviceEntityID}, rootEntityIDs...))
 	if len(seeds) == 0 {
-		return []string{}, nil
+		return []string{}, false, nil
 	}
 	depth := clampTraversalDepth(maxDepth, DefaultBoundaryDepth)
+	limit := clampObservabilityLimit(maxEntities)
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE reached AS (
 			SELECT n.id, 0 AS depth, ARRAY[n.id]::uuid[] AS path
@@ -422,24 +425,29 @@ func (r *ServiceObservabilityRepo) ServiceBoundaryEntityIDs(
 		FROM shortest s JOIN resource_nodes n ON n.id = s.id
 		ORDER BY s.depth, n.name, s.id
 		LIMIT $3
-	`, seeds, depth, clampObservabilityLimit(maxEntities))
+	`, seeds, depth, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("store: 计算服务实体边界失败: %w", err)
+		return nil, false, fmt.Errorf("store: 计算服务实体边界失败: %w", err)
 	}
 	defer rows.Close()
-	ids := []string{}
+	ids := make([]string, 0, limit)
+	truncated := false
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("store: 扫描服务实体边界失败: %w", err)
+			return nil, false, fmt.Errorf("store: 扫描服务实体边界失败: %w", err)
+		}
+		if len(ids) == limit {
+			truncated = true
+			break
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: 遍历服务实体边界失败: %w", err)
+		return nil, false, fmt.Errorf("store: 遍历服务实体边界失败: %w", err)
 	}
 	sort.Strings(ids)
-	return ids, nil
+	return ids, truncated, nil
 }
 
 // DeclaredReachableEntityIDs 返回从 service entity 出发沿 declared depends_on/part_of
