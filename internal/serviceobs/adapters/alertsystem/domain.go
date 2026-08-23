@@ -66,12 +66,13 @@ func (a *DomainAdapter) ReadDomain(
 		Incidents:         []serviceobs.DomainIncident{},
 	}
 	err = a.runner.WithRead(ctx, func(reader Reader) error {
-		boundary, err := reader.ServiceBoundaryEntityIDs(ctx, req.ServiceEntityID,
+		boundary, truncated, err := reader.ServiceBoundaryEntityIDs(ctx, req.ServiceEntityID,
 			req.RootEntityIDs, boundaryDepth, maxEntities)
 		if err != nil {
 			return err
 		}
 		facts.BoundaryEntityIDs = boundary
+		facts.BoundaryTruncated = truncated
 		if len(boundary) == 0 {
 			// 边界为空就什么都不查。宁可返回空，也不放宽成"查全库"。
 			return nil

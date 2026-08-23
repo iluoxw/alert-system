@@ -412,6 +412,30 @@ func TestServiceObservabilityScanWalksCompleteCandidateSetByKeyset(t *testing.T)
 	}
 }
 
+func TestServiceObservabilityBoundaryTruncationIsExplicit(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	fixture := seedObservabilityFixture(t, ctx, st)
+	repo := NewServiceObservabilityRepo()
+
+	var boundary []string
+	var truncated bool
+	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		boundary, truncated, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+			[]string{fixture.rootEntityID}, 1, 2)
+		return err
+	}); err != nil {
+		t.Fatalf("读取实体边界失败: %v", err)
+	}
+	if !truncated {
+		t.Fatal("fixture 边界超过 maxEntities=2 时必须标 truncated")
+	}
+	if len(boundary) != 2 {
+		t.Fatalf("截断后应保留前 2 个实体，实际 %d: %v", len(boundary), boundary)
+	}
+}
+
 func TestServiceObservabilityBoundaryIsolatesSecondService(t *testing.T) {
 	st := setupTestStore(t)
 	ctx := context.Background()
@@ -422,7 +446,7 @@ func TestServiceObservabilityBoundaryIsolatesSecondService(t *testing.T) {
 	var facts DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		boundary, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -497,7 +521,7 @@ func TestServiceObservabilityFocusOnlyNarrowsDomainRefs(t *testing.T) {
 
 	var unfocused, focused, missFocus DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
-		boundary, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -569,7 +593,7 @@ func TestServiceObservabilityDomainBoundaryIndependentOfTopology(t *testing.T) {
 	var facts DomainFactsRows
 	if err := st.WithReadTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		boundary, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err = repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err
@@ -746,7 +770,7 @@ func TestServiceObservabilityQueriesAreReadOnly(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		boundary, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
+		boundary, _, err := repo.ServiceBoundaryEntityIDs(ctx, tx, fixture.primaryEntityID,
 			[]string{fixture.rootEntityID}, 1, 100)
 		if err != nil {
 			return err

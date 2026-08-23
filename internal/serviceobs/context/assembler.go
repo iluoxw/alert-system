@@ -669,7 +669,12 @@ func (a *Assembler) readDomain(
 
 	state := model.AvailabilityAvailable
 	reason := ""
-	if len(facts.Alerts) == 0 && len(facts.Faults) == 0 &&
+	if facts.BoundaryTruncated {
+		// 达到 entity 边界上限：已返回的事实全部保留，但这个来源的覆盖不完整，
+		// 状态必须是 unknown 并把整页 Data 推到 Partial。
+		state = model.AvailabilityUnknown
+		reason = serviceobs.ReasonDomainBoundsReached
+	} else if len(facts.Alerts) == 0 && len(facts.Faults) == 0 &&
 		len(facts.Impacts) == 0 && len(facts.Incidents) == 0 {
 		state = model.AvailabilityEmpty
 		if facts.FocusApplied {
@@ -921,11 +926,17 @@ func resolveScope(
 	}
 
 	from, to := req.From, req.To
+	synthesizedDefault := from.IsZero() && to.IsZero()
 	switch {
-	case from.IsZero() && to.IsZero():
-		// 服务端只取一次 now，保证 from/to 一致。
+	case synthesizedDefault:
+		// 服务端只取一次 now，保证 from/to 一致。schema 允许 default_window 独立于
+		// max_window，因此合成窗口取 min(default, max)，只对显式 caller 范围报超限。
 		to = now
-		from = to.Add(-time.Duration(defaultWindow) * time.Second)
+		window := defaultWindow
+		if maxWindow > 0 && window > maxWindow {
+			window = maxWindow
+		}
+		from = to.Add(-time.Duration(window) * time.Second)
 	case from.IsZero() || to.IsZero():
 		return model.ContextScope{}, 0, fmt.Errorf("%w: from 与 to 必须同时出现", ErrInvalidTimeRange)
 	}
@@ -945,7 +956,8 @@ func resolveScope(
 		return model.ContextScope{}, 0, fmt.Errorf("%w: 窗口不足 1 秒", ErrInvalidTimeRange)
 	}
 	// 上限比较用真实时长，不用截断后的整数，因此不存在任何绕过上限的余量。
-	if duration > time.Duration(maxWindow)*time.Second {
+	// 只对显式 caller From/To 报 ErrScopeTooBroad；合成缺省窗口已在上面 clamp。
+	if !synthesizedDefault && duration > time.Duration(maxWindow)*time.Second {
 		// 超限显式报错，绝不静默截断成一个用户没请求过的窗口。
 		return model.ContextScope{}, 0, fmt.Errorf("%w: 窗口 %ds 超过上限 %ds",
 			serviceobs.ErrScopeTooBroad, windowSeconds, maxWindow)

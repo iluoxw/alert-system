@@ -752,6 +752,33 @@ func TestWorkspaceRejectsInvalidFocusAndOversizedWindow(t *testing.T) {
 	}
 }
 
+// Profile default 大于 max 时，目录 cache key 与 RefreshSummary 必须使用同一有效窗口。
+func TestWindowForClampsDefaultToEffectiveMax(t *testing.T) {
+	published := publishedProfileFixture("svc-a")
+	published.Limits.DefaultWindowSeconds = 7200
+	published.Limits.MaxWindowSeconds = 3600
+	published.Normalize()
+	readers := &fakeReaders{facts: map[string]serviceobs.ServiceFacts{
+		"svc-a": {Identity: identity("svc-a", "Alpha", "Platform SRE", model.ServiceTier1)},
+	}}
+	service := newService(t, &fakeCandidates{}, newFakeSummaries(), readers,
+		fakeProfiles{published: map[string]model.Profile{"svc-a": published}})
+
+	if got := service.windowFor(&published); got != 3600 {
+		t.Fatalf("windowFor 应 clamp 到 max=3600，实际 %d", got)
+	}
+	refreshed, err := service.RefreshSummary(context.Background(), cache.Key{
+		ServiceID: "svc-a", Environment: "production",
+		ProfileVersion: published.ProfileVersion, DefaultWindowSeconds: 3600,
+	})
+	if err != nil {
+		t.Fatalf("RefreshSummary 不得 422，实际 %v", err)
+	}
+	if refreshed.Data.State == model.DataStateUnconfigured {
+		t.Fatal("RefreshSummary 应成功装配")
+	}
+}
+
 // 两个时间都缺省时用服务端单次 now 与 Profile 默认窗口生成 [now-window, now]。
 func TestWorkspaceDefaultWindowUsesProfileDefault(t *testing.T) {
 	published := publishedProfileFixture("svc-a")
