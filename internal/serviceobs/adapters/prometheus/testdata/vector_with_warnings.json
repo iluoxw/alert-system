@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "warnings": ["PromQL warning: metric might be stale"],
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {"instance": "a"},
+        "value": [1435781430.789, "1"]
+      }
+    ]
+  }
+}

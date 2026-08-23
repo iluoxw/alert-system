@@ -1,0 +1,16 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "matrix",
+    "result": [
+      {
+        "metric": {"instance": "a"},
+        "values": [
+          [1435781430.789, "1"],
+          [1435781490.789, "2"],
+          [1435781550.789, "3"]
+        ]
+      }
+    ]
+  }
+}

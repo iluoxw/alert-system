@@ -1,0 +1,11 @@
+{
+  "status": "success",
+  "data": {
+    "node_memory_HugePages_Total": [
+      {"type": "gauge", "help": "Total hugepages", "unit": "bytes"}
+    ],
+    "node_memory_HugePages_Free": [
+      {"type": "gauge", "help": "Free hugepages", "unit": "bytes"}
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {"instance": "b", "job": "node"},
+        "value": [1435781430.789, "12"]
+      },
+      {
+        "metric": {"instance": "a", "job": "node"},
+        "value": [1435781431.789, "42.5"]
+      }
+    ]
+  }
+}

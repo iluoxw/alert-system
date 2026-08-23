@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {"instance": "a"},
+        "value": [1435781430.789, "+Inf"]
+      }
+    ]
+  }
+}
