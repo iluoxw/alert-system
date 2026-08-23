@@ -307,11 +307,21 @@
    "当前看到的是完整候选集合"这件事变得不可判断）。 */
 .service-directory-more { display: flex; justify-content: center; padding: 12px 0 4px; }
 
+/* 页脚图例是一行"信号：+ 四个 Health 徽章 + Traffic/Rate 说明"。
+   必须允许换行：四个徽章各自 white-space: nowrap，flex 项的 min-width: auto 让它们无法
+   收缩到文字宽度以下，说明文字开头的 `Traffic/Rate` 又是不可断的拉丁 token，因此窄屏下
+   这一行的最小内容宽度会超过容器，内容溢出到文档流外面、把整个页面顶出横向滚动条。
+   （macOS 经典 15px 滚动条下 clientWidth 只有 375，实测 Directory 因此溢出十几像素；
+   overlay 滚动条把可用宽度多给 15px，恰好掩盖了这一点。）
+   宽屏内容装得下时 flex-wrap 是 no-op，1536/1180/900 的单行呈现不变。
+   同类元素 .topology-semantics 本来就是 wrap，这里只是补齐同一口径。 */
 .service-signal-legend {
   min-height: 42px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 4px;
   color: #55637a;
   font-size: 11px;
 }
@@ -998,4 +1008,8 @@
   .topology-status-legend { align-items: flex-start; flex-direction: column; gap: 6px; }
   .topology-canvas-summary { align-items: flex-start; flex-direction: column; gap: 3px; }
   .topology-canvas-summary > span:last-child { width: 100%; justify-content: flex-start; }
+  /* 窄屏下让 Traffic/Rate 说明独占一行：与徽章挤在同一行时它会被压成两三个字换行，
+     读起来比单独一行更差。margin-left 的缩进只在同行时有意义，独占一行时清零。 */
+  .service-signal-legend { column-gap: 8px; }
+  .service-signal-legend > span:last-child { flex-basis: 100%; margin-left: 0; }
 }

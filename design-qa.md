@@ -238,3 +238,55 @@ stage / node / relation / evidence / timeline 选择、table ↔ canvas、focus(
 摘要首屏 2 条合并支持事实（完整列表在证据页签）、右栏信号标签省略号（关系全名在上方标题）。
 
 final result: passed
+
+---
+
+## Slice R3 修订：Directory 页脚图例导致窄屏页面级横向溢出（已修）
+
+> 只追加，不改写上方任何段落。base SHA `e05e3a218a030d3648bcd3413418be6d12b2a405`。
+
+### 结论更正
+
+上一节"响应式"表格里的 **390 三路由 0 溢出"结论被推翻**。Codex 用 in-app Browser 在 macOS
+经典 15px 滚动条下复核：`innerWidth 390` 时 `document.clientWidth` 只有 375，
+Directory `document.scrollWidth = 387`（页面级溢出 12px），Overview / Workspace 均为 375。
+元凶是页脚 `.service-signal-legend`（rect/client 351、scrollWidth 375）。
+
+**假绿机制是测量方法缺陷**：上一节跑在 Cloud headless 的 overlay scrollbar 下，
+`clientWidth == innerWidth == 390`，图例拿到 366px 恰好装得下。断言口径原本用 `innerWidth`，
+而只有 `document.documentElement.clientWidth` 才跨平台等价。此后统一按
+`document.scrollWidth <= document.documentElement.clientWidth` 断言。
+
+### P2（已修）根因与修复
+
+图例原本是没有 `flex-wrap` 的单行 flex：四个 Health 徽章各自 `white-space: nowrap`、
+flex 项 `min-width: auto` 无法收缩到文字宽度以下，说明文字开头的 `Traffic/Rate` 又是不可断的
+拉丁 token，最小内容宽度因此超过容器并溢出到文档流外。R3 把该图例字号 10px → 11px 是推过
+临界点的直接诱因，属 R3 自引入回归。同类元素 `.topology-semantics` 本来就是 `wrap`，
+本次只是补齐同一口径：基础规则加 `flex-wrap: wrap` 并把 `gap` 拆为
+`column-gap 12px / row-gap 4px`；`max-width: 600px` 内收紧 `column-gap` 到 8px，
+并让说明 span `flex-basis: 100%; margin-left: 0` 独占一行。DOM 未改。
+
+### 修复前后实测（等效内容宽度 375px）
+
+| | Directory `scrollWidth` / `clientWidth` | 图例 `clientW` / `scrollW` | 图例行数 |
+|---|---|---|---|
+| 修复前 | **389 / 375（+14px）** | 351 / 377 | 3 |
+| 修复后 | 375 / 375（0） | 351 / 351 | 2 |
+
+与 Codex 的 387 / 351→375 相差约 2px，为 Linux 与 macOS 字体度量差异；元素与机制一致。
+
+### 复测矩阵
+
+| 宽度 | 结论 |
+|---|---|
+| 360 / 375 / 390 | Directory、Overview、Workspace 及 Complete/Partial/Forbidden/Empty/Stale 共 21 次测量全部 `scrollWidth == clientWidth`；console 0 warning / 0 error |
+| 375 细项 | 图例换行两行、说明独占一行且未裁剪；`.service-table-scroll` 仍 `1240 > 349`、左端可达（内部横滚是预期行为，不计入页面溢出） |
+| 360 / 375 专项扫描 | 三条路由"不换行 flex 行" **0 个**其它页面级溢出源 |
+| 900 / 1180 / 1536 | 无页面溢出；Directory 页脚图例仍单行、height 42、`column-gap 12px`、`margin-left 10px` |
+| 1536 逐像素 | 与上一节版本对比，内容区（x ≥ 208）diff bbox 为 `None`；唯一差异是侧栏左上角 30×32 logo 字形，与本改动无关 |
+
+观察项（本轮不改）：1536 Overview 有两个 `.service-dependency-group-cell` 内容比自身盒宽 2px，
+位于依赖表格内、右边缘 x≈325，够不到视口边界，不构成页面级溢出。
+
+final result: passed

@@ -430,3 +430,118 @@ npm run build                                                 # 通过
 7. **右栏信号列的标签会省略号**：`API 到 Orchestrator 请求率` 在 113px 列宽下放不下。
    标签属次要 metadata（9.5px），读数是 11.5px；关系全名在紧邻上方的标题里已经完整给出。
 8. **摘要面板里的证据摘要单行省略**：证据页签有纵向空间，同一组件在那里折两行完整显示。
+
+---
+
+## 10. Slice R3 修订：窄屏页面级横向溢出与门禁结论更正
+
+> 本节只追加，不改写 §9。base SHA `e05e3a218a030d3648bcd3413418be6d12b2a405`。
+
+### 10.1 §9.4 的"390 三路由 0 溢出"结论被推翻
+
+Codex 用 in-app Browser 在 macOS 经典 15px 滚动条下复核，推翻了 §9.4 里
+"390 页面级零横向溢出"这一条：
+
+| 项 | Codex 原实测（macOS 经典滚动条） |
+|---|---|
+| `window.innerWidth` | 390 |
+| `document.documentElement.clientWidth` | 375 |
+| Directory `document.scrollWidth` | **387（页面级溢出 12px）** |
+| Overview / Workspace `document.scrollWidth` | 375（正常） |
+| 元凶 `.service-signal-legend` | rect/client width 351、scrollWidth 375 |
+
+**假绿机制**：§9.4 的验证跑在 Cloud headless 的 overlay scrollbar 下，
+`clientWidth == innerWidth == 390`，图例容器拿到 366px 恰好装得下，溢出被掩盖。经典滚动条
+把可用宽度压到 375 / 容器 351 才暴露。这是**验证方法缺陷**，不只是一个偶然漏网的数值：
+断言口径原本用的是 `innerWidth`，而只有 `document.documentElement.clientWidth` 才跨平台等价。
+本节起统一按 `document.scrollWidth <= document.documentElement.clientWidth` 断言。
+
+### 10.2 根因
+
+`.service-signal-legend` 是页脚的一行"`信号：` + 四个 Health 徽章 + Traffic/Rate 说明"，
+原规则是 `display: flex; gap: 12px` 且**没有 `flex-wrap`**。四个徽章各自
+`white-space: nowrap`，flex 项的 `min-width: auto` 让它们无法收缩到文字宽度以下；说明文字
+开头的 `Traffic/Rate` 又是不可断的拉丁 token。三者相加的最小内容宽度超过容器可用宽度，
+内容溢出到文档流外面，把整个页面顶出横向滚动条。
+
+R3 把该图例字号从 10px 提到 11px 是把它推过临界点的直接诱因，因此这是 **R3 自己引入的回归**，
+不是历史遗留。Overview / Workspace 的同类元素 `.topology-semantics` 本来就带
+`flex-wrap: wrap`，这正是它们 375 == 375 的原因；本次修复只是给 Directory 图例补齐同一口径。
+
+### 10.3 本机（Cursor Cloud）复现与修复后实测
+
+复现用等效内容宽度 375px（即 macOS 的 `clientWidth`）：
+
+| 状态 | Directory `scrollWidth` / `clientWidth` | 图例 `clientW` / `scrollW` | 图例行数 |
+|---|---|---|---|
+| 修复前 | **389 / 375（溢出 +14px）** | 351 / 377（溢出 26px） | 3 |
+| 修复后 | 375 / 375（溢出 0） | 351 / 351（无溢出） | 2 |
+
+与 Codex 的 387 / 375（+12px）、351 / 375 相差约 2px，来自 Linux 与 macOS 对同一段中英文
+混排的字体度量差异；元素、机制与方向完全一致。修复后同尺寸复测：
+
+| 宽度（= `clientWidth`） | Directory | Overview | Workspace | Complete/Partial/Forbidden/Empty/Stale |
+|---|---|---|---|---|
+| 360 | 360 == 360 | 360 == 360 | 360 == 360 | 全部 360 == 360 |
+| 375 | 375 == 375 | 375 == 375 | 375 == 375 | 全部 375 == 375 |
+| 390 | 390 == 390 | 390 == 390 | 390 == 390 | 全部 390 == 390 |
+
+七个视图 × 三个宽度共 21 次测量全部无页面级横向溢出，console 全程 0 warning / 0 error。
+
+内部横滚是**预期行为**，不算页面溢出，并且未受影响：375 下 `.service-table-scroll`
+`scrollWidth 1240 > clientWidth 349`、左端可达、`maxScrollLeft 891`。375 下图例换行为两行，
+说明文字独占第二行且未被裁剪（`lastSpanClipped: false`）。
+
+另外在 360 / 375 对三条路由做了"不换行 flex 行"专项扫描，**0 个**其它页面级溢出源。
+1536 下 Overview 有两个 `.service-dependency-group-cell` 内容比自身盒宽 2px（`91` vs `93`），
+但它们位于依赖表格内、右边缘在 x≈325，够不到视口边界，不构成页面级溢出；本轮不在范围内改动，
+如实记录为观察项。
+
+### 10.4 宽屏零回归
+
+| 宽度 | Directory / Overview / Workspace | Directory 页脚图例 |
+|---|---|---|
+| 900 | 全部 `scrollWidth == clientWidth` | 单行、height 42、无溢出、`column-gap 12px`、`margin-left 10px` |
+| 1180 | 同上 | 同上 |
+| 1536 | 同上 | 同上 |
+
+1536 Directory 与 §9 版本做了逐像素比对：**内容区（x ≥ 208）diff bbox 为 `None`**，
+表格区与页脚区 diff 同为 `None`；整页唯一差异是侧栏左上角 30×32 的应用 logo 字形
+（占整页 0.061%，与本次仅作用于 `.service-signal-legend` 的改动无关）。
+
+### 10.5 §9.6 Docker 结论更正
+
+§9.6 把 Docker 缺失写成了本轮的通用限制，这一表述需要收窄：**那只描述 Cursor Cloud 环境**。
+Codex 的本地环境 Docker 可用，并已实际执行通过：
+
+```bash
+env -u DB_DSN go test -count=1 ./...                      # full unit，通过
+env -u DB_DSN go test -tags=integration ./... -race -count=1   # integration -race，通过
+```
+
+因此 Phase 2 的 full unit 与 integration race 套件在本地是**已通过**状态，不能继续写成全局
+未验证。本次修订在 Cloud 侧仍然缺 Docker（`docker` 不在 PATH），这两条命令在 Cloud 未执行；
+本轮改动只涉及一条 CSS 规则，不触碰 store / 迁移 / HTTP 契约 / Go 代码。
+
+### 10.6 §9.1 "改动文件"澄清
+
+§9.1 表格里的三个文件指的是 R3 的**实现文件**（一个 CSS + 两个 tsx 的语义顺序小改），
+不含该切片同时追加的文档。本次修订的实现文件只有
+`web/src/serviceObservability/serviceObservability.css` 一个，另外两个是本文件与 `design-qa.md`
+的追加证据。
+
+### 10.7 本次修订的命令与门禁
+
+```bash
+git diff --check                                              # 无输出
+python3 docs/contracts/service-observability/v1/verify_examples.py  # PASS 5 schemas + 全部 fixture + 4 scenario
+go build ./... && go vet ./...                                # 通过
+go test -race -count=1 ./internal/serviceobs/... ./internal/api ./internal/safelink  # 全部 ok
+cd web && npx oxlint && npx tsc -b                            # 通过
+npm run test:service-observability                            # verifier 通过；fixture provider 140 项
+npm run build                                                 # 通过
+```
+
+生产 bundle 对 17 个 fixture / scenario / DEV-only token 零命中；三个 hold path 从
+`6e4eddd..HEAD`、base `e05e3a2` 与工作区三维度零 diff；未改动任何 `.tsx` / Go / contracts /
+fixtures / 依赖 / Kubernetes / OTel 文件。
