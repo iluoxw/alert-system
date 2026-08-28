@@ -6,7 +6,7 @@ Accepted — 2026-08-02
 
 ## Context
 
-应用服务目录与 Alert Mapping 已能把权威 Alert 稳定投影为 canonical entity 上的 Fault，但应用服务尚不能显式声明自己依赖哪些 Kubernetes、数据库、Kafka、网络或其他共享能力。现有 `dependency_edges` 只由完整拓扑快照写入，并要求 `sync_run_id`；因此无法承载服务负责人维护的长期依赖契约。现有 E2B 关联器可以按单一 topology source 计算爆炸半径，但通用 Mapping 还不能跨来源把基础设施 Fault 投影为应用 Impact。
+应用服务目录与 Alert Mapping 已能把权威 Alert 稳定投影为 canonical entity 上的 Fault，但应用服务尚不能显式声明自己依赖哪些 Kubernetes、数据库、Kafka、网络或其他共享能力。现有 `dependency_edges` 只由完整拓扑快照写入，并要求 `sync_run_id`；因此无法承载服务负责人维护的长期依赖契约。通用 Mapping 需要跨来源把基础设施 Fault 投影为应用 Impact。
 
 关键安全约束是：图可达只能说明“可能受影响”，不能证明业务已经退化；拓扑过期、循环或缺失不得触发自动 Incident。
 
@@ -27,7 +27,7 @@ Accepted — 2026-08-02
 
 ### Positive
 
-- E2B、CCH 及新业务使用同一服务依赖契约，无需业务专属传播代码。
+- 各业务使用同一服务依赖契约，无需业务专属传播代码。
 - 复用现有 PostgreSQL 事务、递归 CTE、FaultImpact 与人工裁决优先级，实施和运维成本低。
 - 关系来源、传播路径、stale 状态和自动确认依据可解释。
 - 应用 SLO Alert 与基础设施 Fault 可以在通用模型中双向汇合。
@@ -65,4 +65,3 @@ Accepted — 2026-08-02
 
 - `docs/adr/0003-alertmanager-authoritative-layered-entity-model.md`
 - `docs/adr/0004-explicit-service-catalog-and-deterministic-alert-mapping.md`
-- `docs/plans/2026-08-02-entity-relations-blast-radius-implementation.md`

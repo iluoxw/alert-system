@@ -10,14 +10,9 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 - 第一阶段由外部 Prometheus/Thanos Ruler/vmalert 负责规则求值，Alertmanager 是 Alert 生命周期、去重、分组、路由、静默、抑制和 Alert 级通知的唯一权威；SRE Control 只同步 Alert 状态并负责实体绑定、Fault、Impact 和 Incident，不自建 Ruler，也不对 Alertmanager 来源再次执行本地 route/group/silence/inhibit。规则工作站不属于第一阶段。
 - 默认工作台应围绕数据源健康、当前技术 Fault、应用服务影响、负责团队和活跃 Incident 展开，按 confirmed impact、Fault severity、potential 数量和持续时间排序；原始 Alert、应用服务目录和分层拓扑作为下钻入口。进入 Incident 后才切换到责任接管、协作处置、通信、恢复和复盘；Alertmanager Source、AlertMapping、实体认领和团队登记统一收敛到控制中心。
 - 第一阶段优先建立跨 `infrastructure / platform / application` 三层的通用实体依赖图、Fault、FaultAlertLink 和 Incident 最小闭环，并复用现有告警、时间线、通知日志、排班和 action rule 基础；爆炸半径先止于应用服务及其负责团队，不提前建模业务能力和用户旅程。
-- 产品与实现的黄金验收场景是 E2B `500: Failed to place sandbox`：从缺失快照对象、无效 auto-resume/重连、重复或孤儿 Firecracker、CPU/HugePages 压力到 Sandbox create/resume SLO 受损，贯通拓扑、证据、Fault、Incident、Runbook、恢复和飞书通报。
-- E2B 只是首个黄金场景，不是产品根对象。ManagedSystem 可作为责任、配置和导航视图，但不强制成为拓扑根；共享基础设施允许跨多个系统提供服务，核心页面与服务禁止依赖 `e2b.*` 等领域私有键。
+- ManagedSystem 可作为责任、配置和导航视图，但不强制成为拓扑根；共享基础设施允许跨多个系统提供服务，核心页面与服务禁止依赖业务私有键或领域专用分支。
 - 采集 `source` 只表示数据来源，不能兼任实体身份或拓扑命名空间。默认按协议/技术类别复用 Alertmanager、Grafana、OTel 和拓扑适配器；新业务优先通过标准资源标识、应用服务登记和依赖关系接入，只有标准契约无法表达私有拓扑或受控动作时才增加业务专属 Connector。
 - 扩展依赖方向固定为“接入方适配 SRE Control 核心契约”，禁止核心为每个业务增加私有实体、状态机、页面分支或 action key 判断。第一版核心契约收敛为跨层 Entity、Relation、Alert、Fault、FaultImpact 和负责团队；层级用于分类/展示，影响计算以多对多关系图为准，不能把 IaaS/PaaS/应用层误实现成一棵严格树。
-- E2B 验收必须区分“placement attempt 失败很高但用户 create 仍成功”与“资源泄漏/过载已击穿用户 SLO”两个阶段：前者只形成 Fault 和风险提示，后者才建议宣布 Incident。
-- `Failed to place sandbox` 不是领域实体名：一次节点 placement attempt 失败是 Signal，用户请求窗口超阈值是 Alert，单 SID 无法恢复是实例级 Fault，create/resume SLO 失守是能力级 Fault，需要跨团队响应时才由人宣布 Incident。
-- 关联必须同时支持两个方向：常规基础设施告警可自底向上形成 candidate Fault/风险预警；用户级 `Failed to place` 超阈值后，系统也要自顶向下回溯拓扑、近期 Alert 和变更，构建根因候选、放大因素和排除证据。
-- 硬验收是可重复的本地故障回放，最终验收是经单独授权的 E2B UAT 实机演练；生产 E2B 不作为自动化测试靶场。
 - 产品边界不是通用 ITSM：不扩张为工单资产管理平台；AI 只能基于证据辅助总结、关联和建议，不替代事故负责人做高风险决策。
 
 ## 技术栈
@@ -41,7 +36,7 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 - `cmd/server/` 薄入口；`internal/app/` 共享装配（wiring），cmd 与 test/e2e 共用，**不要在两处手写重复装配**
 - `internal/domain/` 纯函数领域层（状态机、matcher、指纹）；`internal/store/` 仓储（所有方法带 `tx pgx.Tx` 参数，事务由调用方开）
 - `internal/pipeline/` 管道 stage；`internal/ingest/` webhook 接入 + AM/Grafana 适配器；`internal/scheduler/` 统一定时器；`internal/oncall/` 值班与人员升级链；`internal/notify/` 通知策略/渠道/生命周期；`internal/api/` HTTP 层
-- `migrations/` golang-migrate 格式，编号顺延（当前到 000021）；`test/e2e/` docker-compose 真实 PG，包含 E2B 黄金场景纵向切片
+- `migrations/` golang-migrate 格式，编号顺延（当前到 000025）；`test/e2e/` docker-compose 真实 PG，覆盖 Alertmanager 权威同步与服务目录映射等通用场景
 
 ## 核心架构不变量（改代码前必读）
 
@@ -56,7 +51,7 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 9. **AI enrichment 红线**：任何 AI/LLM 调用都是外部 IO，只准发生在异步 enrichment 层（管道外、任何持锁事务外，消费已提交数据）；管道 stage、scheduler handler、四大通知意图接口内禁止出现模型调用。LLM/enrichment 组件不可用时，系统全部既有功能必须 100% 不受影响——AI 是增强不是依赖。告警内容外发模型 API 前必须按既有口径脱敏。
 10. **降噪一律 opt-in**：group_mode 默认 'label'、storm_threshold_per_min 默认 0、FLAP_WINDOW_SECONDS 默认 0——零值/缺省时全部降噪逻辑短路，行为与引入前逐字节一致。新增降噪能力必须遵守同一口径。
 11. **Incident 必须人工宣布并受双重关闭门槛约束**：自动关联只能创建/更新 Fault；任意 scope 的 `active Fault + confirmed business_system impact` 均可由登录用户宣布 Incident，应用服务 Fault 也允许作为响应起点。同一个 Fault 至多绑定一个 Incident。进入 monitoring 前必须满足全部 mitigation criteria，并把所有 `included + active` 关联 Fault 推进为 monitoring；进入 resolved 前必须同时满足 resolution/观察窗口、所有响应任务为 `done/canceled`，且不存在 `included + active` Fault，再把所有 `included + monitoring` Fault 推进为 resolved。前后端都要提示门槛，后端事务内必须再次校验，禁止任意 PATCH 状态绕过。
-12. **Runbook 只执行白名单类型化动作**：禁止 command/shell 入口。生产默认 `DisabledExecutor`，未显式接入受支持 API 时宁可审计失败也不退化成本机命令。`cleanup_apply` 只能由 Incident Commander/Technical Lead 执行，必须引用成功且未过期的 dry-run、重新计算并匹配计划内容 SHA256、再次确认停止重试、持有相同 hash 的有效审批，且审批人与执行人分离；所有拒绝也必须落 `runbook_runs` 和 Incident 时间线。`e2b.lifecycle_verify` 永远要求单独 UAT 授权，普通 API 参数不能自行开启；`.uat` 域名本身不是隔离证据，执行器还必须校验服务端环境/模板/授权白名单与精确 ingress IP，禁用环境代理，不回退使用生产 URL/key，并在任何已创建 Sandbox 的路径上独立超时清理。外部执行开始后，即使 HTTP 请求被取消，清理与最终审计也必须分别使用脱离 request cancellation 的有界 context，禁止遗留永久 `running` 记录。
+12. **Runbook 只执行白名单类型化动作**：禁止 command/shell 入口。生产默认 `DisabledExecutor`，未显式接入受支持 API 时宁可审计失败也不退化成本机命令。所有拒绝也必须落 `runbook_runs` 和 Incident 时间线。
 13. **API 审计输出必须安全且结构稳定**：集合字段即使为空也返回 `[]`，不能返回 `null` 让页面崩溃；Incident 的通信目标对外响应只允许返回脱敏后的审计引用（Webhook 最多到 origin），原始目标只留在可靠发送内部，禁止经详情、列表、总览或 Fault 关联响应泄露。
 14. **Alertmanager 是第一阶段 Alert 唯一权威**：外部 Ruler 求值并向 Alertmanager 发 Alert；SRE Control 的 Alertmanager 接入只做可靠同步、幂等落库、实体绑定和 Fault 关联，禁止再次应用本地 route/group/silence/inhibit 或发送重复的 Alert 级通知。Alert 必须拆成 Alertmanager 写入的 `source_state=firing/resolved/unknown`、用户写入的 `response_state=unacknowledged/acknowledged` 和 Alertmanager 写入的 `suppression_state=none/silenced/inhibited`；Ack/Handoff/Note 只是本地响应协作，Alertmanager 来源禁止人工 Resolve。同步基线是普通通知 Webhook 实时入队加 `/api/v2/alerts` 周期对账，Event Recorder 仅为可选增强；HA 副本归属同一逻辑 AlertSource，occurrence 幂等键使用 `source_id + upstream_fingerprint + starts_at`。Alert webhook 唯一入口是 `POST /ingest/v1/hook/{hook_uuid}`：hook UUID 是只显示一次、只存 SHA-256、可轮换的 URL bearer credential，通过它反查稳定 source_id；禁止兼容 source 主键路径或 Authorization/X-Ingest-Token Header 鉴权。Alertmanager 不可用或数据过期时标记来源 stale，禁止把“暂时看不到”推断为 resolved。SRE Control 只拥有 Fault/Impact/Incident 生命周期。
 15. **实体身份与来源解耦**：跨源拓扑使用 canonical Entity、EntityAlias 和 EntityRelation；Prometheus、Kubernetes、CMDB、OTel 等来源的 external ref 只能作为 alias，不能各自创建互不相认的业务实体。应用服务及 `owner_team_id` 必须由显式服务登记提供权威值；遥测仅可自动发现 `unmanaged` 待认领实体，禁止依据不可信 label 自动创建团队或改变归属。关系边统一以消费者/从属对象为 `from`、提供者/承载对象为 `to`，爆炸半径从故障提供者沿反向边遍历。

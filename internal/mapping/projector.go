@@ -1,5 +1,5 @@
 // Package mapping implements the generic, deterministic Alert -> Entity -> Fault
-// projection. It contains no E2B/CCH branches: business semantics live in data.
+// projection. Business semantics live in data, not in core branches.
 package mapping
 
 import (

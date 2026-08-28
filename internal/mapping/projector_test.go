@@ -13,7 +13,7 @@ func TestBuildCorrelationKeyDeterministicAndEntityScoped(t *testing.T) {
 	if first != second {
 		t.Fatalf("correlation labels 顺序不应改变 key: %s != %s", first, second)
 	}
-	otherEntity := buildCorrelationKey("service/e2b/prod", "proxy_degradation", []string{"cluster", "instance"}, labels)
+	otherEntity := buildCorrelationKey("service/alpha/prod", "proxy_degradation", []string{"cluster", "instance"}, labels)
 	if otherEntity == first {
 		t.Fatal("不同 canonical entity 不得共享 correlation key")
 	}

@@ -316,24 +316,8 @@ func DefaultRecoveryCriteria(incidentID string) []RecoveryCriterion {
 	}
 }
 
-// DefaultRecoveryCriteriaForFault 把黄金场景扩展限制在对应 Fault 类型内，避免把
-// E2B 的指标名称和生命周期探针泄漏到其他业务的 Incident。
-func DefaultRecoveryCriteriaForFault(incidentID string, fault Fault) []RecoveryCriterion {
-	if fault.Kind == "sandbox_placement_degradation" {
-		return DefaultE2BRecoveryCriteria(incidentID)
-	}
+// DefaultRecoveryCriteriaForFault 按 Fault 类型返回恢复判据。当前所有 Fault 共享
+// 通用最小契约；业务专用判据应通过配置或后续扩展注入，不在核心代码硬编码。
+func DefaultRecoveryCriteriaForFault(incidentID string, _ Fault) []RecoveryCriterion {
 	return DefaultRecoveryCriteria(incidentID)
-}
-
-// DefaultE2BRecoveryCriteria 固化黄金场景的恢复证据契约。最后一项观察窗口属于
-// resolution gate，避免“探针刚绿一次”就直接关闭 Incident。
-func DefaultE2BRecoveryCriteria(incidentID string) []RecoveryCriterion {
-	return []RecoveryCriterion{
-		{IncidentID: incidentID, Key: "user_create_slo_recovered", Description: "用户级 Sandbox create 成功率恢复到 SLO", Gate: RecoveryGateMitigation, Required: true, Status: RecoveryCriterionPending},
-		{IncidentID: incidentID, Key: "placement_attempt_rate_recovered", Description: "placement attempt 失败率回落到安全范围", Gate: RecoveryGateMitigation, Required: true, Status: RecoveryCriterionPending},
-		{IncidentID: incidentID, Key: "fc_gauge_drift_converged", Description: "Firecracker 进程数与 running gauge 差值收敛", Gate: RecoveryGateMitigation, Required: true, Status: RecoveryCriterionPending},
-		{IncidentID: incidentID, Key: "node_capacity_recovered", Description: "节点负载与 HugePages 恢复启动余量", Gate: RecoveryGateMitigation, Required: true, Status: RecoveryCriterionPending},
-		{IncidentID: incidentID, Key: "lifecycle_probe_passed", Description: "create→pause→resume→delete 生命周期探针通过", Gate: RecoveryGateMitigation, Required: true, Status: RecoveryCriterionPending},
-		{IncidentID: incidentID, Key: "observation_window_complete", Description: "恢复观察窗口结束且无再次退化", Gate: RecoveryGateResolution, Required: true, Status: RecoveryCriterionPending},
-	}
 }

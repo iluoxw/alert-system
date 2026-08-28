@@ -155,21 +155,6 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 
 	teamID := ids.Team.ID
 
-	// E2B 黄金回放一次会产生多条 firing Alert。它们的目标是验证 Alert→Fault，
-	// 不应在共享 TestMain 中启动真实的重复通知/人员升级链并污染后续场景。静默在
-	// pipeline 第一次处理任何回放事件前创建，避免 SilenceStage 10s 缓存窗口；匹配
-	// 范围只覆盖固定 scenario_id，不影响其他 E2E 告警。
-	if _, _, err := client.doJSON(http.MethodPost, "/api/v1/admin/silences", map[string]any{
-		"matchers": []map[string]string{{
-			"name": "scenario_id", "op": "=", "value": "e2b-failed-to-place-sandbox",
-		}},
-		"starts_at": time.Now().Add(-time.Hour).Format(time.RFC3339Nano),
-		"ends_at":   time.Now().Add(6 * time.Hour).Format(time.RFC3339Nano),
-		"comment":   "isolate e2b golden replay notifications",
-	}, nil); err != nil {
-		return nil, fmt.Errorf("e2e: 创建 E2B 回放隔离静默失败: %w", err)
-	}
-
 	if _, _, err := client.doJSON(http.MethodPost, "/api/v1/admin/routes", map[string]any{
 		"priority":                100,
 		"matchers":                []map[string]string{{"name": "severity", "op": "=~", "value": ".*"}},

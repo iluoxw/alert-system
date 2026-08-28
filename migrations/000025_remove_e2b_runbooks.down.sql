@@ -1,0 +1,1 @@
+-- Intentionally empty: E2B demo runbooks are not restored on rollback.

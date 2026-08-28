@@ -8,10 +8,10 @@ import (
 	"alert-system/internal/domain"
 )
 
-// TestGenericServiceCatalogMapping_E2BAndCCH proves that onboarding a second
+// TestGenericServiceCatalogMapping_TwoServices proves that onboarding a second
 // business requires data only: service + alias + policy. Core code has no branch
-// for either E2B or CCH.
-func TestGenericServiceCatalogMapping_E2BAndCCH(t *testing.T) {
+// for either service.
+func TestGenericServiceCatalogMapping_TwoServices(t *testing.T) {
 	client := newLoggedInClient(t)
 	suffix := uniqueSuffix()
 	source := adminCreate(t, client, "/api/v1/admin/integrations", map[string]any{
@@ -22,9 +22,9 @@ func TestGenericServiceCatalogMapping_E2BAndCCH(t *testing.T) {
 	sourceID, _ := source["id"].(string)
 	webhookPath, _ := source["webhook_path"].(string)
 
-	e2bKey := "service/e2b/" + suffix
+	alphaKey := "service/alpha/" + suffix
 	cchKey := "service/cch/" + suffix
-	createMappedService(t, client, e2bKey, "E2B Sandbox Runtime", "e2b-"+suffix)
+	createMappedService(t, client, alphaKey, "Alpha Runtime", "alpha-"+suffix)
 	cchService := createMappedService(t, client, cchKey, "Claude Code Hub", "cch-"+suffix)
 	cchServiceID, _ := cchService["id"].(string)
 	status, body, err := client.doJSON(http.MethodPut, "/api/v1/admin/services/"+cchServiceID, map[string]any{
@@ -36,12 +36,12 @@ func TestGenericServiceCatalogMapping_E2BAndCCH(t *testing.T) {
 	if err != nil || status != http.StatusUnprocessableEntity {
 		t.Fatalf("canonical entity key 应保持不可变 status=%d body=%s err=%v", status, body, err)
 	}
-	createMappingPolicy(t, client, 20000, "e2b-failed-to-place-"+suffix, "FailedToPlaceSandbox", "sandbox_placement_failure")
+	createMappingPolicy(t, client, 20000, "alpha-placement-"+suffix, "FailedToPlaceSandbox", "sandbox_placement_failure")
 	createMappingPolicy(t, client, 20001, "cch-proxy-slo-"+suffix, "CCHProxySLOBreach", "proxy_request_degradation")
 
-	e2bAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "FailedToPlaceSandbox", "e2b-"+suffix, "critical", "e2b-map-"+suffix)
+	alphaAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "FailedToPlaceSandbox", "alpha-"+suffix, "critical", "alpha-map-"+suffix)
 	cchAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "CCHProxySLOBreach", "cch-"+suffix, "critical", "cch-map-"+suffix)
-	assertMappedToServiceFault(t, client, e2bAlert.ID, e2bKey, "sandbox_placement_failure")
+	assertMappedToServiceFault(t, client, alphaAlert.ID, alphaKey, "sandbox_placement_failure")
 	assertMappedToServiceFault(t, client, cchAlert.ID, cchKey, "proxy_request_degradation")
 
 	// No policy means governance queue, never an inferred active Fault.
@@ -55,7 +55,7 @@ func TestGenericServiceCatalogMapping_E2BAndCCH(t *testing.T) {
 	assertMappingStatus(t, client, conflictAlert.ID, "conflict", "alias_conflict")
 }
 
-func TestGenericEntityRelations_E2BAndCCHBlastRadius(t *testing.T) {
+func TestGenericEntityRelations_MultiServiceBlastRadius(t *testing.T) {
 	client := newLoggedInClient(t)
 	suffix := uniqueSuffix()
 	source := adminCreate(t, client, "/api/v1/admin/integrations", map[string]any{
@@ -76,47 +76,47 @@ func TestGenericEntityRelations_E2BAndCCHBlastRadius(t *testing.T) {
 		t.Fatalf("受管平台实体响应缺少 id: %+v", provider)
 	}
 
-	e2bKey := "service/e2b-radius/" + suffix
+	alphaKey := "service/alpha-radius/" + suffix
 	cchKey := "service/cch-radius/" + suffix
-	e2bService := createMappedServiceWithDependencies(t, client, e2bKey, "E2B Radius App", "e2b-radius-"+suffix, providerID)
+	alphaService := createMappedServiceWithDependencies(t, client, alphaKey, "Alpha Radius App", "alpha-radius-"+suffix, providerID)
 	cchService := createMappedServiceWithDependencies(t, client, cchKey, "CCH Radius App", "cch-radius-"+suffix, providerID)
-	e2bEntityID := serviceEntityID(t, e2bService)
+	alphaEntityID := serviceEntityID(t, alphaService)
 	cchEntityID := serviceEntityID(t, cchService)
 
 	createFixedTargetMappingPolicy(t, client, 21000, "shared-kubernetes-pressure-"+suffix, "SharedKubernetesPressure", providerID, "cluster_capacity_degradation")
-	createMappingPolicy(t, client, 21001, "e2b-radius-slo-"+suffix, "E2BRadiusSLOBreach", "application_slo_degradation")
+	createMappingPolicy(t, client, 21001, "alpha-radius-slo-"+suffix, "AlphaRadiusSLOBreach", "application_slo_degradation")
 	createMappingPolicy(t, client, 21002, "cch-radius-slo-"+suffix, "CCHRadiusSLOBreach", "application_slo_degradation")
 
 	providerAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "SharedKubernetesPressure", "shared-k8s-"+suffix, "critical", "provider-radius-"+suffix)
 	providerFaultID := mappingFaultID(t, client, providerAlert.ID)
 	assertImpactStates(t, client, providerFaultID, map[string]domain.ImpactState{
-		e2bEntityID: domain.ImpactStatePotential,
-		cchEntityID: domain.ImpactStatePotential,
+		alphaEntityID: domain.ImpactStatePotential,
+		cchEntityID:   domain.ImpactStatePotential,
 	}, true)
 
 	cchStartsAt := time.Now().UTC().Truncate(time.Millisecond)
 	postAuthorityMappingOccurrence(t, client, sourceID, webhookPath, "firing", "CCHRadiusSLOBreach", "cch-radius-"+suffix, "critical", "cch-radius-evidence-"+suffix, cchStartsAt)
 	assertImpactStates(t, client, providerFaultID, map[string]domain.ImpactState{
-		e2bEntityID: domain.ImpactStatePotential,
-		cchEntityID: domain.ImpactStateConfirmed,
+		alphaEntityID: domain.ImpactStatePotential,
+		cchEntityID:   domain.ImpactStateConfirmed,
 	}, true)
 
 	postAuthorityMappingOccurrence(t, client, sourceID, webhookPath, "resolved", "CCHRadiusSLOBreach", "cch-radius-"+suffix, "critical", "cch-radius-evidence-"+suffix, cchStartsAt)
 	assertImpactStates(t, client, providerFaultID, map[string]domain.ImpactState{
-		e2bEntityID: domain.ImpactStatePotential,
-		cchEntityID: domain.ImpactStatePotential,
+		alphaEntityID: domain.ImpactStatePotential,
+		cchEntityID:   domain.ImpactStatePotential,
 	}, true)
 
-	status, body, err := client.doJSON(http.MethodPut, "/api/v1/faults/"+providerFaultID+"/impacts/"+e2bEntityID, map[string]any{
-		"state": "ruled_out", "rationale": "E2B synthetic 与用户 SLO 均健康", "confidence": 1,
+	status, body, err := client.doJSON(http.MethodPut, "/api/v1/faults/"+providerFaultID+"/impacts/"+alphaEntityID, map[string]any{
+		"state": "ruled_out", "rationale": "合成探针与用户 SLO 均健康", "confidence": 1,
 	}, nil)
 	if err != nil || status != http.StatusOK {
-		t.Fatalf("人工排除 E2B Impact 失败 status=%d body=%s err=%v", status, body, err)
+		t.Fatalf("人工排除 Alpha Impact 失败 status=%d body=%s err=%v", status, body, err)
 	}
-	postAuthorityMappingAlert(t, client, sourceID, webhookPath, "E2BRadiusSLOBreach", "e2b-radius-"+suffix, "critical", "e2b-radius-evidence-"+suffix)
+	postAuthorityMappingAlert(t, client, sourceID, webhookPath, "AlphaRadiusSLOBreach", "alpha-radius-"+suffix, "critical", "alpha-radius-evidence-"+suffix)
 	assertImpactStates(t, client, providerFaultID, map[string]domain.ImpactState{
-		e2bEntityID: domain.ImpactStateRuledOut,
-		cchEntityID: domain.ImpactStatePotential,
+		alphaEntityID: domain.ImpactStateRuledOut,
+		cchEntityID:   domain.ImpactStatePotential,
 	}, true)
 }
 
@@ -203,7 +203,6 @@ func postAuthorityMappingOccurrence(t *testing.T, client *apiClient, sourceID, w
 		if err != nil || !ok || candidate.SourceIntegrationID != sourceID || candidate.SourceState != sourceState {
 			return false
 		}
-		// Multiple occurrences can share alertname; locate the newest source alert.
 		alert = candidate
 		return true
 	}, "Alertmanager occurrence 入库")
