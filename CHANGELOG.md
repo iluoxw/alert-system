@@ -3,6 +3,10 @@
 > 面向接手人的交付记录：按时间倒序，每节列「交付了什么、关键决策、验收状态」。
 > 架构不变量与协作约定见 `CLAUDE.md`（改代码前必读）；规格文档见 `.spec-workflow/specs/`。
 
+## [Unreleased]
+
+- 移除 E2B demo 专用代码、Runbook、回放 fixture、种子命令与相关文档/UI；生产 SRE Control 不再包含 E2B 产品面。
+
 ## [v0.1.0] 2026-08-02 — 首个可部署 MVP 基线
 
 - Alert Source 接入升级为 managed hook：SRE Control 分发

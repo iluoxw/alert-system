@@ -11,17 +11,44 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"alert-system/internal/domain"
-	"alert-system/internal/e2b"
 )
+
+func testBlastRadiusTopologySnapshot() domain.TopologySnapshot {
+	observedAt := time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC)
+	return domain.TopologySnapshot{
+		SchemaVersion: 1,
+		Source:        "test-topology-sync",
+		Environment:   "test",
+		ObservedAt:    observedAt,
+		Nodes: []domain.ResourceNode{
+			{ExternalRef: "shared.orchestrator.pool", Name: "Shared Orchestrator Pool", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.orchestrator.node-a", Name: "Shared Orchestrator Node A", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.orchestrator.node-b", Name: "Shared Orchestrator Node B", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.api", Name: "Shared API", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.client-proxy", Name: "Shared Client Proxy", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.redis", Name: "Shared Redis Metadata", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.object-storage", Name: "Shared Object Storage", Kind: domain.ResourceNodeKindResource},
+			{ExternalRef: "shared.runtime", Name: "Shared Runtime", Kind: domain.ResourceNodeKindInfrastructureCapability},
+			{ExternalRef: "preview.app", Name: "Preview Application", Kind: domain.ResourceNodeKindBusinessSystem},
+		},
+		Edges: []domain.DependencyEdge{
+			{FromExternalRef: "shared.orchestrator.node-a", ToExternalRef: "shared.orchestrator.pool", Relation: domain.DependencyRelationPartOf, Criticality: domain.DependencyCriticalityHigh},
+			{FromExternalRef: "shared.orchestrator.node-b", ToExternalRef: "shared.orchestrator.pool", Relation: domain.DependencyRelationPartOf, Criticality: domain.DependencyCriticalityHigh},
+			{FromExternalRef: "shared.api", ToExternalRef: "shared.orchestrator.pool", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+			{FromExternalRef: "shared.client-proxy", ToExternalRef: "shared.api", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+			{FromExternalRef: "shared.runtime", ToExternalRef: "shared.client-proxy", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+			{FromExternalRef: "shared.runtime", ToExternalRef: "shared.redis", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+			{FromExternalRef: "shared.runtime", ToExternalRef: "shared.object-storage", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+			{FromExternalRef: "preview.app", ToExternalRef: "shared.runtime", Relation: domain.DependencyRelationDependsOn, Criticality: domain.DependencyCriticalityCritical},
+		},
+	}
+}
 
 func TestTopologyRepoImportAndBlastRadius(t *testing.T) {
 	st := setupTestStore(t)
 	ctx := context.Background()
 	repo := NewTopologyRepo()
-	snapshot, err := e2b.LoadTopologyFixture()
-	if err != nil {
-		t.Fatal(err)
-	}
+	snapshot := testBlastRadiusTopologySnapshot()
 
 	var imported TopologyImportResult
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
@@ -36,16 +63,16 @@ func TestTopologyRepoImportAndBlastRadius(t *testing.T) {
 	}
 
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
-		radius, err := repo.ListBlastRadius(ctx, tx, snapshot.Source, "e2b.orchestrator.pool", 8)
+		radius, err := repo.ListBlastRadius(ctx, tx, snapshot.Source, "shared.orchestrator.pool", 8)
 		if err != nil {
 			return err
 		}
 		wantDepth := map[string]int{
-			"e2b.orchestrator.pool":    0,
-			"e2b.api":                  1,
-			"e2b.client-proxy":         2,
-			"e2b.sandbox-runtime":      3,
-			"insforge.preview-runtime": 4,
+			"shared.orchestrator.pool": 0,
+			"shared.api":               1,
+			"shared.client-proxy":      2,
+			"shared.runtime":           3,
+			"preview.app":              4,
 		}
 		if len(radius) != len(wantDepth) {
 			return fmt.Errorf("爆炸半径节点=%d want=%d: %+v", len(radius), len(wantDepth), radius)
@@ -159,10 +186,7 @@ func TestFaultRepoPreservesHumanEvidenceAndMonotonicActivation(t *testing.T) {
 	topologyRepo := NewTopologyRepo()
 	faultRepo := NewFaultRepo()
 	alertRepo := NewAlertRepo()
-	snapshot, err := e2b.LoadTopologyFixture()
-	if err != nil {
-		t.Fatal(err)
-	}
+	snapshot := testBlastRadiusTopologySnapshot()
 
 	var nodeID, alertID string
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
@@ -170,7 +194,7 @@ func TestFaultRepoPreservesHumanEvidenceAndMonotonicActivation(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		nodeID = result.NodeIDs["e2b.sandbox-runtime"]
+		nodeID = result.NodeIDs["shared.runtime"]
 		alert, _, err := alertRepo.UpsertByFingerprint(ctx, tx, testAlertEvent("fault-evidence-alert"), "")
 		if err != nil {
 			return err
@@ -186,9 +210,9 @@ func TestFaultRepoPreservesHumanEvidenceAndMonotonicActivation(t *testing.T) {
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
 		var err error
 		fault, _, err = faultRepo.Upsert(ctx, tx, domain.Fault{
-			CorrelationKey: "test:e2b:capability", Scope: domain.FaultScopeCapability,
+			CorrelationKey: "test:shared:capability", Scope: domain.FaultScopeCapability,
 			Status: domain.FaultStatusCandidate, Severity: domain.SeverityWarning,
-			Kind: "sandbox_placement_degradation", Title: "Placement 容量退化",
+			Kind: "provider_capacity_degradation", Title: "Placement 容量退化",
 			ResourceNodeID: nodeID, Confidence: 0.7, FirstDetected: now, LastEvaluated: now,
 		})
 		if err != nil {
@@ -260,10 +284,7 @@ func TestFaultImpactHumanDecisionWins(t *testing.T) {
 	topologyRepo := NewTopologyRepo()
 	faultRepo := NewFaultRepo()
 	actor := mustUser(t, ctx, st, "impact-reviewer")
-	snapshot, err := e2b.LoadTopologyFixture()
-	if err != nil {
-		t.Fatal(err)
-	}
+	snapshot := testBlastRadiusTopologySnapshot()
 
 	var fault domain.Fault
 	var impactedNodeID string
@@ -273,12 +294,12 @@ func TestFaultImpactHumanDecisionWins(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		impactedNodeID = result.NodeIDs["insforge.preview-runtime"]
+		impactedNodeID = result.NodeIDs["preview.app"]
 		fault, _, err = faultRepo.Upsert(ctx, tx, domain.Fault{
 			CorrelationKey: "test:impact:decision", Scope: domain.FaultScopeCapability,
 			Status: domain.FaultStatusActive, Severity: domain.SeverityCritical,
 			Kind: "provider_unavailable", Title: "共享能力不可用",
-			ResourceNodeID: result.NodeIDs["e2b.orchestrator.pool"], Confidence: 0.9,
+			ResourceNodeID: result.NodeIDs["shared.orchestrator.pool"], Confidence: 0.9,
 			FirstDetected: now, LastEvaluated: now,
 		})
 		if err != nil {
@@ -286,7 +307,7 @@ func TestFaultImpactHumanDecisionWins(t *testing.T) {
 		}
 		return faultRepo.ReplaceAutomatedImpacts(ctx, tx, fault.ID, []domain.FaultImpact{{
 			NodeID: impactedNodeID, State: domain.ImpactStatePotential,
-			Path:      []string{result.NodeIDs["e2b.orchestrator.pool"], impactedNodeID},
+			Path:      []string{result.NodeIDs["shared.orchestrator.pool"], impactedNodeID},
 			Rationale: "拓扑反向遍历可达", Confidence: 0.6,
 		}})
 	}); err != nil {

@@ -1461,16 +1461,3 @@ export function executeRunbook(incidentId: string, actionKey: string, parameters
     method: 'POST', body: JSON.stringify({ action_key: actionKey, parameters }),
   })
 }
-
-export function approveRunbook(incidentId: string, runId: string, planSHA256: string, comment: string): Promise<void> {
-  return request(`/incidents/${incidentId}/runbook-runs/${runId}/approval`, {
-    method: 'POST', body: JSON.stringify({ plan_sha256: planSHA256, decision: 'approved', comment }),
-  })
-}
-
-export function applyRunbook(incidentId: string, planRunId: string, confirmPlanSHA256: string): Promise<RunbookRun> {
-  return request(`/incidents/${incidentId}/runbook-apply`, {
-    method: 'POST',
-    body: JSON.stringify({ plan_run_id: planRunId, confirm_plan_sha256: confirmPlanSHA256, retries_stopped: true }),
-  })
-}

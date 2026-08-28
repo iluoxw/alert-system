@@ -9,7 +9,7 @@ import (
 func TestTopologySnapshotValidate(t *testing.T) {
 	snapshot := TopologySnapshot{
 		SchemaVersion: 1,
-		Source:        "e2b-replay",
+		Source:        "topology-sync",
 		ObservedAt:    time.Now(),
 		Nodes: []ResourceNode{
 			{ExternalRef: "runtime", Name: "Sandbox Runtime", Kind: ResourceNodeKindInfrastructureCapability},

@@ -37,8 +37,6 @@ var version = "dev"
 func main() {
 	configPath := flag.String("config", "", "YAML 配置文件路径（可选）")
 	defaultTeamID := flag.String("default-team-id", "", "路由未命中任何规则时的兜底团队 ID（可选，留空表示不路由）")
-	fakeRunbookExecutor := flag.Bool("e2e-fake-runbooks", false, "仅用于隔离的本地 E2E：启用不修改外部状态的 Runbook 假执行器")
-	enableE2BUATRunbooks := flag.Bool("enable-e2b-uat-runbooks", false, "显式启用隔离 E2B UAT 生命周期 Runbook（需要专用 UAT 配置）")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -55,26 +53,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if *fakeRunbookExecutor && *enableE2BUATRunbooks {
-		fmt.Println("启动失败: -e2e-fake-runbooks 与 -enable-e2b-uat-runbooks 不能同时启用")
-		os.Exit(1)
-	}
-	uatRuntime, err := buildE2BUATRuntime(*enableE2BUATRunbooks)
-	if err != nil {
-		fmt.Printf("加载 E2B UAT Runbook 配置失败: %v\n", err)
-		os.Exit(1)
-	}
-	var runbookExecutor runbook.Executor = uatRuntime.Executor
-	if *fakeRunbookExecutor {
-		runbookExecutor = runbook.NewFakeExecutor()
-		logger.Warn("alert-system: 已启用本地 E2E Runbook 假执行器", "external_mutation", false)
-	}
-	if *enableE2BUATRunbooks {
-		logger.Warn("alert-system: 已启用隔离 E2B UAT 生命周期执行器",
-			"host", uatRuntime.Host, "allowed_template_count", uatRuntime.AllowedTemplateCount,
-			"authorization_expires_at", uatRuntime.AuthorizationExpires)
-	}
-	if err := run(ctx, cfg, *defaultTeamID, runbookExecutor, uatRuntime.Policy, logger); err != nil {
+	if err := run(ctx, cfg, *defaultTeamID, runbook.DisabledExecutor{}, logger); err != nil {
 		logger.Error("alert-system: 退出", "err", err)
 		os.Exit(1)
 	}
@@ -82,7 +61,7 @@ func main() {
 
 // run 组装全部依赖，启动 HTTP 服务与后台 worker，阻塞直到 ctx 被取消（收到中断信号）
 // 或 HTTP 服务异常退出。
-func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, uatPolicy runbook.UATPolicy, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, logger *slog.Logger) error {
 	st, err := store.New(ctx, cfg.DBDSN)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
@@ -192,7 +171,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
 	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
-	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor, runbook.WithUATPolicy(uatPolicy))
+	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)

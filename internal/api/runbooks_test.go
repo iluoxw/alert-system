@@ -13,19 +13,24 @@ import (
 	"alert-system/internal/runbook"
 )
 
-func TestRunbookHandlerMapsExpectedUATFailuresToBadGateway(t *testing.T) {
+func TestRunbookHandlerMapsExecutorDisabledToServiceUnavailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, failure := range []error{
-		runbook.ErrE2BUATTransport,
-		errors.Join(runbook.ErrE2BUATOperation, errors.New("pause 返回 HTTP 500")),
-		runbook.ErrUATCleanupFailed,
-	} {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		handler := &runbookHandlers{router: &Router{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
-		handler.handleError(ctx, failure, "UAT test")
-		if recorder.Code != http.StatusBadGateway {
-			t.Fatalf("expected 502 for %v, got %d body=%s", failure, recorder.Code, recorder.Body.String())
-		}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	handler := &runbookHandlers{router: &Router{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	handler.handleError(ctx, runbook.ErrExecutorDisabled, "execute")
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRunbookHandlerMapsGuardRejectedToConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	handler := &runbookHandlers{router: &Router{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	handler.handleError(ctx, errors.Join(runbook.ErrGuardRejected, errors.New("role missing")), "execute")
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }

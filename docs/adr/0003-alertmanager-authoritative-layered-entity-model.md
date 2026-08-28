@@ -9,7 +9,7 @@ Accepted
 alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默、抑制、通知和 Incident-first 纵向切片，但同时存在三个结构性问题：
 
 1. 本地管道复刻了 Alertmanager 的部分语义，来源事实、本地 Ack 和人工 Resolve 又混在单一 Alert 状态中，可能产生双权威和状态冲突；
-2. 现有拓扑以 source/外部引用及业务样例为中心，E2B 相关器、页面和 Runbook 出现硬编码，新增 CCH 等业务时容易演变为每业务一套插件；
+2. 现有拓扑以 source/外部引用及业务样例为中心，部分 Runbook 与关联逻辑曾出现业务硬编码，新增业务时容易演变为每业务一套插件；
 3. 依赖图可推导爆炸半径，但无法单独证明应用已经受影响；把 potential 直接当 confirmed 会制造错误 Incident。
 
 同时，SRE Control 的定位不是遥测存储系统。Prometheus/Thanos/VictoriaMetrics/OTel 后端继续保存原始 metrics/logs/traces；外部 rule evaluator 已经负责告警规则；Alertmanager 已经负责 Alert 生命周期、分组、路由、静默和抑制。
@@ -28,12 +28,9 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 8. **只有显式 `AlertMappingPolicy` 或受信标准标签能自动创建 Fault 证据。** 未映射 Alert 进入治理队列；不根据 alertname 猜测实体和故障类型。
 9. **Impact 只有 potential、confirmed、ruled_out。** 图遍历只能产生 potential；应用 SLO/synthetic 或人工判断才能确认或排除。第一阶段不实现完整冗余与容量推理。
 10. **Incident 可以关联多个 Fault。** 维护一个可审计变更的 primary fault；关闭要求所有关联 active Fault 均已处理或被人工排除。
-11. **E2B 和 CCH 是验收场景而不是领域分支。** 两者通过相同的服务登记、实体别名、关系和 Alert Mapping 接入。
+11. **示例业务场景不是领域分支。** 新业务通过相同的服务登记、实体别名、关系和 Alert Mapping 接入。
 
-详细契约、非功能目标、失败模式与 E2E 门禁见 `docs/plans/2026-08-02-alertmanager-authoritative-sre-control-design.md`。
-
-同步里程碑的事务边界、并发控制、兼容迁移和验收细则见
-`docs/plans/2026-08-02-alertmanager-authority-sync-implementation.md`。
+详细契约与非功能目标见已归档设计文档；同步实现见 `internal/alertsource` 与相关 E2E。
 
 ## Consequences
 
@@ -51,7 +48,7 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 - 同时维护 webhook 和 API 对账增加同步器、状态收敛和测试复杂度。
 - 显式服务登记、alias 治理和 mapping 发布带来接入成本。
 - 不实现冗余推理意味着部分 Impact 需要业务探针或人工判断才能排除。
-- 从当前单状态 Alert、source-scoped topology 和 E2B 硬编码迁移需要兼容期。
+- 从当前单状态 Alert、source-scoped topology 和业务硬编码迁移需要兼容期。
 
 ### Neutral
 
@@ -75,7 +72,7 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 
 ### 每个业务实现 Connector/System Pack
 
-拒绝作为默认接入模型。业务专用采集适配器可以存在于边缘，但核心接入应依靠通用服务登记、实体别名、关系和映射策略。否则 E2B、CCH 之后会持续复制领域与 UI 分支。
+拒绝作为默认接入模型。业务专用采集适配器可以存在于边缘，但核心接入应依靠通用服务登记、实体别名、关系和映射策略。否则会持续复制领域与 UI 分支。
 
 ### 以 ManagedSystem 作为所有拓扑的强制根节点
 
@@ -88,8 +85,6 @@ alert-system 当前已经具备 Alert 入站、去重、路由、分组、静默
 ## References
 
 - `docs/adr/0001-adopt-infrastructure-first-fault-incident-model.md`
-- `docs/adr/0002-use-e2b-failed-to-place-as-golden-scenario.md`
-- `docs/plans/2026-08-02-alertmanager-authoritative-sre-control-design.md`
 - [Prometheus Alertmanager overview](https://prometheus.io/docs/alerting/latest/alertmanager/)
 - [Alertmanager configuration](https://prometheus.io/docs/alerting/latest/configuration/)
 - [Alertmanager API](https://github.com/prometheus/alertmanager#api)

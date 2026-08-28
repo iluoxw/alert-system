@@ -120,18 +120,6 @@ func newLoggedInClient(t *testing.T) *apiClient {
 	return client
 }
 
-func newLoggedInApproverClient(t *testing.T) *apiClient {
-	t.Helper()
-	client, err := newAPIClient(sys.Server.URL)
-	if err != nil {
-		t.Fatalf("e2e: 创建审批人 HTTP 客户端失败: %v", err)
-	}
-	if err := client.login(seedApproverUsername, seedApproverPassword); err != nil {
-		t.Fatalf("e2e: 审批人登录失败: %v", err)
-	}
-	return client
-}
-
 // ---- 场景①：Alertmanager webhook -> 去重 -> 路由 -> 分组 -> mock 飞书收到组通知 ->
 // Ack -> 人员/渠道升级定时器被取消 ----
 func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {

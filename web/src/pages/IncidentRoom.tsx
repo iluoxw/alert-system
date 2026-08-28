@@ -1,12 +1,22 @@
 import { useMemo, useState } from 'react'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Alert, Button, Checkbox, Empty, Form, Input, Modal, Select, Skeleton, Tag, Timeline, message } from 'antd'
+import {
+  Alert,
+  Button,
+  Empty,
+  Form,
+  Input,
+  Modal,
+  Select,
+  Skeleton,
+  Tag,
+  Timeline,
+  message,
+} from 'antd'
 import {
   ArrowLeftOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
-  FileProtectOutlined,
-  ExperimentOutlined,
   LinkOutlined,
   PlusOutlined,
   SafetyCertificateOutlined,
@@ -19,11 +29,8 @@ import { Link, useParams } from 'react-router-dom'
 import type { IncidentFaultDisposition, IncidentFaultLink, IncidentRole, IncidentTimelineKind, RecoveryCriterion, RunbookRun } from '../api/client'
 import {
   addIncidentTimeline,
-  applyRunbook,
-  approveRunbook,
   assignIncidentRole,
   createIncidentTask,
-  executeRunbook,
   getFault,
   getIncident,
   linkIncidentFault,
@@ -72,8 +79,6 @@ export function IncidentRoom() {
   const [modalApi, modalContextHolder] = Modal.useModal()
   const [taskOpen, setTaskOpen] = useState(false)
   const [timelineOpen, setTimelineOpen] = useState(false)
-  const [dryRunOpen, setDryRunOpen] = useState(false)
-  const [lifecycleOpen, setLifecycleOpen] = useState(false)
   const [linkFaultOpen, setLinkFaultOpen] = useState(false)
   const [faultAction, setFaultAction] = useState<FaultAction | null>(null)
   const [criterion, setCriterion] = useState<RecoveryCriterion | null>(null)
@@ -81,8 +86,6 @@ export function IncidentRoom() {
   const [taskForm] = Form.useForm()
   const [timelineForm] = Form.useForm()
   const [criterionForm] = Form.useForm()
-  const [dryRunForm] = Form.useForm()
-  const [lifecycleForm] = Form.useForm()
   const [linkFaultForm] = Form.useForm()
   const [faultActionForm] = Form.useForm()
   const detailQuery = useQuery({ queryKey: ['incident', id], queryFn: () => getIncident(id), enabled: Boolean(id), refetchInterval: 10_000 })
@@ -120,7 +123,6 @@ export function IncidentRoom() {
   const roleMap = useMemo(() => new Map(detail?.roles.map((role) => [role.role, role.user_id]) ?? []), [detail?.roles])
   const userOptions = (usersQuery.data ?? []).map((user) => ({ value: user.id, label: user.display_name }))
   const userName = (userId?: string) => usersQuery.data?.find((user) => user.id === userId)?.display_name || userId || '未分配'
-  const lifecycleDefinition = runbooksQuery.data?.items.find((item) => item.action_key === 'e2b.lifecycle_verify')
 
   if (detailQuery.isLoading) return <div className="ops-detail-page"><Skeleton active paragraph={{ rows: 14 }} /></div>
   if (detailQuery.error || !detail) return <div className="ops-detail-page"><Alert type="error" showIcon message="Incident Room 加载失败" description={detailQuery.error instanceof Error ? detailQuery.error.message : 'Incident 不存在'} /></div>
@@ -134,8 +136,6 @@ export function IncidentRoom() {
     outstandingTasks.length === 0 && linkedFaultsReady && blockingActiveFaults.length === 0
   const nextTransition = detail.incident.status === 'declared' || detail.incident.status === 'mitigating'
     ? 'monitoring' : detail.incident.status === 'monitoring' ? 'resolved' : null
-  const latestPlan = [...(runsQuery.data?.items ?? [])].reverse().find((run) => run.action_key === 'e2b.cleanup_dry_run' && run.status === 'succeeded')
-  const applyCompleted = (runsQuery.data?.items ?? []).some((run) => run.action_key === 'e2b.cleanup_apply' && run.status === 'succeeded')
   const completedTaskCount = detail.tasks.filter((task) => task.status === 'done' || task.status === 'canceled').length
   const passedCriterionCount = detail.recovery_criteria.filter((item) => item.status === 'passed').length
   const linkedFaultIDs = new Set(detail.faults.map((link) => link.fault_id))
@@ -192,34 +192,7 @@ export function IncidentRoom() {
     }), '恢复证据已记录')
     setCriterion(null); criterionForm.resetFields()
   }
-  const createDryRun = async () => {
-    const values = await dryRunForm.validateFields()
-    const targets = String(values.targets).split(/[\s,]+/).map((value) => value.trim()).filter(Boolean)
-    await runAction(() => executeRunbook(id, 'e2b.cleanup_dry_run', {
-      target_refs: targets, retries_stopped: true, retries_stopped_at: new Date().toISOString(),
-      retries_stopped_by: values.stoppedBy, ticket_ref: values.ticket,
-    }), 'Dry-run 计划已生成')
-    setDryRunOpen(false); dryRunForm.resetFields()
-  }
-  const executeLifecycleProbe = async () => {
-    const values = await lifecycleForm.validateFields()
-    const succeeded = await runAction(() => executeRunbook(id, 'e2b.lifecycle_verify', {
-      environment_id: values.environmentId, authorization_ref: values.authorizationRef,
-      template_id: values.templateId, template_alias: values.templateAlias,
-      confirm_cleanup: values.confirmCleanup,
-    }), 'E2B UAT 生命周期探针已完成并清理')
-    if (succeeded) { setLifecycleOpen(false); lifecycleForm.resetFields() }
-  }
-  const confirmApply = (plan: RunbookRun) => {
-    modalApi.confirm({
-      title: '确认执行 Cleanup Apply？',
-      content: <div className="runbook-confirm-copy"><p>这会按已审批计划执行精确清理。系统将重新校验内容哈希、有效期、停止重试记录与执行人分离。</p><code>{plan.plan_sha256}</code></div>,
-      okText: '执行精确清理',
-      okButtonProps: { danger: true },
-      cancelText: '取消',
-      onOk: () => runAction(() => applyRunbook(id, plan.id, plan.plan_sha256 ?? ''), 'Cleanup apply 已完成'),
-    })
-  }
+
   const advanceIncident = () => {
     if (!nextTransition) return
     const action = () => runAction(
@@ -307,13 +280,12 @@ export function IncidentRoom() {
 
       <div className="incident-operations-grid">
         <section className="work-ledger-panel runbook-panel">
-          <header><div><h3>受控诊断与操作</h3><p>Guarded Runbooks · 无任意 Shell</p></div><span className="runbook-head-actions"><Button icon={<FileProtectOutlined />} onClick={() => setDryRunOpen(true)}>Cleanup dry-run</Button><Button danger icon={<ExperimentOutlined />} data-testid="e2b-uat-lifecycle" disabled={!lifecycleDefinition?.runtime_available} title={lifecycleDefinition?.runtime_reason} onClick={() => setLifecycleOpen(true)}>UAT 生命周期验收</Button></span></header>
-          <Alert type="warning" showIcon message="Cleanup apply 必须校验计划 SHA256、有效期、停止重试记录和独立审批。" />
+          <header><div><h3>受控诊断与操作</h3><p>Guarded Runbooks · 无任意 Shell</p></div></header>
           <div className="runbook-catalog">
             {(runbooksQuery.data?.items ?? []).map((definition) => <span className={definition.runtime_available ? '' : 'is-unavailable'} key={definition.action_key}><SafetyCertificateOutlined /><b>{definition.name}</b><small>{definition.risk_level}{definition.uat_only ? ' · UAT only' : ''}{definition.runtime_available ? '' : ` · ${definition.runtime_reason || '执行器不可用'}`}</small></span>)}
+            {(runbooksQuery.data?.items.length ?? 0) === 0 && <div className="ledger-empty is-compact">当前环境尚未配置可执行的 Runbook 动作。</div>}
           </div>
-          <div className="runbook-runs">{(runsQuery.data?.items ?? []).slice(-6).reverse().map((run) => <RunbookRunRow key={run.id} run={run} incidentId={id} pending={pending} onAction={runAction} />)}{(runsQuery.data?.items.length ?? 0) === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚无 Runbook 执行记录" />}</div>
-          {latestPlan && <div className="runbook-plan-callout"><span><b>最新计划</b><code>{latestPlan.plan_sha256}</code><small>有效至 {latestPlan.plan_expires_at ? new Date(latestPlan.plan_expires_at).toLocaleString() : '—'}</small></span><Button disabled={applyCompleted} onClick={() => void runAction(() => approveRunbook(id, latestPlan.id, latestPlan.plan_sha256 ?? '', '已在 Incident Room 复核计划'), '审批已记录')}>审批计划</Button><Button danger type="primary" disabled={applyCompleted} onClick={() => confirmApply(latestPlan)}>{applyCompleted ? 'Apply 已执行' : '执行 Apply'}</Button></div>}
+          <div className="runbook-runs">{(runsQuery.data?.items ?? []).slice(-6).reverse().map((run) => <RunbookRunRow key={run.id} run={run} />)}{(runsQuery.data?.items.length ?? 0) === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚无 Runbook 执行记录" />}</div>
         </section>
 
         <aside className="incident-collaboration-rail">
@@ -334,12 +306,10 @@ export function IncidentRoom() {
       <Modal title="关联 Supporting Fault" open={linkFaultOpen} confirmLoading={pending} onOk={() => void linkFault()} onCancel={() => setLinkFaultOpen(false)} okText="关联到 Incident"><Alert type="info" showIcon message="关联只扩展本次响应范围，不会复制或修改 Fault 证据。已属于其他 Incident 的 Fault 会被拒绝。" /><Form form={linkFaultForm} layout="vertical" className="ops-modal-form" autoComplete="off"><Form.Item name="fault_id" label="选择 Fault" rules={[{ required: true }]}><Select showSearch virtual={false} optionFilterProp="label" loading={faultCatalogQuery.isLoading} options={linkFaultOptions} placeholder="按 Fault ID、标题或状态搜索" /></Form.Item></Form></Modal>
       <Modal title={faultAction?.action === 'exclude' ? '从关闭范围排除 Fault' : faultAction?.action === 'include' ? '重新纳入 Fault' : faultAction?.action === 'monitoring' ? '标记关联 Fault 已缓解' : '标记关联 Fault 已恢复'} open={Boolean(faultAction)} confirmLoading={pending} onOk={() => void submitFaultAction()} onCancel={() => setFaultAction(null)} okText="记录裁决"><Alert type={faultAction?.action === 'exclude' ? 'warning' : 'info'} showIcon message={faultAction?.action === 'exclude' ? 'Fault 会继续保留在 Incident 和时间线中，但不再阻止本次 Incident 关闭。' : '该操作会推进当前 Fault 的事实状态，并写入 Incident 决策时间线。'} /><Form form={faultActionForm} layout="vertical" className="ops-modal-form" autoComplete="off"><Form.Item name="rationale" label="证据与理由" rules={[{ required: true, min: 8 }]}><Input.TextArea rows={4} placeholder="写明指标、探针、拓扑证据或人工判断依据…" /></Form.Item></Form></Modal>
       <Modal title="记录恢复证据" open={Boolean(criterion)} confirmLoading={pending} onOk={() => void passCriterion()} onCancel={() => setCriterion(null)} okText="标记通过"><Alert type="info" showIcon message={criterion?.description} /><Form form={criterionForm} layout="vertical" className="ops-modal-form" autoComplete="off"><Form.Item name="summary" label="观测证据" rules={[{ required: true, min: 8 }]}><Input.TextArea rows={4} placeholder="写明指标值、阈值、探针结果或观察窗口…" /></Form.Item></Form></Modal>
-      <Modal title="生成 Cleanup Dry-run 计划" open={dryRunOpen} confirmLoading={pending} onOk={() => void createDryRun()} onCancel={() => setDryRunOpen(false)} okText="生成短时效计划"><Alert type="warning" showIcon message="仅填写脱敏的精确 target ref。此操作不会修改外部状态。" /><Form form={dryRunForm} layout="vertical" className="ops-modal-form" autoComplete="off"><Form.Item name="targets" label="Target refs（逗号或换行分隔）" rules={[{ required: true }]}><Input.TextArea rows={3} placeholder="例如 sid-a91c, sid-b72e…" /></Form.Item><Form.Item name="stoppedBy" label="停止重试确认人" rules={[{ required: true, message: '请选择已确认停止重试的成员' }]}><Select showSearch virtual={false} optionFilterProp="label" loading={usersQuery.isLoading} options={userOptions} placeholder="选择已确认停止重试的成员" /></Form.Item><Form.Item name="ticket" label="工单 / Incident 引用" rules={[{ required: true }]}><Input /></Form.Item></Form></Modal>
-      <Modal title="E2B UAT 生命周期验收" open={lifecycleOpen} confirmLoading={pending} onOk={() => void executeLifecycleProbe()} onCancel={() => setLifecycleOpen(false)} okText="执行并自动清理" okButtonProps={{ danger: true }}><Alert type="error" showIcon message="该操作会在服务端白名单限定的隔离 UAT 创建测试 Sandbox" description="系统执行 create → ready → pause → resume → verify，并在成功、失败或取消后尝试 delete。仅 Incident Commander / Technical Lead 可执行；API Key 不会进入浏览器。" /><Form form={lifecycleForm} layout="vertical" className="ops-modal-form" autoComplete="off"><Form.Item name="environmentId" label="隔离环境标识" rules={[{ required: true }]}><Input placeholder="与已审批 UAT 环境一致" /></Form.Item><Form.Item name="authorizationRef" label="变更授权引用" rules={[{ required: true }]}><Input placeholder="例如 CHG-…" /></Form.Item><Form.Item name="templateId" label="UAT 模板 ID" rules={[{ required: true }]}><Input placeholder="必须在服务端模板白名单内" /></Form.Item><Form.Item name="templateAlias" label="模板别名（可选）"><Input maxLength={64} /></Form.Item><Form.Item name="confirmCleanup" valuePropName="checked" rules={[{ validator: (_, value) => value ? Promise.resolve() : Promise.reject(new Error('必须确认自动清理')) }]}><Checkbox>我确认该模板和环境仅用于 UAT，并授权系统自动删除测试 Sandbox</Checkbox></Form.Item></Form></Modal>
     </div>
   )
 }
 
-function RunbookRunRow({ run, incidentId, pending, onAction }: { run: RunbookRun; incidentId: string; pending: boolean; onAction: (action: () => Promise<unknown>, success: string) => Promise<boolean> }) {
-  return <div className={`runbook-run-row is-${run.status}`}><span><b>{run.action_key}</b><small>{new Date(run.requested_at).toLocaleString()}</small></span><Tag>{run.status}</Tag>{run.error && <p>{run.error}</p>}{run.plan_sha256 && <Button size="small" disabled={pending} onClick={() => void onAction(() => approveRunbook(incidentId, run.id, run.plan_sha256 ?? '', 'Incident Room 人工审批'), '审批已记录')}>审批</Button>}</div>
+function RunbookRunRow({ run }: { run: RunbookRun }) {
+  return <div className={`runbook-run-row is-${run.status}`}><span><b>{run.action_key}</b><small>{new Date(run.requested_at).toLocaleString()}</small></span><Tag>{run.status}</Tag>{run.error && <p>{run.error}</p>}</div>
 }

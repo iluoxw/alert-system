@@ -54,7 +54,6 @@ type system struct {
 	Runbooks             *store.RunbookRepo
 	Services             *store.ServiceCatalogRepo
 	AlertMappings        *store.AlertMappingRepo
-	RunbookExecutor      *runbook.FakeExecutor
 
 	scheduler  *scheduler.Scheduler
 	pipeline   *pipeline.Pipeline
@@ -90,7 +89,6 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	topology := store.NewTopologyRepo()
 	incidents := store.NewIncidentRepo()
 	runbooks := store.NewRunbookRepo()
-	runbookExecutor := runbook.NewFakeExecutor()
 	serviceCatalog := store.NewServiceCatalogRepo()
 	alertMappings := store.NewAlertMappingRepo()
 
@@ -157,7 +155,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
 	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
-	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
+	runbookService := runbook.NewService(st, incidents, runbooks, runbook.DisabledExecutor{})
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
@@ -191,7 +189,6 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		Runbooks:             runbooks,
 		Services:             serviceCatalog,
 		AlertMappings:        alertMappings,
-		RunbookExecutor:      runbookExecutor,
 		scheduler:            sched,
 		pipeline:             pl,
 		reconciler:           reconciler,
