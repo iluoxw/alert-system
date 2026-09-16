@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +17,13 @@ import (
 	"alert-system/internal/oncall"
 	"alert-system/internal/ops"
 	"alert-system/internal/scheduler"
+	"alert-system/internal/store"
 )
+
+// groupMessageMaxTitles 是分组通知 Body 摘要里最多列出的成员标题数，超出部分折叠
+// 为"…另有 N 条"——避免组内成员很多时消息体过长，同时给值班人足够的影响面线索
+// （比缺陷 1 只显示第一条更有用）。
+const groupMessageMaxTitles = 5
 
 // notifySendTimerKind 是 outbox 定时器在 scheduler 里的 kind：六个注册 kind 里唯一
 // 由本包（而不是各业务包）定义的一个，因为它是纯装配层概念，不属于任何业务包的
@@ -32,9 +40,12 @@ const notifySendTimerKind = "notify_send"
 const teamNotifyChannel = "lark"
 
 // notifyOutboxScheduler 是 notifyOutbox 依赖的定时器子集，由 *scheduler.Scheduler 实现。
+// Cancel 是 IncidentOutbox.CancelRecoveryNudge 需要的额外能力（notifyOutbox 本身
+// 不用它，与 IncidentOutbox 共享同一个接口只是为了不再声明第二个几乎相同的接口）。
 type notifyOutboxScheduler interface {
 	Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error
 	ScheduleIfAbsent(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) (bool, error)
+	Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error
 }
 
 // notifyOutboxChainStarter 抽象 oncall.Chain.Start，供 NotifyGroup 的"首次通知编排"
@@ -49,6 +60,14 @@ type notifyOutboxEngineStarter interface {
 	Start(ctx context.Context, tx pgx.Tx, alert domain.Alert, baseTime time.Time) error
 }
 
+// notifyOutboxRouteRepo 是 NotifyGroup 解析路由级 repeat_interval 依赖的仓储子集，
+// 由 store.RouteRepo 实现（结构化满足）。缺陷 1 修复：路由的 RepeatIntervalSeconds
+// 此前只写入 pipeline.RouteResult 却从未被消费，是一份死配置——这里在"意图时刻"
+// （首个 alert_repeat 定时器注册时）按告警的 RouteID 查一次路由，取其配置值。
+type notifyOutboxRouteRepo interface {
+	GetByID(ctx context.Context, tx pgx.Tx, id string) (*store.Route, error)
+}
+
 // notifyOutbox 同时实现四个"通知意图"接口。每个方法只做一件事：把意图翻译成一个
 // 或多个 scheduleSend 调用；NotifyGroup 额外承担"首次通知编排"职责（组首时间基准
 // 的渠道升级 + 首个 repeat 定时器 + 人员升级链启动），见该方法注释。
@@ -56,6 +75,7 @@ type notifyOutbox struct {
 	scheduler        notifyOutboxScheduler
 	engine           notifyOutboxEngineStarter
 	chain            notifyOutboxChainStarter
+	routes           notifyOutboxRouteRepo // 路由级 repeat_interval 查询，可为 nil（无路由仓储时全部走全局默认）
 	repeatInterval   time.Duration
 	personnelChannel string // 到人发送的渠道种类（config.PersonnelChannel，默认 "email"）
 	now              func() time.Time
@@ -169,8 +189,16 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 		if err := o.engine.Start(ctx, tx, alert, baseTime); err != nil {
 			return fmt.Errorf("app: 启动渠道升级序列失败: %w", err)
 		}
-		fireAt := o.now().Add(o.repeatInterval)
-		if _, err := o.scheduler.ScheduleIfAbsent(ctx, tx, notify.TimerKindAlertRepeat, alert.ID, fireAt, nil); err != nil {
+		interval, err := o.resolveRepeatInterval(ctx, tx, alert.RouteID)
+		if err != nil {
+			return err
+		}
+		repeatPayload, err := json.Marshal(notify.RepeatPayload{IntervalSeconds: int(interval / time.Second)})
+		if err != nil {
+			return fmt.Errorf("app: 序列化 repeat payload 失败: %w", err)
+		}
+		fireAt := o.now().Add(interval)
+		if _, err := o.scheduler.ScheduleIfAbsent(ctx, tx, notify.TimerKindAlertRepeat, alert.ID, fireAt, repeatPayload); err != nil {
 			return fmt.Errorf("app: 注册首个 repeat 定时器失败: %w", err)
 		}
 		if err := o.chain.Start(ctx, tx, alert); err != nil {
@@ -178,6 +206,31 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 		}
 	}
 	return nil
+}
+
+// resolveRepeatInterval 按告警的 RouteID 解析本条 repeat 链应使用的间隔：路由未
+// 命中过任何规则（RouteID 为空）、未注入路由仓储、路由已被删除，或路由的
+// RepeatIntervalSeconds<=0（未配置，沿用全局默认，对齐不变量 10"降噪一律
+// opt-in"同一口径）时，一律回落 o.repeatInterval。
+//
+// 只有"未找到"可以回落；其他查询错误必须上抛：同一 pgx.Tx 内一次失败的查询会让
+// 整个事务进入 aborted 状态，吞掉错误并不能让后续 ScheduleIfAbsent 成功，只会把
+// 真正根因换成"current transaction is aborted"（见不变量 21 同类教训）。
+func (o *notifyOutbox) resolveRepeatInterval(ctx context.Context, tx pgx.Tx, routeID string) (time.Duration, error) {
+	if o.routes == nil || routeID == "" {
+		return o.repeatInterval, nil
+	}
+	route, err := o.routes.GetByID(ctx, tx, routeID)
+	if errors.Is(err, store.ErrNotFound) {
+		return o.repeatInterval, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("app: 查询路由 repeat 间隔失败: %w", err)
+	}
+	if route.RepeatIntervalSeconds <= 0 {
+		return o.repeatInterval, nil
+	}
+	return time.Duration(route.RepeatIntervalSeconds) * time.Second, nil
 }
 
 // activeAlerts 过滤出 alerts 里当前未被任何静默命中的子集，顺序与输入一致。
@@ -279,15 +332,72 @@ func buildAlertMessage(alert domain.Alert) notify.Message {
 }
 
 // buildGroupMessage 把一组告警组装成分组摘要 Message，OccurredAt 取组首时间。
+// Body 缺陷修复（此前恒为 alerts[0].Title，组内多条告警时值班人无法从消息判断
+// 影响面）：改为列出组内成员摘要，见 buildGroupBody。
 func buildGroupMessage(groupKey string, alerts []domain.Alert) notify.Message {
 	return notify.Message{
 		AlertIDs:   alertIDs(alerts),
 		GroupKey:   groupKey,
 		Severity:   string(alerts[0].Severity),
 		Title:      fmt.Sprintf("%d 条告警（分组 %s）", len(alerts), groupKey),
-		Body:       alerts[0].Title,
+		Body:       buildGroupBody(alerts),
 		OccurredAt: earliestStartsAt(alerts),
 	}
+}
+
+// groupSeverityRank 给严重程度定一个用于排序的权重：数值越小越严重。展示顺序
+// "严重程度从高到低"依赖这个显式权重，而不是 Severity 字符串本身的字典序
+// （"critical" < "info" < "warning" 的字典序与业务语义相反）。
+var groupSeverityRank = map[domain.Severity]int{
+	domain.SeverityCritical: 0,
+	domain.SeverityWarning:  1,
+	domain.SeverityInfo:     2,
+}
+
+// buildGroupBody 按"严重程度从高到低、同级按 StartsAt 从早到晚"排序后，最多列出
+// 前 groupMessageMaxTitles 条告警标题，超出部分折叠为"…另有 N 条"。只有 1 条时
+// 保持原样（不加多余格式），与升级前单条分组的展示一致。
+//
+// 排序在拷贝出的切片上进行（不修改调用方传入的 alerts 底层数组），排序键是
+// Severity → StartsAt → Title → ID 的全序：批量触发时同级同 StartsAt 很常见，
+// 若缺少 Title/ID 兜底，稳定排序会保留输入顺序，乱序到达就会产出不同 Body。
+func buildGroupBody(alerts []domain.Alert) string {
+	if len(alerts) == 1 {
+		return alerts[0].Title
+	}
+
+	sorted := make([]domain.Alert, len(alerts))
+	copy(sorted, alerts)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri, rj := groupSeverityRank[sorted[i].Severity], groupSeverityRank[sorted[j].Severity]
+		if ri != rj {
+			return ri < rj
+		}
+		if !sorted[i].StartsAt.Equal(sorted[j].StartsAt) {
+			return sorted[i].StartsAt.Before(sorted[j].StartsAt)
+		}
+		if sorted[i].Title != sorted[j].Title {
+			return sorted[i].Title < sorted[j].Title
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+
+	shown := sorted
+	remaining := 0
+	if len(shown) > groupMessageMaxTitles {
+		remaining = len(shown) - groupMessageMaxTitles
+		shown = shown[:groupMessageMaxTitles]
+	}
+
+	titles := make([]string, len(shown))
+	for i, a := range shown {
+		titles[i] = a.Title
+	}
+	body := strings.Join(titles, "；")
+	if remaining > 0 {
+		body += fmt.Sprintf("；…另有 %d 条", remaining)
+	}
+	return body
 }
 
 func alertIDs(alerts []domain.Alert) []string {

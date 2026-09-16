@@ -235,10 +235,17 @@ func validateManagedProvider(node domain.ResourceNode) error {
 	return nil
 }
 
+// EntityRegistrySource 是受管基础设施/平台实体的唯一写入来源，用于隔离
+// replaceEntityDependencies 只清理本实体自己声明的边（不变量 15）。导出给
+// API 层在回显依赖时按同一 source 过滤（见 ListDependenciesForSource）。
+const EntityRegistrySource = "entity_registry"
+
 // CreateManagedEntity registers a canonical infrastructure/platform provider.
 // Application entities must continue to use ServiceCatalogRepo so ownership,
-// tier and aliases stay in one authority.
-func (r *TopologyRepo) CreateManagedEntity(ctx context.Context, tx pgx.Tx, node domain.ResourceNode) (domain.ResourceNode, error) {
+// tier and aliases stay in one authority. aliases/dependencies 与
+// ServiceCatalogRepo.Create 共用 replaceEntityAliases/replaceEntityDependencies，
+// 只是依赖边的 source 换成 entity_registry，避免与应用服务的边互相清除。
+func (r *TopologyRepo) CreateManagedEntity(ctx context.Context, tx pgx.Tx, node domain.ResourceNode, aliases []domain.EntityAlias, dependencies []domain.DependencyEdge) (domain.ResourceNode, error) {
 	if err := validateManagedProvider(node); err != nil {
 		return domain.ResourceNode{}, err
 	}
@@ -262,10 +269,16 @@ func (r *TopologyRepo) CreateManagedEntity(ctx context.Context, tx pgx.Tx, node 
 	if err != nil {
 		return domain.ResourceNode{}, fmt.Errorf("store: 创建受管实体失败: %w", err)
 	}
+	if err := replaceEntityAliases(ctx, tx, id, aliases); err != nil {
+		return domain.ResourceNode{}, err
+	}
+	if err := replaceEntityDependencies(ctx, tx, EntityRegistrySource, id, node.Environment, dependencies); err != nil {
+		return domain.ResourceNode{}, err
+	}
 	return r.GetByID(ctx, tx, id)
 }
 
-func (r *TopologyRepo) UpdateManagedEntity(ctx context.Context, tx pgx.Tx, id string, node domain.ResourceNode) (domain.ResourceNode, error) {
+func (r *TopologyRepo) UpdateManagedEntity(ctx context.Context, tx pgx.Tx, id string, node domain.ResourceNode, aliases []domain.EntityAlias, dependencies []domain.DependencyEdge) (domain.ResourceNode, error) {
 	if err := validateManagedProvider(node); err != nil {
 		return domain.ResourceNode{}, err
 	}
@@ -295,7 +308,31 @@ func (r *TopologyRepo) UpdateManagedEntity(ctx context.Context, tx pgx.Tx, id st
 	`, id, node.Name, node.Provider, node.Environment, node.OwnerTeamID, labels, attributes); err != nil {
 		return domain.ResourceNode{}, fmt.Errorf("store: 更新受管实体失败: %w", err)
 	}
+	// nil 表示调用方未提供该集合，保持现状；非 nil（含空切片）才整体替换。
+	if aliases != nil {
+		if err := replaceEntityAliases(ctx, tx, id, aliases); err != nil {
+			return domain.ResourceNode{}, err
+		}
+	}
+	if dependencies != nil {
+		if err := replaceEntityDependencies(ctx, tx, EntityRegistrySource, id, node.Environment, dependencies); err != nil {
+			return domain.ResourceNode{}, err
+		}
+	}
 	return r.GetByID(ctx, tx, id)
+}
+
+// ListAliases 返回实体的全部 Entity Alias；entity_aliases 不区分创建来源，
+// 受管实体与应用服务共用同一张表和同一套 ResolveAlias 语义。
+func (r *TopologyRepo) ListAliases(ctx context.Context, tx pgx.Tx, entityID string) ([]domain.EntityAlias, error) {
+	return listEntityAliases(ctx, tx, entityID)
+}
+
+// ListDependenciesForSource 返回以 entityID 为消费方、且写入来源等于 source 的依赖边，
+// 用于按创建方（拓扑同步 / 应用服务登记 / 受管实体登记）分别回显各自声明的依赖，
+// 不与其他来源的边混在一起（不变量 15 的 source 隔离）。
+func (r *TopologyRepo) ListDependenciesForSource(ctx context.Context, tx pgx.Tx, source, entityID string) ([]domain.DependencyEdge, error) {
+	return listEntityDependencies(ctx, tx, source, entityID)
 }
 
 func (r *TopologyRepo) ListNodes(ctx context.Context, tx pgx.Tx, kind domain.ResourceNodeKind, limit int) ([]domain.ResourceNode, error) {
@@ -530,4 +567,111 @@ func (r *TopologyRepo) listCanonicalTraversal(ctx context.Context, tx pgx.Tx, ro
 		return nil, ErrResourceNodeNotFound
 	}
 	return result, nil
+}
+
+// replaceEntityAliases 原子替换一个实体的全部 Entity Alias。entity_aliases 按
+// entity_id 归属、不区分创建来源，ServiceCatalogRepo（应用服务）与 TopologyRepo
+// （受管基础设施/平台实体）共用这一份实现，避免同一段 DELETE+INSERT 逻辑抄两份。
+func replaceEntityAliases(ctx context.Context, tx pgx.Tx, entityID string, aliases []domain.EntityAlias) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM entity_aliases WHERE entity_id = $1`, entityID); err != nil {
+		return fmt.Errorf("store: 清理 Entity Alias 失败: %w", err)
+	}
+	for _, alias := range aliases {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO entity_aliases (namespace, alias_value, entity_id, enabled)
+			VALUES ($1, $2, $3, $4)
+		`, strings.TrimSpace(alias.Namespace), strings.TrimSpace(alias.Value), entityID, alias.Enabled); err != nil {
+			return fmt.Errorf("store: 保存 Entity Alias 失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func listEntityAliases(ctx context.Context, tx pgx.Tx, entityID string) ([]domain.EntityAlias, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, namespace, alias_value, entity_id::text, enabled, created_at, updated_at
+		FROM entity_aliases WHERE entity_id = $1 ORDER BY namespace, alias_value
+	`, entityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	aliases := []domain.EntityAlias{}
+	for rows.Next() {
+		var alias domain.EntityAlias
+		if err := rows.Scan(&alias.ID, &alias.Namespace, &alias.Value, &alias.EntityID,
+			&alias.Enabled, &alias.CreatedAt, &alias.UpdatedAt); err != nil {
+			return nil, err
+		}
+		aliases = append(aliases, alias)
+	}
+	return aliases, rows.Err()
+}
+
+// replaceEntityDependencies 原子替换指定 source 下、以 entityID 为消费方（from）声明的
+// 依赖边。source 隔离不同写入方的边集合（不变量 15）：service_registry 归应用服务、
+// entity_registry 归受管实体、拓扑同步各用自己的 source，互相不清除对方写入的边；
+// origin 固定 declared，与拓扑同步写入的 observed 边区分开。ServiceCatalogRepo 与
+// TopologyRepo 共用这份实现，只是各自传入不同的 source。
+func replaceEntityDependencies(ctx context.Context, tx pgx.Tx, source, entityID, environment string, dependencies []domain.DependencyEdge) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM dependency_edges WHERE source = $1 AND from_node_id = $2`, source, entityID); err != nil {
+		return fmt.Errorf("store: 清理依赖失败: %w", err)
+	}
+	topology := NewTopologyRepo()
+	for _, dependency := range dependencies {
+		target, err := topology.GetByID(ctx, tx, dependency.ToNodeID)
+		if errors.Is(err, ErrResourceNodeNotFound) {
+			return fmt.Errorf("%w: 依赖目标实体不存在", ErrServiceDependencyInvalid)
+		}
+		if err != nil {
+			return err
+		}
+		if target.ID == entityID {
+			return fmt.Errorf("%w: 不能依赖自身", ErrServiceDependencyInvalid)
+		}
+		if target.Environment != "" && target.Environment != "global" && environment != "" && target.Environment != environment {
+			return fmt.Errorf("%w: 与依赖实体环境不一致", ErrServiceDependencyInvalid)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO dependency_edges (
+				source, from_node_id, to_node_id, relation, criticality,
+				evidence, observed_at, sync_run_id, origin
+			) VALUES ($1, $2, $3, 'depends_on', $4, jsonb_build_object('authority', $1::text), now(), NULL, 'declared')
+		`, source, entityID, target.ID, dependency.Criticality); err != nil {
+			return fmt.Errorf("store: 保存依赖失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func listEntityDependencies(ctx context.Context, tx pgx.Tx, source, entityID string) ([]domain.DependencyEdge, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT e.id::text, e.source, e.from_node_id::text, e.to_node_id::text,
+		       fn.external_ref, tn.external_ref, fn.name, tn.name, e.relation,
+		       e.criticality, e.origin, e.evidence, e.observed_at
+		FROM dependency_edges e
+		JOIN resource_nodes fn ON fn.id = e.from_node_id
+		JOIN resource_nodes tn ON tn.id = e.to_node_id
+		WHERE e.source = $1 AND e.from_node_id = $2
+		ORDER BY e.criticality DESC, tn.name
+	`, source, entityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	dependencies := []domain.DependencyEdge{}
+	for rows.Next() {
+		var edge domain.DependencyEdge
+		var evidenceRaw []byte
+		if err := rows.Scan(&edge.ID, &edge.Source, &edge.FromNodeID, &edge.ToNodeID,
+			&edge.FromExternalRef, &edge.ToExternalRef, &edge.FromNodeName, &edge.ToNodeName,
+			&edge.Relation, &edge.Criticality, &edge.Origin, &evidenceRaw, &edge.ObservedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(evidenceRaw, &edge.Evidence); err != nil {
+			return nil, err
+		}
+		dependencies = append(dependencies, edge)
+	}
+	return dependencies, rows.Err()
 }

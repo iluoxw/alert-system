@@ -30,6 +30,11 @@ const (
 	// 由 main 装配统一注入 notify.LifecycleHandlers，见该类型构造函数文档）。
 	defaultRepeatInterval = 30 * time.Minute
 
+	// defaultIncidentNudgeInterval 是 Incident 恢复提醒（incident_recovery_nudge）
+	// 的默认轮询周期：证据全部解除却无人收尾的 Incident 每隔这么久被提醒一次。
+	// <=0 表示关闭，不调度、handler 直接无副作用返回（见 internal/app/incident_nudge.go）。
+	defaultIncidentNudgeInterval = 6 * time.Hour
+
 	// defaultSMTPStartTLS 默认开启，与 SessionCookieSecure 同样的"默认从严、本地联调显式关闭"取舍。
 	defaultSMTPStartTLS = true
 
@@ -64,6 +69,9 @@ type Config struct {
 
 	RepeatInterval time.Duration // R6.5 重复提醒周期，main 装配注入 notify.LifecycleHandlers
 
+	// IncidentNudgeInterval 是 incident_recovery_nudge 定时器的轮询周期；<=0 表示关闭。
+	IncidentNudgeInterval time.Duration
+
 	SMTP             SMTPConfig      // R3 email 渠道凭据
 	PersonnelChannel string          // R3 人员到人通知的默认渠道，默认 "email"
 	Retention        RetentionConfig // R5 timers/notification_log 数据保留策略
@@ -97,6 +105,24 @@ type RetentionConfig struct {
 	NotificationLogDays int           // notification_log 表：早于此天数的行会被清理
 	SweepInterval       time.Duration // 无积压时的对账周期
 	BatchSize           int           // 单批 DELETE 的最大行数
+}
+
+// Validate 拒绝会让清理任务失控的取值。NotificationLogDays<1 会立即删光通知日志，
+// 而 notification_log 承载发送幂等键，删掉后 at-least-once 重投会变成重复发送；
+// SweepInterval 过小会让 handler 自续期空转；BatchSize<1 时 LIMIT 0 永远"删满一批"，
+// 触发每分钟一次的追赶续期。
+func (c RetentionConfig) Validate() error {
+	switch {
+	case c.TimersDays < 1:
+		return fmt.Errorf("retention.timers_days 必须 >= 1，当前 %d", c.TimersDays)
+	case c.NotificationLogDays < 1:
+		return fmt.Errorf("retention.notification_log_days 必须 >= 1，当前 %d", c.NotificationLogDays)
+	case c.SweepInterval < time.Minute:
+		return fmt.Errorf("retention.sweep_interval 必须 >= 1m，当前 %s", c.SweepInterval)
+	case c.BatchSize < 1:
+		return fmt.Errorf("retention.batch_size 必须 >= 1，当前 %d", c.BatchSize)
+	}
+	return nil
 }
 
 // LarkConfig 是飞书开放平台凭据配置（R6.2/R6.4 飞书渠道与回调验签）。
@@ -140,6 +166,10 @@ type fileConfig struct {
 
 	RepeatInterval string `yaml:"repeat_interval"`
 
+	// IncidentNudgeInterval 与 RepeatInterval 同一套字符串 Duration 风格；空字符串
+	// 不出现在 YAML 里时用下方 defaultIncidentNudgeInterval 兜底。
+	IncidentNudgeInterval string `yaml:"incident_nudge_interval"`
+
 	SMTP             fileSMTPConfig      `yaml:"smtp"`
 	PersonnelChannel string              `yaml:"personnel_channel"`
 	Retention        fileRetentionConfig `yaml:"retention"`
@@ -182,6 +212,7 @@ func Load(path string) (Config, error) {
 		SessionIdleTTL:        defaultSessionIdleTTL.String(),
 		SessionCookieSecure:   defaultSessionCookieSecure,
 		RepeatInterval:        defaultRepeatInterval.String(),
+		IncidentNudgeInterval: defaultIncidentNudgeInterval.String(),
 		SMTP: fileSMTPConfig{
 			StartTLS: defaultSMTPStartTLS,
 		},
@@ -228,12 +259,26 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid repeat_interval %q: %w", fc.RepeatInterval, err)
 	}
+	incidentNudgeInterval, err := time.ParseDuration(fc.IncidentNudgeInterval)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid incident_nudge_interval %q: %w", fc.IncidentNudgeInterval, err)
+	}
 	retentionSweepInterval, err := time.ParseDuration(fc.Retention.SweepInterval)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid retention.sweep_interval %q: %w", fc.Retention.SweepInterval, err)
 	}
 	corsAllowedOrigins, err := normalizeOrigins(fc.CORSAllowedOrigins)
 	if err != nil {
+		return Config{}, err
+	}
+
+	retention := RetentionConfig{
+		TimersDays:          fc.Retention.TimersDays,
+		NotificationLogDays: fc.Retention.NotificationLogDays,
+		SweepInterval:       retentionSweepInterval,
+		BatchSize:           fc.Retention.BatchSize,
+	}
+	if err := retention.Validate(); err != nil {
 		return Config{}, err
 	}
 
@@ -247,11 +292,12 @@ func Load(path string) (Config, error) {
 			VerificationToken: fc.Lark.VerificationToken,
 			EncryptKey:        fc.Lark.EncryptKey,
 		},
-		SessionTTL:          sessionTTL,
-		SessionIdleTTL:      sessionIdleTTL,
-		SessionCookieSecure: fc.SessionCookieSecure,
-		CORSAllowedOrigins:  corsAllowedOrigins,
-		RepeatInterval:      repeatInterval,
+		SessionTTL:            sessionTTL,
+		SessionIdleTTL:        sessionIdleTTL,
+		SessionCookieSecure:   fc.SessionCookieSecure,
+		CORSAllowedOrigins:    corsAllowedOrigins,
+		RepeatInterval:        repeatInterval,
+		IncidentNudgeInterval: incidentNudgeInterval,
 		SMTP: SMTPConfig{
 			Host:     fc.SMTP.Host,
 			Port:     fc.SMTP.Port,
@@ -260,13 +306,8 @@ func Load(path string) (Config, error) {
 			From:     fc.SMTP.From,
 			StartTLS: fc.SMTP.StartTLS,
 		},
-		PersonnelChannel: fc.PersonnelChannel,
-		Retention: RetentionConfig{
-			TimersDays:          fc.Retention.TimersDays,
-			NotificationLogDays: fc.Retention.NotificationLogDays,
-			SweepInterval:       retentionSweepInterval,
-			BatchSize:           fc.Retention.BatchSize,
-		},
+		PersonnelChannel:  fc.PersonnelChannel,
+		Retention:         retention,
 		FlapWindowSeconds: fc.FlapWindowSeconds,
 		FlapThreshold:     fc.FlapThreshold,
 	}, nil
@@ -313,6 +354,9 @@ func applyEnvOverrides(fc *fileConfig) {
 	}
 	if v := os.Getenv("REPEAT_INTERVAL"); v != "" {
 		fc.RepeatInterval = v
+	}
+	if v := os.Getenv("INCIDENT_NUDGE_INTERVAL"); v != "" {
+		fc.IncidentNudgeInterval = v
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {
 		fc.SMTP.Host = v

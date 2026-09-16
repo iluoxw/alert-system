@@ -573,6 +573,26 @@ func (r *IncidentRepo) UpdateStatus(ctx context.Context, tx pgx.Tx, id string, f
 	return incident, nil
 }
 
+// ListOpenIDs 返回所有仍处于 open（非 resolved）状态的 Incident ID，供
+// incident_recovery_nudge 定时器的启动对账使用。不分页——Incident 数量级远小于
+// 告警，与 ops.ListEnabledSettings 同样不做分页。
+func (r *IncidentRepo) ListOpenIDs(ctx context.Context, tx pgx.Tx) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT id::text FROM incidents WHERE status <> 'resolved'`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 open Incident 列表失败: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: 扫描 open Incident ID 失败: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (r *IncidentRepo) Detail(ctx context.Context, tx pgx.Tx, id string) (domain.IncidentDetail, error) {
 	incident, err := r.GetByID(ctx, tx, id)
 	if err != nil {

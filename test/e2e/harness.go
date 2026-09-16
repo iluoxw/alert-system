@@ -120,6 +120,15 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	if err := app.ReconcileOpsTimers(context.Background(), st, opsRepo, sched); err != nil {
 		return nil, fmt.Errorf("e2e: ops 定时器启动对账失败: %w", err)
 	}
+	// 与生产 main.go 共用同一个 app.ReconcileIncidentNudgeTimers；E2E 默认关闭
+	// INCIDENT_NUDGE_INTERVAL 时函数内部直接跳过，保留调用只是不让两处装配分叉。
+	if err := app.ReconcileIncidentNudgeTimers(context.Background(), st, incidents, sched, cfg.IncidentNudgeInterval); err != nil {
+		return nil, fmt.Errorf("e2e: Incident 恢复提醒定时器启动对账失败: %w", err)
+	}
+	// 与生产 main.go 保持同一装配：retention_sweep 必须启动对账，否则清理任务永远不会运行。
+	if err := app.ReconcileRetentionTimer(context.Background(), st, sched, cfg.Retention); err != nil {
+		return nil, fmt.Errorf("e2e: retention_sweep 定时器启动对账失败: %w", err)
+	}
 
 	// 既有本地路由/分组/通知场景改走 Grafana 兼容入口；Alertmanager 在新架构中
 	// 是唯一 Alert 权威来源，只镜像事实，不再重复执行本地路由/静默/通知。

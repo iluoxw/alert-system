@@ -333,3 +333,18 @@ func TestReconcileRetentionTimer_CreatesOnlyIfAbsent(t *testing.T) {
 		t.Fatalf("已存在 pending 记录时不应被打断/重排期，first=%v second=%v", firstFireAt, secondFireAt)
 	}
 }
+
+// 零值配置（绕过 config.Load 的结构体字面量）必须被拒绝，且不注册任何定时器，
+// 否则会立即触发清理并空转续期。
+func TestReconcileRetentionTimer_RejectsInvalidConfig(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	sched := scheduler.New(st, time.Hour)
+
+	if err := ReconcileRetentionTimer(ctx, st, sched, config.RetentionConfig{}); err == nil {
+		t.Fatal("零值 retention 配置应被拒绝")
+	}
+	if _, found := pendingRetentionTimer(t, ctx, st); found {
+		t.Fatal("配置非法时不应注册 retention_sweep 定时器")
+	}
+}

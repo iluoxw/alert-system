@@ -126,6 +126,7 @@ type fakeStormScheduler struct {
 	scheduleIfAbsentCalls []scheduleCall
 	scheduleErr           error
 	scheduleIfAbsentErr   error
+	cancelCalls           []scheduleCall
 }
 
 func (f *fakeStormScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error {
@@ -142,6 +143,13 @@ func (f *fakeStormScheduler) ScheduleIfAbsent(ctx context.Context, tx pgx.Tx, ki
 	}
 	f.scheduleIfAbsentCalls = append(f.scheduleIfAbsentCalls, scheduleCall{kind, refID, fireAt, payload})
 	return true, nil
+}
+
+// Cancel 让替身同时满足 notifyOutboxScheduler（Incident 恢复提醒引入了取消能力），
+// outbox 单测复用这个替身，只需记录调用。
+func (f *fakeStormScheduler) Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error {
+	f.cancelCalls = append(f.cancelCalls, scheduleCall{kind: kind, refID: refID})
+	return nil
 }
 
 // newTestStormHandler 构造带固定时钟的 stormHandler，routeID 对应的 state/route 已就位。

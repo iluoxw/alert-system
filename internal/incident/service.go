@@ -32,6 +32,14 @@ func (a Actor) valid() bool { return a.UserID != "" && strings.TrimSpace(a.Displ
 
 type NotificationOutbox interface {
 	QueueIncidentNotification(ctx context.Context, tx pgx.Tx, notification domain.IncidentNotification) error
+	// ScheduleRecoveryNudge 在同一事务内注册（若不存在）incident_recovery_nudge
+	// 定时器，供 Declare 建 Incident 时启动周期性恢复提醒。是否真的调度、调度到
+	// 何时由实现根据配置的提醒周期决定（<=0 表示关闭，直接 no-op）——Service 本身
+	// 不持有周期配置，只负责在正确的生命周期时点触发这个意图。
+	ScheduleRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error
+	// CancelRecoveryNudge 在同一事务内取消 incident_recovery_nudge 定时器，Incident
+	// 推进到 resolved 时调用——已关闭的 Incident 不需要再被提醒收尾。
+	CancelRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error
 }
 
 type Service struct {
@@ -127,6 +135,9 @@ func (s *Service) Declare(ctx context.Context, command DeclareCommand, actor Act
 			return err
 		}
 		if err := s.queueNotification(ctx, tx, incident, domain.IncidentNotificationDeclared, now); err != nil {
+			return err
+		}
+		if err := s.scheduleRecoveryNudge(ctx, tx, incident.ID); err != nil {
 			return err
 		}
 		created = true
@@ -507,10 +518,29 @@ func (s *Service) TransitionInTx(ctx context.Context, tx pgx.Tx, incidentID stri
 	case domain.IncidentStatusMonitoring:
 		return incident, s.queueNotification(ctx, tx, incident, domain.IncidentNotificationMitigated, now)
 	case domain.IncidentStatusResolved:
-		return incident, s.queueNotification(ctx, tx, incident, domain.IncidentNotificationResolved, now)
+		if err := s.queueNotification(ctx, tx, incident, domain.IncidentNotificationResolved, now); err != nil {
+			return incident, err
+		}
+		// 已关闭的 Incident 不再需要恢复提醒——取消 pending 的
+		// incident_recovery_nudge 定时器，避免它继续无意义地续期。
+		return incident, s.cancelRecoveryNudge(ctx, tx, incident.ID)
 	default:
 		return incident, nil
 	}
+}
+
+func (s *Service) scheduleRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error {
+	if s.notifier == nil {
+		return fmt.Errorf("incident: 未配置通知 outbox")
+	}
+	return s.notifier.ScheduleRecoveryNudge(ctx, tx, incidentID)
+}
+
+func (s *Service) cancelRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error {
+	if s.notifier == nil {
+		return fmt.Errorf("incident: 未配置通知 outbox")
+	}
+	return s.notifier.CancelRecoveryNudge(ctx, tx, incidentID)
 }
 
 func (s *Service) queueNotification(ctx context.Context, tx pgx.Tx, incident domain.Incident, event domain.IncidentNotificationEvent, at time.Time) error {

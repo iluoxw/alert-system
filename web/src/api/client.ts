@@ -1161,6 +1161,8 @@ export interface InfrastructureNodeDetailResponse {
   node: ResourceNode
   edges: DependencyEdge[]
   faults: Fault[]
+  aliases: EntityAlias[]
+  dependencies: DependencyEdge[]
 }
 
 export interface FaultEvidence {
@@ -1213,13 +1215,21 @@ export interface ManagedEntityRequest {
   environment: string
   owner_team_id: string
   labels?: Record<string, string>
+  aliases?: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
+  dependencies?: ServiceDependencyRequest[]
 }
 
-export function createManagedEntity(body: ManagedEntityRequest): Promise<ResourceNode> {
+// 实体字段平铺在顶层以保持向后兼容，只追加 aliases/dependencies。
+export type ManagedEntityDetailResponse = ResourceNode & {
+  aliases: EntityAlias[]
+  dependencies: DependencyEdge[]
+}
+
+export function createManagedEntity(body: ManagedEntityRequest): Promise<ManagedEntityDetailResponse> {
   return request('/admin/entities', { method: 'POST', body: JSON.stringify(body) })
 }
 
-export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ResourceNode> {
+export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ManagedEntityDetailResponse> {
   return request(`/admin/entities/${id}`, { method: 'PUT', body: JSON.stringify(body) })
 }
 

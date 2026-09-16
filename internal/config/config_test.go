@@ -349,3 +349,31 @@ func TestLoad_FlapEnvOverrides(t *testing.T) {
 		t.Errorf("FlapThreshold = %d, want 5", cfg.FlapThreshold)
 	}
 }
+
+func TestLoad_RejectsUnsafeRetention(t *testing.T) {
+	cases := map[string][2]string{
+		"日志保留 0 天会删光幂等记录": {"RETENTION_NOTIFICATION_LOG_DAYS", "0"},
+		"timers 保留 0 天":   {"RETENTION_TIMERS_DAYS", "0"},
+		"清理间隔 0 会空转":      {"RETENTION_SWEEP_INTERVAL", "0s"},
+		"清理间隔小于 1 分钟":     {"RETENTION_SWEEP_INTERVAL", "30s"},
+		"批量 0 会反复追赶":      {"RETENTION_BATCH_SIZE", "0"},
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(env[0], env[1])
+			if _, err := Load(""); err == nil {
+				t.Fatalf("Load() error = nil for %s=%s", env[0], env[1])
+			}
+		})
+	}
+}
+
+func TestLoad_DefaultRetentionIsValid(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if err := cfg.Retention.Validate(); err != nil {
+		t.Fatalf("默认留存配置应合法: %v", err)
+	}
+}

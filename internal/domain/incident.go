@@ -230,12 +230,38 @@ const (
 	IncidentNotificationDeclared  IncidentNotificationEvent = "declared"
 	IncidentNotificationMitigated IncidentNotificationEvent = "mitigated"
 	IncidentNotificationResolved  IncidentNotificationEvent = "resolved"
+	// IncidentNotificationRecoveryNudge 是 incident_recovery_nudge 定时器在判定
+	// "全部有效证据告警已解除"时入队的提醒事件。故意不叫 xxxRecovered/xxxRepaired：
+	// 证据告警解除（Alertmanager resolved）可能只是采集目标下线或服务发现注销
+	// 导致的假解除，不代表故障真的恢复，文案与命名都不能替事故指挥下这个结论
+	// （2026-09 线上 E2BNomadAgentDown 假解除误报教训）。
+	IncidentNotificationRecoveryNudge IncidentNotificationEvent = "recovery_nudge"
 )
 
 type IncidentNotification struct {
 	Incident   Incident                  `json:"incident"`
 	Event      IncidentNotificationEvent `json:"event"`
 	OccurredAt time.Time                 `json:"occurred_at"`
+	// RecoveryNudge 仅在 Event == IncidentNotificationRecoveryNudge 时非空，携带
+	// 渲染提醒文案需要的证据与门槛快照。
+	RecoveryNudge *IncidentRecoveryNudgeDetail `json:"recovery_nudge,omitempty"`
+}
+
+// IncidentRecoveryNudgeEvidence 是一条已解除的证据告警，供提醒文案列出 alertname
+// 与解除时间，让事故指挥能判断这次"解除"是否可信（而不是无条件当作已恢复）。
+type IncidentRecoveryNudgeEvidence struct {
+	AlertName string    `json:"alert_name"`
+	ClearedAt time.Time `json:"cleared_at"`
+}
+
+// IncidentRecoveryNudgeDetail 是恢复提醒的判定快照：全部有效证据（排除人工判为
+// excluded 的证据）已解除的时间点，以及当前离下一道关闭门槛还差什么。
+type IncidentRecoveryNudgeDetail struct {
+	ClearedEvidence          []IncidentRecoveryNudgeEvidence `json:"cleared_evidence"`
+	LatestClearedAt          time.Time                       `json:"latest_cleared_at"`
+	OpenTaskCount            int                             `json:"open_task_count"`
+	ActiveIncludedFaultCount int                             `json:"active_included_fault_count"`
+	UnmetRequiredCriteria    []string                        `json:"unmet_required_criteria"`
 }
 
 var (
@@ -290,6 +316,27 @@ func incidentTasksClosed(tasks []IncidentTask) bool {
 		}
 	}
 	return true
+}
+
+// UnmetRequiredCriteria 返回从 status 推进到下一道关闭门槛前尚未满足的必需判据
+// 描述，供 incident_recovery_nudge 提醒文案展示"还差什么"。declared/mitigating
+// 只看 mitigation 判据；monitoring 要同时看 mitigation 与 resolution 判据——对齐
+// ValidateIncidentTransition 对 resolved 的门槛口径（两个 gate 都必须满足）。
+func UnmetRequiredCriteria(status IncidentStatus, criteria []RecoveryCriterion) []string {
+	gates := []RecoveryGate{RecoveryGateMitigation}
+	if status == IncidentStatusMonitoring {
+		gates = append(gates, RecoveryGateResolution)
+	}
+	var unmet []string
+	for _, gate := range gates {
+		for _, c := range criteria {
+			if c.Gate != gate || !c.Required || c.Status == RecoveryCriterionPassed {
+				continue
+			}
+			unmet = append(unmet, c.Description)
+		}
+	}
+	return unmet
 }
 
 func requiredCriteriaPassed(criteria []RecoveryCriterion, gate RecoveryGate) bool {

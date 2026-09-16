@@ -127,6 +127,16 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	if err := app.ReconcileOpsTimers(ctx, st, opsRepo, sched); err != nil {
 		logger.Error("alert-system: ops 定时器启动对账失败", "err", err)
 	}
+	// ---- 同样的启动对账，补建所有 open Incident 缺失的 incident_recovery_nudge
+	// 定时器（INCIDENT_NUDGE_INTERVAL<=0 时函数内部直接跳过）----
+	if err := app.ReconcileIncidentNudgeTimers(ctx, st, incidents, sched, cfg.IncidentNudgeInterval); err != nil {
+		logger.Error("alert-system: Incident 恢复提醒定时器启动对账失败", "err", err)
+	}
+	// ---- retention_sweep 启动对账：此前从未被调用，retention_sweep 从未启动，
+	// timers / notification_log 留存清理实际没有运行 ----
+	if err := app.ReconcileRetentionTimer(ctx, st, sched, cfg.Retention); err != nil {
+		logger.Error("alert-system: retention_sweep 定时器启动对账失败", "err", err)
+	}
 
 	// ---- ingest：三个上游 adapter，兜底等级统一取 domain.SeverityWarning（与
 	// integrations.default_severity 列的 DEFAULT 对齐；每 integration 各自的

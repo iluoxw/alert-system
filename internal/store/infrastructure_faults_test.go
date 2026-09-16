@@ -103,14 +103,14 @@ func TestManagedServiceRelationCrossSourceTraversalAndStale(t *testing.T) {
 		infrastructure, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
 			EntityKey: "infra/shared/prod", Layer: domain.EntityLayerInfrastructure,
 			Name: "Shared Compute", Environment: "prod", OwnerTeamID: team.ID,
-		})
+		}, nil, nil)
 		if err != nil {
 			return err
 		}
 		platform, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
 			EntityKey: "platform/kubernetes/prod", Layer: domain.EntityLayerPlatform,
 			Name: "Production Kubernetes", Environment: "prod", OwnerTeamID: team.ID,
-		})
+		}, nil, nil)
 		if err != nil {
 			return err
 		}

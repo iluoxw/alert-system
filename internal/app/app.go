@@ -104,11 +104,12 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 被调用，那时 engine/chain 已经赋值完毕。
 	outbox := &notifyOutbox{
 		scheduler:        sched,
+		routes:           repos.Routes,
 		repeatInterval:   cfg.RepeatInterval,
 		personnelChannel: cfg.PersonnelChannel,
 		now:              time.Now,
 	}
-	incidentOutbox := &IncidentOutbox{scheduler: sched, now: time.Now}
+	incidentOutbox := &IncidentOutbox{scheduler: sched, nudgeInterval: cfg.IncidentNudgeInterval, now: time.Now}
 
 	resolver := oncall.NewResolver(repos.Schedules, repos.Shifts)
 	chain := oncall.NewChain(repos.Alerts, repos.Timeline, repos.EscalationPolicies, resolver, sched, outbox)
@@ -169,9 +170,13 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 触发这里注册的 handler ----
 	storm := newStormHandler(stormState, repos.Routes, repos.Alerts, sched)
 
+	// ---- Incident 恢复提醒 handler（第 12 个 kind）：证据全部解除却无人收尾时
+	// 周期性提醒，绝不自动推进 Incident 状态（不变量 11）----
+	incidentNudge := newIncidentNudgeHandler(repos.Incidents, repos.Faults, repos.Alerts, incidentOutbox, sched, cfg.IncidentNudgeInterval)
+
 	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep + storm_summary
-	// 全部在这里绑定；未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此
-	// 登记全（CLAUDE.md 不变量 2）----
+	// + incident_recovery_nudge 全部在这里绑定；未注册的 kind 到期会被标 failed
+	// 不重试，新增 kind 务必在此登记全（CLAUDE.md 不变量 2）----
 	sched.RegisterHandler(notify.TimerKindAlertTTL, lifecycle.HandleTTL)
 	sched.RegisterHandler(notify.TimerKindAlertRepeat, lifecycle.HandleRepeat)
 	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
@@ -186,6 +191,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	sched.RegisterHandler(ops.TimerKindOncallBroadcast, opsHandlers.HandleOncallBroadcast)
 	sched.RegisterHandler(TimerKindRetentionSweep, retention.Handle)
 	sched.RegisterHandler(TimerKindStormSummary, storm.Handle)
+	sched.RegisterHandler(IncidentRecoveryNudgeTimerKind, incidentNudge.Handle)
 
 	return &App{
 		Scheduler:        sched,
@@ -391,6 +397,11 @@ func ReconcileOpsTimers(ctx context.Context, st *store.Store, opsRepo *store.Ops
 // timers 表）时补建一条。retention_sweep 是全局单例任务（固定 refID="global"），
 // 不像 ops 三个 kind 那样需要按团队枚举 settings，因此不需要查表，直接对账即可。
 func ReconcileRetentionTimer(ctx context.Context, st *store.Store, sched *scheduler.Scheduler, cfg config.RetentionConfig) error {
+	// 调用方可能绕过 config.Load 直接构造配置（如 E2E 结构体字面量），零值配置一旦
+	// 注册就会立即触发清理并空转续期，必须在注册前拦住。
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("app: retention 配置非法，拒绝注册 retention_sweep: %w", err)
+	}
 	return st.WithTx(ctx, func(tx pgx.Tx) error {
 		fireAt := time.Now().Add(cfg.SweepInterval)
 		if _, err := sched.ScheduleIfAbsent(ctx, tx, TimerKindRetentionSweep, retentionSweepRefID, fireAt, nil); err != nil {

@@ -64,6 +64,9 @@ func runTestMain(m *testing.M) (int, error) {
 		// 会让 userContactResolver.Resolve 的 channelKind switch 落进 default 分支报错
 		// （任务 9：人员升级到人发送依赖这个字段，与生产 config.Load() 的默认值 "email" 对齐）。
 		PersonnelChannel: "email",
+		// 结构体字面量不经过 config.Load，必须显式给出与生产默认一致的合法留存配置；
+		// 首轮清理在 1h 后，不会在用例运行期间删除断言依赖的数据。
+		Retention: config.RetentionConfig{TimersDays: 7, NotificationLogDays: 90, SweepInterval: time.Hour, BatchSize: 1000},
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))

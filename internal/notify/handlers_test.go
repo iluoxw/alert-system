@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -65,9 +66,10 @@ func (f *lifecycleFakeTimeline) Append(ctx context.Context, tx pgx.Tx, entry dom
 
 // lifecycleScheduleCall 记录一次 lifecycleFakeScheduler.Schedule 调用的参数。
 type lifecycleScheduleCall struct {
-	kind   string
-	refID  string
-	fireAt time.Time
+	kind    string
+	refID   string
+	fireAt  time.Time
+	payload []byte
 }
 
 // lifecycleFakeScheduler 是 lifecycleScheduler 的可编程测试替身。
@@ -80,7 +82,7 @@ type lifecycleFakeScheduler struct {
 }
 
 func (f *lifecycleFakeScheduler) Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error {
-	f.scheduleCalls = append(f.scheduleCalls, lifecycleScheduleCall{kind: kind, refID: refID, fireAt: fireAt})
+	f.scheduleCalls = append(f.scheduleCalls, lifecycleScheduleCall{kind: kind, refID: refID, fireAt: fireAt, payload: payload})
 	return f.scheduleErr
 }
 
@@ -424,6 +426,96 @@ func TestLifecycleHandlers_HandleRepeat_DownstreamErrors_Propagate(t *testing.T)
 			t.Fatalf("HandleRepeat() 错误 = %v, 期望包裹 %v", err, wantErr)
 		}
 	})
+}
+
+// ⑬.1 payload 携带路由级间隔时：fireAt 用 payload 的间隔而非全局默认，且续约时
+// 原样把同一份 payload 传给下一轮 Schedule（多轮续挂间 payload 不变）。
+func TestLifecycleHandlers_HandleRepeat_PayloadInterval_UsesPayloadAndPersists(t *testing.T) {
+	alert := baseFiringAlert("alert-route")
+	alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{"alert-route": alert}}
+	sched := &lifecycleFakeScheduler{}
+	notifier := &fakeRepeatNotifier{}
+	now := time.Date(2026, 7, 1, 2, 0, 0, 0, time.UTC)
+	globalInterval := 30 * time.Minute
+	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, globalInterval, &lifecycleMutableClock{t: now})
+
+	payload, err := json.Marshal(RepeatPayload{IntervalSeconds: 90})
+	if err != nil {
+		t.Fatalf("序列化 payload 失败: %v", err)
+	}
+
+	if err := h.HandleRepeat(context.Background(), nil, "alert-route", payload); err != nil {
+		t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
+	}
+	if len(sched.scheduleCalls) != 1 {
+		t.Fatalf("Schedule 调用次数 = %d, want 1", len(sched.scheduleCalls))
+	}
+	call := sched.scheduleCalls[0]
+	wantFireAt := now.Add(90 * time.Second)
+	if !call.fireAt.Equal(wantFireAt) {
+		t.Fatalf("fireAt = %v, want %v（应使用 payload 间隔而非全局默认 %v）", call.fireAt, wantFireAt, globalInterval)
+	}
+	if string(call.payload) != string(payload) {
+		t.Fatalf("续约传下去的 payload = %s, want 原样不变 %s", call.payload, payload)
+	}
+}
+
+// ⑬.2 payload 为 nil（升级前遗留的定时器行）：续约应回落全局默认间隔，payload
+// 保持 nil 不变——升级前行为逐字节一致。
+func TestLifecycleHandlers_HandleRepeat_NilPayload_FallsBackToGlobalInterval(t *testing.T) {
+	alert := baseFiringAlert("alert-legacy")
+	alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{"alert-legacy": alert}}
+	sched := &lifecycleFakeScheduler{}
+	notifier := &fakeRepeatNotifier{}
+	now := time.Date(2026, 7, 1, 2, 0, 0, 0, time.UTC)
+	globalInterval := 5 * time.Minute
+	h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, notifier, globalInterval, &lifecycleMutableClock{t: now})
+
+	if err := h.HandleRepeat(context.Background(), nil, "alert-legacy", nil); err != nil {
+		t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
+	}
+	call := sched.scheduleCalls[0]
+	if !call.fireAt.Equal(now.Add(globalInterval)) {
+		t.Fatalf("fireAt = %v, want %v（nil payload 应回落全局默认）", call.fireAt, now.Add(globalInterval))
+	}
+	if call.payload != nil {
+		t.Fatalf("payload = %v, want 保持 nil", call.payload)
+	}
+}
+
+// ⑬.3 payload 无法解析或 IntervalSeconds<=0：同样回落全局默认间隔。
+func TestLifecycleHandlers_HandleRepeat_InvalidPayload_FallsBackToGlobalInterval(t *testing.T) {
+	globalInterval := 5 * time.Minute
+	now := time.Date(2026, 7, 1, 2, 0, 0, 0, time.UTC)
+	cases := map[string][]byte{
+		"损坏的JSON":           []byte("not-json"),
+		"IntervalSeconds为0": mustMarshalRepeatPayload(t, RepeatPayload{IntervalSeconds: 0}),
+		"IntervalSeconds为负": mustMarshalRepeatPayload(t, RepeatPayload{IntervalSeconds: -1}),
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			alerts := &lifecycleFakeAlerts{byID: map[string]domain.Alert{"alert-invalid": baseFiringAlert("alert-invalid")}}
+			sched := &lifecycleFakeScheduler{}
+			h := newLifecycleHandlersForTest(alerts, &lifecycleFakeTimeline{}, sched, &lifecycleFakeEscalation{}, &fakeRepeatNotifier{}, globalInterval, &lifecycleMutableClock{t: now})
+
+			if err := h.HandleRepeat(context.Background(), nil, "alert-invalid", payload); err != nil {
+				t.Fatalf("HandleRepeat() 返回意外错误: %v", err)
+			}
+			call := sched.scheduleCalls[0]
+			if !call.fireAt.Equal(now.Add(globalInterval)) {
+				t.Fatalf("fireAt = %v, want %v", call.fireAt, now.Add(globalInterval))
+			}
+		})
+	}
+}
+
+func mustMarshalRepeatPayload(t *testing.T, rp RepeatPayload) []byte {
+	t.Helper()
+	b, err := json.Marshal(rp)
+	if err != nil {
+		t.Fatalf("序列化 RepeatPayload 失败: %v", err)
+	}
+	return b
 }
 
 // ⑭ CancelLifecycleTimers：无 escalation 注入时只取消 repeat 定时器，不 panic。

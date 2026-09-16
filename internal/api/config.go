@@ -877,9 +877,11 @@ func normalizedGroupMode(m string) string {
 // target_team_id 是否存在；不要求 matchers 非空——留白 matchers 在当前领域模型下
 // 恒不匹配（domain.MatcherSet.Matches），是否应该在 API 层拒绝这种"实质上的死配置"
 // 不在本任务裁决范围内，按 brief 要求只做了列出的三类校验，这里不新增。
-// 另外校验 group_mode（R1/C1）与 storm_threshold_per_min（R3/C3）：group_mode 提供
-// 时只能是 label/window；group_mode=window 与 group_by 语义互斥（window 是固定组键，
-// 不使用 group_by 计算分组），二者同时非空即 422；storm_threshold_per_min 不能为负。
+// 另外校验 group_mode（R1/C1）、storm_threshold_per_min（R3/C3）与
+// repeat_interval_seconds：group_mode 提供时只能是 label/window；group_mode=window
+// 与 group_by 语义互斥（window 是固定组键，不使用 group_by 计算分组），二者同时
+// 非空即 422；storm_threshold_per_min、repeat_interval_seconds 均不能为负——0 是
+// 合法值（表示不覆盖路由级间隔，续用 outbox 注入的全局默认，缺陷 1 修复的一部分）。
 // group_by 本身（含保留键 __template__，R2/C2）在这里不做格式校验——现有实现从未
 // 校验过 group_by 的元素格式（只有 matchers/target_team_id 两类语义校验），因此
 // __template__ 无需任何放行改动即可直接使用。
@@ -907,6 +909,9 @@ func (h *configHandlers) validateRoute(ctx context.Context, tx pgx.Tx, req route
 	}
 	if req.StormThresholdPerMin < 0 {
 		return "storm_threshold_per_min 不能为负数", false, nil
+	}
+	if req.RepeatIntervalSeconds < 0 {
+		return "repeat_interval_seconds 不能为负数", false, nil
 	}
 	return "", true, nil
 }

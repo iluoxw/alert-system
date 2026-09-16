@@ -6,9 +6,11 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { ApartmentOutlined, AppstoreOutlined, DatabaseOutlined, EditOutlined, PlusOutlined, TeamOutlined } from '@ant-design/icons'
-import type { EntityAlias, ManagedEntityRequest, ResourceNode, ServiceRegistration, ServiceRequest, ServiceTier } from '../../api/client'
+import type {
+  EntityAlias, ManagedEntityRequest, ResourceNode, ServiceDependencyRequest, ServiceRegistration, ServiceRequest, ServiceTier,
+} from '../../api/client'
 import {
-  createManagedEntity, createService, listInfrastructureNodes, listServices, listTeamsLite,
+  createManagedEntity, createService, getInfrastructureNode, listInfrastructureNodes, listServices, listTeamsLite,
   updateManagedEntity, updateServiceRegistration,
 } from '../../api/client'
 
@@ -18,7 +20,10 @@ interface ServiceFormValues extends Omit<ServiceRequest, 'aliases'> {
   aliases: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
 }
 
-type EntityFormValues = ManagedEntityRequest
+interface EntityFormValues extends Omit<ManagedEntityRequest, 'aliases' | 'dependencies'> {
+  aliases: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
+  dependencies: ServiceDependencyRequest[]
+}
 
 const tierOptions: Array<{ value: ServiceTier; label: string }> = [
   { value: 'tier-0', label: 'Tier 0 · 核心基础能力' },
@@ -47,6 +52,11 @@ export function ServiceCatalog() {
     entity.id !== editing?.entity.id &&
     (!watchedEnvironment || !entity.environment || entity.environment === 'global' || entity.environment === watchedEnvironment)
   )), [editing?.entity.id, entities, watchedEnvironment])
+  const watchedEntityEnvironment = Form.useWatch('environment', entityForm)
+  const entityDependencyTargets = useMemo(() => entities.filter((entity) => (
+    entity.id !== editingEntity?.id &&
+    (!watchedEntityEnvironment || !entity.environment || entity.environment === 'global' || entity.environment === watchedEntityEnvironment)
+  )), [editingEntity?.id, entities, watchedEntityEnvironment])
 
   const saveMutation = useMutation({
     mutationFn: async (values: ServiceFormValues) => {
@@ -105,12 +115,16 @@ export function ServiceCatalog() {
     setOpen(true)
   }
 
+  const [entityDetailLoading, setEntityDetailLoading] = useState(false)
+
   const saveEntityMutation = useMutation({
     mutationFn: async (values: EntityFormValues) => {
-      const payload = {
+      const payload: ManagedEntityRequest = {
         ...values,
         entity_key: values.entity_key.trim(), name: values.name.trim(), provider: values.provider?.trim() ?? '',
         environment: values.environment.trim(),
+        aliases: (values.aliases ?? []).map((item) => ({ ...item, namespace: item.namespace.trim(), value: item.value.trim() })),
+        dependencies: values.dependencies ?? [],
       }
       return editingEntity ? updateManagedEntity(editingEntity.id, payload) : createManagedEntity(payload)
     },
@@ -128,17 +142,35 @@ export function ServiceCatalog() {
     setEditingEntity(null)
     entityForm.setFieldsValue({
       entity_key: '', layer: 'platform', name: '', provider: '', environment: 'prod', owner_team_id: '', labels: {},
+      aliases: [], dependencies: [],
     })
     setEntityOpen(true)
   }
 
-  const openEntityEdit = (entity: ResourceNode) => {
+  const openEntityEdit = async (entity: ResourceNode) => {
     setEditingEntity(entity)
     entityForm.setFieldsValue({
       entity_key: entity.entity_key, layer: entity.layer as 'infrastructure' | 'platform', name: entity.name,
       provider: entity.provider ?? '', environment: entity.environment ?? 'prod', owner_team_id: entity.owner_team_id ?? '', labels: entity.labels ?? {},
+      aliases: [], dependencies: [],
     })
     setEntityOpen(true)
+    // 列表接口（listInfrastructureNodes）不带 aliases/dependencies，编辑时按需拉详情回显。
+    setEntityDetailLoading(true)
+    try {
+      const detail = await getInfrastructureNode(entity.id)
+      entityForm.setFieldsValue({
+        aliases: detail.aliases.map(({ namespace, value, enabled }) => ({ namespace, value, enabled })),
+        dependencies: detail.dependencies.map((dependency) => ({
+          to_entity_id: dependency.to_node_id,
+          criticality: dependency.criticality ?? 'medium',
+        })),
+      })
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '加载实体依赖详情失败')
+    } finally {
+      setEntityDetailLoading(false)
+    }
   }
 
   const columns: ColumnsType<ServiceRegistration> = [
@@ -307,8 +339,8 @@ export function ServiceCatalog() {
         </Form>
       </Modal>
 
-      <Modal title={editingEntity ? '编辑依赖实体' : '登记依赖实体'} open={entityOpen} width={680}
-        okText="保存实体" cancelText="取消" confirmLoading={saveEntityMutation.isPending}
+      <Modal title={editingEntity ? '编辑依赖实体' : '登记依赖实体'} open={entityOpen} width={760}
+        okText="保存实体" cancelText="取消" confirmLoading={saveEntityMutation.isPending || entityDetailLoading}
         onCancel={() => setEntityOpen(false)} onOk={() => entityForm.submit()} destroyOnHidden>
         <Alert showIcon type="info" message="这里只登记需要人工治理的 canonical 实体" description="自动发现的拓扑实体保持只读；entity key 与 layer 创建后不可修改。" />
         <Form form={entityForm} layout="vertical" onFinish={(values) => saveEntityMutation.mutate(values)} className="ops-modal-form">
@@ -320,6 +352,50 @@ export function ServiceCatalog() {
             <Form.Item name="owner_team_id" label="负责团队" rules={[{ required: true }]}><Select virtual={false} placeholder="选择 owning team" options={(teamQuery.data ?? []).map((team) => ({ value: team.id, label: team.name }))} /></Form.Item>
             <Form.Item name="provider" label="Provider"><Input placeholder="例如 Kubernetes / PostgreSQL / CVTE Cloud" /></Form.Item>
           </div>
+          <section className="alias-editor">
+            <header><div><strong>外部身份 Alias</strong><span>namespace + value 唯一解析到当前实体，用于把 Prometheus instance 等外部标签绑定到该实体</span></div></header>
+            <Form.List name="aliases">
+              {(fields, { add, remove }) => (
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  {fields.map((field) => (
+                    <Space key={field.key} align="start" className="alias-editor__row">
+                      <Form.Item {...field} name={[field.name, 'namespace']} rules={[{ required: true }]}><Input aria-label="Alias namespace" placeholder="prometheus.instance" /></Form.Item>
+                      <Form.Item {...field} name={[field.name, 'value']} rules={[{ required: true }]}><Input aria-label="Alias value" placeholder="10.61.17.11:4646" /></Form.Item>
+                      <Form.Item {...field} name={[field.name, 'enabled']} valuePropName="checked"><Switch aria-label="启用 Alias" /></Form.Item>
+                      <Button onClick={() => remove(field.name)}>移除</Button>
+                    </Space>
+                  ))}
+                  <Button type="dashed" icon={<PlusOutlined />} onClick={() => add({ namespace: '', value: '', enabled: true })}>添加 Alias</Button>
+                </Space>
+              )}
+            </Form.List>
+          </section>
+          <section className="alias-editor dependency-editor">
+            <header><div><strong>显式依赖关系</strong><span>方向固定为“当前实体 → 依赖的提供方”，例如平台能力依赖其承载的主机</span></div></header>
+            <Form.List name="dependencies">
+              {(fields, { add, remove }) => (
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  {fields.map((field) => (
+                    <Space key={field.key} align="start" className="dependency-editor__row">
+                      <Form.Item {...field} name={[field.name, 'to_entity_id']} rules={[{ required: true, message: '请选择依赖实体' }]}>
+                        <Select aria-label="依赖实体" virtual={false} showSearch optionFilterProp="label" placeholder="选择基础设施或平台实体" options={entityDependencyTargets.map((entity) => ({
+                          value: entity.id, label: `${entity.name} · ${entity.entity_key} · ${entity.layer}`,
+                        }))} />
+                      </Form.Item>
+                      <Form.Item {...field} name={[field.name, 'criticality']} rules={[{ required: true }]}>
+                        <Select aria-label="依赖关键度" virtual={false} options={[
+                          { value: 'critical', label: 'Critical · 无替代路径' }, { value: 'high', label: 'High · 关键依赖' },
+                          { value: 'medium', label: 'Medium · 标准依赖' }, { value: 'low', label: 'Low · 弱依赖' },
+                        ]} />
+                      </Form.Item>
+                      <Button onClick={() => remove(field.name)}>移除</Button>
+                    </Space>
+                  ))}
+                  <Button type="dashed" icon={<PlusOutlined />} onClick={() => add({ to_entity_id: '', criticality: 'medium' })}>添加依赖</Button>
+                </Space>
+              )}
+            </Form.List>
+          </section>
         </Form>
       </Modal>
     </div>

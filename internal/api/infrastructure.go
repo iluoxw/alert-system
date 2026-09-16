@@ -48,7 +48,8 @@ func (h *infrastructureHandlers) handleError(c *gin.Context, err error, operatio
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource not found"})
 		return
 	}
-	if errors.Is(err, store.ErrManagedEntityReadOnly) || errors.Is(err, store.ErrManagedEntityIdentityImmutable) {
+	if errors.Is(err, store.ErrManagedEntityReadOnly) || errors.Is(err, store.ErrManagedEntityIdentityImmutable) ||
+		errors.Is(err, store.ErrServiceDependencyInvalid) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
@@ -62,16 +63,45 @@ func (h *infrastructureHandlers) handleError(c *gin.Context, err error, operatio
 }
 
 type managedEntityRequest struct {
-	EntityKey   string             `json:"entity_key"`
-	Layer       domain.EntityLayer `json:"layer"`
-	Name        string             `json:"name"`
-	Provider    string             `json:"provider"`
-	Environment string             `json:"environment"`
-	OwnerTeamID string             `json:"owner_team_id"`
-	Labels      map[string]string  `json:"labels"`
+	EntityKey    string              `json:"entity_key"`
+	Layer        domain.EntityLayer  `json:"layer"`
+	Name         string              `json:"name"`
+	Provider     string              `json:"provider"`
+	Environment  string              `json:"environment"`
+	OwnerTeamID  string              `json:"owner_team_id"`
+	Labels       map[string]string   `json:"labels"`
+	Aliases      []aliasRequest      `json:"aliases"`
+	Dependencies []dependencyRequest `json:"dependencies"`
 }
 
-func (request managedEntityRequest) domain() (domain.ResourceNode, error) {
+// managedEntityResponse 保持受管实体响应的向后兼容：实体字段仍平铺在顶层（旧客户端
+// 与 E2E 直接读 `id`），只追加 aliases/dependencies 两个集合字段；集合恒为 [] 不为 null。
+type managedEntityResponse struct {
+	domain.ResourceNode
+	Aliases      []domain.EntityAlias    `json:"aliases"`
+	Dependencies []domain.DependencyEdge `json:"dependencies"`
+}
+
+func newManagedEntityResponse(node domain.ResourceNode, aliases []domain.EntityAlias, dependencies []domain.DependencyEdge) managedEntityResponse {
+	if aliases == nil {
+		aliases = []domain.EntityAlias{}
+	}
+	if dependencies == nil {
+		dependencies = []domain.DependencyEdge{}
+	}
+	return managedEntityResponse{ResourceNode: node, Aliases: aliases, Dependencies: dependencies}
+}
+
+// managedEntityForm 是 managedEntityRequest 校验通过后的落地形态。ResourceNode
+// 本身不携带 aliases/dependencies（避免把这两个字段污染到拓扑同步、告警响应等
+// 所有消费 ResourceNode 的路径），单独拆出来传给 store 层。
+type managedEntityForm struct {
+	Node         domain.ResourceNode
+	Aliases      []domain.EntityAlias
+	Dependencies []domain.DependencyEdge
+}
+
+func (request managedEntityRequest) domain() (managedEntityForm, error) {
 	request.EntityKey = strings.TrimSpace(request.EntityKey)
 	request.Name = strings.TrimSpace(request.Name)
 	request.Provider = strings.TrimSpace(request.Provider)
@@ -79,13 +109,58 @@ func (request managedEntityRequest) domain() (domain.ResourceNode, error) {
 	if !entityKeyPattern.MatchString(request.EntityKey) || request.Name == "" || request.Environment == "" ||
 		!uuidPattern.MatchString(request.OwnerTeamID) ||
 		(request.Layer != domain.EntityLayerInfrastructure && request.Layer != domain.EntityLayerPlatform) {
-		return domain.ResourceNode{}, errors.New("受管实体字段非法")
+		return managedEntityForm{}, errors.New("受管实体字段非法")
 	}
-	return domain.ResourceNode{
+	form := managedEntityForm{Node: domain.ResourceNode{
 		EntityKey: request.EntityKey, Layer: request.Layer, Managed: true,
 		Name: request.Name, Provider: request.Provider, Environment: request.Environment,
 		OwnerTeamID: request.OwnerTeamID, Labels: request.Labels,
-	}, nil
+	}}
+	// 字段缺失（nil）与显式空数组语义不同：缺失表示"不修改"，[] 表示"清空"。
+	// 旧客户端/脚本或缓存的旧前端调 PUT 时不带这两个字段，若一律当作清空，一次
+	// 改名就会抹掉实体全部别名与依赖边——告警映射随之静默失效。
+	if request.Aliases != nil {
+		form.Aliases = []domain.EntityAlias{}
+	}
+	if request.Dependencies != nil {
+		form.Dependencies = []domain.DependencyEdge{}
+	}
+	seenAliases := map[string]struct{}{}
+	for _, item := range request.Aliases {
+		namespace, value := strings.TrimSpace(item.Namespace), strings.TrimSpace(item.Value)
+		if namespace == "" || value == "" {
+			return form, errors.New("Entity Alias namespace/value 不能为空")
+		}
+		key := namespace + "\x00" + value
+		if _, ok := seenAliases[key]; ok {
+			return form, errors.New("同一实体内 Entity Alias 不可重复")
+		}
+		seenAliases[key] = struct{}{}
+		aliasEnabled := true
+		if item.Enabled != nil {
+			aliasEnabled = *item.Enabled
+		}
+		form.Aliases = append(form.Aliases, domain.EntityAlias{Namespace: namespace, Value: value, Enabled: aliasEnabled})
+	}
+	seenTargets := map[string]struct{}{}
+	for _, item := range request.Dependencies {
+		item.ToEntityID = strings.TrimSpace(item.ToEntityID)
+		if item.Criticality == "" {
+			item.Criticality = domain.DependencyCriticalityMedium
+		}
+		if !uuidPattern.MatchString(item.ToEntityID) || !item.Criticality.IsValid() {
+			return form, errors.New("依赖字段非法")
+		}
+		if _, exists := seenTargets[item.ToEntityID]; exists {
+			return form, errors.New("同一实体不能重复声明依赖")
+		}
+		seenTargets[item.ToEntityID] = struct{}{}
+		form.Dependencies = append(form.Dependencies, domain.DependencyEdge{
+			ToNodeID: item.ToEntityID, Relation: domain.DependencyRelationDependsOn,
+			Criticality: item.Criticality, Origin: domain.RelationOriginDeclared,
+		})
+	}
+	return form, nil
 }
 
 func (h *infrastructureHandlers) createManagedEntity(c *gin.Context) {
@@ -94,21 +169,31 @@ func (h *infrastructureHandlers) createManagedEntity(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	node, err := request.domain()
+	form, err := request.domain()
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
+	var node domain.ResourceNode
+	var aliases []domain.EntityAlias
+	var dependencies []domain.DependencyEdge
 	err = h.router.tx.WithTx(c, func(tx pgx.Tx) error {
 		var err error
-		node, err = h.topology.CreateManagedEntity(c, tx, node)
+		node, err = h.topology.CreateManagedEntity(c, tx, form.Node, form.Aliases, form.Dependencies)
+		if err != nil {
+			return err
+		}
+		if aliases, err = h.topology.ListAliases(c, tx, node.ID); err != nil {
+			return err
+		}
+		dependencies, err = h.topology.ListDependenciesForSource(c, tx, store.EntityRegistrySource, node.ID)
 		return err
 	})
 	if err != nil {
 		h.handleError(c, err, "受管实体创建")
 		return
 	}
-	c.JSON(http.StatusCreated, node)
+	c.JSON(http.StatusCreated, newManagedEntityResponse(node, aliases, dependencies))
 }
 
 func (h *infrastructureHandlers) updateManagedEntity(c *gin.Context) {
@@ -117,21 +202,39 @@ func (h *infrastructureHandlers) updateManagedEntity(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	node, err := request.domain()
+	form, err := request.domain()
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
+	// 依赖指向自身在创建阶段无法判断（实体 ID 尚未生成），但更新阶段已知 URL 中
+	// 的目标 ID，提前拒绝给出更明确的错误；store 层仍会用同样的规则兜底校验。
+	for _, dependency := range form.Dependencies {
+		if dependency.ToNodeID == c.Param("id") {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "受管实体不能依赖自身"})
+			return
+		}
+	}
+	var node domain.ResourceNode
+	var aliases []domain.EntityAlias
+	var dependencies []domain.DependencyEdge
 	err = h.router.tx.WithTx(c, func(tx pgx.Tx) error {
 		var err error
-		node, err = h.topology.UpdateManagedEntity(c, tx, c.Param("id"), node)
+		node, err = h.topology.UpdateManagedEntity(c, tx, c.Param("id"), form.Node, form.Aliases, form.Dependencies)
+		if err != nil {
+			return err
+		}
+		if aliases, err = h.topology.ListAliases(c, tx, node.ID); err != nil {
+			return err
+		}
+		dependencies, err = h.topology.ListDependenciesForSource(c, tx, store.EntityRegistrySource, node.ID)
 		return err
 	})
 	if err != nil {
 		h.handleError(c, err, "受管实体更新")
 		return
 	}
-	c.JSON(http.StatusOK, node)
+	c.JSON(http.StatusOK, newManagedEntityResponse(node, aliases, dependencies))
 }
 
 func (h *infrastructureHandlers) overview(c *gin.Context) {
@@ -212,6 +315,8 @@ func (h *infrastructureHandlers) nodeDetail(c *gin.Context) {
 	var node domain.ResourceNode
 	var edges []domain.DependencyEdge
 	var faults []domain.Fault
+	var aliases []domain.EntityAlias
+	var dependencies []domain.DependencyEdge
 	err := h.router.tx.WithTx(ctx, func(tx pgx.Tx) error {
 		var err error
 		node, err = h.topology.GetByID(ctx, tx, c.Param("id"))
@@ -223,6 +328,16 @@ func (h *infrastructureHandlers) nodeDetail(c *gin.Context) {
 			return err
 		}
 		faults, err = h.faults.ListForNode(ctx, tx, node.ID, 50)
+		if err != nil {
+			return err
+		}
+		if aliases, err = h.topology.ListAliases(ctx, tx, node.ID); err != nil {
+			return err
+		}
+		// 依赖按节点自己的写入 source 过滤，只回显该节点自己声明的边（entity_registry/
+		// service_registry/拓扑同步各自的 declared 边），供编辑表单回显；已在 edges
+		// 里的双向全量视图不受影响。
+		dependencies, err = h.topology.ListDependenciesForSource(ctx, tx, node.Source, node.ID)
 		return err
 	})
 	if err != nil {
@@ -235,7 +350,16 @@ func (h *infrastructureHandlers) nodeDetail(c *gin.Context) {
 	if faults == nil {
 		faults = []domain.Fault{}
 	}
-	c.JSON(http.StatusOK, gin.H{"node": node, "edges": edges, "faults": faults})
+	if aliases == nil {
+		aliases = []domain.EntityAlias{}
+	}
+	if dependencies == nil {
+		dependencies = []domain.DependencyEdge{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"node": node, "edges": edges, "faults": faults,
+		"aliases": aliases, "dependencies": dependencies,
+	})
 }
 
 func (h *infrastructureHandlers) listFaults(c *gin.Context) {
