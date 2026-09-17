@@ -166,7 +166,7 @@ MTTR = 确认 → 定位（什么坏了 / 影响谁 / 最近改了啥）→ 缓�
 | **S1** | generic 通知引擎 | 分组只合并首条消息；渠道升级、重复提醒、人员升级链**按组内每条告警各启动一份** | 组内 N 条：首次 1 条，之后每个周期 **N 条** | ✅ `internal/app/outbox.go` `NotifyGroup` 中 `for _, alert := range active` 分别调用 `engine.Start`、注册 repeat、`chain.Start`；`NotifyRepeat` 按 `AlertID` 单发 |
 | S2 | generic 接入 | 降噪默认关闭 | 无保护 | ✅ 不变量 10 |
 | S3 | Alertmanager / 自建探针 | 接收方或探针自身 | E2B 探针连发 4 条 | 在 SRE Control 之外 |
-| S4 | 发送重复投递 | 已发出未提交即崩溃 | 重复 1 次 | ✅ 已接受的 at-least-once；租约 5min 远大于最坏发送耗时约 25s（`scheduler.go` `defaultLeaseTTL`、渠道超时 5s），慢发送导致重复领取的概率很低 |
+| S4 | 发送重复投递 | 已发出未提交即崩溃 | 重复 1 次 | ✅ 已接受的 at-least-once。租约与发送耗时：一次 `notify_send` 领取只处理**一个** `SendRequest`（一个渠道 + 一个目标），扇出在意图侧完成（`outbox.go` `DispatchStep` 按渠道各注册一个定时器；`notifySendPayloadHandler` 只调一次 `sender.Send`），单次最多 3 次尝试、渠道超时 5s，最坏约 25s，远小于 `scheduler.go` `defaultLeaseTTL=5min`，慢发送导致重复领取的概率很低 |
 | S5 | 恢复提醒 | 每个未关闭事故每 6h 一条 | 有上限 | ✅ |
 
 ### 3.3 若引入 Fault 级通知会新增的风险
@@ -233,7 +233,7 @@ PagerDuty / Flashduty 强在叫醒，incident.io 强在聊天协作；几乎没�
 |---|---|---|
 | 映射治理是前提 | 覆盖率 14%，P0 | 护城河，优先级第一 |
 | 不重做 Alertmanager | 不在 SRE Control 重发 Alert 级通知 | 明确不做 |
-| 假解除 | uat 实证，靠聚合证据 + 建模完整度防御 | 写成硬不变量是差异化 |
+| 假解除 | uat 实证，靠聚合证据 + 建模完整度防御 | 市场缺口：几乎没有同类产品把「假解除不能自动关单」写成硬不变量；在做什么中落为 Recovery 的假解除提示 |
 | AI 边界 | 只做确定性 | 只做异步建议与草稿 |
 | 可靠性 | M2 元监控、M3 发送失败兜底 | 运维可靠性继续硬化 |
 
@@ -291,7 +291,11 @@ PagerDuty / Flashduty 强在叫醒，incident.io 强在聊天协作；几乎没�
 ### E4 Fault 级通知与确认（工程 P1，对应 D1–D4）
 
 - 问题：Fault 通知的最小可行设计
+- **为什么不违反不变量 14**：14 禁止对 Alertmanager 来源重复发送 **Alert 级**通知；Fault 是另一类对象
+  （N 条告警收敛到同一实体 + 故障类型），Fault 级通知不是重复的 Alert 通知。已有先例：`IncidentOutbox`
+  作为非 Alert 对象经同一套 `notify_send` 发通知
 - 必须包含：拓扑抑制、一个故障周期只通知一次、冷却期、未映射告警保底、`faults` 增加 owner / acked_by / acked_at
+  （**迁移仅作为方案提出，探索阶段不要编写**：迁移编号在并行分支间会冲突，落地时由主对话统一分配）
 - 前置：修复 S1（§3.2）
 - 验收用例建议：组或 Fault 内 N 条告警时，每个周期只发 1 条
 - 起点：`internal/app/outbox.go`、`internal/oncall`、`internal/app/incident_outbox.go`（非 Alert 对象走 `notify_send` 的先例）
