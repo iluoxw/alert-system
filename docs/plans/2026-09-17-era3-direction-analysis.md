@@ -1,8 +1,8 @@
 # 时代三方向分析：领域模型、MTTA/MTTR 断层、漏报与风暴、产品定位
 
-> 状态：**探索输入，未裁决**。本文汇总 2026-09-17 三轮讨论（领域对象关系、时代一→二变迁与演进方向、漏报与风暴风险），
-> 并合入产品侧的同类产品分层与边界分析，供多个 Agent 并行探索。任何实现前须经主对话或用户裁决，
-> 并继续遵守 `CLAUDE.md` 核心架构不变量。
+> 状态：**已裁决**（2026-09-17）。决策固化于 `docs/adr/0006-fault-work-unit-and-platform-topology.md`。
+> 本文保留为裁决前的探索输入与证据记录；§6.3 的 D1–D6 已旁注最终裁决，与 ADR 冲突时以 ADR 为准。
+> 任何实现前继续遵守 `CLAUDE.md` 核心架构不变量（其中不变量 22–24 由本次裁决新增）。
 >
 > 代码基线：`main@d27e397`（tag `v0.2.0`）。uat 数据快照时点：2026-09-17。
 
@@ -10,7 +10,7 @@
 
 - **✅ 已核实**：通过代码、迁移约束或 uat 只读查询确认，附文件位置。
 - **🔶 推断**：基于代码阅读或经验的判断，尚未实测，并行探索时应优先证伪。
-- **❓ 待裁决**：存在多个合理方案，需要用户决定。
+- **❓ 待裁决**：存在多个合理方案，需要用户决定。**本文所有 ❓ 已于 2026-09-17 裁决完毕，结论见 §6.3 与 ADR-0006；正文保留裁决前的原始表述，不再逐处改写。**
 - 引用的 uat 数字只代表快照时点，探索时以实时查询为准。
 
 ---
@@ -249,16 +249,20 @@ PagerDuty / Flashduty 强在叫醒，incident.io 强在聊天协作；几乎没�
 4. **Impact 确认门槛影响通知时机**。confirmed 依赖人工或 SLO 探针；以"active + confirmed"作为通知门槛可能太晚，
    以"active"又可能太吵。Impact 确认工作流（产品侧第二优先级）与 Fault 通知门槛是同一问题的两面。
 
-### 6.3 待裁决问题清单
+### 6.3 待裁决问题清单（已裁决）
 
-| # | 问题 | 选项 | 影响 |
-|---|---|---|---|
-| D1 | Fault 级通知是否进入下一阶段 | 进入 / 仅做度量先观察 / 不做 | MTTA 能否下降 |
-| D2 | Fault 通知门槛 | active / active + 严重度 / active + confirmed | 噪音与及时性 |
-| D3 | 通知意图产生位置 | mapping projector 事务内 / 异步扫描已提交 Fault | projector 纯净性与延迟 |
-| D4 | 送达通道 | 仅飞书卡片 / 飞书 + 外挂 paging | 叫醒能力与集成成本 |
-| D5 | 时代一本地控制面去留 | 冻结不删 / 自建探针迁往 Alertmanager 后删除 | 维护成本与接入路径统一 |
-| D6 | 度量是否作为公共前置 | 是 / 否 | 所有工作流能否验收 |
+下表 D1–D6 于 2026-09-17 裁决完毕，「裁决」列为最终结论。后续讨论又追加了 4 项不在本表的裁决
+（Grafana 权威化方式、平台拓扑同步方式、`RELY_NODE` 身份对齐责任方、自伤消歧），
+完整八项见 `docs/adr/0006-fault-work-unit-and-platform-topology.md`。
+
+| # | 问题 | 选项 | 影响 | 裁决 |
+|---|---|---|---|---|
+| D1 | Fault 级通知是否进入下一阶段 | 进入 / 仅做度量先观察 / 不做 | MTTA 能否下降 | **进入**，作为 v0.3 范围 |
+| D2 | Fault 通知门槛 | active / active + 严重度 / active + confirmed | 噪音与及时性 | **active 即通知 owner team**；影响外播按 confirmed 另行触发，两类门槛独立 |
+| D3 | 通知意图产生位置 | mapping projector 事务内 / 异步扫描已提交 Fault | projector 纯净性与延迟 | **mapping 事务内产生意图**，但只 `Schedule notify_send`，不做任何外部 IO |
+| D4 | 送达通道 | 仅飞书卡片 / 飞书 + 外挂 paging | 叫醒能力与集成成本 | **仅飞书卡片先行**（不依赖平台团队）；平台通知嵌入反向查询为争取项 |
+| D5 | 时代一本地控制面去留 | 冻结不删 / 自建探针迁往 Alertmanager 后删除 | 维护成本与接入路径统一 | **冻结不删**，禁止新增能力；删除待 generic 来源确认为零之后 |
+| D6 | 度量是否作为公共前置 | 是 / 否 | 所有工作流能否验收 | **是**，但先量先行指标（映射率 / 无 owner 的 active Fault / 认领时长 / 假解除拦截 / 未对齐身份数），MTTR 等 n 足够后再量 |
 
 ---
 
@@ -320,9 +324,51 @@ PagerDuty / Flashduty 强在叫醒，incident.io 强在聊天协作；几乎没�
 
 ---
 
+## 8. 实施阶段对应关系（2026-09-18 补）
+
+本文 §7 的 E1–E7 是**裁决前**的探索题目；裁决后的执行计划改用 **P0–P5** 阶段编号，执行权威为
+`.spec-workflow/specs/era3-fault-workunit/`（`requirements.md` R1–R10 / `design.md` / `tasks.md` 任务 1–43）。
+**两套编号不可互换**，对照关系如下。
+
+> **注意命名冲突**：§7 中出现的「工程 P0 / 工程 P1 / 工程 P3」是**工程优先级**编号（P0 最高），
+> 与实施阶段 P0–P5 **不是同一套编号**。例如 E1 标注「工程 P0」指优先级最高，
+> 而阶段 P0 是文档固化，与 E1 无关。阅读时请以「工程优先级 Pn」与「阶段 Pn」区分。
+
+| 探索题目（§7） | 实施阶段 | 说明 |
+|---|---|---|
+| E2 Impact 确认工作流 | **P4** | health 证据 + 自伤消歧 + 影响外播与卡片裁决 |
+| E4 Fault 级通知与确认（工程 P1） | **P2** | 对应 D1–D4，另含 owner 归属与 `fault_timeline_entries` |
+| E5 度量 | **P5** | 收敛为先行指标（D6 口径） |
+| E6 可靠性（M2 / M3 / M4） | **P5** | `/readyz` 增强 + 通知最终失败兜底 |
+| E7 变更关联（工程 P3） | **P4** | 只做「变更 → 自伤消歧」这一段 |
+| E1 映射治理体验（工程 P0） | **未纳入** | 见下方说明 |
+| E3 飞书 Incident 指挥闭环 | **未纳入** | 见下方说明 |
+| — | **P0** 文档固化 | 本轮新增（ADR-0006 / 本文状态同步 / CLAUDE.md 不变量 22–24） |
+| — | **P1** 身份对齐 + ccloud 拓扑导入 | 本轮新增主线：由 §5 与 ADR-0006 Context 第 2 条澄清「拓扑最弱不是缺数据，而是缺身份对齐」后浮现，本文撰写时尚无对应题目 |
+
+### E1 与 E3 为何未纳入 v0.3–v0.5
+
+- **E1 映射治理体验**：覆盖率仍是最高产品优先级，但它是一个**独立工作面**（治理 UI、标签聚类、策略质量反馈），
+  与「Fault 成为工作单元」这条主线的耦合只在于「Fault 通知质量取决于映射质量」。
+  v0.3–v0.5 只吸收其中可度量的部分：P5 把 firing 告警映射率暴露到 `/api/v1/ops/indicators`，
+  P3 把 Grafana 接入为第二权威源以扩大映射覆盖面。**治理体验本身仍需单独立项。**
+- **E3 飞书 Incident 指挥闭环**：卡片动作网关（迁移 000023）与 Incident 通报/恢复提醒已经存在，
+  E3 的增量主要是「把已有动作搬到卡片上」。本 spec 只新增 Fault 与 Impact 两个 `resourceType`
+  （P2 任务 19、P4 任务 34），Incident 侧动作卡片化继续留在 E3。**建议 P2 上线并观察一轮后重启该题。**
+
+---
+
 ## 附录 A：uat 现场快照（2026-09-17）
 
-- 部署：单副本，镜像 `sre-control-api:0.1.0`（`0.2.0` 已推送至内网仓库，未部署）
+- 部署：单副本。**（2026-09-18 更正）** 原写「`0.2.0` 已推送至内网仓库，未部署」已过期：
+  API 实际已升至 `sre-control-api:0.2.0`，Web 仍为 `sre-control-web:0.1.0`
+- uat 标识：namespace `9f007a5faaad40438cef89ec`，kubectl context `uat`（ccloud 平台）
+- 部署对象映射（**以平台 `biz-app-tag` 标签为准**，勿凭口头转述）：
+  - `app-8eaa009a01d04f669682bff6-1` = **firebreak-web**（`sre-control-web`，svc `firebreak-web:8080`，探针 `/readyz`）
+  - `app-996058f6d07f4f8fae7d7c38-1` = **firebreak-server**（`sre-control-api`，svc `firebreak-server:8081`；
+    liveness 与 readiness **都打 `/healthz`**，恒 200，未经过任何依赖检查）
+- API 环境：envFrom ConfigMap `secret`（`DB_DSN` 明文）+ `sre-control-config`；
+  `CORS_ALLOWED_ORIGINS=https://sre-control.test.seewo.com`
 - Alertmanager 接入健康：webhook 与对账持续成功，连续失败 0
 - 数据：告警 28 条（映射 4 条）、Fault 3 个、Incident 1 个、映射策略 3 条、实体 5 个、别名 6 条
 - 解除原因分布：`source_webhook` 21、`source_reconciled_absence` 5（均为测试或 canary 告警）、空 2
@@ -332,7 +378,7 @@ PagerDuty / Flashduty 强在叫醒，incident.io 强在聊天协作；几乎没�
 
 ## 附录 B：已知待办（未纳入上述题目）
 
-- uat 部署 v0.2.0（API 与 Web 镜像；部署后 retention 清理首次运行）
+- uat 部署 v0.2.0（**API 已于 2026-09-17 完成**，retention 清理首次运行待确认；**Web 仍为 0.1.0 待部署**）
 - `DB_DSN` 位于名为 `secret` 的 ConfigMap（明文），应迁至 Secret 并轮换；飞书 webhook token 曾在排查中暴露，应轮换
 - liveness `initialDelaySeconds=490`、单副本、内存 request 50Mi
 - `sslmode=disable`
