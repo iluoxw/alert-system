@@ -34,7 +34,7 @@
 
 ## P1 身份对齐 + ccloud 拓扑导入
 
-- [ ] 4. config 增加 ccloud 配置项
+- [-] 4. config 增加 ccloud 配置项
   - File: internal/config/config.go, internal/config/config_test.go
   - 新增 CCLOUD_BASE_URL、CCLOUD_TOKEN_ENV（存放 token 的环境变量名，不直接存 token）、CCLOUD_PROJECT_IDS（逗号分隔）、CCLOUD_SYNC_INTERVAL（默认 10m，**0 = 完全关闭且不产生任何 IO**）
   - Purpose: 让 ccloud 接入可整体开关，且 token 不落配置与日志
@@ -42,7 +42,7 @@
   - _Requirements: R2.1, NFR-Security_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 在 internal/config 增加 ccloud 相关配置项，SYNC_INTERVAL 为 0 时整条链路短路；TOKEN_ENV 只存环境变量名 | Restrictions: 不引入新配置框架；token 值不得出现在日志或结构体 String() 输出；缺 BASE_URL/PROJECT_IDS 且 interval>0 时启动期报错 | Success: 单测覆盖 interval=0 短路、缺配置报错、token 不在错误信息中 | 完成后按工作流在 tasks.md 标记状态并用 log-implementation 记录_
 
-- [ ] 5. 实现 ccloud 客户端与 DTO
+- [-] 5. 实现 ccloud 客户端与 DTO
   - File: internal/ccloud/client.go, internal/ccloud/client_test.go
   - **先读 `internal/ccloud/testdata/README.md`**：DTO 必须按该目录两份真实响应定义；关键点——`Health *float64`（`null` 与 `0.0` 都是合法值且语义不同）、`nodeType` 可空、`serviceType` 有前导空格、`metadata` 可为 `null`、外层 `message` 可空且两视图字段不同（全链路多 trace 字段）
   - FetchFullLinkTopology(projectID)、FetchServiceTopology(appID)、FetchAppHealth(appIDs)；内置字段只留 from/to/totalCount 与节点分类所需字段，**不解析 `coreMetrics`**（两视图的量纲/大小写/顺序不一致，不得用于判定）
@@ -51,7 +51,7 @@
   - _Requirements: R2.1, R2.3_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师（HTTP 客户端） | Task: 定义 ccloud 三个接口的 DTO 与 Fetch 方法，全部带 context 与超时；只暴露 from/to/totalCount，不解析 edge.key 与 sourceInfo/targetInfo 名字 | Restrictions: 包内不得 import store；不得自行发明字段名，按真实响应定义；错误必须可区分超时与业务错误 | Success: httptest 假服务下单测通过，超时返回明确错误，DTO 可正确反序列化平台样例 JSON | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 6. 实现拓扑映射（纯函数）
+- [-] 6. 实现拓扑映射（纯函数）
   - File: internal/ccloud/importer.go, internal/ccloud/importer_test.go
   - MapTopology(in, svc, resolve AliasResolver) ImportResult：**分类判据 `nodeType` 非空时用它、为空回落 `serviceType`**（`EXTERNAL_HTTP_SERVER` 节点 nodeType 为空），比较前 `TrimSpace`；CCLOUD_APP→application(source=ccloud, external_ref=node.key, alias ns ccloud.app_id)；APISIX/WAF→platform；RELY_NODE→**用 `node.key` 锚定**，合法 host:port 时同时写 `ccloud.rely_node` alias，未命中→Unresolved（value=node.key，附 host_port/service_type）；EXTERNAL_HTTP_SERVER 忽略并**计入 `DroppedExternalHTTP`**（非零说明该类型开始带边，需重新评估）；边方向 **from/to 与 consumer→provider 同向，直接照抄不翻转**；totalCount=0→Stale=true；自环丢弃；**CCLOUD_APP 若已有 service_registrations 登记 → alias 合并到已有 application 实体（不新建）；未登记 → 保留 unmanaged 待认领，不建团队、不改归属**
   - Purpose: 把平台契约坑固化为可测的纯函数，避免同步路径出错
@@ -107,7 +107,7 @@
 > 阻塞于 uat 尚无飞书可访问的公网回调入口。P2 的认领路径为 REST 端点 + Web；通知走 `lark_webhook` 纯文本。
 > 受影响的验收条件 R4.6、R5.7、R5.9 已在 requirements.md 标注延后。
 
-- [ ] 12. 迁移 000026：Fault 归属/认领字段与 fault_timeline_entries
+- [-] 12. 迁移 000026：Fault 归属/认领字段与 fault_timeline_entries
   - File: migrations/000026_fault_workunit.up.sql, migrations/000026_fault_workunit.down.sql
   - faults 增 owner_team_id / acked_by / acked_by_name / acked_at / owner_notified_at + 索引 (status, owner_team_id)；新建 fault_timeline_entries（**全库已核实无 fault 时间线表**：Alert 用 000001 timeline_entries，Incident 用 000013 incident_timeline_entries）
   - Purpose: 承载 R3/R4 的持久化
@@ -115,7 +115,7 @@
   - _Requirements: R3.1, R4.1, R4.4_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: PostgreSQL DBA | Task: 编写 000026 迁移，ackinfo 与 owner 字段可空，fault_timeline_entries 结构对齐 incident_timeline_entries | Restrictions: 编号必须为 000026；up/down 可往返；外键齐全；不得修改既有迁移 | Success: 迁移往返通过，索引经 EXPLAIN 可用于 (status, owner_team_id) 查询 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 13. domain 层 Fault 认领语义
+- [-] 13. domain 层 Fault 认领语义
   - File: internal/domain/fault.go, internal/domain/fault_test.go
   - Fault 增 owner/acked 字段；AckFault(fault, actorID, actorName, now) 返回时间线条目；已 ack 短路不重写
   - Purpose: 把幂等口径固化为纯函数，供 REST 与飞书回调共用
@@ -123,7 +123,7 @@
   - _Requirements: R4.2, R4.3_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 领域建模工程师 | Task: 实现 AckFault 纯函数，actorID 进 UUID 字段、actorName 进时间线；重复 ack 短路返回当前状态 | Restrictions: domain 零外部依赖；不得触碰存储；不得返回 409 语义 | Success: 表驱动测试覆盖首次 ack、重复 ack、空 actorName 校验 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 14. mapping projector 写入 owner 并暴露 transition
+- [-] 14. mapping projector 写入 owner 并暴露 transition
   - File: internal/mapping/projector.go, internal/mapping/projector_test.go
   - Upsert Fault 时 owner_team_id 取 resource_nodes.owner_team_id（解析不到置 NULL）；返回值带上 transition 信息（created / candidate→active）
   - Purpose: 让 owner 自动就位，并给通知触发提供判定依据
