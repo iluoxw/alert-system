@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"alert-system/internal/domain"
 )
 
 const (
@@ -173,11 +175,11 @@ func (r *AlertSourceRepo) List(ctx context.Context, tx pgx.Tx, limit int) ([]Ale
 		FROM integrations i
 		LEFT JOIN alert_source_status s ON s.integration_id = i.id
 		LEFT JOIN alerts a ON a.source_integration_id = i.id AND a.upstream_fingerprint != ''
-		WHERE i.kind = 'alertmanager'
+		WHERE i.kind = ANY($2)
 		GROUP BY i.id, s.integration_id
 		ORDER BY i.name
 		LIMIT $1
-	`, clampLimit(limit))
+	`, clampLimit(limit), domain.AuthoritativeSourceKinds)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询 Alertmanager sources 失败: %w", err)
 	}
@@ -199,9 +201,9 @@ func (r *AlertSourceRepo) GetByID(ctx context.Context, tx pgx.Tx, id string) (Al
 		FROM integrations i
 		LEFT JOIN alert_source_status s ON s.integration_id = i.id
 		LEFT JOIN alerts a ON a.source_integration_id = i.id AND a.upstream_fingerprint != ''
-		WHERE i.id = $1::uuid AND i.kind = 'alertmanager'
+		WHERE i.id = $1::uuid AND i.kind = ANY($2)
 		GROUP BY i.id, s.integration_id
-	`, id)
+	`, id, domain.AuthoritativeSourceKinds)
 	s, err := scanAlertSource(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AlertSource{}, ErrNotFound

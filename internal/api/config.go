@@ -364,7 +364,7 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == "alertmanager" {
+	if req.Kind == domain.SourceKindAlertmanager {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
@@ -474,7 +474,7 @@ func (h *configHandlers) updateIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == "alertmanager" {
+	if req.Kind == domain.SourceKindAlertmanager {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
@@ -534,8 +534,8 @@ func (h *configHandlers) rotateHook(c *gin.Context, alertmanagerOnly bool) {
 		if getErr != nil {
 			return getErr
 		}
-		if alertmanagerOnly && in.Kind != "alertmanager" {
-			return &validationError{msg: "该 integration 不是 Alertmanager 数据源"}
+		if alertmanagerOnly && !domain.IsAuthoritativeSourceKind(in.Kind) {
+			return &validationError{msg: "该 integration 不是权威告警数据源"}
 		}
 		return h.deps.Integrations.RotateHookIDHash(ctx, tx, id, hashIntegrationHookID(hookID))
 	})

@@ -239,6 +239,29 @@ func (a Alert) IsAuthoritativeSource() bool {
 	return a.SourceIntegrationID != "" && a.UpstreamFingerprint != ""
 }
 
+// 权威来源 integration kind 常量（对应 integrations.kind）。新增权威来源（如
+// Grafana）只需在 AuthoritativeSourceKinds 中追加，避免各处平铺 "alertmanager"
+// 字面量分支（不变量 14/24）：Alertmanager 是 Alert 生命周期唯一权威，Grafana 作为
+// 第二条权威源独立接入，两者共享"跳过本地 route/group/silence/inhibit"的语义。
+const (
+	SourceKindAlertmanager = "alertmanager"
+	SourceKindGrafana      = "grafana"
+)
+
+// AuthoritativeSourceKinds 是当前已接入的权威来源 kind 集合。
+var AuthoritativeSourceKinds = []string{SourceKindAlertmanager, SourceKindGrafana}
+
+// IsAuthoritativeSourceKind 判断给定 integration kind 是否属于权威来源。仅表达
+// "来源种类"这一维度，不替代 Alert.IsAuthoritativeSource 依赖持久化身份字段的判断。
+func IsAuthoritativeSourceKind(kind string) bool {
+	for _, k := range AuthoritativeSourceKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // ProjectLegacyStatus 在兼容期把三轴投影回旧 status，供尚未迁移的查询/页面使用。
 // resolved 优先；其余情况下 Ack 只影响响应投影，不篡改 SourceState。
 func ProjectLegacyStatus(source SourceState, response ResponseState) Status {

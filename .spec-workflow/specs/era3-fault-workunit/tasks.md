@@ -191,7 +191,7 @@
 
 ## P3 Grafana 权威源
 
-- [ ] 22. 权威来源常量集与替换硬编码
+- [x] 22. 权威来源常量集与替换硬编码
   - File: internal/domain/alert.go, internal/pipeline/stage_dedup.go, internal/mapping/projector.go, internal/store/alert_sources.go, internal/api/config.go
   - 新增 AuthoritativeSourceKinds = {alertmanager, grafana} 与 IsAuthoritativeSourceKind()；替换 4 个文件中的字面量（alert_sources.go 改 kind IN）
   - Purpose: 让第二条权威源只是配置问题，而不是到处加分支

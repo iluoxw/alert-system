@@ -203,7 +203,7 @@ func (p *Projector) resolveContract(ctx context.Context, tx pgx.Tx, alert domain
 }
 
 func isAuthoritativeAlertmanager(alert domain.Alert) bool {
-	return alert.Source == "alertmanager" && strings.TrimSpace(alert.SourceIntegrationID) != "" && strings.TrimSpace(alert.UpstreamFingerprint) != ""
+	return domain.IsAuthoritativeSourceKind(alert.Source) && strings.TrimSpace(alert.SourceIntegrationID) != "" && strings.TrimSpace(alert.UpstreamFingerprint) != ""
 }
 
 func (p *Projector) resolvePolicyEntity(ctx context.Context, tx pgx.Tx, policy domain.AlertMappingPolicy, labels map[string]string) (domain.ResourceNode, domain.AlertMappingStatus, string, string, error) {

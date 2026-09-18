@@ -10,8 +10,9 @@ import (
 	"alert-system/internal/domain"
 )
 
-// alertmanagerKind 是 Alertmanager webhook adapter 的注册名。
-const alertmanagerKind = "alertmanager"
+// alertmanagerKind 是 Alertmanager webhook adapter 的注册名，与 domain 权威来源常量
+// 保持同一字面量，避免散落定义（任务 22）。
+const alertmanagerKind = domain.SourceKindAlertmanager
 
 // alertmanagerWebhook 对应 Alertmanager webhook_config 投递的 payload 顶层结构
 // （prometheus/alertmanager/template.Data 内嵌进 WebhookMessage，外加

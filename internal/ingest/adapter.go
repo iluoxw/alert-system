@@ -14,7 +14,8 @@ import (
 // （Alertmanager/Grafana 等）都实现该接口，Kind() 的返回值与 integrations 表的 kind
 // 列一一对应，决定某个 integration 的请求交给哪个 adapter 处理。
 type InboundAdapter interface {
-	// Kind 返回该 adapter 的注册名（如 "generic"、"alertmanager"、"grafana"）。
+	// Kind 返回该 adapter 的注册名（如 generic、domain.SourceKindAlertmanager、
+	// domain.SourceKindGrafana 对应的字符串）。
 	Kind() string
 	// Parse 把一次 webhook 请求体翻译为一条或多条统一告警信封。
 	Parse(body []byte) ([]domain.AlertEvent, error)
