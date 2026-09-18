@@ -53,6 +53,10 @@ const (
 	defaultFlapWindowSeconds = 0
 	// defaultFlapThreshold 是窗口内状态翻转次数阈值，仅在窗口>0 时生效。
 	defaultFlapThreshold = 3
+
+	// defaultCCloudSyncInterval 是 ccloud 拓扑/健康度独立周期 loop（不变量 23）的默认
+	// 拉取间隔；<=0 表示整条链路关闭，不产生任何外部 IO（R2.1）。
+	defaultCCloudSyncInterval = 10 * time.Minute
 )
 
 // Config 是服务启动所需的全部配置项。
@@ -80,6 +84,49 @@ type Config struct {
 	// 与翻转次数阈值；FlapWindowSeconds<=0 表示关闭（opt-in，默认关闭）。
 	FlapWindowSeconds int
 	FlapThreshold     int
+
+	CCloud CCloudConfig // R1/R2 ccloud 拓扑与健康度接入配置
+}
+
+// CCloudConfig 是 ccloud 平台拓扑/健康度接入的配置（不变量 23：外部 IO 只走独立周期
+// loop）。SyncInterval<=0 表示整条链路关闭，此时其余字段即使缺失也不校验，也不会
+// 产生任何 IO——这是让接入可整体开关的唯一口径（R2.1）。
+//
+// TokenEnv 只存放"读取 token 的环境变量名"，不直接存 token 值本身：token 明文只在
+// 进程环境变量里，配置结构体、日志与 String() 输出永远看不到它（对齐现有 DSN 密码
+// 掩码与 LarkConfig.String 的口径）。
+type CCloudConfig struct {
+	BaseURL      string        // ccloud API 基础地址
+	TokenEnv     string        // 存放 token 的环境变量名（非 token 本身）
+	ProjectIDs   []string      // 需要拉取全链路拓扑的项目 ID 列表
+	SyncInterval time.Duration // 独立周期 loop 的拉取间隔；<=0 关闭
+}
+
+// String 实现 fmt.Stringer：TokenEnv 只是环境变量名，不是凭据本身，可以原样打印，
+// 便于排查"到底读的是哪个环境变量"；BaseURL/ProjectIDs 均非敏感信息。
+func (c CCloudConfig) String() string {
+	return fmt.Sprintf("CCloudConfig{BaseURL:%q, TokenEnv:%q, ProjectIDs:%v, SyncInterval:%s}",
+		c.BaseURL, c.TokenEnv, c.ProjectIDs, c.SyncInterval)
+}
+
+// Enabled 以 BaseURL 是否配置作为启用开关：BaseURL 为空视为未接入 ccloud，
+// 与 SyncInterval 默认值无关，保证现有未配置 ccloud 的部署零影响；SyncInterval<=0
+// 是显式关闭，即使配置了 BaseURL 也不产生任何外部 IO（R2.1）。
+func (c CCloudConfig) Enabled() bool {
+	return strings.TrimSpace(c.BaseURL) != "" && c.SyncInterval > 0
+}
+
+// Validate 只在已启用（Enabled）时校验其余必填项，由 config.Load 在启动期调用：
+// 配了 BaseURL 却缺 ProjectIDs 属于配置错误，必须启动即失败，而不是等到周期 loop
+// 第一轮才暴露。错误信息只提示缺哪个配置项，绝不拼接 TokenEnv 指向的 token 值。
+func (c CCloudConfig) Validate() error {
+	if !c.Enabled() {
+		return nil
+	}
+	if len(c.ProjectIDs) == 0 {
+		return fmt.Errorf("ccloud.project_ids 不能为空（已配置 ccloud.base_url 且 ccloud.sync_interval > 0）")
+	}
+	return nil
 }
 
 // SMTPConfig 是 email 通知渠道（R3）所需的 SMTP 凭据配置。Host 为空表示未配置，
@@ -176,6 +223,15 @@ type fileConfig struct {
 
 	FlapWindowSeconds int `yaml:"flap_window_seconds"`
 	FlapThreshold     int `yaml:"flap_threshold"`
+
+	CCloud fileCCloudConfig `yaml:"ccloud"`
+}
+
+type fileCCloudConfig struct {
+	BaseURL      string   `yaml:"base_url"`
+	TokenEnv     string   `yaml:"token_env"`
+	ProjectIDs   []string `yaml:"project_ids"`
+	SyncInterval string   `yaml:"sync_interval"`
 }
 
 type fileSMTPConfig struct {
@@ -225,6 +281,9 @@ func Load(path string) (Config, error) {
 		},
 		FlapWindowSeconds: defaultFlapWindowSeconds,
 		FlapThreshold:     defaultFlapThreshold,
+		CCloud: fileCCloudConfig{
+			SyncInterval: defaultCCloudSyncInterval.String(),
+		},
 	}
 
 	if path != "" {
@@ -271,6 +330,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	ccloudSyncInterval, err := time.ParseDuration(fc.CCloud.SyncInterval)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid ccloud.sync_interval %q: %w", fc.CCloud.SyncInterval, err)
+	}
 
 	retention := RetentionConfig{
 		TimersDays:          fc.Retention.TimersDays,
@@ -279,6 +342,16 @@ func Load(path string) (Config, error) {
 		BatchSize:           fc.Retention.BatchSize,
 	}
 	if err := retention.Validate(); err != nil {
+		return Config{}, err
+	}
+
+	ccloud := CCloudConfig{
+		BaseURL:      fc.CCloud.BaseURL,
+		TokenEnv:     fc.CCloud.TokenEnv,
+		ProjectIDs:   trimNonEmpty(fc.CCloud.ProjectIDs),
+		SyncInterval: ccloudSyncInterval,
+	}
+	if err := ccloud.Validate(); err != nil {
 		return Config{}, err
 	}
 
@@ -310,6 +383,7 @@ func Load(path string) (Config, error) {
 		Retention:         retention,
 		FlapWindowSeconds: fc.FlapWindowSeconds,
 		FlapThreshold:     fc.FlapThreshold,
+		CCloud:            ccloud,
 	}, nil
 }
 
@@ -411,6 +485,32 @@ func applyEnvOverrides(fc *fileConfig) {
 			fc.FlapThreshold = n
 		}
 	}
+	if v := os.Getenv("CCLOUD_BASE_URL"); v != "" {
+		fc.CCloud.BaseURL = v
+	}
+	if v := os.Getenv("CCLOUD_TOKEN_ENV"); v != "" {
+		fc.CCloud.TokenEnv = v
+	}
+	if v := os.Getenv("CCLOUD_PROJECT_IDS"); v != "" {
+		fc.CCloud.ProjectIDs = strings.Split(v, ",")
+	}
+	if v := os.Getenv("CCLOUD_SYNC_INTERVAL"); v != "" {
+		fc.CCloud.SyncInterval = v
+	}
+}
+
+// trimNonEmpty 去除每一项两端空白并丢弃空字符串，用于 CCLOUD_PROJECT_IDS 这类
+// 逗号分隔的列表配置，避免 "a,,b" 或尾随逗号产生空 ID。
+func trimNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 func normalizeOrigins(values []string) ([]string, error) {

@@ -122,4 +122,9 @@ type AlertMappingResult struct {
 	EvaluatedAt    time.Time          `json:"evaluated_at"`
 	CreatedAt      time.Time          `json:"created_at"`
 	UpdatedAt      time.Time          `json:"updated_at"`
+
+	// Transition 不落库（alert_mapping_results 表无此列，UpsertResult 的 Scan 不
+	// 涉及该字段，调用后原样保留）：只是 Project 与调用方（任务 17 的通知触发点）
+	// 之间的进程内契约，标识本次投影是否让 Fault 进入 active。
+	Transition FaultTransition `json:"-"`
 }

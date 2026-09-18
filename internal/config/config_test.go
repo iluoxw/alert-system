@@ -377,3 +377,142 @@ func TestLoad_DefaultRetentionIsValid(t *testing.T) {
 		t.Fatalf("默认留存配置应合法: %v", err)
 	}
 }
+
+func TestLoad_CCloudDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CCloud.SyncInterval != defaultCCloudSyncInterval {
+		t.Errorf("CCloud.SyncInterval = %v, want %v", cfg.CCloud.SyncInterval, defaultCCloudSyncInterval)
+	}
+	if cfg.CCloud.BaseURL != "" || cfg.CCloud.TokenEnv != "" || len(cfg.CCloud.ProjectIDs) != 0 {
+		t.Errorf("CCloud 默认应全部为空: %+v", cfg.CCloud)
+	}
+}
+
+// TestLoad_CCloudSyncIntervalZeroShortCircuits 覆盖「0 = 完全关闭且不产生任何 IO」：
+// 即使 BaseURL/ProjectIDs 缺失，interval=0 时 Load() 与显式 Validate() 都不应报错。
+func TestLoad_CCloudSyncIntervalZeroShortCircuits(t *testing.T) {
+	t.Setenv("CCLOUD_SYNC_INTERVAL", "0s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v, interval=0 应短路校验", err)
+	}
+	if cfg.CCloud.SyncInterval != 0 {
+		t.Errorf("CCloud.SyncInterval = %v, want 0", cfg.CCloud.SyncInterval)
+	}
+	if err := cfg.CCloud.Validate(); err != nil {
+		t.Fatalf("CCloud.Validate() error = %v, interval=0 应短路校验", err)
+	}
+}
+
+func TestLoad_CCloudEnvOverrides(t *testing.T) {
+	t.Setenv("CCLOUD_BASE_URL", "https://ccloud.example.com")
+	t.Setenv("CCLOUD_TOKEN_ENV", "CCLOUD_API_TOKEN")
+	t.Setenv("CCLOUD_PROJECT_IDS", "proj-a, proj-b,,proj-c ")
+	t.Setenv("CCLOUD_SYNC_INTERVAL", "5m")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CCloud.BaseURL != "https://ccloud.example.com" {
+		t.Errorf("CCloud.BaseURL = %q", cfg.CCloud.BaseURL)
+	}
+	if cfg.CCloud.TokenEnv != "CCLOUD_API_TOKEN" {
+		t.Errorf("CCloud.TokenEnv = %q", cfg.CCloud.TokenEnv)
+	}
+	wantIDs := []string{"proj-a", "proj-b", "proj-c"}
+	if len(cfg.CCloud.ProjectIDs) != len(wantIDs) {
+		t.Fatalf("CCloud.ProjectIDs = %v, want %v", cfg.CCloud.ProjectIDs, wantIDs)
+	}
+	for i, id := range wantIDs {
+		if cfg.CCloud.ProjectIDs[i] != id {
+			t.Errorf("CCloud.ProjectIDs[%d] = %q, want %q", i, cfg.CCloud.ProjectIDs[i], id)
+		}
+	}
+	if cfg.CCloud.SyncInterval != 5*time.Minute {
+		t.Errorf("CCloud.SyncInterval = %v, want 5m", cfg.CCloud.SyncInterval)
+	}
+}
+
+// TestLoad_CCloudRequiresBaseURLAndProjectIDsWhenEnabled 覆盖「interval>0 但缺
+// BASE_URL/PROJECT_IDS 时启动期报错」——Load() 本身不报错（不影响未配置 ccloud 的
+// 现有部署），由装配方在启动期显式调用 CCloud.Validate() 触发。
+func TestLoad_CCloudEnableSwitch(t *testing.T) {
+	cases := []struct {
+		name    string
+		envs    map[string]string
+		wantErr bool
+		enabled bool
+	}{
+		// 未配置 BASE_URL 即未接入：默认 interval 10m 也不得让现有部署启动失败。
+		{"未配 BASE_URL 视为关闭", map[string]string{"CCLOUD_SYNC_INTERVAL": "5m", "CCLOUD_PROJECT_IDS": "proj-a"}, false, false},
+		{"默认配置视为关闭", map[string]string{}, false, false},
+		// 配了 BASE_URL 却缺 PROJECT_IDS 是配置错误，必须启动期失败。
+		{"配 BASE_URL 缺 PROJECT_IDS 启动失败", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com"}, true, false},
+		{"interval=0 显式关闭", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_SYNC_INTERVAL": "0s"}, false, false},
+		{"完整配置启用", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_PROJECT_IDS": "proj-a"}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.envs {
+				t.Setenv(k, v)
+			}
+			cfg, err := Load("")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Load() error = nil, want 启动期报错")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if got := cfg.CCloud.Enabled(); got != tc.enabled {
+				t.Fatalf("Enabled() = %v, want %v", got, tc.enabled)
+			}
+		})
+	}
+}
+
+// TestLoad_CCloudTokenNeverInErrorMessage 覆盖「token 不出现在日志/错误信息中」：
+// TOKEN_ENV 只是环境变量名，真正的 token 值即便被设置也绝不能出现在校验失败的
+// 错误信息里（这里连 BASE_URL/PROJECT_IDS 一起缺失触发报错，确认 token 明文不泄露）。
+func TestLoad_CCloudTokenNeverInErrorMessage(t *testing.T) {
+	const secretToken = "super-secret-ccloud-token-value"
+	t.Setenv("CCLOUD_BASE_URL", "https://ccloud.example.com")
+	t.Setenv("CCLOUD_TOKEN_ENV", "CCLOUD_API_TOKEN")
+	t.Setenv("CCLOUD_API_TOKEN", secretToken)
+
+	_, verr := Load("")
+	if verr == nil {
+		t.Fatalf("Load() error = nil, want 缺 PROJECT_IDS 报错")
+	}
+	if strings.Contains(verr.Error(), secretToken) {
+		t.Fatalf("错误信息泄露了 token 明文: %v", verr)
+	}
+}
+
+// TestCCloudConfig_String_NeverLeaksToken 覆盖 String() 输出不落 token：TokenEnv
+// 只是变量名，即便该环境变量当前被设置为敏感值，CCloudConfig 结构体本身也不持有
+// 该值，String() 自然无从输出。
+func TestCCloudConfig_String_NeverLeaksToken(t *testing.T) {
+	const secretToken = "super-secret-ccloud-token-value"
+	t.Setenv("CCLOUD_API_TOKEN", secretToken)
+
+	cfg := CCloudConfig{
+		BaseURL:      "https://ccloud.example.com",
+		TokenEnv:     "CCLOUD_API_TOKEN",
+		ProjectIDs:   []string{"proj-a"},
+		SyncInterval: 5 * time.Minute,
+	}
+	s := cfg.String()
+	if strings.Contains(s, secretToken) {
+		t.Fatalf("CCloudConfig.String() 泄露了 token 明文: %v", s)
+	}
+	if !strings.Contains(s, "CCLOUD_API_TOKEN") {
+		t.Errorf("CCloudConfig.String() 应包含 TokenEnv 变量名本身: %v", s)
+	}
+}

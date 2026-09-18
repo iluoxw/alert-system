@@ -22,10 +22,15 @@ var (
 	ErrFaultImpactNotFound = errors.New("store: Fault Impact 不存在")
 )
 
+// faultColumns 覆盖迁移 000026 新增的五个归属/认领列（owner_team_id / acked_by /
+// acked_by_name / acked_at / owner_notified_at），所有读 Fault 的查询共用同一列表，
+// 避免个别查询漏读导致 API 层拿不到 owner/ack 字段（R4.7）。
 const faultColumns = `
 	id, correlation_key, scope, status, severity, kind, title, summary,
 	COALESCE(resource_node_id::text, ''), entity_ref, confidence, metadata,
-	first_detected_at, last_evaluated_at, resolved_at, created_at, updated_at
+	first_detected_at, last_evaluated_at, resolved_at, created_at, updated_at,
+	COALESCE(owner_team_id::text, ''), COALESCE(acked_by::text, ''),
+	COALESCE(acked_by_name, ''), acked_at, owner_notified_at
 `
 
 type faultRowScanner interface {
@@ -35,17 +40,24 @@ type faultRowScanner interface {
 func scanFault(row faultRowScanner) (domain.Fault, error) {
 	var fault domain.Fault
 	var metadataRaw []byte
-	var resolvedAt *time.Time
+	var resolvedAt, ackedAt, ownerNotifiedAt *time.Time
 	if err := row.Scan(
 		&fault.ID, &fault.CorrelationKey, &fault.Scope, &fault.Status, &fault.Severity,
 		&fault.Kind, &fault.Title, &fault.Summary, &fault.ResourceNodeID, &fault.EntityRef,
 		&fault.Confidence, &metadataRaw, &fault.FirstDetected, &fault.LastEvaluated,
 		&resolvedAt, &fault.CreatedAt, &fault.UpdatedAt,
+		&fault.OwnerTeamID, &fault.AckedBy, &fault.AckedByName, &ackedAt, &ownerNotifiedAt,
 	); err != nil {
 		return domain.Fault{}, err
 	}
 	if resolvedAt != nil {
 		fault.ResolvedAt = *resolvedAt
+	}
+	if ackedAt != nil {
+		fault.AckedAt = *ackedAt
+	}
+	if ownerNotifiedAt != nil {
+		fault.OwnerNotifiedAt = *ownerNotifiedAt
 	}
 	if err := json.Unmarshal(metadataRaw, &fault.Metadata); err != nil {
 		return domain.Fault{}, fmt.Errorf("store: 反序列化 Fault metadata 失败: %w", err)
@@ -69,11 +81,11 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 		INSERT INTO faults (
 			correlation_key, scope, status, severity, kind, title, summary,
 			resource_node_id, entity_ref, confidence, metadata,
-			first_detected_at, last_evaluated_at, resolved_at
+			first_detected_at, last_evaluated_at, resolved_at, owner_team_id
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
 			NULLIF($8, '')::uuid, $9, $10, $11,
-			$12, $13, $14
+			$12, $13, $14, NULLIF($15, '')::uuid
 		)
 		ON CONFLICT (correlation_key) WHERE status <> 'resolved' DO UPDATE SET
 			status = CASE
@@ -88,11 +100,14 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 			confidence = GREATEST(faults.confidence, EXCLUDED.confidence),
 			metadata = EXCLUDED.metadata,
 			first_detected_at = LEAST(faults.first_detected_at, EXCLUDED.first_detected_at),
-			last_evaluated_at = GREATEST(faults.last_evaluated_at, EXCLUDED.last_evaluated_at)
+			last_evaluated_at = GREATEST(faults.last_evaluated_at, EXCLUDED.last_evaluated_at),
+			-- 本轮解析不到 owner（EXCLUDED.owner_team_id 为 NULL）时保留已有值，
+			-- 避免实体登记暂时性缺失把已经生效的归属冲成 NULL（R3.2/不变量 15）。
+			owner_team_id = COALESCE(EXCLUDED.owner_team_id, faults.owner_team_id)
 		RETURNING `+faultColumns+`, (xmax = 0) AS created
 	`, fault.CorrelationKey, fault.Scope, fault.Status, fault.Severity, fault.Kind,
 		fault.Title, fault.Summary, fault.ResourceNodeID, fault.EntityRef, fault.Confidence,
-		metadata, fault.FirstDetected, fault.LastEvaluated, nullableTime(fault.ResolvedAt))
+		metadata, fault.FirstDetected, fault.LastEvaluated, nullableTime(fault.ResolvedAt), fault.OwnerTeamID)
 
 	var created bool
 	stored, err := scanFaultWithExtra(row, &created)
@@ -105,12 +120,13 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 func scanFaultWithExtra(row faultRowScanner, extra ...any) (domain.Fault, error) {
 	var fault domain.Fault
 	var metadataRaw []byte
-	var resolvedAt *time.Time
+	var resolvedAt, ackedAt, ownerNotifiedAt *time.Time
 	dest := []any{
 		&fault.ID, &fault.CorrelationKey, &fault.Scope, &fault.Status, &fault.Severity,
 		&fault.Kind, &fault.Title, &fault.Summary, &fault.ResourceNodeID, &fault.EntityRef,
 		&fault.Confidence, &metadataRaw, &fault.FirstDetected, &fault.LastEvaluated,
 		&resolvedAt, &fault.CreatedAt, &fault.UpdatedAt,
+		&fault.OwnerTeamID, &fault.AckedBy, &fault.AckedByName, &ackedAt, &ownerNotifiedAt,
 	}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
@@ -118,6 +134,12 @@ func scanFaultWithExtra(row faultRowScanner, extra ...any) (domain.Fault, error)
 	}
 	if resolvedAt != nil {
 		fault.ResolvedAt = *resolvedAt
+	}
+	if ackedAt != nil {
+		fault.AckedAt = *ackedAt
+	}
+	if ownerNotifiedAt != nil {
+		fault.OwnerNotifiedAt = *ownerNotifiedAt
 	}
 	if err := json.Unmarshal(metadataRaw, &fault.Metadata); err != nil {
 		return domain.Fault{}, fmt.Errorf("store: 反序列化 Fault metadata 失败: %w", err)
