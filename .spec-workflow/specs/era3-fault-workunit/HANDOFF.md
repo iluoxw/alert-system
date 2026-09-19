@@ -1,6 +1,6 @@
 # 交接说明 — era3-fault-workunit
 
-> 交接时点：2026-09-19。第 3 批（P1 9–11 + P2 18/20/21）与第 4 批（P3 23–27）已在工作区落地并验证，**尚未提交**。进度 **26 / 45**。P2 是第一次 era3 → main 合并点。
+> 交接时点：2026-09-19（第二次交接）。第 1–4 批（P0–P3，26 / 45）已提交、review 修复，并**快进合入 main（`63efc10`）**。下一步是第 5 批 P5（37–40），见 §3。
 > 接手 Agent 负责实现，原主对话负责后续 review。**开工前完整读完本文件，再读 `tasks.md` 与 `Implementation Logs/`。**
 > 本文件记录的是 `requirements.md` / `design.md` / `tasks.md` 之外、在实现过程中做出的裁决与踩过的坑；三份规格与 ADR-0006 仍是权威，冲突时以本文件的"实现裁决"为准（它们晚于规格、已被用户确认）。
 
@@ -12,10 +12,10 @@
 
 | 分支 | 位置 | 说明 |
 |---|---|---|
-| `main` | `d27e397`（tag `v0.2.0`） | 只包含"已实现并验证"的现实。**era3 的任何改动都还没进 main** |
-| `era3` | `e09626e` 起（最新以 `git log origin/era3` 为准） | 集成分支：ADR-0006、不变量 22–24、spec、以及下表已完成任务的代码 |
+| `main` | `63efc10`（P0–P3 已合入；上一个 tag 仍是 `v0.2.0`，v0.3.0 在任务 42 打） | 已实现并验证的现实 |
+| `era3` | `63efc10` 起（最新以 `git log origin/era3` 为准） | 集成分支，继续在这里做第 5 批及之后 |
 
-合并策略（用户已确认）：计划文件与未完成代码不进 main；**每个阶段完成并全量验证后，era3 连同 CHANGELOG 合入 main**。建议第一个合并点是 P2 完成（任务 21 通过）——P1 已落地的部分在未配置 `CCLOUD_BASE_URL` 时完全不生效，随 P2 一起进 main 无风险。
+合并策略（用户已确认）：**每个阶段完成并全量验证后，era3 连同 CHANGELOG 快进合入 main**；合并需用户明确同意。第一次合并（P0–P3）已于 2026-09-19 完成。P1 在未配置 `CCLOUD_BASE_URL` 时完全不生效。
 
 ### 1.2 已完成（26）
 
@@ -33,11 +33,11 @@
 
 每个任务的接口签名与**跨任务警告**都在 `Implementation Logs/` 里，开工前必读对应上游任务的记录。
 
-### 1.3 最后一次全量验证（第 3+4 批 review 修复后）
+### 1.3 最后一次全量验证（第 3+4 批 review 修复后，即合入 main 的版本）
 
-- `go build ./... && go vet ./...`：零错误
-- `go test -tags=integration ./internal/... -race -count=1`：第 3 批后 18 个包全绿
-- `test/e2e`：全绿（约 66s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
+- `go build ./... && go vet ./... && go vet -tags=integration ./...`：零错误
+- `go test -tags=integration ./internal/... -race -count=1`：21 个包全绿（store 约 235s）
+- `test/e2e`：全绿（约 65s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
 - `cd web && npm run build && npx oxlint`：通过
 - 本批无新迁移；000028 仍预留给任务 28
 
@@ -76,9 +76,8 @@
 
 | 批次 | 内容 | 前置 | 备注 |
 |---|---|---|---|
-| 第 3 批 | P2：18、20、21 ∥ P1：9、10、11 | — | 已完成、review 修复并提交。P2 收口 |
-| 第 4 批 | P3：23、24、25、26、27 | — | 已完成、review 修复并提交 |
-| 第 5 批 | P5：37、38、39、40 | P2 完成 | 39（readyz）与 40（发送失败兜底）直接对应漏报风险 M2/M3，价值高 |
+| 第 3、4 批 | P2 18/20/21、P1 9–11、P3 23–27 | — | 已完成并合入 main |
+| **第 5 批（下一步）** | P5：A 线 39→40 ∥ B 线 37→38 | 无 | 39（readyz）与 40（发送失败兜底）直接对应漏报风险 M2/M3，**A 线优先** |
 | 第 6 批 | P4：28–33、35、36 | P1 + P2 完成，**且拿到 `CCLOUD_HEALTH_WINDOW`** | 29 规定该值必填、无默认，只能由平台团队提供 |
 | 延后 | 19、34、45 | uat 公网回调入口 | 见 D7 |
 | 收尾 | 41、42、43、44 | 各自前置 | 43、44、45 为人工动作，需用户确认后执行 |
@@ -86,15 +85,19 @@
 ### 3.2 并行度与文件边界
 
 - 每条并行线**一次派 2–3 个相邻任务**，做完一批验收合并再派下一批；**同时最多 2 条线**（3 条并行时出现过共享文件冲突）
-- 第 3 批两条线的文件边界：
-  - P2 线：`internal/api/faults.go`、`internal/api/router.go`、`web/src/pages/Faults/*`、`test/e2e/fault_notify_test.go`
-  - P1 线：`internal/ccloud/syncer.go`、`internal/api/topology.go`、`internal/app/app.go`（装配）、`cmd/server/main.go`、`test/e2e/harness.go`、`web/src/pages/Settings/ServiceCatalog.tsx`
-  - **冲突点**：`internal/api/router.go`（18 与 10 都要注册路由）。建议 P1 线的任务 10 等 P2 线的 18 合入后再开始，或由主对话合并时手工解决
+- 第 5 批两条线的文件边界：
+  - A 线（39→40）：`internal/api/directory.go`、`internal/scheduler/scheduler.go`、`internal/pipeline/pipeline.go`、`internal/notify/sender.go`、`internal/app/outbox.go`、`cmd/server/main.go`（ready func 装配）、`test/e2e/harness.go`
+  - B 线（37→38）：`internal/ops/indicators.go`（新）、`internal/ops/report.go`、`internal/api/ops.go`、`internal/api/router.go`、`web/src/pages/Overview/*`、`web/src/api/client.ts`
+  - **冲突点**：`cmd/server/main.go` 与 `test/e2e/harness.go`（若 37 需要新装配）。两处装配必须同步修改，合并时由主对话核对
 
 ### 3.3 各待办任务的上游警告（摘自 Implementation Logs）
 
 | 任务 | 必须知道的事 |
 |---|---|
+| 37 | "未对齐身份数"按 D11 只统计当前仍未解析的行，不能 count(*)；"通知是否送达"按 D4 查 `notification_log`，不能用 `owner_notified_at`；admin only，集合字段空返回 `[]`，比率在分母为 0 时返回 null 并在前端显示"暂无数据"，不能返回 NaN |
+| 38 | 总览只加卡片，不新增一级导航或页面（不变量 19）；日报追加小节要有空数据文案 |
+| 39 | 现有 `RegisterHealthRoutes` 注入 ready func（`internal/api/directory.go:104`），扩展它而不是另起路由。scheduler（`scheduler.go:534` Run）与 pipeline（`pipeline.go:187` Run）在**每次轮询成功**后用 `atomic.Int64` 记录时间戳，**空轮询（没取到任务）也算成功**，否则低峰期会误报 503。只看进程内状态、不查外部系统：ccloud、Alertmanager 不可用都不得导致 503。503 响应体不得含 DSN 或错误原文（现有测试 `directory_test.go:178` 已在查）。任务 43 的 k8s 探针切换是人工动作，不在本任务内 |
+| 40 | `notify_send` 是事务外执行的 DetachedHandler（不变量 3），最终失败在 `Sender.markFailed`（`sender.go:286`）。建议：在写 failed 的同一短事务里 **Schedule 一条新的 `notify_send`** 发给 `FAULT_NOTIFY_FALLBACK_TARGET`，payload 带 `meta_alert=true`；元告警自身最终失败时**只记日志与时间线、不再 Schedule**，从根上杜绝递归。不要在 markFailed 里同步发 HTTP（绕过幂等与租约）。幂等键沿用不变量 4 口径，round 取原始意图的 round，保证原通知重投时不会重复发元告警。fallback target 为空时写时间线说明"无兜底目标"，不能静默（D5）。元告警内容不得包含原始目标 URL（不变量 13） |
 | 18 | `store.FaultRepo.Ack` **只写 faults 表、不写时间线**。必须在同一事务内配对：`domain.AckFault` 产出条目 → `FaultRepo.Ack` → `FaultRepo.AppendTimeline`，靠 `AckFault` 返回的 `ok` 判断是否写时间线（不要比较 struct）。重复认领按不变量 6 返回 200 + 当前状态 |
 | 9 | 把 `ccloud.Edge` 转为 `domain.DependencyEdge`：`FromEntityID/ToEntityID → FromNodeID/ToNodeID`，`Stale → NoRecentTraffic`；以 `cfg.CCloud.Enabled()` 决定是否启动（D1）；接口路径可配置（D2）；写 `unresolved_identities` 时 `first_seen` 只在首次插入写 |
 | 10 | 如需在边查询响应里透出 `no_recent_traffic`，`ListEdgesForNode` 与 `listEntityDependencies` 的 SELECT 目前没有该列；集合字段空时返回 `[]`（不变量 13） |
@@ -135,9 +138,11 @@
 | ccloud 三个接口的真实路径与鉴权方式 | 任务 9 上线（编码不阻塞，D2） | 用户 |
 | `CCLOUD_HEALTH_WINDOW`、健康度刷新周期、负责人查询接口 | 任务 29–31 | 平台团队 |
 | uat 飞书可回调的公网入口 | 任务 19、34、45 | 用户 |
-| uat 部署 v0.2.0（线上仍是 0.1.0；Web 镜像尚未推送） | P2 上线前建议先完成，分开风险 | 用户 |
+| uat 部署 main（`63efc10`，含迁移 000026/000027）；需同时推送 Web 镜像 | Fault 通知在真实数据上验证 | 用户 |
+| **任务 44：uat 配置 `FAULT_NOTIFY_FALLBACK_TARGET` 与 `WEB_BASE_URL`** | 部署 main 前必须完成，否则无 owner 渠道的 Fault 只写时间线、无人收到 | 用户 |
+| ccloud `CCLOUD_ENVIRONMENT` 的取值（D9） | 任务 9 上线 | 用户 / 平台团队 |
 | 凭据轮换：飞书机器人 webhook token（排查时暴露过）、DB 密码（明文放在名为 `secret` 的 ConfigMap 中） | 安全 | 用户 |
-| 本机 `.git/index.lock` 反复残留（已出现 3 次），疑似 root 运行的 `git-ai install-hooks` 进程所致 | 多 worktree 并行时会撞上 | 用户排查 |
+| 本机 `.git/index.lock` 反复残留（已出现 4 次，最近一次 2026-09-19 23:28），疑似 root 运行的 `git-ai install-hooks` 进程所致 | 多 worktree 并行时会撞上 | 用户排查 |
 
 ---
 
