@@ -624,3 +624,93 @@ func TestSender_TargetUserID_ResolverOtherError_FollowsExistingFailurePath(t *te
 		t.Fatalf("期望写入 1 条时间线记录，实际 %d 条", got)
 	}
 }
+
+func TestSender_FinalFailure_SchedulesMetaAlertOnce(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook", fn: func(int) error { return errors.New("boom") }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.MaxAttempts = 1
+
+	var got []SendRequest
+	s.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, original SendRequest) error {
+		got = append(got, original)
+		return nil
+	}
+
+	req := SendRequest{
+		AlertID:     "alert-1",
+		ChannelKind: "webhook",
+		Target:      "https://hooks.example/secret-token",
+		Round:       42,
+	}
+	if err := s.Send(context.Background(), req); err == nil {
+		t.Fatal("期望 Send 返回错误")
+	}
+	if len(got) != 1 {
+		t.Fatalf("期望 OnFinalFailure 调用 1 次，实际 %d", len(got))
+	}
+	if got[0].MetaAlert {
+		t.Fatal("交给 OnFinalFailure 的应是原始请求，不能已经是元告警")
+	}
+	if got[0].Round != 42 || got[0].AlertID != "alert-1" {
+		t.Fatalf("OnFinalFailure 收到的请求不对: %+v", got[0])
+	}
+}
+
+func TestSender_MetaAlertFailure_DoesNotRecurse(t *testing.T) {
+	ch := &fakeChannel{kind: "lark_webhook", fn: func(int) error { return errors.New("fallback down") }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.MaxAttempts = 1
+	s.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, original SendRequest) error {
+		t.Fatal("元告警最终失败不得再调用 OnFinalFailure")
+		return nil
+	}
+
+	req := SendRequest{
+		AlertID:     "alert-1",
+		ChannelKind: "lark_webhook",
+		Target:      "https://fallback.example/hook",
+		Round:       42,
+		MetaAlert:   true,
+	}
+	if err := s.Send(context.Background(), req); err == nil {
+		t.Fatal("期望 Send 返回错误")
+	}
+	entry, err := logs.GetByIdempotencyKey(context.Background(), nil, idempotencyKey(req))
+	if err != nil {
+		t.Fatalf("查询通知记录失败: %v", err)
+	}
+	if entry.Status != "failed" {
+		t.Fatalf("元告警失败仍应标记 failed，实际 %q", entry.Status)
+	}
+	if tl.count() != 1 {
+		t.Fatalf("元告警失败应写时间线，got %d", tl.count())
+	}
+}
+
+func TestSender_SameRoundRetry_OnFinalFailureUsesOriginalRound(t *testing.T) {
+	ch := &fakeChannel{kind: "webhook", fn: func(int) error { return errors.New("boom") }}
+	logs := newFakeLogStore()
+	tl := &fakeTimeline{}
+	s := newSenderForTest(logs, tl, ch)
+	s.MaxAttempts = 1
+
+	var rounds []int64
+	s.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, original SendRequest) error {
+		rounds = append(rounds, original.Round)
+		return nil
+	}
+
+	req := SendRequest{AlertID: "alert-1", ChannelKind: "webhook", Target: "http://x", Round: 1000}
+	_ = s.Send(context.Background(), req)
+	_ = s.Send(context.Background(), req)
+	if len(rounds) != 2 {
+		t.Fatalf("两次最终失败都应进入 OnFinalFailure，got %d", len(rounds))
+	}
+	if rounds[0] != 1000 || rounds[1] != 1000 {
+		t.Fatalf("两次都应沿用原始 round=1000，got %v", rounds)
+	}
+}

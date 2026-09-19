@@ -177,7 +177,11 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
-	router.RegisterHealthRoutes(st.Pool.Ping)
+	router.RegisterHealthRoutes(api.ComposeReady(
+		api.DatabaseReady(st.Pool.Ping),
+		api.WorkerReady("scheduler", sched),
+		api.WorkerReady("pipeline", pl),
+	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)

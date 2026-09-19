@@ -194,7 +194,11 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
-	router.RegisterHealthRoutes(st.Pool.Ping)
+	router.RegisterHealthRoutes(api.ComposeReady(
+		api.DatabaseReady(st.Pool.Ping),
+		api.WorkerReady("scheduler", sched),
+		api.WorkerReady("pipeline", pl),
+	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpServer := &http.Server{

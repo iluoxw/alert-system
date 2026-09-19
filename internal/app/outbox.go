@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -419,6 +420,106 @@ func earliestStartsAt(alerts []domain.Alert) time.Time {
 		}
 	}
 	return earliest
+}
+
+// scheduleNotifyFailureMetaAlert 在 notify_send 最终失败的同一短事务里登记一条
+// 元告警：发给 FAULT_NOTIFY_FALLBACK_* ，payload.meta_alert=true，round 沿用原意图。
+// fallback 为空时写时间线说明"无兜底目标"（D5），不静默、不 Schedule。
+// 本函数只 Schedule，绝不做 HTTP。
+func scheduleNotifyFailureMetaAlert(ctx context.Context, tx pgx.Tx, sched notifyOutboxScheduler, faults metaAlertFaultRepo, channel, target string, now time.Time, original notify.SendRequest) error {
+	if original.MetaAlert {
+		return nil
+	}
+	if channel == "" || target == "" {
+		return writeNoFallbackAudit(ctx, tx, faults, original, now)
+	}
+	if sched == nil {
+		return writeNoFallbackAudit(ctx, tx, faults, original, now)
+	}
+	meta := buildMetaAlertRequest(original, channel, target, now)
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("app: 序列化元告警 notify_send 失败: %w", err)
+	}
+	if err := sched.Schedule(ctx, tx, notifySendTimerKind, notifySendRefID(meta), now, payload); err != nil {
+		return fmt.Errorf("app: 注册元告警 notify_send 失败: %w", err)
+	}
+	return nil
+}
+
+type metaAlertFaultRepo interface {
+	AppendTimeline(ctx context.Context, tx pgx.Tx, entry domain.FaultTimelineEntry) (string, error)
+}
+
+func buildMetaAlertRequest(original notify.SendRequest, channel, target string, now time.Time) notify.SendRequest {
+	return notify.SendRequest{
+		AlertID:     original.AlertID,
+		GroupKey:    original.GroupKey,
+		IncidentID:  original.IncidentID,
+		Step:        original.Step,
+		ChannelKind: channel,
+		Target:      target,
+		Round:       original.Round,
+		MetaAlert:   true,
+		Msg: notify.Message{
+			AlertIDs:     original.Msg.AlertIDs,
+			GroupKey:     original.Msg.GroupKey,
+			Severity:     original.Msg.Severity,
+			Title:        "通知发送失败",
+			Body:         metaAlertBody(original),
+			DetailURL:    original.Msg.DetailURL,
+			ResourceType: original.Msg.ResourceType,
+			ResourceID:   original.Msg.ResourceID,
+			OccurredAt:   now,
+		},
+	}
+}
+
+// metaAlertBody 只描述资源身份，禁止带上原始通知目标 URL（不变量 13）。
+func metaAlertBody(original notify.SendRequest) string {
+	switch {
+	case original.AlertID != "":
+		return fmt.Sprintf("告警 %s 的通知在重试耗尽后仍未送达。", original.AlertID)
+	case original.IncidentID != "":
+		return fmt.Sprintf("Incident %s 的通报在重试耗尽后仍未送达。", original.IncidentID)
+	case original.GroupKey != "":
+		return fmt.Sprintf("分组 %s 的通知在重试耗尽后仍未送达。", original.GroupKey)
+	default:
+		return "一条通知在重试耗尽后仍未送达。"
+	}
+}
+
+func writeNoFallbackAudit(ctx context.Context, tx pgx.Tx, faults metaAlertFaultRepo, original notify.SendRequest, now time.Time) error {
+	faultID := ""
+	if original.Msg.ResourceType == "fault" {
+		faultID = original.Msg.ResourceID
+	}
+	if faultID == "" {
+		faultID = faultIDFromNotifyGroupKey(original.GroupKey)
+	}
+	if faultID != "" && faults != nil {
+		if _, err := faults.AppendTimeline(ctx, tx, domain.FaultTimelineEntry{
+			FaultID: faultID, Actor: "system", Action: domain.FaultTimelineActionNotifySkipped, At: now,
+			Detail: map[string]any{"reason": "notify_send_failed_no_fallback"},
+		}); err != nil {
+			return fmt.Errorf("app: 写入无兜底目标时间线失败: %w", err)
+		}
+		return nil
+	}
+	log.Printf("notify: 发送最终失败且无兜底目标，跳过元告警 alert=%s group=%s", original.AlertID, original.GroupKey)
+	return nil
+}
+
+func faultIDFromNotifyGroupKey(groupKey string) string {
+	const prefix = "fault:"
+	if !strings.HasPrefix(groupKey, prefix) {
+		return ""
+	}
+	rest := groupKey[len(prefix):]
+	if i := strings.LastIndex(rest, ":"); i > 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 // notifySendPayloadHandler 构造 "notify_send" 的 scheduler.DetachedHandler：解码

@@ -178,3 +178,85 @@ func TestReadyz_ReadyFuncError_Returns503(t *testing.T) {
 		t.Fatalf("readyz 503 响应体泄露了 DSN/密码: %s", w.Body.String())
 	}
 }
+
+type fakeHeartbeat struct {
+	last     time.Time
+	interval time.Duration
+}
+
+func (f fakeHeartbeat) LastPollSuccessAt() time.Time { return f.last }
+func (f fakeHeartbeat) PollInterval() time.Duration  { return f.interval }
+
+func TestReadyz_WorkerHeartbeatFresh_Returns200(t *testing.T) {
+	router, _, _, _, _ := newTestRouter(time.Hour, time.Hour)
+	router.RegisterHealthRoutes(ComposeReady(
+		DatabaseReady(func(ctx context.Context) error { return nil }),
+		WorkerReady("scheduler", fakeHeartbeat{last: time.Now(), interval: time.Second}),
+		WorkerReady("pipeline", fakeHeartbeat{last: time.Now(), interval: time.Second}),
+	))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestReadyz_WorkerHeartbeatStale_Returns503(t *testing.T) {
+	router, _, _, _, _ := newTestRouter(time.Hour, time.Hour)
+	router.RegisterHealthRoutes(ComposeReady(
+		DatabaseReady(func(ctx context.Context) error { return nil }),
+		WorkerReady("scheduler", fakeHeartbeat{last: time.Now().Add(-10 * time.Second), interval: time.Second}),
+	))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "后台任务停摆") {
+		t.Fatalf("期望 503 文案含「后台任务停摆」，body=%s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "postgres://") || strings.Contains(w.Body.String(), "secret") {
+		t.Fatalf("readyz 503 响应体泄露了细节: %s", w.Body.String())
+	}
+}
+
+func TestReadyz_NeverPolled_Returns503(t *testing.T) {
+	router, _, _, _, _ := newTestRouter(time.Hour, time.Hour)
+	router.RegisterHealthRoutes(WorkerReady("pipeline", fakeHeartbeat{interval: time.Second}))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestReadyz_ExternalDependencyDown_Still200(t *testing.T) {
+	// ComposeReady 故意不检查 ccloud / Alertmanager：外部依赖不可用不得导致 503。
+	ccloudDown := true
+	router, _, _, _, _ := newTestRouter(time.Hour, time.Hour)
+	router.RegisterHealthRoutes(ComposeReady(
+		DatabaseReady(func(ctx context.Context) error { return nil }),
+		WorkerReady("scheduler", fakeHeartbeat{last: time.Now(), interval: time.Second}),
+		WorkerReady("pipeline", fakeHeartbeat{last: time.Now(), interval: time.Second}),
+	))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("ccloudDown=%v 时 readyz 仍应 200，status=%d body=%s", ccloudDown, w.Code, w.Body.String())
+	}
+}
+
+func TestHealthz_WorkersStale_Still200(t *testing.T) {
+	router, _, _, _, _ := newTestRouter(time.Hour, time.Hour)
+	router.RegisterHealthRoutes(WorkerReady("scheduler", fakeHeartbeat{last: time.Now().Add(-time.Hour), interval: time.Second}))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, authedRequest(http.MethodGet, "/healthz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("/healthz 必须恒 200，status=%d body=%s", w.Code, w.Body.String())
+	}
+}

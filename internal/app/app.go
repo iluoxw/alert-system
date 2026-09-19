@@ -98,6 +98,11 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 任务 9：到人发送在 Sender.Send 第 0 段解析 TargetUserID -> 实际渠道地址，
 	// 具体解析实现见下方 userContactResolver（基于 UserRepo 的薄适配器）。
 	sender.Resolver = userContactResolver{users: repos.Users}
+	// 任务 40：发送最终失败在写 failed 的同一短事务里 Schedule 元告警（只 Schedule，
+	// 不在 markFailed 里做 HTTP）。元告警自身失败不再进入这里（Sender 见 MetaAlert）。
+	sender.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, original notify.SendRequest) error {
+		return scheduleNotifyFailureMetaAlert(ctx, tx, sched, repos.Faults, cfg.FaultNotify.FallbackChannel, cfg.FaultNotify.FallbackTarget, time.Now(), original)
+	}
 
 	// outbox 依赖 chain/engine，chain/engine 又依赖 outbox 作为通知意图的实现——
 	// 用零值字段构造 outbox 打破这个环：NotifyEscalation/NotifyRepeat/DispatchStep

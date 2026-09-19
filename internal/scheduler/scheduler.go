@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -116,6 +117,11 @@ type Scheduler struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler
 	detached map[string]DetachedHandler
+
+	// lastPollUnixNano 是最近一次成功轮询的时间戳（Unix nano）。空轮询（没取到
+	// 到期定时器）也算成功：业务低峰时 worker 仍在转，/readyz 不能因此误报 503。
+	// 0 表示 Run 还从未成功轮询过（进程刚启动或 worker 没起来）。
+	lastPollUnixNano atomic.Int64
 }
 
 // New 构造 Scheduler。st 仅供 Run 内部按 pollInterval 周期性开事务、轮询到期定时器
@@ -151,6 +157,25 @@ func (s *Scheduler) RegisterDetachedHandler(kind string, h DetachedHandler) {
 		s.detached = make(map[string]DetachedHandler)
 	}
 	s.detached[kind] = h
+}
+
+func (s *Scheduler) recordPollSuccess() {
+	s.lastPollUnixNano.Store(time.Now().UnixNano())
+}
+
+// LastPollSuccessAt 返回最近一次成功轮询的本地时间；从未成功轮询过时为零值。
+// /readyz 用它判断 worker 是否停摆，不查外部系统。
+func (s *Scheduler) LastPollSuccessAt() time.Time {
+	ns := s.lastPollUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// PollInterval 是 Run 的固定 tick，供 /readyz 按 3× 间隔判定停摆。
+func (s *Scheduler) PollInterval() time.Duration {
+	return s.pollInterval
 }
 
 func (s *Scheduler) handlerFor(kind string) (Handler, bool) {
@@ -440,8 +465,15 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 	})
 
 	if !found {
+		if txErr == nil {
+			// 空轮询也是成功心跳：没取到到期定时器说明 worker 仍在转，不能让
+			// /readyz 在业务低峰时误报 503。
+			s.recordPollSuccess()
+		}
 		return false, txErr
 	}
+	// 取到了一条（无论随后 handler 成败）：本轮轮询本身是成功的。
+	s.recordPollSuccess()
 	if txErr != nil {
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 执行失败: %v", t.id, t.kind, t.refID, txErr)
 		if merr := s.store.WithTx(ctx, func(tx pgx.Tx) error {
@@ -534,6 +566,8 @@ func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int,
 func (s *Scheduler) Run(ctx context.Context) {
 	if err := s.pollOnce(ctx); err != nil {
 		log.Printf("scheduler: 轮询失败: %v", err)
+	} else {
+		s.recordPollSuccess()
 	}
 
 	ticker := time.NewTicker(s.pollInterval)
@@ -545,6 +579,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 		case <-ticker.C:
 			if err := s.pollOnce(ctx); err != nil {
 				log.Printf("scheduler: 轮询失败: %v", err)
+			} else {
+				s.recordPollSuccess()
 			}
 		}
 	}
