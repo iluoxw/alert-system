@@ -146,7 +146,8 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
-	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
+	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).
+		WithProjector(a.AlertProjector).WithFaultActivation(a.FaultOutbox.TriggerFromMappingResult)
 
 	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发，与下面 REST API
 	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes）共用同一套

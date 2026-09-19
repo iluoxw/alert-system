@@ -108,6 +108,12 @@ type ResourceNode struct {
 }
 
 // DependencyEdge 表示 FromExternalRef 依赖 ToExternalRef。
+//
+// FromNodeID/ToNodeID 除了承载查询结果外，导入快照时也可作为输入：当某一端
+// 指向的是已登记在其他来源的 canonical 实体（不在本次快照 Nodes 列表内，例如
+// ccloud CCLOUD_APP 命中 service_registrations、RELY_NODE 命中既有基础设施
+// 别名），调用方直接给出已解析的 NodeID，ImportSnapshot 在按 ExternalRef 查
+// 不到本地节点时回落使用（任务 8，跨源边）。
 type DependencyEdge struct {
 	ID              string                `json:"id,omitempty"`
 	Source          string                `json:"source,omitempty"`
@@ -122,6 +128,9 @@ type DependencyEdge struct {
 	Origin          RelationOrigin        `json:"origin"`
 	Evidence        map[string]any        `json:"evidence,omitempty"`
 	ObservedAt      time.Time             `json:"observed_at,omitempty"`
+	// NoRecentTraffic 承载平台侧“统计窗口内 totalCount=0”（ADR-0006），与
+	// observed_at 过期是两个独立的 stale 来源，不得互相替代（不变量 16）。
+	NoRecentTraffic bool `json:"no_recent_traffic,omitempty"`
 }
 
 // TopologySnapshot 是一次来源内的完整拓扑快照。导入时边集合按 Source 原子替换，
@@ -169,16 +178,34 @@ func (s TopologySnapshot) Validate() error {
 		if edge.Criticality != "" && !edge.Criticality.IsValid() {
 			return fmt.Errorf("%w: edges[%d] criticality=%q", ErrInvalidTopologySnapshot, i, edge.Criticality)
 		}
-		if edge.FromExternalRef == edge.ToExternalRef {
-			return fmt.Errorf("%w: edges[%d] 不允许自环", ErrInvalidTopologySnapshot, i)
+		// 自环判定：两端都靠 NodeID 标识时按 NodeID 比对，都靠 ExternalRef 时按
+		// ExternalRef 比对；一端跨源（只给 NodeID）一端本地（只给 ExternalRef）时
+		// 无法在不查库的前提下判断同一性，保守放行——跨源边本就是任务 8 新增的
+		// 场景，真正的自环会在写入 dependency_edges 时被 CHECK 约束拦下。
+		switch {
+		case edge.FromNodeID != "" && edge.ToNodeID != "":
+			if edge.FromNodeID == edge.ToNodeID {
+				return fmt.Errorf("%w: edges[%d] 不允许自环", ErrInvalidTopologySnapshot, i)
+			}
+		case edge.FromNodeID == "" && edge.ToNodeID == "":
+			if edge.FromExternalRef == edge.ToExternalRef {
+				return fmt.Errorf("%w: edges[%d] 不允许自环", ErrInvalidTopologySnapshot, i)
+			}
 		}
-		if _, ok := refs[edge.FromExternalRef]; !ok {
-			return fmt.Errorf("%w: edges[%d] from=%q 不存在", ErrInvalidTopologySnapshot, i, edge.FromExternalRef)
+		// 只有未提供 NodeID 的一端才要求 ExternalRef 命中本次快照的节点列表；
+		// 提供了 NodeID 表示该端指向其他来源已登记的 canonical 实体（不在本
+		// 快照 Nodes 里也合法，见任务 8 跨源边扩展）。
+		if edge.FromNodeID == "" {
+			if _, ok := refs[edge.FromExternalRef]; !ok {
+				return fmt.Errorf("%w: edges[%d] from=%q 不存在", ErrInvalidTopologySnapshot, i, edge.FromExternalRef)
+			}
 		}
-		if _, ok := refs[edge.ToExternalRef]; !ok {
-			return fmt.Errorf("%w: edges[%d] to=%q 不存在", ErrInvalidTopologySnapshot, i, edge.ToExternalRef)
+		if edge.ToNodeID == "" {
+			if _, ok := refs[edge.ToExternalRef]; !ok {
+				return fmt.Errorf("%w: edges[%d] to=%q 不存在", ErrInvalidTopologySnapshot, i, edge.ToExternalRef)
+			}
 		}
-		key := string(edge.Relation) + "\x00" + edge.FromExternalRef + "\x00" + edge.ToExternalRef
+		key := string(edge.Relation) + "\x00" + edge.FromExternalRef + "\x00" + edge.FromNodeID + "\x00" + edge.ToExternalRef + "\x00" + edge.ToNodeID
 		if _, exists := edges[key]; exists {
 			return fmt.Errorf("%w: edges[%d] 重复", ErrInvalidTopologySnapshot, i)
 		}

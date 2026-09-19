@@ -516,3 +516,82 @@ func TestCCloudConfig_String_NeverLeaksToken(t *testing.T) {
 		t.Errorf("CCloudConfig.String() 应包含 TokenEnv 变量名本身: %v", s)
 	}
 }
+
+// TestLoad_FaultNotifyDefaults 覆盖 R5.2/R5.3 的默认值：冷却 30 分钟，兜底渠道
+// lark_webhook，兜底 target 默认为空（未配置视为"无兜底"，由 FaultOutbox 据此
+// 决定是否写"无可用通知目标"时间线）。
+func TestLoad_FaultNotifyDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FaultNotify.Cooldown != defaultFaultNotifyCooldown {
+		t.Errorf("FaultNotify.Cooldown = %v, want %v", cfg.FaultNotify.Cooldown, defaultFaultNotifyCooldown)
+	}
+	if cfg.FaultNotify.FallbackChannel != defaultFaultNotifyFallbackChannel {
+		t.Errorf("FaultNotify.FallbackChannel = %q, want %q", cfg.FaultNotify.FallbackChannel, defaultFaultNotifyFallbackChannel)
+	}
+	if cfg.FaultNotify.FallbackTarget != "" {
+		t.Errorf("FaultNotify.FallbackTarget 默认应为空，got %q", cfg.FaultNotify.FallbackTarget)
+	}
+	if cfg.WebBaseURL != "" {
+		t.Errorf("WebBaseURL 默认应为空，got %q", cfg.WebBaseURL)
+	}
+}
+
+// TestLoad_FaultNotifyEnvOverrides 覆盖三个环境变量与 WEB_BASE_URL 的覆盖生效。
+func TestLoad_FaultNotifyEnvOverrides(t *testing.T) {
+	t.Setenv("FAULT_NOTIFY_COOLDOWN", "10m")
+	t.Setenv("FAULT_NOTIFY_FALLBACK_CHANNEL", "lark")
+	t.Setenv("FAULT_NOTIFY_FALLBACK_TARGET", "chat_id:oc_test")
+	t.Setenv("WEB_BASE_URL", "https://sre.example.com")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FaultNotify.Cooldown != 10*time.Minute {
+		t.Errorf("FaultNotify.Cooldown = %v, want 10m", cfg.FaultNotify.Cooldown)
+	}
+	if cfg.FaultNotify.FallbackChannel != "lark" {
+		t.Errorf("FaultNotify.FallbackChannel = %q, want lark", cfg.FaultNotify.FallbackChannel)
+	}
+	if cfg.FaultNotify.FallbackTarget != "chat_id:oc_test" {
+		t.Errorf("FaultNotify.FallbackTarget = %q, want chat_id:oc_test", cfg.FaultNotify.FallbackTarget)
+	}
+	if cfg.WebBaseURL != "https://sre.example.com" {
+		t.Errorf("WebBaseURL = %q, want https://sre.example.com", cfg.WebBaseURL)
+	}
+}
+
+// TestLoad_FaultNotifyInvalidCooldown 覆盖非法 duration 启动即失败（不允许猜测默认值）。
+func TestLoad_FaultNotifyInvalidCooldown(t *testing.T) {
+	t.Setenv("FAULT_NOTIFY_COOLDOWN", "not-a-duration")
+	if _, err := Load(""); err == nil {
+		t.Fatal("非法 fault_notify.cooldown 应导致 Load() 报错")
+	}
+}
+
+// TestFaultNotifyConfig_String_NeverLeaksFallbackTarget 覆盖安全约束：兜底 target
+// 可能是飞书机器人 hook URL（凭据本身），String() 输出必须脱敏，不能被 %v/%s
+// 打印整个结构体时泄露（不变量 13、安全约束）。
+func TestFaultNotifyConfig_String_NeverLeaksFallbackTarget(t *testing.T) {
+	const secretHookURL = "https://open.feishu.cn/open-apis/bot/v2/hook/super-secret-token"
+	c := FaultNotifyConfig{Cooldown: 30 * time.Minute, FallbackChannel: "lark_webhook", FallbackTarget: secretHookURL}
+	s := c.String()
+	if strings.Contains(s, secretHookURL) {
+		t.Fatalf("FaultNotifyConfig.String() 泄露了兜底 target 明文: %v", s)
+	}
+	if !strings.Contains(s, "lark_webhook") {
+		t.Errorf("FaultNotifyConfig.String() 应保留非敏感的 FallbackChannel: %v", s)
+	}
+}
+
+// TestFaultNotifyConfig_String_EmptyTargetNotMaskedAsPresent 覆盖空 target 不应
+// 被误打印成"已配置但脱敏"，与 SMTPConfig.String 的既有口径一致。
+func TestFaultNotifyConfig_String_EmptyTargetNotMaskedAsPresent(t *testing.T) {
+	s := FaultNotifyConfig{FallbackChannel: "lark_webhook"}.String()
+	if !strings.Contains(s, `FallbackTarget:""`) {
+		t.Errorf("空 FallbackTarget 应原样显示为空串，got %v", s)
+	}
+}

@@ -138,7 +138,8 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
-	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
+	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).
+		WithProjector(a.AlertProjector).WithFaultActivation(a.FaultOutbox.TriggerFromMappingResult)
 
 	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle).
 		SetLarkIdentityStore(users).

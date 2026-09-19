@@ -75,6 +75,7 @@ type App struct {
 	IncidentOutbox   *IncidentOutbox
 	AlertProjector   *alertmapping.Projector
 	ImpactProjector  *impactprojection.Projector
+	FaultOutbox      *FaultOutbox
 }
 
 // Build 组装唯一的 scheduler 实例、notify.Sender、outbox、oncall.Chain/notify.Engine/
@@ -151,7 +152,14 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	dedupStage := pipeline.NewDedupStage(repos.Alerts, repos.Timeline, sched, nil, cfg.FlapWindowSeconds, cfg.FlapThreshold)
 	impactProjector := impactprojection.NewProjector(repos.Topology, repos.Faults)
 	projector := alertmapping.NewProjector(repos.AlertMappings, repos.ServiceCatalog, repos.Topology, repos.Faults, impactProjector)
-	mappingStage := pipeline.NewMappingStage(projector)
+
+	// ---- Fault 级通知 outbox（R5）：拓扑抑制判定复用 impactProjector.ProviderNodeIDs
+	// 既有的 maxDepth/staleAfter 裁决，不在这里重复定义遍历参数。
+	// TriggerFromMappingResult 是 pipeline.MappingStage 与 alertsource.Reconciler
+	// 两个 Project 调用方共用的触发入口（R5.10/R5.11），见该方法文档 ----
+	faultOutbox := NewFaultOutbox(sched, repos.Faults, repos.Ops, impactProjector,
+		cfg.FaultNotify.Cooldown, cfg.FaultNotify.FallbackChannel, cfg.FaultNotify.FallbackTarget, cfg.WebBaseURL)
+	mappingStage := pipeline.NewMappingStage(projector).WithFaultActivation(faultOutbox.TriggerFromMappingResult)
 	routeStage := pipeline.NewRouteStage(repos.Routes, repos.Alerts, defaultTeamID)
 	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox, repos.Routes, stormState)
 	silenceStage := pipeline.NewSilenceStage(repos.Silences, repos.Alerts)
@@ -203,6 +211,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 		IncidentOutbox:   incidentOutbox,
 		AlertProjector:   projector,
 		ImpactProjector:  impactProjector,
+		FaultOutbox:      faultOutbox,
 	}
 }
 

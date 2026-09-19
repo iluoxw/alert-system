@@ -125,6 +125,13 @@ type FaultTimelineAction string
 
 const (
 	FaultTimelineActionAck FaultTimelineAction = "ack"
+	// FaultTimelineActionNotifySuppressed 记录"上游 provider 已有已通知的 active
+	// Fault，本 Fault 不单独通知"这一拓扑抑制决策（不变量 22），Detail 携带
+	// upstream_fault_id 供人回溯抑制来源。
+	FaultTimelineActionNotifySuppressed FaultTimelineAction = "notify_suppressed"
+	// FaultTimelineActionNotifySkipped 记录"owner team 与全局 fallback 均未配置
+	// 通知渠道，本轮未产生任何通知意图"，避免通知静默失败无迹可寻。
+	FaultTimelineActionNotifySkipped FaultTimelineAction = "notify_skipped"
 )
 
 // FaultTimelineEntry 是不可篡改的 Fault 时间线条目，结构对齐

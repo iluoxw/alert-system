@@ -33,6 +33,11 @@ type Reconciler struct {
 	now       func() time.Time
 	tick      time.Duration
 	projector AlertProjector
+	// faultActivation 在 projector.Project 返回后被无条件调用（若已配置），由
+	// 调用方（internal/app.Build）决定是否需要触发 Fault 通知（R5.10）。这是
+	// 「Alertmanager 曾不可用、恢复后重新出现告警」场景下 Fault 通知的唯一入口——
+	// 漏接会导致对账路径产生的 active Fault 永远不通知 owner，等同漏报。
+	faultActivation func(ctx context.Context, tx pgx.Tx, result domain.AlertMappingResult) error
 }
 
 type AlertProjector interface {
@@ -57,6 +62,22 @@ func NewReconciler(st *store.Store, sources *store.AlertSourceRepo, alerts *stor
 func (r *Reconciler) WithProjector(projector AlertProjector) *Reconciler {
 	r.projector = projector
 	return r
+}
+
+// WithFaultActivation 注入 Fault 激活通知的触发钩子（R5.10：周期对账路径，
+// 覆盖 unknown->firing 恢复与快照缺失两处 Project 调用）。
+func (r *Reconciler) WithFaultActivation(fn func(ctx context.Context, tx pgx.Tx, result domain.AlertMappingResult) error) *Reconciler {
+	r.faultActivation = fn
+	return r
+}
+
+// triggerFaultActivation 是两处 Project 调用共用的收尾：faultActivation 未配置
+// 时是零成本 no-op（保持 R2.9"ccloud/通知配置缺失不影响既有功能"的降级口径）。
+func (r *Reconciler) triggerFaultActivation(ctx context.Context, tx pgx.Tx, result domain.AlertMappingResult) error {
+	if r.faultActivation == nil {
+		return nil
+	}
+	return r.faultActivation(ctx, tx, result)
 }
 
 func (r *Reconciler) Run(ctx context.Context) {
@@ -157,8 +178,12 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 					return err
 				}
 				if r.projector != nil {
-					if _, err := r.projector.Project(ctx, tx, alert); err != nil {
+					mappingResult, err := r.projector.Project(ctx, tx, alert)
+					if err != nil {
 						return fmt.Errorf("投影 Alert Mapping 失败: %w", err)
+					}
+					if err := r.triggerFaultActivation(ctx, tx, mappingResult); err != nil {
+						return fmt.Errorf("触发 Fault 通知失败: %w", err)
 					}
 				}
 			}
@@ -169,8 +194,12 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 		}
 		for _, alert := range missing {
 			if r.projector != nil {
-				if _, err := r.projector.Project(ctx, tx, alert); err != nil {
+				mappingResult, err := r.projector.Project(ctx, tx, alert)
+				if err != nil {
 					return fmt.Errorf("投影缺失 Alert Mapping 失败: %w", err)
+				}
+				if err := r.triggerFaultActivation(ctx, tx, mappingResult); err != nil {
+					return fmt.Errorf("触发 Fault 通知失败: %w", err)
 				}
 			}
 			switch alert.SourceState {

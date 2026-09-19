@@ -474,6 +474,10 @@ func (h *serviceCatalogHandlers) getAlertMapping(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// reprocessAlert 人工触发重新映射，属于治理操作（修正错配、补映射规则后回放），
+// 不代表"新发生的故障"，因此故意不调用 QueueFaultActivated（R5.10 明确排除本
+// 端点）：即使本次 Project 让 Fault 从 candidate 升级为 active，也不产生通知
+// 意图，避免管理员批量重跑映射时对 owner 造成通知轰炸。
 func (h *serviceCatalogHandlers) reprocessAlert(c *gin.Context) {
 	var result domain.AlertMappingResult
 	err := h.router.tx.WithTx(c, func(tx pgx.Tx) error {

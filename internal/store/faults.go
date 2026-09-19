@@ -408,6 +408,96 @@ func (r *FaultRepo) RemoveAutomatedEvidenceForAlertExcept(ctx context.Context, t
 	return err
 }
 
+// Ack 认领 Fault：仅在尚未认领（acked_at IS NULL）时写入 acked_by/acked_by_name/
+// acked_at；已认领时不覆盖既有认领人，返回当前状态且 ok=false——与
+// domain.AckFault 的幂等短路语义一致（不变量 6），调用方据此判断是否需要追加
+// 时间线，而不是把"重复认领"当错误处理。
+func (r *FaultRepo) Ack(ctx context.Context, tx pgx.Tx, id, actorID, actorName string, at time.Time) (domain.Fault, bool, error) {
+	if strings.TrimSpace(actorName) == "" {
+		return domain.Fault{}, false, fmt.Errorf("store: ack 的 actorName 不能为空")
+	}
+	row := tx.QueryRow(ctx, `
+		UPDATE faults
+		SET acked_by = NULLIF($2, '')::uuid, acked_by_name = $3, acked_at = $4
+		WHERE id = $1 AND acked_at IS NULL
+		RETURNING `+faultColumns, id, actorID, actorName, at)
+	fault, err := scanFault(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 0 行受影响：要么已认领，要么 Fault 不存在，两种情况都需要回查当前状态
+		// 才能区分（GetByID 在不存在时返回 ErrFaultNotFound）。
+		existing, getErr := r.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return domain.Fault{}, false, getErr
+		}
+		return existing, false, nil
+	}
+	if err != nil {
+		return domain.Fault{}, false, fmt.Errorf("store: 认领 Fault 失败: %w", err)
+	}
+	return fault, true, nil
+}
+
+// SetOwnerNotified 记录 Fault owner 团队通知意图已产生的时刻（R5.6）。语义取舍见
+// app.FaultOutbox.QueueFaultActivated 的文档：这里是"意图已调度"而非"确认发送
+// 成功"，因为拓扑抑制需要在意图时刻就能看到"已通知"。
+func (r *FaultRepo) SetOwnerNotified(ctx context.Context, tx pgx.Tx, id string, at time.Time) error {
+	ct, err := tx.Exec(ctx, `UPDATE faults SET owner_notified_at = $2 WHERE id = $1`, id, at)
+	if err != nil {
+		return fmt.Errorf("store: 记录 Fault owner 通知时间失败: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrFaultNotFound
+	}
+	return nil
+}
+
+// AppendTimeline 是 fault_timeline_entries 的唯一写入方法（append-only）。
+// entry.ActorID 可空（系统动作无用户），entry.Actor 必填。
+func (r *FaultRepo) AppendTimeline(ctx context.Context, tx pgx.Tx, entry domain.FaultTimelineEntry) (string, error) {
+	if entry.FaultID == "" || strings.TrimSpace(entry.Actor) == "" || entry.Action == "" || entry.At.IsZero() {
+		return "", fmt.Errorf("store: Fault 时间线字段非法")
+	}
+	detail, err := marshalJSONObject(entry.Detail)
+	if err != nil {
+		return "", fmt.Errorf("store: 序列化 Fault 时间线 detail 失败: %w", err)
+	}
+	var id string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO fault_timeline_entries (fault_id, actor_id, actor_name, action, detail, at)
+		VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6)
+		RETURNING id::text
+	`, entry.FaultID, entry.ActorID, entry.Actor, entry.Action, detail, entry.At).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("store: 写入 Fault 时间线失败: %w", err)
+	}
+	return id, nil
+}
+
+// ListRecentlyResolvedByCorrelationKey 查询同一 correlation_key 在 since 之后
+// resolved 的 Fault（冷却窗口判定用，R5.3）：非空即表示冷却窗口内刚恢复，本轮
+// 不应重新通知。correlation_key 的部分唯一索引只约束未 resolved 的行，因此同一
+// key 的历史 resolved 行可能有多条，这里按 resolved_at 倒序返回全部匹配。
+func (r *FaultRepo) ListRecentlyResolvedByCorrelationKey(ctx context.Context, tx pgx.Tx, correlationKey string, since time.Time) ([]domain.Fault, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT `+faultColumns+` FROM faults
+		WHERE correlation_key = $1 AND status = 'resolved' AND resolved_at >= $2
+		ORDER BY resolved_at DESC
+	`, correlationKey, since)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询近期 resolved Fault 失败: %w", err)
+	}
+	defer rows.Close()
+	var result []domain.Fault
+	for rows.Next() {
+		item, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
 func (r *FaultRepo) ListEvidence(ctx context.Context, tx pgx.Tx, faultID string) ([]domain.FaultEvidence, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT fault_id::text, alert_id::text, role, rationale, confidence,

@@ -57,6 +57,13 @@ const (
 	// defaultCCloudSyncInterval 是 ccloud 拓扑/健康度独立周期 loop（不变量 23）的默认
 	// 拉取间隔；<=0 表示整条链路关闭，不产生任何外部 IO（R2.1）。
 	defaultCCloudSyncInterval = 10 * time.Minute
+
+	// defaultFaultNotifyCooldown 是 R5.3 冷却窗口的默认时长：同一 correlation_key
+	// 在这段时间内刚 resolved，本轮不重新通知。
+	defaultFaultNotifyCooldown = 30 * time.Minute
+	// defaultFaultNotifyFallbackChannel 是 owner team 未配置渠道时的全局兜底渠道
+	// 种类；P2 阶段固定走飞书群自定义机器人（只发纯文本，无回调，见 design.md R5.7）。
+	defaultFaultNotifyFallbackChannel = "lark_webhook"
 )
 
 // Config 是服务启动所需的全部配置项。
@@ -86,6 +93,27 @@ type Config struct {
 	FlapThreshold     int
 
 	CCloud CCloudConfig // R1/R2 ccloud 拓扑与健康度接入配置
+
+	FaultNotify FaultNotifyConfig // R5 Fault 级通知的冷却与兜底渠道配置
+
+	// WebBaseURL 非空时用于拼出通知正文里的 Fault 详情链接（{WebBaseURL}/faults/{id}）；
+	// 为空表示尚未部署可访问的 Web 前端域名，通知不带链接（不是错误，属预期降级）。
+	WebBaseURL string
+}
+
+// FaultNotifyConfig 是 R5 Fault 级通知的判定与兜底配置（app.FaultOutbox 消费）。
+type FaultNotifyConfig struct {
+	Cooldown        time.Duration // 冷却窗口：同 correlation_key 在窗口内刚 resolved 不重发（R5.3）
+	FallbackChannel string        // owner team 未配置渠道时的兜底渠道种类
+	FallbackTarget  string        // 兜底渠道地址；飞书机器人 hook URL 本身是凭据，禁止落日志
+}
+
+// String 实现 fmt.Stringer：FallbackTarget 可能是飞书机器人 hook URL（凭据本身，
+// 不变量 13/安全约束禁止落日志），脱敏原则与 SMTPConfig.String 一致；Cooldown/
+// FallbackChannel 非敏感，原样打印。
+func (c FaultNotifyConfig) String() string {
+	return fmt.Sprintf("FaultNotifyConfig{Cooldown:%s, FallbackChannel:%q, FallbackTarget:%s}",
+		c.Cooldown, c.FallbackChannel, maskSecret(c.FallbackTarget))
 }
 
 // CCloudConfig 是 ccloud 平台拓扑/健康度接入的配置（不变量 23：外部 IO 只走独立周期
@@ -225,6 +253,15 @@ type fileConfig struct {
 	FlapThreshold     int `yaml:"flap_threshold"`
 
 	CCloud fileCCloudConfig `yaml:"ccloud"`
+
+	FaultNotify fileFaultNotifyConfig `yaml:"fault_notify"`
+	WebBaseURL  string                `yaml:"web_base_url"`
+}
+
+type fileFaultNotifyConfig struct {
+	Cooldown        string `yaml:"cooldown"`
+	FallbackChannel string `yaml:"fallback_channel"`
+	FallbackTarget  string `yaml:"fallback_target"`
 }
 
 type fileCCloudConfig struct {
@@ -284,6 +321,10 @@ func Load(path string) (Config, error) {
 		CCloud: fileCCloudConfig{
 			SyncInterval: defaultCCloudSyncInterval.String(),
 		},
+		FaultNotify: fileFaultNotifyConfig{
+			Cooldown:        defaultFaultNotifyCooldown.String(),
+			FallbackChannel: defaultFaultNotifyFallbackChannel,
+		},
 	}
 
 	if path != "" {
@@ -333,6 +374,10 @@ func Load(path string) (Config, error) {
 	ccloudSyncInterval, err := time.ParseDuration(fc.CCloud.SyncInterval)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid ccloud.sync_interval %q: %w", fc.CCloud.SyncInterval, err)
+	}
+	faultNotifyCooldown, err := time.ParseDuration(fc.FaultNotify.Cooldown)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid fault_notify.cooldown %q: %w", fc.FaultNotify.Cooldown, err)
 	}
 
 	retention := RetentionConfig{
@@ -384,6 +429,12 @@ func Load(path string) (Config, error) {
 		FlapWindowSeconds: fc.FlapWindowSeconds,
 		FlapThreshold:     fc.FlapThreshold,
 		CCloud:            ccloud,
+		FaultNotify: FaultNotifyConfig{
+			Cooldown:        faultNotifyCooldown,
+			FallbackChannel: fc.FaultNotify.FallbackChannel,
+			FallbackTarget:  fc.FaultNotify.FallbackTarget,
+		},
+		WebBaseURL: fc.WebBaseURL,
 	}, nil
 }
 
@@ -496,6 +547,18 @@ func applyEnvOverrides(fc *fileConfig) {
 	}
 	if v := os.Getenv("CCLOUD_SYNC_INTERVAL"); v != "" {
 		fc.CCloud.SyncInterval = v
+	}
+	if v := os.Getenv("FAULT_NOTIFY_COOLDOWN"); v != "" {
+		fc.FaultNotify.Cooldown = v
+	}
+	if v := os.Getenv("FAULT_NOTIFY_FALLBACK_CHANNEL"); v != "" {
+		fc.FaultNotify.FallbackChannel = v
+	}
+	if v := os.Getenv("FAULT_NOTIFY_FALLBACK_TARGET"); v != "" {
+		fc.FaultNotify.FallbackTarget = v
+	}
+	if v := os.Getenv("WEB_BASE_URL"); v != "" {
+		fc.WebBaseURL = v
 	}
 }
 

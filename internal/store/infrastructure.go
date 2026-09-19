@@ -153,18 +153,33 @@ func (r *TopologyRepo) ImportSnapshot(ctx context.Context, tx pgx.Tx, snapshot d
 		if criticality == "" {
 			criticality = domain.DependencyCriticalityMedium
 		}
+		// 跨源边：本次快照的 Nodes 里查不到 ExternalRef 时，回落调用方已给出的
+		// NodeID（指向其他来源已登记的 canonical 实体，任务 8）。既有同源路径
+		// nodeIDs 命中时行为不变。
+		fromID, ok := nodeIDs[input.FromExternalRef]
+		if !ok {
+			fromID = input.FromNodeID
+		}
+		toID, ok := nodeIDs[input.ToExternalRef]
+		if !ok {
+			toID = input.ToNodeID
+		}
+		if fromID == "" || toID == "" {
+			return TopologyImportResult{}, fmt.Errorf("store: 拓扑边 %s -> %s 缺少可解析节点", input.FromExternalRef, input.ToExternalRef)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dependency_edges (
 				source, from_node_id, to_node_id, relation, criticality,
-				evidence, observed_at, sync_run_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				evidence, observed_at, sync_run_id, no_recent_traffic
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (source, from_node_id, to_node_id, relation) DO UPDATE SET
 				criticality = EXCLUDED.criticality,
 				evidence = EXCLUDED.evidence,
 				observed_at = EXCLUDED.observed_at,
-				sync_run_id = EXCLUDED.sync_run_id
-		`, snapshot.Source, nodeIDs[input.FromExternalRef], nodeIDs[input.ToExternalRef],
-			input.Relation, criticality, evidence, observedAt, runID); err != nil {
+				sync_run_id = EXCLUDED.sync_run_id,
+				no_recent_traffic = EXCLUDED.no_recent_traffic
+		`, snapshot.Source, fromID, toID,
+			input.Relation, criticality, evidence, observedAt, runID, input.NoRecentTraffic); err != nil {
 			return TopologyImportResult{}, fmt.Errorf("store: upsert 拓扑边 %s -> %s 失败: %w", input.FromExternalRef, input.ToExternalRef, err)
 		}
 	}
@@ -533,6 +548,7 @@ func (r *TopologyRepo) listCanonicalTraversal(ctx context.Context, tx pgx.Tx, ro
 
 			SELECT %[1]s, i.depth + 1, i.path || %[1]s,
 			       i.stale OR (e.origin = 'observed' AND e.observed_at < now() - ($3 * interval '1 second'))
+			       OR e.no_recent_traffic
 			FROM reached i
 			JOIN dependency_edges e ON %[2]s AND e.relation = 'depends_on'
 			WHERE i.depth < $2 AND NOT %[1]s = ANY(i.path)
