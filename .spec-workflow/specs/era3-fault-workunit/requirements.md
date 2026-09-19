@@ -178,7 +178,8 @@ ADR-0006 的三根支柱就是本 spec 的验收目标：
 
 1. WHEN Impact 变为 confirmed THEN 系统 SHALL 通知受影响应用的 owner team 渠道；通知目标与 R5 的 Fault 通知门槛**互相独立**。
 2. 外播通知 SHALL 沿用不变量 4 口径：只 `Schedule notify_send`，幂等键含 round。
-3. 卡片动作 SHALL 使用 `resourceType="impact"`（value 含 `fault_id` + `node_id`），动作 `confirm` / `rule_out` 落到既有 `PUT /api/v1/faults/:id/impacts/:node_id` 的人工裁决语义。
+3. **（延后，与 R4.6/R5.7/R5.9 同属卡片交互）** 卡片动作 SHALL 使用 `resourceType="impact"`（value 含 `fault_id` + `node_id`），动作 `confirm` / `rule_out` 落到既有 `PUT /api/v1/faults/:id/impacts/:node_id` 的人工裁决语义。
+   依赖 uat 公网可回调入口，随任务 34 / 45 一并实现。延后期间外播走 `lark_webhook` 纯文本 + 详情链接，裁决在 Web 完成。
 4. WHEN Fault 变为 resolved THEN 系统 SHALL 向所有 confirmed 影响的团队外播恢复通知。
 5. 所有外播 SHALL 落 `fault_timeline_entries` 与通知日志，且通信目标在对外响应中只暴露脱敏引用（沿用不变量 13）。
 

@@ -296,9 +296,10 @@
   - _Requirements: R9.1, R9.2, R9.4, R9.5_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 实现影响外播两个入口，门槛与 Fault 通知独立，只 Schedule | Restrictions: 幂等键含 round 且随 payload 持久化；事务内禁止同步 IO；对外响应不得泄露原始通信目标（不变量 13） | Success: 单测覆盖 confirmed 外播一次、resolved 通知所有 confirmed 团队、无 owner 渠道时的回落行为 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 34. 飞书卡片影响动作
+- [ ] 34. 飞书卡片影响动作（**延后**：阻塞于公网回调入口，与任务 19、45 同期进行）
   - File: internal/api/lark_callback.go
   - 新增 case "impact"：confirm / rule_out 落到既有 PUT /api/v1/faults/:id/impacts/:node_id 的人工裁决语义
+  - **延后理由（2026-09-19，与任务 19 同一裁决）**：卡片按钮回调依赖 uat 公网可回调入口，当前不具备；延后期间裁决经既有 `PUT /api/v1/faults/:id/impacts/:node_id` 在 Web 完成。任务 33 的外播不依赖本任务，可正常实现
   - Purpose: 让业务团队无需登录即可裁决
   - _Leverage: 现有 alert/fault/incident 分支与幂等表_
   - _Requirements: R9.3_
@@ -399,7 +400,7 @@
     ③ 配置 `LARK_VERIFICATION_TOKEN`（安全约束要求非空验签）与 `LARK_ENCRYPT_KEY`；④ 给值班人绑定 `users.lark_open_id`（未绑定者点按钮会被拒绝）
   - **已知阻塞点**：回调地址要求飞书侧能访问到 uat 服务；uat 目前为内网部署，需先确认对外入口是否存在
   - **未决**：值班人 open_id 目前只能经 `PUT /api/v1/admin/users/:id` 逐个填写；人数多时是否需要批量导入或自助绑定入口，本 spec 未覆盖
-  - 完成后：把 owner team 渠道由 `lark_webhook` 切到 `lark`（纯配置变更），并**解冻任务 19**（卡片故障动作的实现与验证与本任务同期进行）
+  - 完成后：把 owner team 渠道由 `lark_webhook` 切到 `lark`（纯配置变更），并**解冻任务 19 与 34**（卡片故障动作、卡片影响动作的实现与验证与本任务同期进行）
   - Purpose: 让 R5.7 的卡片认领在真实环境成立，把认领从 Web 前移到卡片
   - _Leverage: internal/notify/channel_lark.go 已实现的按钮卡片；internal/api/lark_callback.go 已实现的验签与幂等_
   - _Requirements: R5.7, R4.3, R4.6_
