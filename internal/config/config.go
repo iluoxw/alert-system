@@ -128,13 +128,21 @@ type CCloudConfig struct {
 	TokenEnv     string        // 存放 token 的环境变量名（非 token 本身）
 	ProjectIDs   []string      // 需要拉取全链路拓扑的项目 ID 列表
 	SyncInterval time.Duration // 独立周期 loop 的拉取间隔；<=0 关闭
+	// Environment 是导入实体的环境标识（如 production）。平台拓扑响应里没有环境字段，
+	// 只能由部署方显式声明；不得用项目 ID 代替——项目 ID 不是环境，且服务目录的
+	// 依赖校验要求双方 environment 一致，取错会让业务服务无法依赖导入的节点。
+	Environment string
+	// Path* 覆盖 client 占位路径（D2）。空则使用 internal/ccloud 的 DefaultPath*。
+	PathFullLink string
+	PathService  string
+	PathHealth   string
 }
 
 // String 实现 fmt.Stringer：TokenEnv 只是环境变量名，不是凭据本身，可以原样打印，
 // 便于排查"到底读的是哪个环境变量"；BaseURL/ProjectIDs 均非敏感信息。
 func (c CCloudConfig) String() string {
-	return fmt.Sprintf("CCloudConfig{BaseURL:%q, TokenEnv:%q, ProjectIDs:%v, SyncInterval:%s}",
-		c.BaseURL, c.TokenEnv, c.ProjectIDs, c.SyncInterval)
+	return fmt.Sprintf("CCloudConfig{BaseURL:%q, TokenEnv:%q, ProjectIDs:%v, Environment:%q, SyncInterval:%s, PathFullLink:%q, PathService:%q, PathHealth:%q}",
+		c.BaseURL, c.TokenEnv, c.ProjectIDs, c.Environment, c.SyncInterval, c.PathFullLink, c.PathService, c.PathHealth)
 }
 
 // Enabled 以 BaseURL 是否配置作为启用开关：BaseURL 为空视为未接入 ccloud，
@@ -153,6 +161,9 @@ func (c CCloudConfig) Validate() error {
 	}
 	if len(c.ProjectIDs) == 0 {
 		return fmt.Errorf("ccloud.project_ids 不能为空（已配置 ccloud.base_url 且 ccloud.sync_interval > 0）")
+	}
+	if strings.TrimSpace(c.Environment) == "" {
+		return fmt.Errorf("ccloud.environment 不能为空（已配置 ccloud.base_url 且 ccloud.sync_interval > 0）")
 	}
 	return nil
 }
@@ -269,6 +280,10 @@ type fileCCloudConfig struct {
 	TokenEnv     string   `yaml:"token_env"`
 	ProjectIDs   []string `yaml:"project_ids"`
 	SyncInterval string   `yaml:"sync_interval"`
+	PathFullLink string   `yaml:"path_fulllink"`
+	PathService  string   `yaml:"path_service"`
+	PathHealth   string   `yaml:"path_health"`
+	Environment  string   `yaml:"environment"`
 }
 
 type fileSMTPConfig struct {
@@ -395,6 +410,10 @@ func Load(path string) (Config, error) {
 		TokenEnv:     fc.CCloud.TokenEnv,
 		ProjectIDs:   trimNonEmpty(fc.CCloud.ProjectIDs),
 		SyncInterval: ccloudSyncInterval,
+		PathFullLink: strings.TrimSpace(fc.CCloud.PathFullLink),
+		PathService:  strings.TrimSpace(fc.CCloud.PathService),
+		PathHealth:   strings.TrimSpace(fc.CCloud.PathHealth),
+		Environment:  strings.TrimSpace(fc.CCloud.Environment),
 	}
 	if err := ccloud.Validate(); err != nil {
 		return Config{}, err
@@ -547,6 +566,18 @@ func applyEnvOverrides(fc *fileConfig) {
 	}
 	if v := os.Getenv("CCLOUD_SYNC_INTERVAL"); v != "" {
 		fc.CCloud.SyncInterval = v
+	}
+	if v := os.Getenv("CCLOUD_PATH_FULLLINK"); v != "" {
+		fc.CCloud.PathFullLink = v
+	}
+	if v := os.Getenv("CCLOUD_PATH_SERVICE"); v != "" {
+		fc.CCloud.PathService = v
+	}
+	if v := os.Getenv("CCLOUD_PATH_HEALTH"); v != "" {
+		fc.CCloud.PathHealth = v
+	}
+	if v := os.Getenv("CCLOUD_ENVIRONMENT"); v != "" {
+		fc.CCloud.Environment = v
 	}
 	if v := os.Getenv("FAULT_NOTIFY_COOLDOWN"); v != "" {
 		fc.FaultNotify.Cooldown = v

@@ -88,6 +88,8 @@ webhook_configs:
 
 当前支持 `alertmanager`、`grafana`、`generic` 三种 adapter。入站 Source URL 与飞书群
 机器人等出站通知 URL 是两个独立凭据域，禁止互相复用或写入对方配置。
+本地 route / group / silence / inhibit 仅对 `generic` 来源生效；Alertmanager 与
+Grafana 是 Alert 生命周期权威来源，不经过这套本地编排。
 
 ## 测试
 

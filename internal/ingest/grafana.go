@@ -9,8 +9,8 @@ import (
 	"alert-system/internal/domain"
 )
 
-// grafanaKind 是 Grafana webhook adapter 的注册名。
-const grafanaKind = "grafana"
+// grafanaKind 是 Grafana webhook adapter 的注册名，与权威来源常量同一字面量。
+const grafanaKind = domain.SourceKindGrafana
 
 // grafanaWebhook 对应 Grafana Unified Alerting 的 webhook 通知器投递的 payload。
 // Grafana ngalert 的 webhook sender 复用了 Alertmanager 的 template.Data 结构，
@@ -102,6 +102,10 @@ func (a *GrafanaAdapter) translate(payload grafanaWebhook, alert grafanaAlert) (
 	}
 
 	severity, fallback := mapSeverity(alert.Labels["severity"], a.defaultSeverity)
+	sourceUpdatedAt := alert.StartsAt
+	if status == domain.StatusResolved && !alert.EndsAt.IsZero() {
+		sourceUpdatedAt = alert.EndsAt
+	}
 
 	signalContext, err := json.Marshal(map[string]any{
 		"generator_url":      alert.GeneratorURL,
@@ -123,18 +127,21 @@ func (a *GrafanaAdapter) translate(payload grafanaWebhook, alert grafanaAlert) (
 	}
 
 	return domain.AlertEvent{
-		RuleID:           ruleID,
-		SignalKind:       domain.SignalKindMetric,
-		Severity:         severity,
-		SeverityFallback: fallback,
-		Status:           status,
-		Title:            titleFromAnnotations(alert.Annotations, ruleID),
-		Labels:           alert.Labels,
-		Source:           grafanaKind,
-		ResourceRef:      normalizeResourceRef(alert.Labels),
-		ResolvePolicy:    domain.ResolvePolicySource,
-		SignalContext:    signalContext,
-		StartsAt:         alert.StartsAt,
-		EndsAt:           alert.EndsAt,
+		RuleID:              ruleID,
+		UpstreamFingerprint: alert.Fingerprint,
+		SignalKind:          domain.SignalKindMetric,
+		Severity:            severity,
+		SeverityFallback:    fallback,
+		Status:              status,
+		Title:               titleFromAnnotations(alert.Annotations, ruleID),
+		Labels:              alert.Labels,
+		Source:              grafanaKind,
+		ResourceRef:         normalizeResourceRef(alert.Labels),
+		ResolvePolicy:       domain.ResolvePolicySource,
+		SignalContext:       signalContext,
+		StartsAt:            alert.StartsAt,
+		EndsAt:              alert.EndsAt,
+		SourceUpdatedAt:     sourceUpdatedAt,
+		SuppressionState:    domain.SuppressionStateNone,
 	}, nil
 }

@@ -30,7 +30,28 @@ func NewClient(httpClient *http.Client) *Client {
 	return &Client{httpClient: httpClient}
 }
 
-func ValidateConfig(cfg store.AlertmanagerSourceConfig) error {
+const (
+	alertmanagerAlertsPath = "/api/v2/alerts"
+	grafanaAlertsPath      = "/api/alertmanager/grafana/api/v2/alerts"
+)
+
+// SnapshotAlertsPath 按权威来源 kind 选择对账快照路径。空 kind 回落 Alertmanager
+// 路径，保持既有调用方字面量构造的 source 行为不变。
+func SnapshotAlertsPath(kind string) (string, error) {
+	switch kind {
+	case "", domain.SourceKindAlertmanager:
+		return alertmanagerAlertsPath, nil
+	case domain.SourceKindGrafana:
+		return grafanaAlertsPath, nil
+	default:
+		return "", fmt.Errorf("不支持的对账来源 kind: %s", kind)
+	}
+}
+
+func ValidateConfig(kind string, cfg store.AlertmanagerSourceConfig) error {
+	if _, err := SnapshotAlertsPath(kind); err != nil {
+		return err
+	}
 	cfg = cfg.WithDefaults()
 	if cfg.APIURL == "" {
 		return fmt.Errorf("api_url 不能为空")
@@ -55,10 +76,14 @@ func ValidateConfig(cfg store.AlertmanagerSourceConfig) error {
 }
 
 func (c *Client) Fetch(ctx context.Context, source store.AlertSource) ([]domain.AlertEvent, error) {
-	if err := ValidateConfig(source.Config); err != nil {
+	if err := ValidateConfig(source.Kind, source.Config); err != nil {
 		return nil, err
 	}
-	endpoint := strings.TrimRight(source.Config.APIURL, "/") + "/api/v2/alerts"
+	path, err := SnapshotAlertsPath(source.Kind)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(source.Config.APIURL, "/") + path
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("alertsource: 构造 alerts API URL 失败: %w", err)
@@ -115,6 +140,9 @@ func (c *Client) Fetch(ctx context.Context, source store.AlertSource) ([]domain.
 		event, err := ingest.AlertmanagerAPIEvent(alert, defaultSeverity)
 		if err != nil {
 			return nil, fmt.Errorf("alertsource: 第 %d 条 Alert 无效: %w", i, err)
+		}
+		if source.Kind != "" {
+			event.Source = source.Kind
 		}
 		events = append(events, event)
 	}

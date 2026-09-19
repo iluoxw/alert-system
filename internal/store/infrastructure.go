@@ -343,6 +343,144 @@ func (r *TopologyRepo) ListAliases(ctx context.Context, tx pgx.Tx, entityID stri
 	return listEntityAliases(ctx, tx, entityID)
 }
 
+// ResolveAlias 按 namespace+value 查找已启用的 canonical 实体。与
+// ServiceCatalogRepo.ResolveAlias 同一条 SQL：命中 0 条表示未对齐，命中多条
+// 是别名冲突，调用方不得任选其一。
+func (r *TopologyRepo) ResolveAlias(ctx context.Context, tx pgx.Tx, namespace, value string) ([]domain.ResourceNode, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT `+resourceNodeColumnsQualified+`
+		FROM entity_aliases a
+		JOIN resource_nodes n ON n.id = a.entity_id
+		WHERE a.namespace = $1 AND a.alias_value = $2 AND a.enabled
+		ORDER BY n.entity_key
+	`, namespace, value)
+	if err != nil {
+		return nil, fmt.Errorf("store: 解析 alias 失败: %w", err)
+	}
+	defer rows.Close()
+	var nodes []domain.ResourceNode
+	for rows.Next() {
+		node, err := scanResourceNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if nodes == nil {
+		nodes = []domain.ResourceNode{}
+	}
+	return nodes, nil
+}
+
+// EnsureAlias 给实体补一条 alias：已存在则保持 enabled，不覆盖其他实体上的同名
+// alias（UNIQUE 是 namespace+value+entity_id，冲突留给治理队列而不是静默改归属）。
+func (r *TopologyRepo) EnsureAlias(ctx context.Context, tx pgx.Tx, entityID, namespace, value string) error {
+	if entityID == "" || strings.TrimSpace(namespace) == "" || strings.TrimSpace(value) == "" {
+		return fmt.Errorf("store: alias 字段非法")
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO entity_aliases (namespace, alias_value, entity_id, enabled)
+		VALUES ($1, $2, $3, true)
+		ON CONFLICT (namespace, alias_value, entity_id) DO UPDATE SET enabled = true
+	`, namespace, value, entityID)
+	if err != nil {
+		return fmt.Errorf("store: 写入 alias 失败: %w", err)
+	}
+	return nil
+}
+
+// UnresolvedIdentity 是 unresolved_identities 的读模型（R1.2/R1.4）。
+type UnresolvedIdentity struct {
+	Namespace   string    `json:"namespace"`
+	Value       string    `json:"value"`
+	HostPort    string    `json:"host_port"`
+	ServiceType string    `json:"service_type"`
+	FirstSeen   time.Time `json:"first_seen"`
+	LastSeen    time.Time `json:"last_seen"`
+	SampleApp   string    `json:"sample_app"`
+}
+
+// UpsertUnresolvedIdentities 写入待对齐队列。first_seen 只在首次插入写，
+// last_seen/host_port/service_type/sample_app 每次覆盖（任务 7 跨任务警告）。
+func (r *TopologyRepo) UpsertUnresolvedIdentities(ctx context.Context, tx pgx.Tx, items []UnresolvedIdentity, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.Namespace) == "" || strings.TrimSpace(item.Value) == "" {
+			return fmt.Errorf("store: unresolved identity 字段非法")
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO unresolved_identities (namespace, value, host_port, service_type, first_seen, last_seen, sample_app)
+			VALUES ($1, $2, $3, $4, $5, $5, $6)
+			ON CONFLICT (namespace, value) DO UPDATE SET
+				host_port = EXCLUDED.host_port,
+				service_type = EXCLUDED.service_type,
+				last_seen = EXCLUDED.last_seen,
+				sample_app = EXCLUDED.sample_app
+		`, item.Namespace, item.Value, item.HostPort, item.ServiceType, now, item.SampleApp); err != nil {
+			return fmt.Errorf("store: UPSERT unresolved_identities 失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// ListUnresolvedIdentities 按 last_seen 倒序分页；空集合返回 [] 而不是 nil（不变量 13）。
+func (r *TopologyRepo) ListUnresolvedIdentities(ctx context.Context, tx pgx.Tx, limit, offset int) ([]UnresolvedIdentity, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT namespace, value, COALESCE(host_port, ''), COALESCE(service_type, ''),
+			first_seen, last_seen, COALESCE(sample_app, '')
+		FROM unresolved_identities
+		ORDER BY last_seen DESC, namespace, value
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 unresolved_identities 失败: %w", err)
+	}
+	defer rows.Close()
+	items := make([]UnresolvedIdentity, 0)
+	for rows.Next() {
+		var item UnresolvedIdentity
+		if err := rows.Scan(&item.Namespace, &item.Value, &item.HostPort, &item.ServiceType,
+			&item.FirstSeen, &item.LastSeen, &item.SampleApp); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// RecordSyncFailure 在 fetch 失败、未进入 ImportSnapshot 时写一条 failed 同步记录，
+// 让 SRE 能从 topology_sync_runs 看到退避原因（R2.9）。
+func (r *TopologyRepo) RecordSyncFailure(ctx context.Context, tx pgx.Tx, source string, observedAt time.Time, errMsg string) error {
+	if strings.TrimSpace(source) == "" {
+		return fmt.Errorf("store: topology sync source 不能为空")
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	if len(errMsg) > 2000 {
+		errMsg = errMsg[:2000]
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO topology_sync_runs (source, status, observed_at, snapshot_hash, error, finished_at)
+		VALUES ($1, 'failed', $2, '', $3, now())
+	`, source, observedAt, errMsg)
+	if err != nil {
+		return fmt.Errorf("store: 记录拓扑同步失败失败: %w", err)
+	}
+	return nil
+}
+
 // ListDependenciesForSource 返回以 entityID 为消费方、且写入来源等于 source 的依赖边，
 // 用于按创建方（拓扑同步 / 应用服务登记 / 受管实体登记）分别回显各自声明的依赖，
 // 不与其他来源的边混在一起（不变量 15 的 source 隔离）。

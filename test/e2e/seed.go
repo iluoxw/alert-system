@@ -137,9 +137,9 @@ type seedConfigResult struct {
 // 仓储建一条覆盖当前时刻的班次——schedules 有 CRUD 端点但 shifts 没有）、升级
 // 策略（Levels 的 Targets 是团队 ID，oncall.Resolver 按团队 ID 查值班表求值，不是
 // 用户 ID，见 internal/oncall/escalation.go）、全局默认通知策略（team_id=""+
-// matchers=[]，R13.5 三级兜底链的最后一级）、两个 webhook 集成（grafana 用于
-// 仍需验证本地路由/分组/通知的场景①②/R13/⑤；generic 用于场景③）。真正的
-// Alertmanager 权威源由专门的 authority E2E 场景创建，不能复用来测试本地通知。
+// matchers=[]，R13.5 三级兜底链的最后一级）、两个 webhook 集成（generic 用于
+// 本地路由/分组/通知与 TTL；grafana 仅保留 hook 身份）。真正的 Alertmanager/
+// Grafana 权威源由专门的 authority E2E 创建，不能复用来测试本地通知。
 //
 // 所有等待时长都用秒级短配置压缩：group_wait/group_interval=1s 让分组尽快 flush，
 // escalation 两级 wait=0/6s，notification steps 的 warning 两级 wait=0/3s（对应
@@ -224,6 +224,8 @@ func seedConfig(ctx context.Context, sys *system, ids *seedIdentities) (*seedCon
 		return nil, fmt.Errorf("e2e: 创建种子通知策略失败: %w", err)
 	}
 
+	// Grafana 现为权威来源，本地编排场景必须走 generic；仍登记一条 grafana
+	// integration，供需要时核对 hook 轮换，但默认投递路径改为 generic。
 	grafanaWebhookPath, err := createIntegration(client, "grafana", "e2e-grafana")
 	if err != nil {
 		return nil, err

@@ -170,7 +170,8 @@ func alertmanagerPayload(fingerprint string, firing bool, startsAt time.Time) st
 // Project 调用点（unknown->firing 恢复、快照缺失）都必须触发 faultActivation 钩子。
 //
 // 三轮对账驱动状态机：
-//  1. 首次出现 fp1 firing -> 创建，不触发（previous 为空，非 unknown->firing）。
+//  1. 首次出现 fp1 firing -> 快照新建 occurrence，触发一次（webhook 丢失时对账是唯一
+//     入口；曾经不投影不触发，等同漏报）。
 //  2. 服务端不再返回 fp1 -> MarkMissingAfterSnapshot 判定 miss，MissingConfirmations
 //     强制 >=2，第一次 miss 只到 unknown，进入"快照缺失"调用点，触发一次。
 //  3. fp1 重新出现 firing -> UpsertAuthoritativeOccurrence 识别 previous=unknown ->
@@ -228,8 +229,8 @@ func TestReconciler_FaultActivationTriggeredOnBothPaths(t *testing.T) {
 	if _, err := reconciler.ReconcileSource(ctx, source.ID); err != nil {
 		t.Fatalf("第 1 轮对账失败: %v", err)
 	}
-	if trigger.callCount() != 0 {
-		t.Fatalf("首次创建不应触发 Fault 通知，got %d", trigger.callCount())
+	if trigger.callCount() != 1 {
+		t.Fatalf("快照首次出现的告警必须投影并触发 Fault 通知，got %d", trigger.callCount())
 	}
 
 	// 第 2 轮：快照缺失路径。
@@ -239,8 +240,8 @@ func TestReconciler_FaultActivationTriggeredOnBothPaths(t *testing.T) {
 	if _, err := reconciler.ReconcileSource(ctx, source.ID); err != nil {
 		t.Fatalf("第 2 轮对账失败: %v", err)
 	}
-	if trigger.callCount() != 1 {
-		t.Fatalf("快照缺失路径应触发一次，got %d", trigger.callCount())
+	if trigger.callCount() != 2 {
+		t.Fatalf("快照缺失路径应再触发一次（累计 2 次），got %d", trigger.callCount())
 	}
 
 	// 第 3 轮：unknown -> firing 恢复路径。
@@ -250,8 +251,8 @@ func TestReconciler_FaultActivationTriggeredOnBothPaths(t *testing.T) {
 	if _, err := reconciler.ReconcileSource(ctx, source.ID); err != nil {
 		t.Fatalf("第 3 轮对账失败: %v", err)
 	}
-	if trigger.callCount() != 2 {
-		t.Fatalf("恢复路径应再触发一次（累计 2 次），got %d", trigger.callCount())
+	if trigger.callCount() != 3 {
+		t.Fatalf("恢复路径应再触发一次（累计 3 次），got %d", trigger.callCount())
 	}
 }
 

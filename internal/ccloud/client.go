@@ -112,11 +112,40 @@ type healthItem struct {
 	SLAStandard float64  `json:"slaStandard"`
 }
 
+// Default 占位路径（任务 5）。真实平台路径未定时由装配方经 WithPaths / 配置覆盖，
+// 拿到真实接口后只改配置、不改代码（D2）。
+const (
+	DefaultPathFullLink = "/openapi/v1/topology/fulllink"
+	DefaultPathService  = "/openapi/v1/topology/service"
+	DefaultPathHealth   = "/openapi/v1/health"
+)
+
+// ClientPaths 是三个 Fetch 方法使用的 URL 路径，空字段回落 DefaultPath*。
+type ClientPaths struct {
+	FullLink string
+	Service  string
+	Health   string
+}
+
+func (p ClientPaths) withDefaults() ClientPaths {
+	if strings.TrimSpace(p.FullLink) == "" {
+		p.FullLink = DefaultPathFullLink
+	}
+	if strings.TrimSpace(p.Service) == "" {
+		p.Service = DefaultPathService
+	}
+	if strings.TrimSpace(p.Health) == "" {
+		p.Health = DefaultPathHealth
+	}
+	return p
+}
+
 // Client 是 ccloud API 的 HTTP 客户端，只读，不持有任何数据库依赖。
 type Client struct {
 	baseURL    string
 	tokenEnv   string
 	httpClient *http.Client
+	paths      ClientPaths
 }
 
 // NewClient 构造客户端。baseURL 为空时后续 Fetch 调用会报错（由调用方在装配阶段
@@ -127,13 +156,32 @@ func NewClient(baseURL, tokenEnv string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), tokenEnv: tokenEnv, httpClient: httpClient}
+	return &Client{
+		baseURL: strings.TrimRight(baseURL, "/"), tokenEnv: tokenEnv,
+		httpClient: httpClient, paths: ClientPaths{}.withDefaults(),
+	}
+}
+
+// WithPaths 覆盖占位路径。空字段保持默认，便于只改其中一个接口。
+func (c *Client) WithPaths(paths ClientPaths) *Client {
+	merged := c.paths
+	if strings.TrimSpace(paths.FullLink) != "" {
+		merged.FullLink = paths.FullLink
+	}
+	if strings.TrimSpace(paths.Service) != "" {
+		merged.Service = paths.Service
+	}
+	if strings.TrimSpace(paths.Health) != "" {
+		merged.Health = paths.Health
+	}
+	c.paths = merged.withDefaults()
+	return c
 }
 
 // FetchFullLinkTopology 拉取项目级全链路拓扑视图（含 APISIX/WAF，不含 RELY_NODE，
 // README §1）。
 func (c *Client) FetchFullLinkTopology(ctx context.Context, projectID string) (ProjectTopology, error) {
-	u, err := c.buildURL("/openapi/v1/topology/fulllink", url.Values{"projectId": {projectID}})
+	u, err := c.buildURL(c.paths.FullLink, url.Values{"projectId": {projectID}})
 	if err != nil {
 		return ProjectTopology{}, err
 	}
@@ -147,7 +195,7 @@ func (c *Client) FetchFullLinkTopology(ctx context.Context, projectID string) (P
 // FetchServiceTopology 拉取单应用的服务拓扑视图（含 RELY_NODE/EXTERNAL_HTTP_SERVER，
 // 不含 APISIX/WAF，且全部 12 条边都围绕该 appId，README §1）。
 func (c *Client) FetchServiceTopology(ctx context.Context, appID string) (ServiceTopology, error) {
-	u, err := c.buildURL("/openapi/v1/topology/service", url.Values{"appId": {appID}})
+	u, err := c.buildURL(c.paths.Service, url.Values{"appId": {appID}})
 	if err != nil {
 		return ServiceTopology{}, err
 	}
@@ -164,7 +212,7 @@ func (c *Client) FetchAppHealth(ctx context.Context, appIDs []string) ([]AppHeal
 	if len(appIDs) == 0 {
 		return nil, nil
 	}
-	u, err := c.buildURL("/openapi/v1/health", url.Values{"appIds": {strings.Join(appIDs, ",")}})
+	u, err := c.buildURL(c.paths.Health, url.Values{"appIds": {strings.Join(appIDs, ",")}})
 	if err != nil {
 		return nil, err
 	}

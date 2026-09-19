@@ -67,6 +67,8 @@ func runTestMain(m *testing.M) (int, error) {
 		// 结构体字面量不经过 config.Load，必须显式给出与生产默认一致的合法留存配置；
 		// 首轮清理在 1h 后，不会在用例运行期间删除断言依赖的数据。
 		Retention: config.RetentionConfig{TimersDays: 7, NotificationLogDays: 90, SweepInterval: time.Hour, BatchSize: 1000},
+		// P2 Fault 通知冷却必须 >0，否则 QueueFaultActivated 跳过 R5.3 判定。
+		FaultNotify: config.FaultNotifyConfig{Cooldown: 30 * time.Minute},
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -131,7 +133,7 @@ func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {
 	alertname := "e2e-s1-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -229,7 +231,7 @@ func TestScenario2_SilenceSuppressesThenResumesRepeat(t *testing.T) {
 	alertname := "e2e-s2-" + uniqueSuffix()
 	startsAt := time.Now()
 	post := func() {
-		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+		if _, _, err := client.postManagedHook(seedResult.GenericWebhookPath,
 			compatibleWebhookPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}
@@ -317,7 +319,7 @@ func TestScenarioR13_ChannelEscalationEmailThenLark(t *testing.T) {
 	alertname := "e2e-r13-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "warning", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -367,7 +369,7 @@ func TestScenario5_UngroupedRouteStillNotifies(t *testing.T) {
 	alertname := "e2e-s5-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}

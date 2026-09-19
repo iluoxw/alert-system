@@ -70,21 +70,38 @@ type ImportResult struct {
 	DroppedExternalHTTP int
 }
 
-// nodeClass 是节点分类判据的结果，只用于本文件内部的边处理分支。
-type nodeClass int
+// NodeClass 是节点分类判据的结果。syncer 用它决定哪些节点进入快照、哪些只写
+// 待对齐队列；比较逻辑仍只在 classify 一处。
+type NodeClass int
 
 const (
-	classUnknown nodeClass = iota
-	classApp
-	classPlatform
-	classRelyNode
-	classExternalHTTP
+	NodeClassUnknown NodeClass = iota
+	NodeClassApp
+	NodeClassPlatform
+	NodeClassRelyNode
+	NodeClassExternalHTTP
 )
+
+const (
+	classUnknown      = NodeClassUnknown
+	classApp          = NodeClassApp
+	classPlatform     = NodeClassPlatform
+	classRelyNode     = NodeClassRelyNode
+	classExternalHTTP = NodeClassExternalHTTP
+)
+
+// ClassifyNode 导出分类判据，供 syncer 在构建 TopologySnapshot 时复用，避免再
+// 写一套 nodeType/serviceType 规则。
+func ClassifyNode(n TopologyNode) NodeClass { return classify(n) }
+
+// IsLegalHostPort 导出 host:port 合法性判定，供 syncer 决定是否给 RELY_NODE
+// 额外写一条便于人识别的 alias。
+func IsLegalHostPort(s string) bool { return isLegalHostPort(s) }
 
 // classify 判定节点类型：nodeType 非空时用它，为空回落 serviceType（唯一的空
 // nodeType 样本是 EXTERNAL_HTTP_SERVER，见 testdata/README.md §4）；比较前一律
 // TrimSpace（serviceType 有前导空格，如 " POSTGRESQL"）。
-func classify(n TopologyNode) nodeClass {
+func classify(n TopologyNode) NodeClass {
 	t := strings.TrimSpace(n.NodeType)
 	if t == "" {
 		t = n.TrimmedServiceType()

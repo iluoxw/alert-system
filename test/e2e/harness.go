@@ -12,6 +12,7 @@ import (
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
+	"alert-system/internal/ccloud"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	incidentservice "alert-system/internal/incident"
@@ -55,9 +56,10 @@ type system struct {
 	Services             *store.ServiceCatalogRepo
 	AlertMappings        *store.AlertMappingRepo
 
-	scheduler  *scheduler.Scheduler
-	pipeline   *pipeline.Pipeline
-	reconciler *alertsource.Reconciler
+	scheduler    *scheduler.Scheduler
+	pipeline     *pipeline.Pipeline
+	reconciler   *alertsource.Reconciler
+	ccloudSyncer *ccloud.Syncer
 }
 
 // buildSystem 组装全部依赖并起一个 httptest.Server，但不启动 scheduler/pipeline
@@ -168,6 +170,8 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	runbookService := runbook.NewService(st, incidents, runbooks, runbook.DisabledExecutor{})
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterFaultRoutes(faults)
+	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterMemberRoutes(teams, users, memberships)
@@ -177,6 +181,16 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)
+
+	var ccloudSyncer *ccloud.Syncer
+	if cfg.CCloud.Enabled() {
+		client := ccloud.NewClient(cfg.CCloud.BaseURL, cfg.CCloud.TokenEnv, nil).WithPaths(ccloud.ClientPaths{
+			FullLink: cfg.CCloud.PathFullLink,
+			Service:  cfg.CCloud.PathService,
+			Health:   cfg.CCloud.PathHealth,
+		})
+		ccloudSyncer = ccloud.NewSyncer(st, topology, client, cfg.CCloud.ProjectIDs, cfg.CCloud.Environment, cfg.CCloud.SyncInterval, logger)
+	}
 
 	return &system{
 		Store:                st,
@@ -202,6 +216,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		scheduler:            sched,
 		pipeline:             pl,
 		reconciler:           reconciler,
+		ccloudSyncer:         ccloudSyncer,
 	}, nil
 }
 
@@ -210,6 +225,9 @@ func (s *system) run(ctx context.Context) {
 	go s.scheduler.Run(ctx)
 	go s.pipeline.Run(ctx)
 	go s.reconciler.Run(ctx)
+	if s.ccloudSyncer != nil {
+		go s.ccloudSyncer.Run(ctx)
+	}
 }
 
 // close 关闭 httptest.Server 与数据库连接池。

@@ -65,6 +65,7 @@ export function Silences() {
       deleteFn={deleteSilence}
       deleteConfirmTitle="删除后立即恢复相关告警通知，确认删除该静默？"
       columns={columns}
+      extraToolbar={<span className="resource-toolbar__hint">仅对 generic 来源生效。Alertmanager / Grafana 权威来源不经过本地静默。</span>}
       renderFields={() => (
         <>
           <Form.Item

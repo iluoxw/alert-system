@@ -408,6 +408,7 @@ func TestLoad_CCloudSyncIntervalZeroShortCircuits(t *testing.T) {
 }
 
 func TestLoad_CCloudEnvOverrides(t *testing.T) {
+	t.Setenv("CCLOUD_ENVIRONMENT", "production")
 	t.Setenv("CCLOUD_BASE_URL", "https://ccloud.example.com")
 	t.Setenv("CCLOUD_TOKEN_ENV", "CCLOUD_API_TOKEN")
 	t.Setenv("CCLOUD_PROJECT_IDS", "proj-a, proj-b,,proj-c ")
@@ -419,6 +420,9 @@ func TestLoad_CCloudEnvOverrides(t *testing.T) {
 	}
 	if cfg.CCloud.BaseURL != "https://ccloud.example.com" {
 		t.Errorf("CCloud.BaseURL = %q", cfg.CCloud.BaseURL)
+	}
+	if cfg.CCloud.Environment != "production" {
+		t.Errorf("CCloud.Environment = %q, want production", cfg.CCloud.Environment)
 	}
 	if cfg.CCloud.TokenEnv != "CCLOUD_API_TOKEN" {
 		t.Errorf("CCloud.TokenEnv = %q", cfg.CCloud.TokenEnv)
@@ -434,6 +438,19 @@ func TestLoad_CCloudEnvOverrides(t *testing.T) {
 	}
 	if cfg.CCloud.SyncInterval != 5*time.Minute {
 		t.Errorf("CCloud.SyncInterval = %v, want 5m", cfg.CCloud.SyncInterval)
+	}
+}
+
+func TestLoad_CCloudPathOverrides(t *testing.T) {
+	t.Setenv("CCLOUD_PATH_FULLLINK", "/real/fulllink")
+	t.Setenv("CCLOUD_PATH_SERVICE", "/real/service")
+	t.Setenv("CCLOUD_PATH_HEALTH", "/real/health")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CCloud.PathFullLink != "/real/fulllink" || cfg.CCloud.PathService != "/real/service" || cfg.CCloud.PathHealth != "/real/health" {
+		t.Fatalf("paths = %+v", cfg.CCloud)
 	}
 }
 
@@ -453,7 +470,9 @@ func TestLoad_CCloudEnableSwitch(t *testing.T) {
 		// 配了 BASE_URL 却缺 PROJECT_IDS 是配置错误，必须启动期失败。
 		{"配 BASE_URL 缺 PROJECT_IDS 启动失败", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com"}, true, false},
 		{"interval=0 显式关闭", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_SYNC_INTERVAL": "0s"}, false, false},
-		{"完整配置启用", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_PROJECT_IDS": "proj-a"}, false, true},
+		// 平台响应没有环境字段，启用时必须显式声明，缺失即启动失败（不得用项目 ID 代替）。
+		{"配 BASE_URL 缺 ENVIRONMENT 启动失败", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_PROJECT_IDS": "proj-a"}, true, false},
+		{"完整配置启用", map[string]string{"CCLOUD_BASE_URL": "https://ccloud.example.com", "CCLOUD_PROJECT_IDS": "proj-a", "CCLOUD_ENVIRONMENT": "production"}, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

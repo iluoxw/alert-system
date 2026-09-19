@@ -21,6 +21,7 @@ import (
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
+	"alert-system/internal/ccloud"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	"alert-system/internal/events"
@@ -185,6 +186,8 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterFaultRoutes(faults)
+	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterMemberRoutes(teams, users, memberships)
@@ -208,6 +211,15 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	go sched.Run(ctx)
 	go pl.Run(ctx)
 	go alertSourceReconciler.Run(ctx)
+	// ccloud 拓扑同步：仅在 Enabled() 时启动（D1），失败不阻断进程（R2.9）。
+	if cfg.CCloud.Enabled() {
+		client := ccloud.NewClient(cfg.CCloud.BaseURL, cfg.CCloud.TokenEnv, nil).WithPaths(ccloud.ClientPaths{
+			FullLink: cfg.CCloud.PathFullLink,
+			Service:  cfg.CCloud.PathService,
+			Health:   cfg.CCloud.PathHealth,
+		})
+		go ccloud.NewSyncer(st, topology, client, cfg.CCloud.ProjectIDs, cfg.CCloud.Environment, cfg.CCloud.SyncInterval, logger).Run(ctx)
+	}
 
 	select {
 	case <-ctx.Done():

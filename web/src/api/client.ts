@@ -1121,6 +1121,11 @@ export interface Fault {
   entity_ref: string
   confidence: number
   metadata: Record<string, unknown>
+  owner_team_id?: string
+  acked_by?: string
+  acked_by_name?: string
+  acked_at?: string
+  owner_notified_at?: string
   first_detected_at: string
   last_evaluated_at: string
   resolved_at?: string
@@ -1233,12 +1238,30 @@ export function updateManagedEntity(id: string, body: ManagedEntityRequest): Pro
   return request(`/admin/entities/${id}`, { method: 'PUT', body: JSON.stringify(body) })
 }
 
+export interface UnresolvedIdentity {
+  namespace: string
+  value: string
+  host_port: string
+  service_type: string
+  first_seen: string
+  last_seen: string
+  sample_app: string
+}
+
+export function listUnresolvedIdentities(): Promise<{ items: UnresolvedIdentity[] }> {
+  return request('/admin/topology/unresolved')
+}
+
 export function listFaults(status?: FaultStatus): Promise<{ items: Fault[] }> {
   return request(`/faults${withQuery({ status })}`)
 }
 
 export function getFault(id: string): Promise<FaultDetailResponse> {
   return request(`/faults/${id}`)
+}
+
+export function ackFault(id: string): Promise<{ fault: Fault }> {
+  return request(`/faults/${id}/ack`, { method: 'POST' })
 }
 
 export function decideFaultEvidence(faultId: string, alertId: string, body: {

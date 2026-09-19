@@ -45,6 +45,14 @@ export function impactTotals(detail?: FaultDetailResponse) {
 }
 
 export function ownerTeam(fault: Fault, nodes: Map<string, ResourceNode>, teams: Map<string, string>) {
-  const teamID = fault.resource_node_id ? nodes.get(fault.resource_node_id)?.owner_team_id : undefined
+  const teamID = fault.owner_team_id || (fault.resource_node_id ? nodes.get(fault.resource_node_id)?.owner_team_id : undefined)
   return teamID ? teams.get(teamID) || teamID : '未登记团队'
+}
+
+export function isFaultAcked(fault: Fault) {
+  return Boolean(fault.acked_at)
+}
+
+export function ackLabel(fault: Fault) {
+  return isFaultAcked(fault) ? (fault.acked_by_name || '已认领') : '未认领'
 }

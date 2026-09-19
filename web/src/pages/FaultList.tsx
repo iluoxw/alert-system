@@ -6,6 +6,7 @@ import { Link } from 'react-router-dom'
 import type { Fault, FaultDetailResponse, FaultImpact, ResourceNode } from '../api/client'
 import { getFault, getInfrastructureOverview, listTeamsLite } from '../api/client'
 import {
+  ackLabel,
   duration,
   faultDisplayID,
   faultStatusLabel,
@@ -80,7 +81,8 @@ export function FaultList() {
             <div className="fault-ledger-table" role="table" aria-label="活动故障工作队列">
               <div className="fault-ledger-table__header" role="row">
                 <span role="columnheader">故障 / 实体</span><span role="columnheader">影响</span>
-                <span role="columnheader">负责团队</span><span role="columnheader">持续</span><span role="columnheader">状态</span>
+                <span role="columnheader">负责团队</span><span role="columnheader">认领</span>
+                <span role="columnheader">持续</span><span role="columnheader">状态</span>
               </div>
               {sortedFaults.map((fault: Fault) => {
                 const totals = impactTotals(detailByID.get(fault.id))
@@ -103,6 +105,7 @@ export function FaultList() {
                       <b className="is-confirmed">{totals.confirmed}</b><b className="is-potential">{totals.potential}</b><b className="is-ruled-out">{totals.ruled_out}</b>
                     </span>
                     <span role="cell">{ownerTeam(fault, nodeByID, teamByID)}</span>
+                    <span role="cell">{ackLabel(fault)}</span>
                     <span role="cell">{duration(fault.first_detected_at)}</span>
                     <span role="cell"><em className={`ledger-state is-${fault.status}`}>{faultStatusLabel[fault.status]}</em></span>
                   </button>

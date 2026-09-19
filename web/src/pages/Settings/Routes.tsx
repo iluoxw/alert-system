@@ -51,6 +51,7 @@ export function RoutesPage() {
       updateFn={updateRoute}
       deleteFn={deleteRoute}
       columns={columns}
+      extraToolbar={<span className="resource-toolbar__hint">仅对 generic 来源生效。Alertmanager / Grafana 权威来源不经过本地路由与分组。</span>}
       renderFields={() => (
         <>
           <Form.Item

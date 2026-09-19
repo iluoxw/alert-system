@@ -68,6 +68,7 @@ const (
 // AlertSource 把 integration 登记、同步水位和当前镜像统计组合成管理面读模型。
 type AlertSource struct {
 	ID              string
+	Kind            string
 	Name            string
 	Enabled         bool
 	DefaultSeverity string
@@ -126,7 +127,7 @@ type AlertSourceRepo struct{}
 func NewAlertSourceRepo() *AlertSourceRepo { return &AlertSourceRepo{} }
 
 const alertSourceSelect = `
-	i.id::text, i.name, i.enabled, i.default_severity, i.config,
+	i.id::text, i.kind, i.name, i.enabled, i.default_severity, i.config,
 	s.last_webhook_at, s.last_reconcile_at, s.last_success_at, s.last_error_at,
 	COALESCE(s.last_error, ''), COALESCE(s.consecutive_failures, 0), COALESCE(s.snapshot_version, 0),
 	count(a.id) FILTER (WHERE a.source_state = 'firing'),
@@ -140,7 +141,7 @@ func scanAlertSource(row alertRowScanner) (AlertSource, error) {
 	var raw []byte
 	var lastWebhook, lastReconcile, lastSuccess, lastError *time.Time
 	if err := row.Scan(
-		&s.ID, &s.Name, &s.Enabled, &s.DefaultSeverity, &raw,
+		&s.ID, &s.Kind, &s.Name, &s.Enabled, &s.DefaultSeverity, &raw,
 		&lastWebhook, &lastReconcile, &lastSuccess, &lastError,
 		&s.LastError, &s.ConsecutiveFailures, &s.SnapshotVersion,
 		&s.FiringCount, &s.UnknownCount, &s.SuppressedCount,

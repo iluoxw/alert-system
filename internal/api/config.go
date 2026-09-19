@@ -364,14 +364,14 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == domain.SourceKindAlertmanager {
+	if domain.IsAuthoritativeSourceKind(req.Kind) {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
 			return
 		}
 		if cfg.APIURL != "" {
-			if err := alertsource.ValidateConfig(cfg); err != nil {
+			if err := alertsource.ValidateConfig(req.Kind, cfg); err != nil {
 				unprocessable(c, err.Error())
 				return
 			}
@@ -474,14 +474,14 @@ func (h *configHandlers) updateIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == domain.SourceKindAlertmanager {
+	if domain.IsAuthoritativeSourceKind(req.Kind) {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
 			return
 		}
 		if cfg.APIURL != "" {
-			if err := alertsource.ValidateConfig(cfg); err != nil {
+			if err := alertsource.ValidateConfig(req.Kind, cfg); err != nil {
 				unprocessable(c, err.Error())
 				return
 			}

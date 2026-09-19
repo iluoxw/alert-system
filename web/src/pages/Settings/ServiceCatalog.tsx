@@ -8,13 +8,22 @@ import type { ColumnsType } from 'antd/es/table'
 import { ApartmentOutlined, AppstoreOutlined, DatabaseOutlined, EditOutlined, PlusOutlined, TeamOutlined } from '@ant-design/icons'
 import type {
   EntityAlias, ManagedEntityRequest, ResourceNode, ServiceDependencyRequest, ServiceRegistration, ServiceRequest, ServiceTier,
+  UnresolvedIdentity,
 } from '../../api/client'
 import {
   createManagedEntity, createService, getInfrastructureNode, listInfrastructureNodes, listServices, listTeamsLite,
-  updateManagedEntity, updateServiceRegistration,
+  listUnresolvedIdentities, updateManagedEntity, updateServiceRegistration,
 } from '../../api/client'
 
 const { Text } = Typography
+
+function isLegalHostPort(value: string) {
+  const idx = value.lastIndexOf(':')
+  if (idx <= 0 || idx === value.length - 1) return false
+  const host = value.slice(0, idx).trim()
+  const port = Number(value.slice(idx + 1))
+  return host.length > 0 && Number.isInteger(port) && port > 0
+}
 
 interface ServiceFormValues extends Omit<ServiceRequest, 'aliases'> {
   aliases: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
@@ -41,11 +50,16 @@ export function ServiceCatalog() {
   const [open, setOpen] = useState(false)
   const [editingEntity, setEditingEntity] = useState<ResourceNode | null>(null)
   const [entityOpen, setEntityOpen] = useState(false)
+  const [aligning, setAligning] = useState<UnresolvedIdentity | null>(null)
+  const [alignEntityID, setAlignEntityID] = useState('')
+  const [aligningSaving, setAligningSaving] = useState(false)
   const serviceQuery = useQuery({ queryKey: ['services'], queryFn: async () => (await listServices(500)).services })
   const teamQuery = useQuery({ queryKey: ['teams-lite'], queryFn: async () => (await listTeamsLite(500)).teams })
   const entityQuery = useQuery({ queryKey: ['infrastructure-nodes'], queryFn: async () => (await listInfrastructureNodes()).items })
+  const unresolvedQuery = useQuery({ queryKey: ['topology-unresolved'], queryFn: async () => (await listUnresolvedIdentities()).items })
   const services = useMemo(() => serviceQuery.data ?? [], [serviceQuery.data])
   const entities = useMemo(() => entityQuery.data ?? [], [entityQuery.data])
+  const unresolved = useMemo(() => unresolvedQuery.data ?? [], [unresolvedQuery.data])
   const managedProviders = useMemo(() => entities.filter((entity) => entity.managed && entity.source === 'entity_registry'), [entities])
   const watchedEnvironment = Form.useWatch('environment', form)
   const dependencyTargets = useMemo(() => entities.filter((entity) => (
@@ -223,6 +237,63 @@ export function ServiceCatalog() {
     },
   ]
 
+  const alignIdentity = async () => {
+    if (!aligning || !alignEntityID) return
+    setAligningSaving(true)
+    try {
+      const detail = await getInfrastructureNode(alignEntityID)
+      const node = detail.node
+      if (!node.owner_team_id || (node.layer !== 'infrastructure' && node.layer !== 'platform')) {
+        throw new Error('只能对齐到已登记负责团队的受管实体')
+      }
+      const aliases = detail.aliases.map(({ namespace, value, enabled }) => ({ namespace, value, enabled }))
+      const addAlias = (namespace: string, value: string) => {
+        if (!value || aliases.some((alias) => alias.namespace === namespace && alias.value === value)) return
+        aliases.push({ namespace, value, enabled: true })
+      }
+      addAlias(aligning.namespace, aligning.value)
+      if (isLegalHostPort(aligning.host_port)) {
+        addAlias(aligning.namespace, aligning.host_port)
+      }
+      await updateManagedEntity(alignEntityID, {
+        entity_key: node.entity_key,
+        layer: node.layer,
+        name: node.name,
+        provider: node.provider ?? '',
+        environment: node.environment ?? 'prod',
+        owner_team_id: node.owner_team_id,
+        labels: node.labels,
+        aliases,
+        dependencies: detail.dependencies.map((dependency) => ({
+          to_entity_id: dependency.to_node_id,
+          criticality: dependency.criticality ?? 'medium',
+        })),
+      })
+      messageApi.success('别名已写入，下一轮拓扑同步会自动并入')
+      setAligning(null)
+      setAlignEntityID('')
+      void queryClient.invalidateQueries({ queryKey: ['topology-unresolved'] })
+      void queryClient.invalidateQueries({ queryKey: ['infrastructure-nodes'] })
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '对齐失败')
+    } finally {
+      setAligningSaving(false)
+    }
+  }
+
+  const unresolvedColumns: ColumnsType<UnresolvedIdentity> = [
+    { title: '命名空间', dataIndex: 'namespace', width: 180 },
+    { title: '外部标识', dataIndex: 'value', render: (value: string) => <code>{value}</code> },
+    { title: 'host:port', dataIndex: 'host_port', width: 160, render: (value: string) => value || '—' },
+    { title: '类型', dataIndex: 'service_type', width: 140, render: (value: string) => value || '—' },
+    { title: '样本应用', dataIndex: 'sample_app', width: 220, render: (value: string) => value ? <code>{value}</code> : '—' },
+    { title: '最近出现', dataIndex: 'last_seen', width: 180, render: (value: string) => value ? new Date(value).toLocaleString() : '—' },
+    {
+      title: '', key: 'actions', width: 88, align: 'right',
+      render: (_, row) => <Button type="link" onClick={() => { setAligning(row); setAlignEntityID('') }}>对齐</Button>,
+    },
+  ]
+
   const entityColumns: ColumnsType<ResourceNode> = [
     {
       title: '依赖实体', key: 'entity',
@@ -255,7 +326,7 @@ export function ServiceCatalog() {
         <Col span={6}><Card><Statistic title="应用服务" value={services.length} prefix={<AppstoreOutlined />} /></Card></Col>
         <Col span={6}><Card><Statistic title="依赖实体" value={managedProviders.length} prefix={<DatabaseOutlined />} /></Card></Col>
         <Col span={6}><Card><Statistic title="责任团队" value={new Set(services.map((item) => item.owner_team_id)).size} prefix={<TeamOutlined />} /></Card></Col>
-        <Col span={6}><Card><Statistic title="显式依赖关系" value={services.reduce((sum, item) => sum + item.dependencies.length, 0)} prefix={<ApartmentOutlined />} /></Card></Col>
+        <Col span={6}><Card><Statistic title="待对齐身份" value={unresolved.length} prefix={<ApartmentOutlined />} /></Card></Col>
       </Row>
       <Card className="source-registry-card entity-relation-card">
         <Tabs items={[
@@ -266,6 +337,10 @@ export function ServiceCatalog() {
           {
             key: 'entities', label: `基础设施 / 平台 ${managedProviders.length}`,
             children: <><div className="catalog-tab-toolbar"><div><strong>受管依赖实体</strong><span>登记可被多个应用共享的基础设施或平台能力；自动发现实体保持只读。</span></div><Button type="primary" icon={<PlusOutlined />} onClick={openEntityCreate}>登记依赖实体</Button></div><Table rowKey="id" columns={entityColumns} dataSource={managedProviders} loading={entityQuery.isLoading} pagination={false} scroll={{ x: 900 }} locale={{ emptyText: '尚未登记共享依赖实体。可先登记 Kubernetes、数据库、Kafka 等平台能力。' }} /></>,
+          },
+          {
+            key: 'unresolved', label: `待对齐身份 ${unresolved.length}`,
+            children: <><div className="catalog-tab-toolbar"><div><strong>未对齐的平台节点</strong><span>选择已有 canonical 实体写入别名；下一轮 ccloud 同步会自动并入，不会新建实体。</span></div></div><Table rowKey={(row) => `${row.namespace}:${row.value}`} columns={unresolvedColumns} dataSource={unresolved} loading={unresolvedQuery.isLoading} pagination={false} scroll={{ x: 1100 }} locale={{ emptyText: '当前没有待对齐身份。' }} /></>,
           },
         ]} />
       </Card>
@@ -397,6 +472,25 @@ export function ServiceCatalog() {
             </Form.List>
           </section>
         </Form>
+      </Modal>
+
+      <Modal title="对齐到 canonical 实体" open={Boolean(aligning)} okText="写入别名" cancelText="取消"
+        confirmLoading={aligningSaving} onCancel={() => { setAligning(null); setAlignEntityID('') }}
+        onOk={() => void alignIdentity()} destroyOnHidden>
+        <p>{aligning ? `${aligning.namespace} = ${aligning.value}` : ''}</p>
+        <Select
+          style={{ width: '100%' }}
+          virtual={false}
+          showSearch
+          optionFilterProp="label"
+          placeholder="选择已有受管实体，禁止手输 UUID"
+          value={alignEntityID || undefined}
+          onChange={setAlignEntityID}
+          options={managedProviders.map((entity) => ({
+            value: entity.id,
+            label: `${entity.name} · ${entity.entity_key} · ${entity.layer}`,
+          }))}
+        />
       </Modal>
     </div>
   )

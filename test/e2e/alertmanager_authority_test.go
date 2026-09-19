@@ -10,11 +10,14 @@ import (
 )
 
 type alertmanagerMock struct {
-	mu        sync.RWMutex
-	mode      string
-	startsAt  time.Time
-	updatedAt time.Time
-	fp        string
+	mu         sync.RWMutex
+	mode       string
+	startsAt   time.Time
+	updatedAt  time.Time
+	fp         string
+	alertsPath string
+	alertname  string
+	labelKey   string
 }
 
 func (m *alertmanagerMock) setMode(mode string, updatedAt time.Time) {
@@ -27,7 +30,11 @@ func (m *alertmanagerMock) setMode(mode string, updatedAt time.Time) {
 }
 
 func (m *alertmanagerMock) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/api/v2/alerts" {
+	alertsPath := m.alertsPath
+	if alertsPath == "" {
+		alertsPath = "/api/v2/alerts"
+	}
+	if r.URL.Path != alertsPath {
 		http.NotFound(w, r)
 		return
 	}
@@ -59,8 +66,8 @@ func (m *alertmanagerMock) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		"endsAt":       time.Time{}.Format(time.RFC3339Nano),
 		"generatorURL": "http://prometheus.test/graph",
 		"labels": map[string]string{
-			"alertname": "SREControlAuthorityProbe", "severity": "critical", "service": "cch",
-			"authority_e2e": fp,
+			"alertname": firstNonEmpty(m.alertname, "SREControlAuthorityProbe"), "severity": "critical", "service": "cch",
+			firstNonEmpty(m.labelKey, "authority_e2e"): fp,
 		},
 		"status": status,
 	}})
@@ -235,6 +242,15 @@ func assertAlertAxesEventually(t *testing.T, client *apiClient, alertID, source,
 		return err == nil && alert.SourceState == source && alert.ResponseState == response &&
 			alert.SuppressionState == suppression && alert.ReconcileMissCount == misses
 	}, "Alert 三轴达到预期")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func assertNoLocalNotification(t *testing.T, alertID string) {

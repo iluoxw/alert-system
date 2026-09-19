@@ -123,28 +123,14 @@ func uniqueSuffix() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&suffixCounter, 1))
 }
 
-// compatibleWebhookPayload 构造 Alertmanager template.Data 兼容格式的单条 webhook；
-// 既有本地编排场景通过 kind=grafana 接入，避免越过 Alertmanager 权威边界。
+// compatibleWebhookPayload 构造本地编排场景用的 generic 信封。Grafana 已是权威来源
+// （必须带 fingerprint，且不经过本地 route/group/silence），这些场景改走 generic。
 func compatibleWebhookPayload(alertname, severity, status string, startsAt time.Time, extraLabels map[string]string) []byte {
 	labels := map[string]string{"alertname": alertname, "severity": severity}
 	for k, v := range extraLabels {
 		labels[k] = v
 	}
-	body := map[string]any{
-		"version":  "4",
-		"status":   status,
-		"receiver": "e2e",
-		"alerts": []map[string]any{
-			{
-				"status":      status,
-				"labels":      labels,
-				"annotations": map[string]string{"summary": alertname + " 测试告警"},
-				"startsAt":    startsAt.Format(time.RFC3339Nano),
-				"endsAt":      "0001-01-01T00:00:00Z",
-			},
-		},
-	}
-	return mustJSON(body)
+	return genericAlertPayload(alertname, severity, status, "source", 0, startsAt, labels)
 }
 
 // genericAlertPayload 构造一条 kind=generic 的 ingest 请求体：唯一能显式指定

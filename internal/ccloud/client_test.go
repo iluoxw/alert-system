@@ -239,6 +239,24 @@ func TestFetch_MissingTokenEnvErrors(t *testing.T) {
 	}
 }
 
+func TestFetch_CustomPathsOverridePlaceholders(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"nodes":[],"edges":[]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", nil).WithPaths(ClientPaths{FullLink: "/real/fulllink"})
+	if _, err := c.FetchFullLinkTopology(context.Background(), "proj-1"); err != nil {
+		t.Fatalf("FetchFullLinkTopology() error = %v", err)
+	}
+	if gotPath != "/real/fulllink" {
+		t.Fatalf("path = %q, want /real/fulllink", gotPath)
+	}
+}
+
 func serveFixture(t *testing.T, w http.ResponseWriter, path string) {
 	t.Helper()
 	data, err := os.ReadFile(path)

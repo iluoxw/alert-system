@@ -165,11 +165,12 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 		}
 		result.SnapshotVersion = version
 		for _, event := range events {
-			alert, _, previous, err := r.alerts.UpsertAuthoritativeOccurrence(ctx, tx, event, sourceID, at, version)
+			alert, created, previous, err := r.alerts.UpsertAuthoritativeOccurrence(ctx, tx, event, sourceID, at, version)
 			if err != nil {
 				return err
 			}
-			if previous == domain.SourceStateUnknown && alert.SourceState == domain.SourceStateFiring {
+			recovered := previous == domain.SourceStateUnknown && alert.SourceState == domain.SourceStateFiring
+			if recovered {
 				result.Recovered++
 				if _, err := r.timeline.Append(ctx, tx, domain.TimelineEntry{
 					AlertID: alert.ID, Actor: "alertmanager-reconciler",
@@ -177,6 +178,12 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 				}); err != nil {
 					return err
 				}
+			}
+			// 快照里首次出现的 occurrence（webhook 丢失或延迟时的唯一入口）与恢复一样必须
+			// 投影并触发 Fault 通知：对账本就是 webhook 的兜底（不变量 14），Fault 通知又由
+			// 本系统负责（不变量 22），漏掉这里等同漏报。webhook 先到时对账只会命中已有
+			// 行（created=false），不会重复投影。
+			if recovered || created {
 				if r.projector != nil {
 					mappingResult, err := r.projector.Project(ctx, tx, alert)
 					if err != nil {
