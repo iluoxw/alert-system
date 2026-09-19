@@ -339,7 +339,7 @@
   - _Requirements: R10.2_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go + React/TS | Task: 日报追加指标小节，总览增加卡片 | Restrictions: 不新建报表体系或页面；不新增一级导航；空数据展示需明确 | Success: 日报渲染测试通过；前端 build 与 oxlint 通过 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 39. /readyz 增强
+- [x] 39. /readyz 增强
   - File: internal/api/directory.go, internal/api/directory_test.go
   - 增加 scheduler/pipeline 最近一次成功轮询距今天数，超过 3× 轮询间隔返回 503；/healthz 保持恒 200
   - Purpose: 让 scheduler/管道静默停摆可见
@@ -347,7 +347,7 @@
   - _Requirements: R10.3, R10.5_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 扩展 readyz 判定并在停摆时返回 503 | Restrictions: 不得改动 /healthz 语义；不得让 readyz 依赖外部 IO（ccloud 不可用不应导致 503）；k8s 探针切换属于人工动作，不在本任务内执行 | Success: 单测覆盖正常、超期 503、外部 IO 不可用仍 200 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 40. 通知最终失败兜底
+- [x] 40. 通知最终失败兜底
   - File: internal/notify/sender.go, internal/scheduler 相关 handler
   - notify_send 最终失败 → 向 fallback target 发送一次元告警（不重试风暴）
   - Purpose: 让发送失败被人感知，而不是静默丢弃
