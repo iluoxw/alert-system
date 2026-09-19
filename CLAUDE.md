@@ -36,7 +36,7 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 - `cmd/server/` 薄入口；`internal/app/` 共享装配（wiring），cmd 与 test/e2e 共用，**不要在两处手写重复装配**
 - `internal/domain/` 纯函数领域层（状态机、matcher、指纹）；`internal/store/` 仓储（所有方法带 `tx pgx.Tx` 参数，事务由调用方开）
 - `internal/pipeline/` 管道 stage；`internal/ingest/` webhook 接入 + AM/Grafana 适配器；`internal/scheduler/` 统一定时器；`internal/oncall/` 值班与人员升级链；`internal/notify/` 通知策略/渠道/生命周期；`internal/api/` HTTP 层
-- `migrations/` golang-migrate 格式，编号顺延（当前到 000025）；`test/e2e/` docker-compose 真实 PG，覆盖 Alertmanager 权威同步与服务目录映射等通用场景
+- `migrations/` golang-migrate 格式，编号顺延（当前到 000027；000028 预留给 era3 任务 28）；`test/e2e/` docker-compose 真实 PG，覆盖 Alertmanager 权威同步与服务目录映射等通用场景
 
 ## 核心架构不变量（改代码前必读）
 
