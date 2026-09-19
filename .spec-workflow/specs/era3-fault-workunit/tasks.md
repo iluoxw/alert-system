@@ -62,15 +62,17 @@
   - _Requirements: R1.1, R1.2, R1.7, R2.3, R2.4, R2.5, R2.8_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 领域建模工程师 | Task: 实现 MapTopology 纯函数，表驱动测试覆盖方向取自 from/to、自环丢弃、totalCount=0 标 stale、`:0` 进 Unresolved、同输入重放结果一致 | Restrictions: 不得 import store 或 database 相关包；不得写库；不得依据 info 中的名字推断身份 | Success: 单测全绿且耗尽平台样例数据；Unresolved 不产生任何实体 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 7. 迁移 000027：unresolved_identities
+- [-] 7. 迁移 000027：unresolved_identities
   - File: migrations/000027_ccloud_topology.up.sql, migrations/000027_ccloud_topology.down.sql
   - 建 unresolved_identities(namespace, value, first_seen, last_seen, sample_app, PRIMARY KEY(namespace, value))；确认 topology_sync_runs 是否已存在（ImportSnapshot 已在用），需要时补 source='ccloud' 枚举约束
+  - **追加（2026-09-19 主对话裁决）**：`dependency_edges` 增 `no_recent_traffic BOOLEAN NOT NULL DEFAULT false`，承载平台 `totalCount=0`
+    （统计窗口内无流量）。按 ADR-0006 该类边标 stale，但"无流量"与"observed 数据过期"语义不同，必须显式落列，不得复用按 `observed_at` 动态计算的过期判定
   - Purpose: 承载 R1 的待对齐队列
   - _Leverage: 现有迁移风格（去掉枚举约束、CHECK 而非 PG ENUM）_
   - _Requirements: R1.2, R1.3_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: PostgreSQL DBA | Task: 编写 000027 迁移建 unresolved_identities，主键 (namespace, value) 以支持 UPSERT 幂等；先核对 topology_sync_runs 现有定义再决定是否改动 | Restrictions: 编号必须为 000027；up/down 必须可往返；不得改动其他迁移 | Success: 迁移往返执行通过，ON CONFLICT UPSERT 单测不产生重复行 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 8. 扩展 TopologySnapshotEdge 支持跨源目标节点
+- [-] 8. 扩展 TopologySnapshotEdge 支持跨源目标节点
   - File: internal/domain/topology.go, internal/store/infrastructure.go, internal/store/infrastructure_integration_test.go
   - 新增 `ToNodeID *uuid.UUID`；ImportSnapshot 在 nodeIDs[external_ref] 查不到时回落 ToNodeID，用于表达 App→canonical RELY_NODE 跨源边
   - Purpose: 让平台 observed 边能指向 entity_registry 已存在的实体
@@ -81,6 +83,8 @@
 - [ ] 9. 实现 sync 周期 loop 并接入装配
   - File: internal/ccloud/syncer.go, internal/app/app.go, cmd/server/main.go, test/e2e/harness.go
   - 模式同 internal/alertsource.Reconciler：事务外 fetch（全链路 + 逐应用服务拓扑）→ 短事务 ImportSnapshot；失败写 topology_sync_runs 并退避；启动即跑一轮
+  - **接口路径暂为占位（2026-09-19 用户裁决：先 mock 不阻塞）**：任务 5 的三个路径 `/openapi/v1/topology/fulllink`、
+    `/openapi/v1/topology/service`、`/openapi/v1/health` 均为占位符。本任务装配时须让路径可经配置覆盖，拿到真实接口后只改配置、不改代码
   - Purpose: 让拓扑图自动存在，不依赖手工触发
   - _Leverage: internal/alertsource.Reconciler、store.TopologyRepo.ImportSnapshot_
   - _Requirements: R2.1, R2.2, R2.9, R1.6, NFR-Reliability_
@@ -134,7 +138,7 @@
   - _Requirements: R3.2, R3.3, R5.1_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 在 projector 写入 owner_team_id 并返回 transition，供 stage_mapping 判断是否进入 active | Restrictions: 不得依据 Alert 标签或平台数据推断 owner（不变量 15）；不得在 projector 内做任何外部 IO | Success: 单测覆盖有 owner / 无 owner / candidate→active / 已 active 不重复触发四种情形 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 15. FaultRepo 扩展
+- [-] 15. FaultRepo 扩展
   - File: internal/store/faults.go, internal/store/faults_integration_test.go
   - 新增 Ack、SetOwnerNotified、AppendTimeline、ListRecentlyResolvedByCorrelationKey(since)、ListDependencyProvidersByNodeID（如缺失）
   - Purpose: 支撑认领、通知冷却与拓扑抑制
@@ -142,7 +146,7 @@
   - _Requirements: R4.1, R4.4, R5.3, R5.4, R5.6_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go + PostgreSQL 工程师 | Task: 实现五个仓储方法，全部带 tx pgx.Tx，调用方开事务 | Restrictions: 方法内不得自开事务；不得在仍打开的 Rows 内嵌套查询（不变量 20）；能一次 JOIN 就一次取回 | Success: 集成测覆盖 Ack 幂等、时间线追加、按 correlation_key 查冷却窗口、按 node 查上游 provider | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 16. 实现 fault_outbox.QueueFaultActivated
+- [-] 16. 实现 fault_outbox.QueueFaultActivated
   - File: internal/app/fault_outbox.go, internal/app/fault_outbox_test.go
   - 五步判定：①同 correlation_key 冷却窗口内刚 resolved → 跳过；②上游 provider 已有 active 且 owner_notified → 不单发并写时间线原因；③目标取 owner team team_ops_settings.channels，缺失回落 FAULT_NOTIFY_FALLBACK_TARGET；④Schedule 一条 notify_send（幂等键 fault:{id}|activated|{channel}|{target}|{round}，round 为意图时刻并随 payload 持久化）；⑤SetOwnerNotified
   - Purpose: R5 的核心实现，同时保证不变量 4 不被破坏
@@ -150,7 +154,7 @@
   - _Requirements: R5.1, R5.2, R5.3, R5.4, R5.5, R5.6, R5.8_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师（异步通知编排） | Task: 以 IncidentOutbox 为模板实现 QueueFaultActivated，五个判定步骤各自可单测，只 Schedule 不发送 | Restrictions: 事务内禁止任何同步外部 IO；round 必须随 payload 持久化而非发送时现算；refID 不含 round | Success: 单测覆盖冷却跳过、上游抑制、owner 渠道缺失回落、正常调度一次；重复调用同 Fault 不产生第二条 pending | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 17. 接入通知触发点（覆盖 Project 的全部调用入口）
+- [-] 17. 接入通知触发点（覆盖 Project 的全部调用入口）
   - File: internal/pipeline/stage_mapping.go, internal/pipeline/stage_mapping_test.go, internal/alertsource/reconciler.go, internal/alertsource/reconciler_test.go, internal/api/service_catalog.go
   - Project 返回 active 转移后、在同一 tx 内调用 QueueFaultActivated
   - **`Project` 有三个生产调用点，触发必须齐全**（已核实：`stage_mapping.go:30`、`reconciler.go:160` 与 `:172`、`service_catalog.go:484`）：
