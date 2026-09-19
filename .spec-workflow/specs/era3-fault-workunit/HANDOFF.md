@@ -1,6 +1,6 @@
 # 交接说明 — era3-fault-workunit
 
-> 交接时点：2026-09-19。代码基线 `era3` @ `e09626e`，其后仅有本交接文档与任务 34 延后标注两个纯文档提交（已推送 origin）。进度 **15 / 45**。
+> 交接时点：2026-09-19。第 3 批（P1 9–11 + P2 18/20/21）与第 4 批（P3 23–27）已在工作区落地并验证，**尚未提交**。进度 **26 / 45**。P2 是第一次 era3 → main 合并点。
 > 接手 Agent 负责实现，原主对话负责后续 review。**开工前完整读完本文件，再读 `tasks.md` 与 `Implementation Logs/`。**
 > 本文件记录的是 `requirements.md` / `design.md` / `tasks.md` 之外、在实现过程中做出的裁决与踩过的坑；三份规格与 ADR-0006 仍是权威，冲突时以本文件的"实现裁决"为准（它们晚于规格、已被用户确认）。
 
@@ -17,7 +17,7 @@
 
 合并策略（用户已确认）：计划文件与未完成代码不进 main；**每个阶段完成并全量验证后，era3 连同 CHANGELOG 合入 main**。建议第一个合并点是 P2 完成（任务 21 通过）——P1 已落地的部分在未配置 `CCLOUD_BASE_URL` 时完全不生效，随 P2 一起进 main 无风险。
 
-### 1.2 已完成（15）
+### 1.2 已完成（26）
 
 | 阶段 | 任务 | 提交 |
 |---|---|---|
@@ -27,15 +27,19 @@
 | P2 | 12 迁移 000026、13 AckFault、14 projector 写 owner + transition | `da95e0d` |
 | P1 | 7 迁移 000027、8 跨源边 + 无流量标记 | `e67f377` |
 | P2 | 15 FaultRepo 扩展、16 FaultOutbox、17 全入口触发 | `e67f377` |
+| P1 | 9 syncer、10 待对齐 API/Tab、11 P1 验收闸门 | 第 3/4 批提交（见 `git log`） |
+| P2 | 18 REST ack、20 Web 认领、21 P2 E2E | 第 3/4 批提交 |
+| P3 | 23 Grafana 适配器、24 对账路径、25 幂等键、26 E2E、27 冻结标注 | 第 3/4 批提交 |
 
 每个任务的接口签名与**跨任务警告**都在 `Implementation Logs/` 里，开工前必读对应上游任务的记录。
 
-### 1.3 最后一次全量验证（e67f377 合并后）
+### 1.3 最后一次全量验证（第 3+4 批 review 修复后）
 
-- `go build ./... && go vet ./... && go vet -tags=integration ./...`：零错误
-- `go test -tags=integration ./internal/... -race -count=1`：18 个包全绿
-- `test/e2e`：11 个场景全绿
-- 迁移 000026、000027：均在全新 PG 上验证过 up → down → up
+- `go build ./... && go vet ./...`：零错误
+- `go test -tags=integration ./internal/... -race -count=1`：第 3 批后 18 个包全绿
+- `test/e2e`：全绿（约 66s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
+- `cd web && npm run build && npx oxlint`：通过
+- 本批无新迁移；000028 仍预留给任务 28
 
 ### 1.4 迁移编号
 
@@ -58,6 +62,10 @@
 | D5 | 冷却、拓扑抑制、无通知目标三种"不发通知"都**必须写 Fault 时间线**，不能静默 | 33 及以后任何新的跳过分支 | 主对话验收修正 |
 | D6 | reprocess 端点（人工重新映射）**不触发** Fault 通知（治理操作）。新增任何 `Projector.Project` 调用方都必须接入 `FaultOutbox.TriggerFromMappingResult` 钩子，否则等同漏报 | 任何新增 Project 调用方 | R5.10 |
 | D7 | **飞书交互卡片整体延后**：uat 暂无飞书可回调的公网入口。P2 通知走 `lark_webhook` 纯文本 + 详情链接，认领在 Web 完成。任务 19 已移到顺延区；任务 34 同样依赖卡片回调，已标延后；R4.6、R5.7、R5.9、R9.3 已标延后 | 19、34、45 | 用户裁决 |
+| D9 | **ccloud 环境由 `CCLOUD_ENVIRONMENT` 显式配置**（启用时必填，缺失 `config.Load` 失败）。平台响应没有环境字段，review 发现 syncer 曾把项目 ID 当作 environment 写入实体 | 9、29、30 | 第 3/4 批 review 修正 |
+| D10 | **对账快照里首次出现的 occurrence 必须投影并触发 Fault 通知**（与 unknown→firing 恢复、快照缺失同等）。webhook 丢失/延迟时对账是唯一入口，review 前该路径不投影，等同漏报 | 任何修改 Reconciler 的任务、39 | 第 3/4 批 review 修正，不变量 14 |
+| D11 | `unresolved_identities` 在别名补齐后**不删除行**；任务 37 的"待对齐数"指标必须只统计当前仍未解析的（如 `last_seen` 不早于最近一次成功同步），不能直接 count(*) | 37 | 第 3/4 批已知缺口 |
+| D12 | **kind=grafana 集成改为权威来源是行为变更**：必须带 fingerprint、跳过本地 route/group/silence/inhibit 与 Alert 级通知。uat 当前无 grafana 集成；合入 main 时 CHANGELOG 须注明 | 26、合入 main | 不变量 24 |
 | D8 | 新增配置：`FAULT_NOTIFY_COOLDOWN`（30m）、`FAULT_NOTIFY_FALLBACK_CHANNEL`（`lark_webhook`）、`FAULT_NOTIFY_FALLBACK_TARGET`（凭据，已脱敏）、`WEB_BASE_URL`（拼 `/faults/{id}` 详情链接） | 18、20、44 | 任务 16 |
 
 ---
@@ -68,8 +76,8 @@
 
 | 批次 | 内容 | 前置 | 备注 |
 |---|---|---|---|
-| **第 3 批（建议立即）** | P2：18、20、21 ∥ P1：9、10、11 | 无 | **21 通过即 P2 收口，可走第一次 era3 → main 合并** |
-| 第 4 批 | P3：23、24、25、26、27 | 无 | 与 P1/P2 文件交集小，可与第 3 批后半并行 |
+| 第 3 批 | P2：18、20、21 ∥ P1：9、10、11 | — | 已完成、review 修复并提交。P2 收口 |
+| 第 4 批 | P3：23、24、25、26、27 | — | 已完成、review 修复并提交 |
 | 第 5 批 | P5：37、38、39、40 | P2 完成 | 39（readyz）与 40（发送失败兜底）直接对应漏报风险 M2/M3，价值高 |
 | 第 6 批 | P4：28–33、35、36 | P1 + P2 完成，**且拿到 `CCLOUD_HEALTH_WINDOW`** | 29 规定该值必填、无默认，只能由平台团队提供 |
 | 延后 | 19、34、45 | uat 公网回调入口 | 见 D7 |

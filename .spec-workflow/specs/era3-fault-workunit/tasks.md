@@ -80,7 +80,7 @@
   - _Requirements: R1.1, R2.2, R2.6, R2.7_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端 + PostgreSQL | Task: 给 TopologySnapshotEdge 增加 ToNodeID 回落逻辑，保持既有 external_ref 路径行为逐字节不变；集成测验证按 source 隔离（ccloud 替换不动 entity_registry 边）与重放幂等 | Restrictions: 不改变现有函数签名语义；同一 tx 内二阶段查询必须先完整扫描并 Close 再发子查询（不变量 20） | Success: 集成测通过；重放同一快照边数不变；entity_registry 边未被触碰 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 9. 实现 sync 周期 loop 并接入装配
+- [x] 9. 实现 sync 周期 loop 并接入装配
   - File: internal/ccloud/syncer.go, internal/app/app.go, cmd/server/main.go, test/e2e/harness.go
   - 模式同 internal/alertsource.Reconciler：事务外 fetch（全链路 + 逐应用服务拓扑）→ 短事务 ImportSnapshot；失败写 topology_sync_runs 并退避；启动即跑一轮
   - **接口路径暂为占位（2026-09-19 用户裁决：先 mock 不阻塞）**：任务 5 的三个路径 `/openapi/v1/topology/fulllink`、
@@ -90,7 +90,7 @@
   - _Requirements: R2.1, R2.2, R2.9, R1.6, NFR-Reliability_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师（并发/调度） | Task: 以 alertsource.Reconciler 为模板实现 ccloud syncer 周期 loop 并在 internal/app 装配，interval=0 时不启动；失败退避且不产生重试风暴 | Restrictions: 不得使用 scheduler timer（不变量 3/23）；外部 IO 必须在事务外；不得 fail fast 阻塞启动 | Success: 单测/集成测验证 interval=0 不启动、失败退避、单轮幂等；main.go 与 e2e harness 均正确启动 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 10. 待对齐身份 API 与前端入口
+- [x] 10. 待对齐身份 API 与前端入口
   - File: internal/api/topology.go, internal/api/router.go, web/src/pages/Settings/ServiceCatalog.tsx
   - GET /api/v1/admin/topology/unresolved（admin only，按 last_seen 倒序分页，空集合返 []）；控制中心「服务目录」新增 Tab「待对齐身份」，操作=选择 canonical 实体创建别名（复用受管实体 PUT aliases）
   - Purpose: 让 SRE 能一次性把未对齐 RELY_NODE 补成别名，补完下一轮自动并入
@@ -98,7 +98,7 @@
   - _Requirements: R1.4, R1.6_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go + React/TS 全栈 | Task: 实现 admin 端点与前端 Tab，别名创建复用既有受管实体 aliases PUT，不新增写入路径 | Restrictions: 端点必须 admin only；空集合返 [] 不返 null；选择器必须目录驱动可搜索，禁止手输 UUID；不得新增一级导航 | Success: 后端单测覆盖鉴权与空集合；前端 build + oxlint 通过；创建别名后下一轮同步即并入 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 11. P1 验证：映射单测与 source 隔离集成测
+- [x] 11. P1 验证：映射单测与 source 隔离集成测
   - File: internal/ccloud/testdata/\*.json, internal/ccloud/importer_test.go, internal/store/infrastructure_integration_test.go
   - 用平台真实样例 JSON 作 fixture 的表驱动单测（方向、自环、totalCount=0、`:0` unresolved、重放幂等）；集成测验证 replace 按 source 隔离
   - **fixture 已就绪**（2026-09-18）：`internal/ccloud/testdata/fulllink_topology.json`（24 节点/77 边）、`internal/ccloud/testdata/service_topology_cplm-boot-prod.json`（22 节点/12 边），契约事实与证据见同目录 `README.md`
@@ -166,7 +166,7 @@
   - _Requirements: R5.1, R5.10, R5.11, D3（裁决 3）_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 在 stage_mapping 与 alertsource.Reconciler 的 active 转移分支调用 fault_outbox，保持同事务只 Schedule；reprocess 端点显式不触发并注释说明 | Restrictions: 不得让 stage 或 reconciler 事务内出现外部 IO；不得把通知耦合进 projector；不得改变既有 stage 顺序与 dedup→mapping→route→group→silence→inhibit 语义；authoritative-safe 来源行为不变 | Success: 单测验证三个入口各自行为（pipeline 触发、对账两处触发、reprocess 不触发），同一次 active 转移只产生一条意图 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 18. Fault 认领 REST 端点
+- [x] 18. Fault 认领 REST 端点
   - File: internal/api/faults.go, internal/api/router.go
   - POST /api/v1/faults/:id/ack（登录即可）；列表与详情响应返回 owner/acked 字段
   - Purpose: 提供 Web 与第三方的认领入口
@@ -177,7 +177,7 @@
 > **任务 19（飞书卡片故障动作）已移至「顺延与人工动作」**：阻塞于 uat 尚无公网可回调入口，不属于 P2 范围。
 > P2 期间认领经 REST 端点（任务 18）与 Web（任务 20）完成。
 
-- [ ] 20. 前端 Fault 归属与认领
+- [x] 20. 前端 Fault 归属与认领
   - File: web/src/pages/Faults/FaultWorkspace.tsx, web/src/pages/Faults/FaultList.tsx
   - Workspace 顶部显示 owner 与认领状态 + 认领按钮（乐观更新后失效 React Query 缓存）；List 增加 owner 列
   - Purpose: 让归属与认领在 Web 可见可操作
@@ -185,7 +185,7 @@
   - _Requirements: R4.5, R4.7_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: React/TS 前端工程师 | Task: 实现 owner 展示与认领交互，已认领状态禁用按钮 | Restrictions: 锁 AntD 5 不升级；不得引入 Redux/Mobx；空值展示不能导致页面崩溃 | Success: `npm run build` 与 `npx oxlint` 通过；认领后列表与详情同步刷新 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 21. P2 端到端验证
+- [x] 21. P2 端到端验证
   - File: test/e2e/fault_notify_test.go
   - Alertmanager webhook → Fault active → 恰好一条 notify_send（owner team channel）→ **REST `POST /api/v1/faults/:id/ack`** → acked；重复 ack 200 短路；同 correlation_key 冷却内不重发；上游已通知时下游不发
   - 说明：卡片 ack 回调路径随任务 19 延后，本阶段不断言；E2E 用既有 mock 渠道验证发送意图，与 uat 选用哪条飞书通道无关
@@ -206,7 +206,7 @@
   - _Requirements: R6.1, R6.2_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师（重构） | Task: 抽出常量集并替换全部字面量出现点，行为对 alertmanager 逐字节不变 | Restrictions: 禁止保留任何散落字面量；不得改变现有 SQL 语义（= 改 IN）；不得顺手重构无关代码 | Success: `go build ./... && go vet ./...` 通过；既有单测与集成测全绿；grep 不到散落字面量 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 23. Grafana ingestion 适配器
+- [x] 23. Grafana ingestion 适配器
   - File: internal/ingest/grafana.go, internal/ingest/grafana_test.go
   - Source="grafana"；UpstreamFingerprint 取 payload.alerts[].fingerprint；StartsAt/EndsAt 与 Alertmanager 同口径；标记为权威来源
   - Purpose: 让 Grafana Alerting（含 ES 日志告警）以同一契约进入
@@ -214,7 +214,7 @@
   - _Requirements: R6.3, R6.4, R6.5_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师（adapter） | Task: 实现 Grafana 适配器，重用 Alertmanager 的信封归一，只改 Source 与 fingerprint 来源 | Restrictions: 不得为 Grafana 新建独立的管道分支；不得发送 Alert 级通知；信封字段口径不得偏离 AM 适配器 | Success: 单测覆盖 firing/resolved 载荷、fingerprint 提取、缺 fingerprint 时的行为 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 24. 对账客户端按 kind 选择路径
+- [x] 24. 对账客户端按 kind 选择路径
   - File: internal/alertsource/client.go, internal/alertsource/client_test.go
   - 按 source.Kind 选路径：alertmanager `/api/v2/alerts`，grafana `/api/alertmanager/grafana/api/v2/alerts`；ValidateConfig 接受 grafana；鉴权沿用 BearerTokenEnv
   - Purpose: 让周期对账对两种来源都成立
@@ -222,7 +222,7 @@
   - _Requirements: R6.3, R6.7_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 增加按 kind 的路径选择与 ValidateConfig 分支 | Restrictions: 不改变 alertmanager 既有路径与鉴权；不得引入第二种认证方式 | Success: httptest 验证两种 kind 各自命中正确路径；Config 校验对未知 kind 仍拒绝 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 25. 校验 occurrence 幂等键对 Grafana 成立
+- [x] 25. 校验 occurrence 幂等键对 Grafana 成立
   - File: internal/store/alert_sources.go, internal/store/alert_sources_integration_test.go
   - 确认 source_id + upstream_fingerprint + starts_at 对 Grafana 成立；如已成立则记录结论，不写代码
   - Purpose: 避免重复升级幂等键造成漏报或重复
@@ -230,7 +230,7 @@
   - _Requirements: R6.4_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 用集成测证明 Grafana 载荷下幂等键成立；若成立则在 log-implementation 中记录结论 | Restrictions: 除非测试证伪，否则不得改动幂等键口径 | Success: 集成测覆盖同 occurrence 重复投递不产生重复记录 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 26. P3 端到端验证
+- [x] 26. P3 端到端验证
   - File: test/e2e/grafana_authority_test.go
   - webhook firing/resolved、对账 absence → stale 不 resolved、Fault 映射生效
   - Purpose: P3 的验收闸门
@@ -238,7 +238,7 @@
   - _Requirements: R6 全部验收条件_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: QA 工程师 | Task: 以 AM 权威测试为模板改造出 Grafana 版本，重点断言「看不到 ≠ resolved」 | Restrictions: 单轮运行；不得修改 AM 测试的既有断言 | Success: E2E 全绿 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 27. 时代一冻结标注
+- [x] 27. 时代一冻结标注
   - File: README.md, web/src/pages/Settings/Routes.tsx, web/src/pages/Settings/Silences.tsx
   - 相关页面与文档标注「仅 generic 来源生效」，说明 AM/Grafana 来源不经过本地 route/group/silence
   - Purpose: 让冻结成为显式契约，防止后续误加能力

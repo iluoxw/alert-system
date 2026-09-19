@@ -306,6 +306,7 @@ ALTER TABLE fault_impacts ADD COLUMN flags JSONB NOT NULL DEFAULT '{}';
 | `CCLOUD_BASE_URL` | P1 | — | 平台地址 |
 | `CCLOUD_TOKEN_ENV` | P1 | — | 存放 token 的环境变量名 |
 | `CCLOUD_PROJECT_IDS` | P1 | — | 要同步的项目，逗号分隔 |
+| `CCLOUD_ENVIRONMENT` | P1 | — | 导入实体的环境（启用时必填；平台响应不含环境，不能用项目 ID 代替） |
 | `CCLOUD_SYNC_INTERVAL` | P1 | 10m | **0 = 完全关闭** |
 | `FAULT_NOTIFY_COOLDOWN` | P2 | 待定 | 同 correlation_key 冷却 |
 | `FAULT_NOTIFY_FALLBACK_TARGET` | P2 | — | owner 渠道缺失时的回落目标 |

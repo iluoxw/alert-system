@@ -5,6 +5,15 @@
 
 ## [Unreleased]
 
+### era3 分支（未合入 main）— Fault 工作单元、ccloud 拓扑、Grafana 权威来源
+
+- **行为变更**：`kind=grafana` 集成改为 Alert 权威来源（不变量 24）——必须携带 fingerprint，
+  不再执行本地 route/group/silence/inhibit，也不再发送 Alert 级通知；对账端点
+  `/api/alertmanager/grafana/api/v2/alerts`。依赖本地编排的场景须改用 generic 来源。
+- 新增配置 `CCLOUD_ENVIRONMENT`：启用 ccloud 同步（`CCLOUD_BASE_URL` + `CCLOUD_SYNC_INTERVAL>0`）时必填，
+  写入所有导入实体；平台响应不含环境信息，不能从项目 ID 推断。
+- 对账修正：快照里首次出现的告警（webhook 丢失/延迟）现在与恢复路径一样投影并触发 Fault 通知。
+
 ## [v0.2.0] 2026-09-17 — Infrastructure-first 事故响应发布基线
 
 > 覆盖 v0.1.0 之后的全部改动：定位反转为 Alertmanager 权威 + Entity / Fault / Impact / Incident，
