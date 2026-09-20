@@ -1,6 +1,7 @@
 # 交接说明 — era3-fault-workunit
 
-> 交接时点：2026-09-20（第三次交接）。P0–P3 已合入 main（`63efc10`）。第 5 批 A 线（39、40）已在 era3 完成、review 修复并推送（`638a3fd`），进度 **28 / 45**。**下一棒是 B 线：任务 37 → 38**，见 §3.2 与 §3.4。
+> 交接时点：2026-09-20（第四次交接）。**P0–P5 全部完成并合入 main，打 tag `v0.3.0`**；收尾任务 41、42 一并完成。进度 **32 / 45**。
+> 剩余 13 个任务全部卡在外部输入或人工动作上，见 §3.1 与 §6——**没有可以立即开工的编码任务**。
 > 接手 Agent 负责实现，原主对话负责后续 review。**开工前完整读完本文件，再读 `tasks.md` 与 `Implementation Logs/`。**
 > 本文件记录的是 `requirements.md` / `design.md` / `tasks.md` 之外、在实现过程中做出的裁决与踩过的坑；三份规格与 ADR-0006 仍是权威，冲突时以本文件的"实现裁决"为准（它们晚于规格、已被用户确认）。
 
@@ -12,8 +13,8 @@
 
 | 分支 | 位置 | 说明 |
 |---|---|---|
-| `main` | `63efc10`（P0–P3 已合入；上一个 tag 仍是 `v0.2.0`，v0.3.0 在任务 42 打） | 已实现并验证的现实 |
-| `era3` | `638a3fd`（最新以 `git log origin/era3` 为准） | 集成分支，继续在这里做 B 线及之后。比 main 多：A 线 39/40 + 元告警键修复 |
+| `main` | tag `v0.3.0`（P0–P5 全部合入） | 已实现并验证的现实 |
+| `era3` | 与 main 同点（已快进合并） | 集成分支；P4 解锁后继续在这里做 |
 
 合并策略（用户已确认）：**每个阶段完成并全量验证后，era3 连同 CHANGELOG 快进合入 main**；合并需用户明确同意。第一次合并（P0–P3）已于 2026-09-19 完成。P1 在未配置 `CCLOUD_BASE_URL` 时完全不生效。
 
@@ -31,16 +32,18 @@
 | P2 | 18 REST ack、20 Web 认领、21 P2 E2E | 第 3/4 批提交 |
 | P3 | 23 Grafana 适配器、24 对账路径、25 幂等键、26 E2E、27 冻结标注 | 第 3/4 批提交 |
 | P5 | 39 readyz 心跳、40 通知失败元告警 | `9fb8166` + review 修复 `638a3fd` |
+| P5 | 37 先行指标、38 日报与总览展示 | `89ca0fb` + review 修复 `feedb19` |
+| 收尾 | 41 CLAUDE.md 目录、42 CHANGELOG v0.3 | 随 v0.3.0 发布 |
 
 每个任务的接口签名与**跨任务警告**都在 `Implementation Logs/` 里，开工前必读对应上游任务的记录。
 
-### 1.3 最后一次全量验证（A 线 review 修复后，即 `638a3fd`）
+### 1.3 最后一次全量验证（P5 收口、review 修复后，即 v0.3.0）
 
 - `go build ./... && go vet ./... && go vet -tags=integration ./...`：零错误
-- `go test -tags=integration ./internal/... -race -count=1`：21 个包全绿（store 约 313s）
-- `test/e2e`：全绿（约 66s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
-- `cd web && npm run build && npx oxlint`：通过（A 线未动前端，最后一次跑在 P3 收口时）
-- A 线无新迁移；000028 仍预留给任务 28
+- `go test -tags=integration ./internal/... -race -count=1`：19 个包全绿（store 约 290s，ops 约 37s）
+- `test/e2e`：全绿（约 65s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
+- `cd web && npm run build && npx oxlint`：通过
+- P5 无新迁移；000028 仍预留给任务 28
 
 ### 1.4 迁移编号
 
@@ -78,8 +81,10 @@
 | 批次 | 内容 | 前置 | 备注 |
 |---|---|---|---|
 | 第 3、4 批 | P2 18/20/21、P1 9–11、P3 23–27 | — | 已完成并合入 main |
-| 第 5 批 A 线 | P5：39、40 | — | 已完成并 review（含一处元告警幂等键修复） |
-| **第 5 批 B 线（下一棒）** | P5：37 → 38（必须串行，38 依赖 37） | 无 | 做完 P5 收口，再整体合入 main |
+| 第 5 批 | P5：39、40、37、38 | — | 已完成、review 修复并随 v0.3.0 合入 main |
+| **第 6 批（阻塞中）** | P4：28–33、35、36 | **必须先拿到 `CCLOUD_HEALTH_WINDOW` 与三个接口的真实路径** | 迁移用 000028。拿不到这两样就无法开工，不要先写占位实现 |
+| 延后 | 19、34、45 | uat 公网回调入口 | 见 D7 |
+| 人工 | 43（k8s 探针切 /readyz）、44（uat 配保底通知目标） | 部署窗口 | 44 必须在 uat 上线 v0.3.0 前完成 |
 | 第 6 批 | P4：28–33、35、36 | P1 + P2 完成，**且拿到 `CCLOUD_HEALTH_WINDOW`** | 29 规定该值必填、无默认，只能由平台团队提供 |
 | 延后 | 19、34、45 | uat 公网回调入口 | 见 D7 |
 | 收尾 | 41、42、43、44 | 各自前置 | 43、44、45 为人工动作，需用户确认后执行 |
@@ -111,7 +116,7 @@
 
 ---
 
-### 3.4 任务 37 的逐指标口径（动手前必读）
+### 3.4 任务 37 的逐指标口径（已实现，作为口径参考保留）
 
 五个指标的名字都很短，但口径大多不是字面意思。**按下表实现，有疑问先问，不要自行推断**：
 
@@ -119,8 +124,8 @@
 |---|---|---|
 | firing 告警映射率 | 分母：`source_state='firing'` 的 Alert 数；分子：其中已命中 AlertMappingPolicy 或受信任标准标签、已关联 Fault 的数量 | 分母为 0 时返回 **null**（前端显示"暂无数据"），**不得返回 0 或 NaN**。不变量 17：未映射告警进待治理队列，这个比率就是它的可见化 |
 | 无 owner 的 active Fault 数 | `faults` 中 `status='active' AND owner_team_id IS NULL` | 有现成索引 `faults_status_owner_team_idx`（000026），照用 |
-| Fault 认领时长中位数 | `acked_at - created_at` 的中位数，只取 `acked_at IS NOT NULL` 的 Fault | 列在 000026：`acked_at`、`acked_by`、`acked_by_name`。用 `percentile_cont` 在 SQL 层算，别捞回 Go 里排序。无样本时返回 null |
-| 恢复提醒拦截数 | **口径存疑，先问主对话**。字面可理解成"发出的 nudge 次数"，也可理解成"被 nudge 拦下的误判恢复数"。可取的确定性数据源是 `timers` 中 `kind='incident_recovery_nudge' AND status='fired'` 的计数 | 不变量 11：nudge **永不推进状态**，所以不存在"拦截了一次自动关闭"这种事件。**不要自己编一个语义** |
+| Fault 认领时长中位数 | `acked_at - first_detected_at` 的中位数，只取 `acked_at IS NOT NULL` 的 Fault（**本行原写 `created_at` 是主对话写错**，R10.1 的口径是 `first_detected_at`，实现已按后者落地） | 列在 000026：`acked_at`、`acked_by`、`acked_by_name`。用 `percentile_cont` 在 SQL 层算，别捞回 Go 里排序。无样本时返回 null |
+| 恢复提醒发出次数 | 用户裁决为"已发出的 nudge 次数"：`timers` 中 `kind='incident_recovery_nudge' AND status='fired'`，**且 `fire_at` 落在显式窗口内**（日报=昨日，端点=近 24 小时） | 不变量 11：nudge **永不推进状态**，不存在"拦截了一次自动关闭"这种事件。窗口不可省：`timers` 的 fired 行会被 retention 按天数清理，全表计数先涨后落、含义随保留配置变化（review 修正） |
 | 未对齐身份数 | 只统计**当前仍未对齐**的：`unresolved_identities` 的行在别名补齐后**不会被删除**（D11），必须按 `last_seen >= 最近一次成功同步的 observed_at` 过滤——syncer 每轮只 UPSERT 仍未解析的身份，已解析的自然停止刷新 | 直接 `count(*)` 会把历史上所有对齐过的身份全算进去，指标只增不减。最近一次成功同步取 `topology_sync_runs` 中 `source='ccloud' AND status='completed'` 的最新 `observed_at`；**没有任何成功同步记录时返回 null**，不是 0（uat 当前没开 ccloud，这是常态） |
 
 其他约束：端点 admin only（`/api/v1/ops/indicators`）；集合字段即使为空也返回 `[]`（不变量 13）；聚合全部在 SQL 层完成；不得为指标新建表或物化视图。

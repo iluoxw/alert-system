@@ -357,7 +357,7 @@
 
 ## 顺延与人工动作
 
-- [ ] 41. CLAUDE.md 核心目录增补 internal/ccloud/
+- [x] 41. CLAUDE.md 核心目录增补 internal/ccloud/
   - File: CLAUDE.md
   - 在 §核心目录结构 增加 `internal/ccloud/` 说明（client/importer/syncer/healthprobe 职责与"外部 IO 只在此包"的约束）
   - Purpose: 让目录说明与结构一致
@@ -365,7 +365,7 @@
   - _Requirements: NFR-Architecture_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: 技术写作者 | Task: 按实际落地结构补目录说明 | Restrictions: 等 P1 建包完成后再写，避免文档与结构不符 | Success: 说明与实际目录一致 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 42. CHANGELOG 记录 v0.3
+- [x] 42. CHANGELOG 记录 v0.3
   - File: CHANGELOG.md
   - P0–P2 完成后统一记录（含迁移 000026/000027、新包、端点、前端改动）
   - Purpose: 满足 CLAUDE.md「交付时间线与接手须知」要求

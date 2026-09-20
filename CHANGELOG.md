@@ -5,14 +5,70 @@
 
 ## [Unreleased]
 
-### era3 分支（未合入 main）— Fault 工作单元、ccloud 拓扑、Grafana 权威来源
+## [v0.3.0] 2026-09-20 — Fault 成为一等工作单元
 
-- **行为变更**：`kind=grafana` 集成改为 Alert 权威来源（不变量 24）——必须携带 fingerprint，
-  不再执行本地 route/group/silence/inhibit，也不再发送 Alert 级通知；对账端点
-  `/api/alertmanager/grafana/api/v2/alerts`。依赖本地编排的场景须改用 generic 来源。
-- 新增配置 `CCLOUD_ENVIRONMENT`：启用 ccloud 同步（`CCLOUD_BASE_URL` + `CCLOUD_SYNC_INTERVAL>0`）时必填，
-  写入所有导入实体；平台响应不含环境信息，不能从项目 ID 推断。
-- 对账修正：快照里首次出现的告警（webhook 丢失/延迟）现在与恢复路径一样投影并触发 Fault 通知。
+> 规格 `.spec-workflow/specs/era3-fault-workunit/`（45 个任务，本版交付 30 个），ADR-0006。
+> 核心变化：Fault 从"告警的聚合产物"变成有归属、可认领、会主动通知的工作单元；
+> Alert 生命周期层收敛到 Alertmanager 与 Grafana；新增平台拓扑接入与一组先行指标。
+> 实现分 P0–P5 六批，由 coder 子代理执行、主对话逐批 review，每批全量验证后合入。
+
+### 行为变更（升级前必读）
+
+- **`kind=grafana` 集成改为 Alert 权威来源**（不变量 24）：必须携带 fingerprint，不再执行本地
+  route/group/silence/inhibit，也不再发送 Alert 级通知；对账端点
+  `/api/alertmanager/grafana/api/v2/alerts`。仍依赖本地编排的接入必须改用 generic 来源。
+- **Fault 进入 active 会主动通知 owner team**（不变量 22）。目标取该 team 的
+  `team_ops_settings.channels`，缺失回落 `FAULT_NOTIFY_FALLBACK_*`。**上线前必须配置保底目标**，
+  否则无 owner 渠道的 Fault 只写时间线、无人收到。冷却、拓扑抑制、无目标三种跳过都写 Fault 时间线。
+- **`/readyz` 新增后台任务心跳判定**：scheduler 或 pipeline 超过 3× 轮询间隔没有成功轮询返回 503
+  （`/healthz` 语义不变，恒 200）。k8s 探针切换是独立的人工动作，本版未执行。
+
+### 新增能力
+
+- **Fault 工作单元**：`owner_team_id`、`acked_by`、`acked_at`（迁移 000026）；
+  `POST /api/v1/faults/:id/ack` 同事务认领 + 时间线，重复认领按不变量 6 返回 200；Web 故障列表与工作台认领入口。
+- **ccloud 平台拓扑接入**：新包 `internal/ccloud`（client / importer / syncer），独立周期 loop，
+  事务外拉取、单短事务写入（不变量 23）。未命中别名的身份进 `unresolved_identities` 待对齐队列，
+  绝不自动建实体（不变量 15）；平台 `totalCount=0` 的边落 `no_recent_traffic`，遍历时按 stale 处理（迁移 000027）。
+  `GET /api/v1/admin/topology/unresolved` 与服务目录「待对齐身份」Tab 供人工认领。
+- **通知发送最终失败兜底**：重试耗尽后向保底目标发一条元告警，让失败被人看见而不是静默丢弃；
+  元告警自身失败只记日志与时间线，不再递归。
+- **先行指标**：`GET /api/v1/ops/indicators`（admin only）——firing 告警映射率、无 owner 的 active Fault 数、
+  Fault 认领时长中位、恢复提醒发出次数（近 24 小时）、未对齐身份数；日报追加「先行指标（平台级）」小节，
+  运行总览加卡片。无数据一律返回 null 并显示「暂无数据」，不用 0 冒充。
+
+### 新增配置
+
+| 配置 | 说明 |
+|---|---|
+| `CCLOUD_BASE_URL` / `CCLOUD_TOKEN_ENV` / `CCLOUD_PROJECT_IDS` / `CCLOUD_ENVIRONMENT` / `CCLOUD_SYNC_INTERVAL` | 平台拓扑同步。**未配 `CCLOUD_BASE_URL` 时整个特性不生效、不产生任何 IO**；配了则 `CCLOUD_ENVIRONMENT` 必填（平台响应不含环境信息，不能从项目 ID 推断） |
+| `CCLOUD_PATH_FULLLINK` / `CCLOUD_PATH_SERVICE` / `CCLOUD_PATH_HEALTH` | 三个接口路径当前是占位符，拿到真实路径后只改配置 |
+| `FAULT_NOTIFY_COOLDOWN` / `FAULT_NOTIFY_FALLBACK_CHANNEL` / `FAULT_NOTIFY_FALLBACK_TARGET` | Fault 通知冷却与保底目标（target 是凭据） |
+| `WEB_BASE_URL` | 通知里拼 `/faults/{id}` 详情链接 |
+
+### 迁移
+
+`000026`（Fault 归属与认领列）、`000027`（`unresolved_identities` 表、`dependency_edges.no_recent_traffic`）。
+`000028` 预留给后续健康证据任务，其他改动不得占用。
+
+### review 中发现并修复的缺陷
+
+- **对账快照首次出现的告警不投影**：webhook 丢失或延迟时对账是唯一入口，该路径不触发 Fault 通知等同漏报。
+- **元告警与原通知共用幂等键**：保底目标常常就是原通知失败的那个目标，元告警会把「从未送达」的
+  `notification_log` 改写成 `sent`，既抹掉要暴露的失败，也让送达指标把失败计成成功。
+- **恢复提醒指标没有统计窗口**：`timers` 的 fired 行会被 retention 清理，全表计数先涨后落、含义随保留配置变化。
+- ccloud syncer 误把项目 ID 当作实体 environment 写入。
+
+### 未完成（15 个任务，规格内）
+
+- 健康证据与影响外播（P4，任务 28–33、35、36）：阻塞于平台团队提供 `CCLOUD_HEALTH_WINDOW` 与真实接口路径。
+- 飞书交互卡片（任务 19、34、45）：阻塞于 uat 的公网回调入口。P2 通知走纯文本 + 详情链接，认领在 Web 完成。
+- k8s 探针切到 `/readyz`（任务 43）、uat 配置保底通知目标（任务 44）：人工动作。
+
+### 验收
+
+`go build` + `go vet`（含 integration tag）零错误；`go test -tags=integration ./internal/... -race` 19 个包全绿；
+`test/e2e` 通过（约 65s）；`web` build 与 oxlint 通过。
 
 ## [v0.2.0] 2026-09-17 — Infrastructure-first 事故响应发布基线
 
