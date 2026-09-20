@@ -52,3 +52,27 @@ func TestBuildRecoveryNudgeBody_DurationSinceCurrentStatus(t *testing.T) {
 		t.Fatalf("缺失状态时间戳时应回落 declared_at，body=%q", body)
 	}
 }
+
+func TestBuildRecoveryNudgeBody_DecommissionExit(t *testing.T) {
+	at := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	incident := domain.Incident{Status: domain.IncidentStatusMonitoring, DeclaredAt: at.Add(-time.Hour), MonitoringAt: at.Add(-time.Hour)}
+	body := buildRecoveryNudgeBody(incident, domain.IncidentRecoveryNudgeDetail{LatestClearedAt: at}, at)
+	if !strings.Contains(body, "请到控制中心的实体详情将对应实体标记为已下线") {
+		t.Fatalf("文案应给出下线出口: %s", body)
+	}
+	if strings.Contains(body, "全部证据实体已下线") {
+		t.Fatalf("未全部下线时不应明示: %s", body)
+	}
+	if strings.Contains(body, "已恢复") {
+		t.Fatalf("文案不得出现\"已恢复\"，body=%q", body)
+	}
+
+	allGone := domain.IncidentRecoveryNudgeDetail{LatestClearedAt: at, AllEvidenceEntitiesDecommissioned: true}
+	explicit := buildRecoveryNudgeBody(incident, allGone, at)
+	if !strings.Contains(explicit, "全部证据实体已下线") {
+		t.Fatalf("全部证据实体已下线时应明示: %s", explicit)
+	}
+	if !strings.Contains(explicit, "Incident 仍须人工确认后关闭") {
+		t.Fatalf("明示后仍须强调人工关闭: %s", explicit)
+	}
+}

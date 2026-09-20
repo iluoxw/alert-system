@@ -262,6 +262,10 @@ type IncidentRecoveryNudgeDetail struct {
 	OpenTaskCount            int                             `json:"open_task_count"`
 	ActiveIncludedFaultCount int                             `json:"active_included_fault_count"`
 	UnmetRequiredCriteria    []string                        `json:"unmet_required_criteria"`
+	// AllEvidenceEntitiesDecommissioned is copy-only: every locatable evidence
+	// entity on included Faults is decommissioned. Does not change trigger
+	// conditions or advance Incident status.
+	AllEvidenceEntitiesDecommissioned bool `json:"all_evidence_entities_decommissioned"`
 }
 
 var (

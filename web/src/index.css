@@ -572,6 +572,13 @@ a {
 .entity-hero p { margin: 0; color: #8190a5; font-family: 'SFMono-Regular', monospace; font-size: 11px; }
 .entity-hero__meta { display: flex; align-items: flex-end; flex-direction: column; gap: 9px; color: #96a3b6; font-size: 11px; }
 .entity-hero__meta .ant-tag { margin: 0; color: #dce7f2; background: #263548; border-color: #3b4d63; }
+.entity-hero.is-decommissioned { border-left-color: #8b96a5; }
+.entity-hero__actions { display: flex; gap: 8px; }
+.lifecycle-preview { display: flex; flex-direction: column; gap: 12px; }
+.lifecycle-preview section strong { display: block; color: #3e4b5c; font-size: 12px; }
+.lifecycle-preview ul { margin: 6px 0 0; padding-left: 18px; }
+.lifecycle-preview li { font-size: 12px; line-height: 1.6; }
+.lifecycle-preview__reason { display: flex; flex-direction: column; gap: 6px; color: #3e4b5c; font-size: 12px; }
 .entity-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; margin-top: 14px; align-items: start; }
 .entity-detail-grid > main { display: flex; flex-direction: column; gap: 14px; }
 .dependency-flow { display: grid; grid-template-columns: minmax(0, 1fr) 180px minmax(0, 1fr); align-items: center; gap: 22px; min-height: 340px; padding: 24px; background-color: #f8f9fa; background-image: linear-gradient(#e7eaee 1px, transparent 1px); background-size: 100% 38px; }
@@ -2059,6 +2066,7 @@ select {
   font-size: 13px;
   font-weight: 650;
 }
+.catalog-primary-cell strong a { color: inherit; }
 
 .catalog-primary-cell code,
 .catalog-settings-page code {

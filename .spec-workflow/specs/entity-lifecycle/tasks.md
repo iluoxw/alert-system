@@ -60,7 +60,7 @@
 
 ## 前端
 
-- [ ] 7. 实体详情下线入口与列表筛选
+- [x] 7. 实体详情下线入口与列表筛选
   - File: web/src/pages/InfrastructureDetail.tsx, web/src/pages/Settings/ServiceCatalog.tsx, web/src/api/client.ts
   - 详情页展示生命周期状态 / 下线时间 / 操作人 / 原因，提供下线与恢复操作；提交前先调 preview 并把影响面呈现给操作人确认；列表支持按状态筛选，默认只看 active
   - Purpose: 让下线成为页面上可完成的任务
@@ -70,7 +70,7 @@
 
 ## 收敛与验收
 
-- [ ] 8. nudge 文案给出下线出口
+- [x] 8. nudge 文案给出下线出口
   - File: internal/app/incident_nudge.go, internal/app/incident_nudge_test.go
   - 在既有「可能源于采集目标下线或服务发现注销」提示后补可执行出口；全部证据实体已下线时在文案中明示
   - Purpose: 把假恢复的判断直接引向下线收口

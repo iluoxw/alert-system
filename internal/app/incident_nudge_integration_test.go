@@ -198,7 +198,7 @@ func TestIncidentNudgeHandler_DisabledIntervalNoop(t *testing.T) {
 	nudgeLinkEvidence(t, ctx, st, fault.ID, alert.ID, actor.ID, domain.EvidenceRoleDirectImpact)
 
 	fakeSched := &recordingScheduler{}
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: fakeSched, nudgeInterval: 0, now: time.Now}, fakeSched, 0)
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
 		return h.Handle(ctx, tx, incident.ID, nil)
@@ -227,7 +227,7 @@ func TestIncidentNudgeHandler_NotAllClearedReschedulesWithoutNotify(t *testing.T
 	nudgeLinkEvidence(t, ctx, st, fault.ID, firingAlert.ID, actor.ID, domain.EvidenceRoleDirectImpact)
 
 	interval := time.Hour
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: scheduler.New(st, time.Second), nudgeInterval: 0, now: time.Now},
 		scheduler.New(st, time.Second), interval)
 
@@ -258,7 +258,7 @@ func TestIncidentNudgeHandler_AllClearedQueuesNudgeWithFireTimeRound(t *testing.
 
 	fireAt := time.Date(2026, 9, 17, 3, 0, 0, 0, time.UTC)
 	interval := time.Hour
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: scheduler.New(st, time.Second), nudgeInterval: 0, now: func() time.Time { return fireAt }},
 		scheduler.New(st, time.Second), interval)
 	h.now = func() time.Time { return fireAt }
@@ -277,6 +277,9 @@ func TestIncidentNudgeHandler_AllClearedQueuesNudgeWithFireTimeRound(t *testing.
 	}
 	if !strings.Contains(body, "告警解除可能源于采集目标下线或服务发现注销，请人工确认实际恢复后再推进 Incident") {
 		t.Fatalf("文案缺少人工确认提示: %s", body)
+	}
+	if !strings.Contains(body, "请到控制中心的实体详情将对应实体标记为已下线") {
+		t.Fatalf("文案应给出下线出口: %s", body)
 	}
 	if strings.Contains(body, "已恢复") {
 		t.Fatalf("文案不应出现'已恢复'字样: %s", body)
@@ -302,7 +305,7 @@ func TestIncidentNudgeHandler_ResolvedIncidentNoReschedule(t *testing.T) {
 	nudgeLinkEvidence(t, ctx, st, fault.ID, alert.ID, actor.ID, domain.EvidenceRoleDirectImpact)
 
 	sched := scheduler.New(st, time.Second)
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: sched, nudgeInterval: 0, now: time.Now}, sched, time.Hour)
 
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
@@ -332,7 +335,7 @@ func TestIncidentNudgeHandler_ExcludedEvidenceIgnored(t *testing.T) {
 	nudgeLinkEvidence(t, ctx, st, fault.ID, excludedAlert.ID, actor.ID, domain.EvidenceRoleExcluded)
 
 	sched := scheduler.New(st, time.Second)
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: sched, nudgeInterval: 0, now: time.Now}, sched, time.Hour)
 
 	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
@@ -364,7 +367,7 @@ func TestIncidentNudgeHandler_DuplicateFireNoDuplicateIntent(t *testing.T) {
 
 	fireAt := time.Now().UTC()
 	sched := scheduler.New(st, time.Second)
-	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(),
+	h := newIncidentNudgeHandler(store.NewIncidentRepo(), store.NewFaultRepo(), store.NewAlertRepo(), store.NewTopologyRepo(),
 		&IncidentOutbox{scheduler: sched, nudgeInterval: 0, now: func() time.Time { return fireAt }},
 		sched, time.Hour)
 	h.now = func() time.Time { return fireAt }

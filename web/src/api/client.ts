@@ -1085,6 +1085,7 @@ export function deleteSilence(id: string): Promise<void> {
 // ============================================================
 
 export type ResourceNodeKind = 'resource' | 'infrastructure_capability' | 'business_system'
+export type EntityLifecycleState = 'active' | 'decommissioned' | 'all'
 export type FaultStatus = 'candidate' | 'active' | 'monitoring' | 'resolved'
 export type FaultScope = 'instance' | 'capability'
 export type EvidenceRole = 'direct_impact' | 'cause_candidate' | 'trigger' | 'amplifier' | 'symptom' | 'supporting' | 'excluded'
@@ -1105,6 +1106,10 @@ export interface ResourceNode {
   labels?: Record<string, string>
   attributes?: Record<string, unknown>
   last_observed_at?: string
+  lifecycle_state?: Exclude<EntityLifecycleState, 'all'>
+  decommissioned_at?: string
+  decommissioned_by?: string
+  decommission_reason?: string
 }
 
 export interface DependencyEdge {
@@ -1219,8 +1224,8 @@ export function getInfrastructureOverview(): Promise<InfrastructureOverviewRespo
   return request('/infrastructure/overview')
 }
 
-export function listInfrastructureNodes(kind?: ResourceNodeKind): Promise<{ items: ResourceNode[] }> {
-  return request(`/infrastructure/nodes${withQuery({ kind })}`)
+export function listInfrastructureNodes(kind?: ResourceNodeKind, lifecycle?: EntityLifecycleState): Promise<{ items: ResourceNode[] }> {
+  return request(`/infrastructure/nodes${withQuery({ kind, lifecycle })}`)
 }
 
 export function getInfrastructureNode(id: string): Promise<InfrastructureNodeDetailResponse> {
@@ -1251,6 +1256,29 @@ export function createManagedEntity(body: ManagedEntityRequest): Promise<Managed
 
 export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ManagedEntityDetailResponse> {
   return request(`/admin/entities/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+export interface EntityLifecyclePreview {
+  active_faults: Fault[]
+  open_incidents: Incident[]
+  firing_alerts: Alert[]
+}
+
+export interface EntityLifecycleChangeResponse {
+  entity: ResourceNode
+  cascaded_faults: Fault[]
+}
+
+export function getEntityLifecyclePreview(id: string): Promise<EntityLifecyclePreview> {
+  return request(`/admin/entities/${id}/lifecycle-preview`)
+}
+
+export function patchEntityLifecycle(id: string, body: {
+  state: Exclude<EntityLifecycleState, 'all'>
+  reason?: string
+  cascade_faults?: boolean
+}): Promise<EntityLifecycleChangeResponse> {
+  return request(`/admin/entities/${id}/lifecycle`, { method: 'PATCH', body: JSON.stringify(body) })
 }
 
 export interface UnresolvedIdentity {

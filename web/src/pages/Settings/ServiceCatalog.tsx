@@ -6,8 +6,9 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { ApartmentOutlined, AppstoreOutlined, DatabaseOutlined, EditOutlined, PlusOutlined, TeamOutlined } from '@ant-design/icons'
+import { Link } from 'react-router-dom'
 import type {
-  EntityAlias, ManagedEntityRequest, ResourceNode, ServiceDependencyRequest, ServiceRegistration, ServiceRequest, ServiceTier,
+  EntityAlias, EntityLifecycleState, ManagedEntityRequest, ResourceNode, ServiceDependencyRequest, ServiceRegistration, ServiceRequest, ServiceTier,
   UnresolvedIdentity,
 } from '../../api/client'
 import {
@@ -53,9 +54,13 @@ export function ServiceCatalog() {
   const [aligning, setAligning] = useState<UnresolvedIdentity | null>(null)
   const [alignEntityID, setAlignEntityID] = useState('')
   const [aligningSaving, setAligningSaving] = useState(false)
+  const [lifecycleFilter, setLifecycleFilter] = useState<EntityLifecycleState>('active')
   const serviceQuery = useQuery({ queryKey: ['services'], queryFn: async () => (await listServices(500)).services })
   const teamQuery = useQuery({ queryKey: ['teams-lite'], queryFn: async () => (await listTeamsLite(500)).teams })
-  const entityQuery = useQuery({ queryKey: ['infrastructure-nodes'], queryFn: async () => (await listInfrastructureNodes()).items })
+  const entityQuery = useQuery({
+    queryKey: ['infrastructure-nodes', lifecycleFilter],
+    queryFn: async () => (await listInfrastructureNodes(undefined, lifecycleFilter)).items,
+  })
   const unresolvedQuery = useQuery({ queryKey: ['topology-unresolved'], queryFn: async () => (await listUnresolvedIdentities()).items })
   const services = useMemo(() => serviceQuery.data ?? [], [serviceQuery.data])
   const entities = useMemo(() => entityQuery.data ?? [], [entityQuery.data])
@@ -297,7 +302,11 @@ export function ServiceCatalog() {
   const entityColumns: ColumnsType<ResourceNode> = [
     {
       title: '依赖实体', key: 'entity',
-      render: (_, entity) => <div className="catalog-primary-cell"><strong>{entity.name}</strong><code>{entity.entity_key}</code><span>{entity.provider || '内部平台能力'}</span></div>,
+      render: (_, entity) => <div className="catalog-primary-cell"><strong><Link to={`/infrastructure/${entity.id}`}>{entity.name}</Link></strong><code>{entity.entity_key}</code><span>{entity.provider || '内部平台能力'}</span></div>,
+    },
+    {
+      title: '生命周期', key: 'lifecycle', width: 110,
+      render: (_, entity) => <Tag color={entity.lifecycle_state === 'decommissioned' ? 'default' : 'success'}>{entity.lifecycle_state === 'decommissioned' ? '已下线' : '运行中'}</Tag>,
     },
     {
       title: '层级 / 环境', key: 'layer', width: 180,
@@ -336,7 +345,7 @@ export function ServiceCatalog() {
           },
           {
             key: 'entities', label: `基础设施 / 平台 ${managedProviders.length}`,
-            children: <><div className="catalog-tab-toolbar"><div><strong>受管依赖实体</strong><span>登记可被多个应用共享的基础设施或平台能力；自动发现实体保持只读。</span></div><Button type="primary" icon={<PlusOutlined />} onClick={openEntityCreate}>登记依赖实体</Button></div><Table rowKey="id" columns={entityColumns} dataSource={managedProviders} loading={entityQuery.isLoading} pagination={false} scroll={{ x: 900 }} locale={{ emptyText: '尚未登记共享依赖实体。可先登记 Kubernetes、数据库、Kafka 等平台能力。' }} /></>,
+            children: <><div className="catalog-tab-toolbar"><div><strong>受管依赖实体</strong><span>登记可被多个应用共享的基础设施或平台能力；自动发现实体保持只读。默认只看运行中。</span></div><Space><Select aria-label="按生命周期筛选" value={lifecycleFilter} onChange={setLifecycleFilter} style={{ width: 140 }} options={[{ value: 'active', label: '仅运行中' }, { value: 'decommissioned', label: '仅已下线' }, { value: 'all', label: '全部' }]} /><Button type="primary" icon={<PlusOutlined />} onClick={openEntityCreate}>登记依赖实体</Button></Space></div><Table rowKey="id" columns={entityColumns} dataSource={managedProviders} loading={entityQuery.isLoading} pagination={false} scroll={{ x: 1000 }} locale={{ emptyText: lifecycleFilter === 'decommissioned' ? '当前没有已下线的受管实体。' : '尚未登记共享依赖实体。可先登记 Kubernetes、数据库、Kafka 等平台能力。' }} /></>,
           },
           {
             key: 'unresolved', label: `待对齐身份 ${unresolved.length}`,

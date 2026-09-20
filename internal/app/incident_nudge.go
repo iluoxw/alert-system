@@ -29,6 +29,7 @@ type incidentNudgeHandler struct {
 	incidents *store.IncidentRepo
 	faults    *store.FaultRepo
 	alerts    *store.AlertRepo
+	topology  *store.TopologyRepo
 	outbox    *IncidentOutbox
 	sched     incidentNudgeScheduler
 	interval  time.Duration
@@ -37,9 +38,9 @@ type incidentNudgeHandler struct {
 	now func() time.Time
 }
 
-func newIncidentNudgeHandler(incidents *store.IncidentRepo, faults *store.FaultRepo, alerts *store.AlertRepo, outbox *IncidentOutbox, sched incidentNudgeScheduler, interval time.Duration) *incidentNudgeHandler {
+func newIncidentNudgeHandler(incidents *store.IncidentRepo, faults *store.FaultRepo, alerts *store.AlertRepo, topology *store.TopologyRepo, outbox *IncidentOutbox, sched incidentNudgeScheduler, interval time.Duration) *incidentNudgeHandler {
 	return &incidentNudgeHandler{
-		incidents: incidents, faults: faults, alerts: alerts,
+		incidents: incidents, faults: faults, alerts: alerts, topology: topology,
 		outbox: outbox, sched: sched, interval: interval, now: time.Now,
 	}
 }
@@ -166,6 +167,8 @@ func (h *incidentNudgeHandler) buildNudgeDetail(ctx context.Context, tx pgx.Tx, 
 	if err != nil {
 		return domain.IncidentRecoveryNudgeDetail{}, err
 	}
+	nodeIDs := make([]string, 0)
+	seenNode := map[string]struct{}{}
 	for _, link := range links {
 		if link.Disposition != domain.IncidentFaultIncluded {
 			continue
@@ -177,6 +180,28 @@ func (h *incidentNudgeHandler) buildNudgeDetail(ctx context.Context, tx pgx.Tx, 
 		if fault.Status == domain.FaultStatusActive {
 			detail.ActiveIncludedFaultCount++
 		}
+		if fault.ResourceNodeID == "" {
+			continue
+		}
+		if _, exists := seenNode[fault.ResourceNodeID]; exists {
+			continue
+		}
+		seenNode[fault.ResourceNodeID] = struct{}{}
+		nodeIDs = append(nodeIDs, fault.ResourceNodeID)
+	}
+	if len(nodeIDs) > 0 && h.topology != nil {
+		allDecommissioned := true
+		for _, nodeID := range nodeIDs {
+			node, err := h.topology.GetByID(ctx, tx, nodeID)
+			if err != nil {
+				return domain.IncidentRecoveryNudgeDetail{}, err
+			}
+			if node.LifecycleState != domain.EntityLifecycleDecommissioned {
+				allDecommissioned = false
+				break
+			}
+		}
+		detail.AllEvidenceEntitiesDecommissioned = allDecommissioned
 	}
 	return detail, nil
 }

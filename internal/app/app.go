@@ -185,7 +185,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 
 	// ---- Incident 恢复提醒 handler（第 12 个 kind）：证据全部解除却无人收尾时
 	// 周期性提醒，绝不自动推进 Incident 状态（不变量 11）----
-	incidentNudge := newIncidentNudgeHandler(repos.Incidents, repos.Faults, repos.Alerts, incidentOutbox, sched, cfg.IncidentNudgeInterval)
+	incidentNudge := newIncidentNudgeHandler(repos.Incidents, repos.Faults, repos.Alerts, repos.Topology, incidentOutbox, sched, cfg.IncidentNudgeInterval)
 
 	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep + storm_summary
 	// + incident_recovery_nudge 全部在这里绑定；未注册的 kind 到期会被标 failed

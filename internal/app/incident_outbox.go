@@ -131,9 +131,15 @@ func buildRecoveryNudgeBody(incident domain.Incident, detail domain.IncidentReco
 		// 固定提示：证据解除不等于故障恢复（可能是采集目标下线/服务发现注销造成
 		// 的假解除），禁止让指挥误以为系统已经判定"已恢复"。
 		"告警解除可能源于采集目标下线或服务发现注销，请人工确认实际恢复后再推进 Incident。",
-		"证据详情：" + formatClearedEvidence(detail.ClearedEvidence),
-		"关闭门槛：" + formatNudgeGateSummary(detail),
+		"若确认采集目标已从集群剔除，请到控制中心的实体详情将对应实体标记为已下线；系统会按「实体已下线」收口关联 Fault，Incident 仍须人工关闭。",
 	}
+	if detail.AllEvidenceEntitiesDecommissioned {
+		lines = append(lines, "全部证据实体已下线。这能解释告警解除，但 Incident 仍须人工确认后关闭。")
+	}
+	lines = append(lines,
+		"证据详情："+formatClearedEvidence(detail.ClearedEvidence),
+		"关闭门槛："+formatNudgeGateSummary(detail),
+	)
 	return strings.Join(lines, "\n")
 }
 
