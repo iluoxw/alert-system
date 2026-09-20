@@ -78,7 +78,7 @@
   - _Requirements: R5.1, R5.2, R5.3, R5.4_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 调整 nudge 文案 | Restrictions: 继续用「解除」而非「恢复」（不变量 11）；**不得**推进 Incident 状态；不得改触发条件与间隔语义 | Success: 单测断言文案包含下线出口，且全部证据实体已下线时有明示 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 9. E2E：下线收口全链路
+- [x] 9. E2E：下线收口全链路
   - File: test/e2e/entity_lifecycle_test.go
   - 造一个挂着 active Fault 与未关闭 Incident 的实体 → 下线并 cascade → 断言 Fault resolved、Incident 仍开、时间线写明原因是下线、爆炸半径不再包含该实体及其下游
   - Purpose: 验证跨 store / impact / api 的联动
@@ -86,7 +86,7 @@
   - _Requirements: R2.1, R3.3, R3.4_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 测试工程师 | Task: 编写端到端场景 | Restrictions: test/e2e 固定端口，任何时刻只能跑一轮；不得修改既有场景的断言 | Success: go test -tags=integration ./test/e2e/... 全绿 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 10. 文档与不变量收口
+- [x] 10. 文档与不变量收口
   - File: CLAUDE.md, CHANGELOG.md
   - CLAUDE.md 增补「实体生命周期」口径（下线是人工终态、遥测不得自动置位、下线不删除历史）；CHANGELOG 记录本次交付
   - Purpose: 让后续实现受同一约束
