@@ -8,7 +8,7 @@
 
 ## 数据与领域
 
-- [ ] 1. 迁移 000029：实体生命周期列
+- [x] 1. 迁移 000029：实体生命周期列
   - File: migrations/000029_entity_lifecycle.up.sql, migrations/000029_entity_lifecycle.down.sql
   - `resource_nodes` 加 `lifecycle_state`（CHECK active/decommissioned，默认 active）、`decommissioned_at`、`decommissioned_by`、`decommission_reason`，加 `lifecycle_state` 索引
   - Purpose: 让「已下线」成为可表达的终态，与 stale 区分开
@@ -16,7 +16,7 @@
   - _Requirements: R1.1, R1.2_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: 数据库工程师 | Task: 按 design.md 数据模型加列与索引 | Restrictions: 纯加列，默认值必须让既有行为逐字节不变；不得新建审计表；不得使用 026/027/028 编号 | Success: 全新 PG 上 up → down → up 实测通过，既有行迁移后全部 active | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 2. store：生命周期读写与列表筛选
+- [x] 2. store：生命周期读写与列表筛选
   - File: internal/store/infrastructure.go, internal/store/infrastructure_lifecycle_test.go
   - 新增专用方法设置 / 恢复生命周期（写审计三列），实体列表支持按状态筛选、默认只返回 active；`faultColumns` 式的列清单要同步扩展，保证读回
   - Purpose: 让状态真正落库并能读回，而不是只活在领域对象里
@@ -24,7 +24,7 @@
   - _Requirements: R1.1, R1.2, R1.5, R1.6, R2.5_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 实现生命周期读写与筛选 | Restrictions: **不得**把状态变更塞进 UpdateManagedEntity（见 D2）；不得删除实体、别名或依赖边；遵守不变量 20 的结果集释放顺序 | Success: 带 //go:build integration 的「写入 → 读回」测试通过，覆盖下线、恢复、默认筛选 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 3. 遍历排除下线实体
+- [x] 3. 遍历排除下线实体
   - File: internal/store/infrastructure.go, internal/store/infrastructure_faults_test.go
   - `listCanonicalTraversal`（infrastructure.go:673）的递归 CTE 加排除条件，使下线节点**及其下游**都不出现在结果里
   - Purpose: 爆炸半径不再包含已不存在的资源
