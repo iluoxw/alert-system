@@ -32,7 +32,7 @@
   - _Requirements: R2.1, R2.4_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go + SQL 工程师 | Task: 在递归 CTE 内排除 decommissioned 实体 | Restrictions: 必须在 SQL 递归里断链，**不得**在 Go 侧过滤返回结果（那样下游仍会被遍历出来，见 D1）；依赖边必须保留在库中；不得引入新的嵌套查询（不变量 20） | Success: 集成测试断言「下线节点的下游也不出现」，且 active 路径不受影响 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 4. Impact：下线实体的自动结论降级
+- [x] 4. Impact：下线实体的自动结论降级
   - File: internal/impact/projector.go, internal/impact/projector_test.go
   - 实体下线后，由它产生的 `potential` Impact 转 `ruled_out`，理由记为实体已下线
   - Purpose: 影响面与现实一致，同时不侵犯人工裁决
@@ -42,7 +42,7 @@
 
 ## API
 
-- [ ] 5. 下线前置检查端点
+- [x] 5. 下线前置检查端点
   - File: internal/api/infrastructure.go, internal/api/infrastructure_lifecycle_test.go
   - `GET /api/v1/admin/entities/:id/lifecycle-preview`：返回该实体的 active/monitoring Fault、未关闭 Incident、未解除告警证据
   - Purpose: 让操作人在下线前看见影响面
@@ -50,7 +50,7 @@
   - _Requirements: R3.1, R4.1_
   - _Prompt: Implement the task for spec entity-lifecycle, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 实现前置检查端点 | Restrictions: admin only；集合字段为空必须返回 [] 而非 null（不变量 13）；一次查询取回，避免 N+1 | Success: 测试覆盖空集合、非 admin 403、实体不存在 404 | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 6. 生命周期变更端点与联动收口
+- [x] 6. 生命周期变更端点与联动收口
   - File: internal/api/infrastructure.go, internal/api/infrastructure_lifecycle_test.go
   - `PATCH /api/v1/admin/entities/:id/lifecycle`：下线 / 恢复；`cascade_faults=true` 时同事务把关联 Fault 推到 resolved 并写时间线；存在 active Fault 且未选 cascade 时 409
   - Purpose: 把下线做成一次可审计、可联动的显式动作

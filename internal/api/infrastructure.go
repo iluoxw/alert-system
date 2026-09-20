@@ -38,6 +38,7 @@ func (r *Router) RegisterInfrastructureRoutes(topology *store.TopologyRepo, faul
 	admin.Use(r.requireAdmin())
 	admin.POST("/entities", h.createManagedEntity)
 	admin.PUT("/entities/:id", h.updateManagedEntity)
+	r.RegisterEntityLifecycleRoutes(newEntityLifecycleAdapter(topology, faults, incidents, alerts))
 	return r
 }
 

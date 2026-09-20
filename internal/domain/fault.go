@@ -132,6 +132,11 @@ const (
 	// FaultTimelineActionNotifySkipped 记录"owner team 与全局 fallback 均未配置
 	// 通知渠道，本轮未产生任何通知意图"，避免通知静默失败无迹可寻。
 	FaultTimelineActionNotifySkipped FaultTimelineAction = "notify_skipped"
+	// FaultTimelineActionEntityDecommissioned 记录「实体已下线，本 Fault 按下线收口」；
+	// 这不是恢复，不得写成恢复语义。
+	FaultTimelineActionEntityDecommissioned FaultTimelineAction = "entity_decommissioned"
+	// FaultTimelineActionEntityRestored 记录「实体从下线恢复为 active」，不重开 Fault。
+	FaultTimelineActionEntityRestored FaultTimelineAction = "entity_restored"
 )
 
 // FaultTimelineEntry 是不可篡改的 Fault 时间线条目，结构对齐

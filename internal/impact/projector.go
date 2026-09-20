@@ -15,13 +15,29 @@ import (
 )
 
 const (
-	defaultMaxDepth   = 8
-	defaultStaleAfter = 24 * time.Hour
+	defaultMaxDepth                = 8
+	defaultStaleAfter              = 24 * time.Hour
+	decommissionedImpactRationale  = "实体已下线"
+	decommissionedImpactConfidence = 0.2
 )
 
+type topologyView interface {
+	ListBlastRadiusByNodeID(ctx context.Context, tx pgx.Tx, nodeID string, maxDepth int, staleAfter time.Duration) ([]domain.BlastRadiusNode, error)
+	ListDependencyProvidersByNodeID(ctx context.Context, tx pgx.Tx, nodeID string, maxDepth int, staleAfter time.Duration) ([]domain.BlastRadiusNode, error)
+}
+
+type faultImpactStore interface {
+	HasActiveDirectEvidenceForFault(ctx context.Context, tx pgx.Tx, faultID string, since time.Time) (bool, error)
+	HasActiveDirectEvidenceForNode(ctx context.Context, tx pgx.Tx, nodeID string, since time.Time) (bool, error)
+	ReplaceAutomatedImpacts(ctx context.Context, tx pgx.Tx, faultID string, impacts []domain.FaultImpact) error
+	UpsertAutomatedImpact(ctx context.Context, tx pgx.Tx, faultID string, impact domain.FaultImpact) error
+	ListForNode(ctx context.Context, tx pgx.Tx, nodeID string, limit int) ([]domain.Fault, error)
+	ListOpenForNodeIDs(ctx context.Context, tx pgx.Tx, nodeIDs []string, limit int) ([]domain.Fault, error)
+}
+
 type Projector struct {
-	topology   *store.TopologyRepo
-	faults     *store.FaultRepo
+	topology   topologyView
+	faults     faultImpactStore
 	maxDepth   int
 	staleAfter time.Duration
 }
@@ -32,6 +48,39 @@ func NewProjector(topology *store.TopologyRepo, faults *store.FaultRepo) *Projec
 
 func isApplication(node domain.ResourceNode) bool {
 	return node.Layer == domain.EntityLayerApplication || node.Kind == domain.ResourceNodeKindBusinessSystem
+}
+
+// classifyAutomatedImpact 只产出自动化结论。下线实体优先于 stale / 直接证据，
+// 一律 ruled_out；人工 confirmed / 人工 ruled_out 不走这里，由 ReplaceAutomatedImpacts
+// 按 decision_origin='human' 拒绝覆盖（不变量 16）。
+func classifyAutomatedImpact(node domain.ResourceNode, depth int, stale, hasDirect bool) (domain.ImpactState, string, float64) {
+	if node.LifecycleState == domain.EntityLifecycleDecommissioned {
+		return domain.ImpactStateRuledOut, decommissionedImpactRationale, decommissionedImpactConfidence
+	}
+	if stale {
+		return domain.ImpactStatePotential,
+			fmt.Sprintf("依赖图反向可达（%d 跳），但 observed 关系已过期", depth), 0.4
+	}
+	if hasDirect {
+		if depth == 0 {
+			return domain.ImpactStateConfirmed, "应用 direct_impact Alert 直接确认自身受影响", 0.95
+		}
+		return domain.ImpactStateConfirmed,
+			fmt.Sprintf("依赖图反向可达（%d 跳），且应用 direct_impact Alert 与 Fault 时间窗重叠", depth), 0.95
+	}
+	return domain.ImpactStatePotential,
+		fmt.Sprintf("依赖图反向可达（%d 跳），尚无直接业务退化证据", depth), 0.65
+}
+
+func decommissionedAutomatedImpact(nodeID string) domain.FaultImpact {
+	return domain.FaultImpact{
+		NodeID:         nodeID,
+		State:          domain.ImpactStateRuledOut,
+		Path:           []string{nodeID},
+		Rationale:      decommissionedImpactRationale,
+		Confidence:     decommissionedImpactConfidence,
+		DecisionOrigin: domain.DecisionOriginAutomation,
+	}
 }
 
 // RebuildFault replaces only automated Impact rows. Human decisions remain
@@ -58,27 +107,53 @@ func (p *Projector) RebuildFault(ctx context.Context, tx pgx.Tx, fault domain.Fa
 		if err != nil {
 			return err
 		}
-		state := domain.ImpactStatePotential
-		confidence := 0.65
-		rationale := fmt.Sprintf("依赖图反向可达（%d 跳），尚无直接业务退化证据", reached.Depth)
-		if reached.Stale {
-			confidence = 0.4
-			rationale = fmt.Sprintf("依赖图反向可达（%d 跳），但 observed 关系已过期", reached.Depth)
-		} else if hasDirect {
-			state = domain.ImpactStateConfirmed
-			confidence = 0.95
-			if reached.Node.ID == fault.ResourceNodeID {
-				rationale = "应用 direct_impact Alert 直接确认自身受影响"
-			} else {
-				rationale = fmt.Sprintf("依赖图反向可达（%d 跳），且应用 direct_impact Alert 与 Fault 时间窗重叠", reached.Depth)
-			}
-		}
+		state, rationale, confidence := classifyAutomatedImpact(reached.Node, reached.Depth, reached.Stale, hasDirect)
 		impacts = append(impacts, domain.FaultImpact{
 			NodeID: reached.Node.ID, State: state, Path: reached.Path,
 			Rationale: rationale, Confidence: confidence, DecisionOrigin: domain.DecisionOriginAutomation,
 		})
 	}
 	return p.faults.ReplaceAutomatedImpacts(ctx, tx, fault.ID, impacts)
+}
+
+// RuleOutDecommissionedImpacts 在实体下线后重算关联 Fault，并把该节点上的自动
+// potential 写成 ruled_out。遍历从下线根出发只含自身，其他 Fault 的半径不再含它，
+// 因此 Rebuild 之后再 Upsert 一条自动化 ruled_out，避免影响行被静默删掉。
+// UpsertAutomatedImpact 的 WHERE decision_origin <> 'human' 保住人工裁决。
+func (p *Projector) RuleOutDecommissionedImpacts(ctx context.Context, tx pgx.Tx, node domain.ResourceNode) error {
+	if node.ID == "" || node.LifecycleState != domain.EntityLifecycleDecommissioned {
+		return nil
+	}
+	related, err := p.faults.ListForNode(ctx, tx, node.ID, 100)
+	if err != nil {
+		return err
+	}
+	for _, fault := range related {
+		if err := p.RebuildFault(ctx, tx, fault); err != nil {
+			return fmt.Errorf("impact: 下线后重算 Fault %s 失败: %w", fault.ID, err)
+		}
+		if !isApplication(node) {
+			continue
+		}
+		if err := p.faults.UpsertAutomatedImpact(ctx, tx, fault.ID, decommissionedAutomatedImpact(node.ID)); err != nil {
+			return fmt.Errorf("impact: 下线降级 Fault %s 失败: %w", fault.ID, err)
+		}
+	}
+	return nil
+}
+
+// RebuildRelatedToNode 恢复实体后重算关联 Fault 的自动 Impact，不再写入 ruled_out。
+func (p *Projector) RebuildRelatedToNode(ctx context.Context, tx pgx.Tx, nodeID string) error {
+	related, err := p.faults.ListForNode(ctx, tx, nodeID, 100)
+	if err != nil {
+		return err
+	}
+	for _, fault := range related {
+		if err := p.RebuildFault(ctx, tx, fault); err != nil {
+			return fmt.Errorf("impact: 恢复后重算 Fault %s 失败: %w", fault.ID, err)
+		}
+	}
+	return nil
 }
 
 func (p *Projector) ProviderNodeIDs(ctx context.Context, tx pgx.Tx, consumerNodeID string) ([]string, error) {

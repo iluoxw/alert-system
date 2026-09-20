@@ -124,6 +124,38 @@ func qualifiedIncidentColumns(alias string) string {
 		alias + `.resolved_at, ` + alias + `.created_at, ` + alias + `.updated_at`
 }
 
+// ListOpenForFaultIDs 一次取回这些 Fault 所挂的未关闭 Incident。faultIDs 为空时
+// 不发查询，直接返回 []（预览空集合，不变量 13）。
+func (r *IncidentRepo) ListOpenForFaultIDs(ctx context.Context, tx pgx.Tx, faultIDs []string) ([]domain.Incident, error) {
+	if len(faultIDs) == 0 {
+		return []domain.Incident{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT `+qualifiedIncidentColumns("i")+`
+		FROM incidents i
+		JOIN incident_fault_links l ON l.incident_id = i.id
+		WHERE l.fault_id::text = ANY($1)
+		  AND i.status <> 'resolved'
+		ORDER BY i.declared_at DESC
+	`, faultIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 Fault 关联未关闭 Incident 失败: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.Incident, 0)
+	for rows.Next() {
+		incident, err := scanIncident(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, incident)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (r *IncidentRepo) List(ctx context.Context, tx pgx.Tx, status domain.IncidentStatus, limit int) ([]domain.Incident, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50

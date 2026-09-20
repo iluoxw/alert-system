@@ -307,7 +307,88 @@ func qualifiedFaultColumns(alias string) string {
 		alias + `.severity, ` + alias + `.kind, ` + alias + `.title, ` + alias + `.summary, ` +
 		`COALESCE(` + alias + `.resource_node_id::text, ''), ` + alias + `.entity_ref, ` +
 		alias + `.confidence, ` + alias + `.metadata, ` + alias + `.first_detected_at, ` +
-		alias + `.last_evaluated_at, ` + alias + `.resolved_at, ` + alias + `.created_at, ` + alias + `.updated_at`
+		alias + `.last_evaluated_at, ` + alias + `.resolved_at, ` + alias + `.created_at, ` + alias + `.updated_at, ` +
+		`COALESCE(` + alias + `.owner_team_id::text, ''), COALESCE(` + alias + `.acked_by::text, ''), ` +
+		`COALESCE(` + alias + `.acked_by_name, ''), ` + alias + `.acked_at, ` + alias + `.owner_notified_at`
+}
+
+// ListOpenRelatedToNode 一次取回挂在该实体上的 active/monitoring Fault：
+// resource_node_id 命中，或 fault_impacts.node_id 命中。resolved / candidate 不进预览。
+func (r *FaultRepo) ListOpenRelatedToNode(ctx context.Context, tx pgx.Tx, nodeID string, limit int) ([]domain.Fault, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT `+qualifiedFaultColumns("f")+`
+		FROM faults f
+		LEFT JOIN fault_impacts i ON i.fault_id = f.id
+		WHERE (f.resource_node_id = $1 OR i.node_id = $1)
+		  AND f.status IN ('active', 'monitoring')
+		ORDER BY f.last_evaluated_at DESC
+		LIMIT $2
+	`, nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询实体关联未收口 Fault 失败: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.Fault, 0)
+	for rows.Next() {
+		item, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// HasActiveRelatedToNode 只看 status='active'。409 用这条，不能拿预览里的
+// monitoring 一并挡下线（R3.2 只约束 active）。
+func (r *FaultRepo) HasActiveRelatedToNode(ctx context.Context, tx pgx.Tx, nodeID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM faults f
+			LEFT JOIN fault_impacts i ON i.fault_id = f.id
+			WHERE (f.resource_node_id = $1 OR i.node_id = $1)
+			  AND f.status = 'active'
+		)
+	`, nodeID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: 查询实体 active Fault 失败: %w", err)
+	}
+	return exists, nil
+}
+
+// ResolveByDecommission 是下线收口专用路径：不走 ValidateFaultTransition
+// （active→resolved 被通用状态机禁止）。已 resolved 则 changed=false，不重写。
+func (r *FaultRepo) ResolveByDecommission(ctx context.Context, tx pgx.Tx, id string, at time.Time) (domain.Fault, bool, error) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	row := tx.QueryRow(ctx, `
+		UPDATE faults
+		SET status = 'resolved',
+		    last_evaluated_at = GREATEST(last_evaluated_at, $2),
+		    resolved_at = $2
+		WHERE id = $1 AND status <> 'resolved'
+		RETURNING `+faultColumns, id, at)
+	fault, err := scanFault(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, getErr := r.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return domain.Fault{}, false, getErr
+		}
+		return existing, false, nil
+	}
+	if err != nil {
+		return domain.Fault{}, false, fmt.Errorf("store: 按下线收口 Fault 失败: %w", err)
+	}
+	return fault, true, nil
 }
 
 func (r *FaultRepo) HasConfirmedBusinessImpact(ctx context.Context, tx pgx.Tx, faultID string) (bool, error) {
