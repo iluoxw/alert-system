@@ -198,3 +198,63 @@ func TestPreviewEntityLifecycle_EmptyCollections(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// 回归：qualifiedFaultColumns 与 scanFault 必须同列。era3 给 scanFault 加了
+// owner/ack 五列却漏改 qualifiedFaultColumns，ListForNode 因此自 da95e0d 起一直
+// 扫描列数不匹配；v0.3.0 带着这个缺陷发到了 uat，而 ListForNode 只有 projector
+// 单测里的 fake，真实 SQL 从未被测过，五轮全量验证全部漏掉。
+// 本测试用真实 PG 跑通查询并断言 era3 列能读回，钉住这一类"列清单漂移"。
+func TestListForNode_RoundTripsEra3OwnerAndAckColumns(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	topology := NewTopologyRepo()
+	faults := NewFaultRepo()
+	team := mustTeam(t, ctx, st, "listfornode-owner")
+	actor := mustUser(t, ctx, st, "listfornode-sre")
+	now := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+
+	var host domain.ResourceNode
+	var fault domain.Fault
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		host, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
+			EntityKey: "host:10.61.17.21", Layer: domain.EntityLayerInfrastructure,
+			Name: "listfornode-host", Environment: "prod", OwnerTeamID: team.ID,
+		}, nil, nil)
+		if err != nil {
+			return err
+		}
+		fault, _, err = faults.Upsert(ctx, tx, domain.Fault{
+			CorrelationKey: "test:listfornode", Scope: domain.FaultScopeInstance,
+			Status: domain.FaultStatusActive, Severity: domain.SeverityWarning,
+			Kind: "exporter_down", Title: "列清单回归", ResourceNodeID: host.ID,
+			EntityRef: host.EntityKey, Confidence: 0.7, FirstDetected: now, LastEvaluated: now,
+			OwnerTeamID: team.ID,
+		})
+		if err != nil {
+			return err
+		}
+		_, _, err = faults.Ack(ctx, tx, fault.ID, actor.ID, "值班 SRE", now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []domain.Fault
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		got, err = faults.ListForNode(ctx, tx, host.ID, 20)
+		return err
+	}); err != nil {
+		t.Fatalf("ListForNode 失败（列清单与 scanFault 不匹配会在这里报错）: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("期望 1 条 Fault，实际 %d", len(got))
+	}
+	if got[0].OwnerTeamID != team.ID {
+		t.Fatalf("owner_team_id 未读回: %q", got[0].OwnerTeamID)
+	}
+	if got[0].AckedBy != actor.ID || got[0].AckedByName != "值班 SRE" {
+		t.Fatalf("认领信息未读回: by=%q name=%q", got[0].AckedBy, got[0].AckedByName)
+	}
+}
