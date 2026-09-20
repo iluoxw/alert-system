@@ -123,19 +123,23 @@ type Handlers struct {
 	// （design.md R2）。本包不感知 web 路由/部署域名等配置，可选留空——留空时
 	// DetailURL 不设置，channel 实现（如飞书卡片）按 Message.DetailURL 为空处理即可。
 	AlertListURL func(teamID string) string
+
+	// queryIndicators 默认 ops.QueryIndicators。单测注入 stub，避免在 nil tx 上跑 SQL。
+	queryIndicators func(ctx context.Context, tx pgx.Tx) (Indicators, error)
 }
 
 // NewHandlers 构造 Handlers，clock 默认为真实时钟（测试可直接覆盖 h.clock 字段）。
 func NewHandlers(settings SettingsRepo, teams TeamRepo, daily DailyStatsRepo, stale StaleAlertRepo, oncall OncallResolver, notifier OpsNotifier, sched TimerScheduler) *Handlers {
 	return &Handlers{
-		settings: settings,
-		teams:    teams,
-		daily:    daily,
-		stale:    stale,
-		oncall:   oncall,
-		notifier: notifier,
-		sched:    sched,
-		clock:    realClock{},
+		settings:        settings,
+		teams:           teams,
+		daily:           daily,
+		stale:           stale,
+		oncall:          oncall,
+		notifier:        notifier,
+		sched:           sched,
+		clock:           realClock{},
+		queryIndicators: QueryIndicators,
 	}
 }
 
@@ -215,7 +219,11 @@ func (h *Handlers) HandleDailyReport(ctx context.Context, tx pgx.Tx, teamID stri
 		return fmt.Errorf("ops: 查询团队名称失败: %w", err)
 	}
 
-	msg := BuildDailyReport(teamName, dayStart, stats, longOpen)
+	lead, err := h.queryIndicators(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("ops: 查询先行指标失败: %w", err)
+	}
+	msg := BuildDailyReport(teamName, dayStart, stats, longOpen, lead)
 	msg.DetailURL = h.detailURL(teamID)
 
 	round := PeriodRound(TimerKindDailyReport, *settings, fireAt)

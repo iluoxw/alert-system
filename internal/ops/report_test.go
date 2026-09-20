@@ -13,7 +13,7 @@ func TestBuildDailyReport_零告警日(t *testing.T) {
 		BySeverity: map[string]int{},
 	}
 	date := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
-	msg := BuildDailyReport("SRE", date, stats, nil)
+	msg := BuildDailyReport("SRE", date, stats, nil, Indicators{})
 
 	if !strings.Contains(msg.Body, "新增 0 条，恢复 0 条") {
 		t.Fatalf("零告警日文案缺少新增/恢复计数: %s", msg.Body)
@@ -32,7 +32,7 @@ func TestBuildDailyReport_MTTA无效显示占位符(t *testing.T) {
 		MTTAAvgValid:    false,
 		MTTAMedianValid: false,
 	}
-	msg := BuildDailyReport("SRE", time.Now(), stats, nil)
+	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
 	if !strings.Contains(msg.Body, "均值 —") || !strings.Contains(msg.Body, "中位 —") {
 		t.Fatalf("无 Ack 数据时 MTTA 均值/中位应显示占位符 —: %s", msg.Body)
 	}
@@ -46,7 +46,7 @@ func TestBuildDailyReport_MTTA有效时显示人性化时长(t *testing.T) {
 		MTTAMedian:      45 * time.Minute,
 		MTTAMedianValid: true,
 	}
-	msg := BuildDailyReport("SRE", time.Now(), stats, nil)
+	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
 	if !strings.Contains(msg.Body, "1小时30分钟") {
 		t.Fatalf("MTTA 均值应格式化为人性化时长: %s", msg.Body)
 	}
@@ -60,7 +60,7 @@ func TestBuildDailyReport_7日均值除零显示占位符(t *testing.T) {
 		BySeverity:     map[string]int{},
 		Prev7DayAvgNew: 0,
 	}
-	msg := BuildDailyReport("SRE", time.Now(), stats, nil)
+	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
 	if !strings.Contains(msg.Body, "—（无历史数据）") {
 		t.Fatalf("7 日均值为 0 时应显示占位符而非除零: %s", msg.Body)
 	}
@@ -72,7 +72,7 @@ func TestBuildDailyReport_7日均值正常对比(t *testing.T) {
 		NewCount:       20,
 		Prev7DayAvgNew: 10,
 	}
-	msg := BuildDailyReport("SRE", time.Now(), stats, nil)
+	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
 	if !strings.Contains(msg.Body, "+100.0%") {
 		t.Fatalf("环比应算出 +100.0%%: %s", msg.Body)
 	}
@@ -84,7 +84,7 @@ func TestBuildDailyReport_长清单截断(t *testing.T) {
 		longOpen[i] = domain.Alert{Severity: domain.SeverityWarning, Title: "alert"}
 	}
 	stats := DailyStats{BySeverity: map[string]int{}}
-	msg := BuildDailyReport("SRE", time.Now(), stats, longOpen)
+	msg := BuildDailyReport("SRE", time.Now(), stats, longOpen, Indicators{})
 
 	if !strings.Contains(msg.Body, "共 25 条") {
 		t.Fatalf("应显示总条数 25: %s", msg.Body)
@@ -102,7 +102,7 @@ func TestBuildDailyReport_短清单不截断(t *testing.T) {
 		{Severity: domain.SeverityCritical, Title: "db down"},
 	}
 	stats := DailyStats{BySeverity: map[string]int{}}
-	msg := BuildDailyReport("SRE", time.Now(), stats, longOpen)
+	msg := BuildDailyReport("SRE", time.Now(), stats, longOpen, Indicators{})
 	if strings.Contains(msg.Body, "仅显示前") {
 		t.Fatalf("未超过上限不应出现截断提示: %s", msg.Body)
 	}
@@ -133,6 +133,58 @@ func TestBuildOncallBroadcast_无排班明示(t *testing.T) {
 	msg := BuildOncallBroadcast("SRE", nil, time.Now())
 	if !strings.Contains(msg.Body, "今日无值班安排") {
 		t.Fatalf("无排班时应明示: %s", msg.Body)
+	}
+}
+
+func TestBuildDailyReport_先行指标空数据显示暂无数据(t *testing.T) {
+	stats := DailyStats{BySeverity: map[string]int{}}
+	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
+	if !strings.Contains(msg.Body, "先行指标：") {
+		t.Fatalf("日报应追加先行指标小节: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "firing 告警映射率：暂无数据") {
+		t.Fatalf("分母为 0 的映射率应显示暂无数据: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "Fault 认领时长中位：暂无数据") {
+		t.Fatalf("无认领样本应显示暂无数据: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "未对齐身份：暂无数据") {
+		t.Fatalf("无成功同步应显示暂无数据: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "无 owner 的 active Fault：0") {
+		t.Fatalf("真实零应显示 0 而不是暂无数据: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "恢复提醒发出次数：0") {
+		t.Fatalf("无 fired nudge 应显示 0: %s", msg.Body)
+	}
+}
+
+func TestBuildDailyReport_先行指标有数据(t *testing.T) {
+	rate := 0.5
+	median := 1800.0
+	unresolved := 4
+	lead := Indicators{
+		FiringMappingRate:        &rate,
+		ActiveFaultsWithoutOwner: 2,
+		FaultAckMedianSeconds:    &median,
+		RecoveryNudgeFiredCount:  3,
+		UnresolvedIdentityCount:  &unresolved,
+	}
+	msg := BuildDailyReport("SRE", time.Now(), DailyStats{BySeverity: map[string]int{}}, nil, lead)
+	if !strings.Contains(msg.Body, "firing 告警映射率：50.0%") {
+		t.Fatalf("映射率文案不对: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "Fault 认领时长中位：30分钟") {
+		t.Fatalf("认领中位文案不对: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "未对齐身份：4") {
+		t.Fatalf("未对齐身份文案不对: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "无 owner 的 active Fault：2") {
+		t.Fatalf("无 owner 文案不对: %s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "恢复提醒发出次数：3") {
+		t.Fatalf("nudge 文案不对: %s", msg.Body)
 	}
 }
 

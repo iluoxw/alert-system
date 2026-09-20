@@ -622,6 +622,19 @@ export function updateOpsSettings(teamId: string, body: OpsSettingsRequest): Pro
   return request(`/admin/teams/${teamId}/ops-settings`, { method: 'PUT', body: JSON.stringify(body) })
 }
 
+// 先行指标（任务 37/38，R10.1）。admin only；null 表示无数据（不是 0）。
+export interface OpsIndicators {
+  firing_mapping_rate: number | null
+  active_faults_without_owner: number
+  fault_ack_duration_median_seconds: number | null
+  recovery_nudge_fired_count: number
+  unresolved_identity_count: number | null
+}
+
+export function getOpsIndicators(): Promise<OpsIndicators> {
+  return request('/ops/indicators')
+}
+
 // ---- users ----
 //
 // 创建接受明文 password（服务端 bcrypt 哈希后落库）；更新不支持改用户名/密码

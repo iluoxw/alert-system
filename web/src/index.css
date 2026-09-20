@@ -391,6 +391,9 @@ a {
 .operations-summary-card small { color: var(--text-secondary); font-size: 10px; font-weight: 600; }
 .operations-summary-card strong { grid-row: 1 / span 2; grid-column: 2; color: var(--text); font-family: 'DIN Alternate', 'Avenir Next', sans-serif; font-size: 30px; font-variant-numeric: tabular-nums; line-height: 1; }
 .operations-summary-card > div > span { overflow: hidden; color: var(--text-secondary); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.operations-leading-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+.operations-leading-grid__span { grid-column: 1 / -1; }
+.operations-summary-card.is-nodata strong { font-size: 16px; line-height: 1.2; }
 .operations-overview-grid { min-width: 0; display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .75fr); gap: 14px; align-items: start; }
 .operations-overview-rail { min-width: 0; display: grid; gap: 14px; }
 .operations-priority-panel .ledger-panel-head > a,
@@ -796,6 +799,10 @@ a {
 .incident-roles-panel label small { color: #9aa2ae; font-size: 8px; }
 .communication-panel > p { margin: 0; padding: 0 16px 16px; color: #788494; font-size: 10px; line-height: 1.6; }
 
+@media (max-width: 1400px) {
+  .operations-leading-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
 @media (max-width: 1280px) {
   .incident-room-grid { grid-template-columns: 300px minmax(420px, 1fr); }
   .incident-people-column { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
@@ -805,6 +812,7 @@ a {
 @media (max-width: 1050px) {
   .operations-summary-grid,
   .incident-queue-summary { grid-template-columns: 1fr 1fr; }
+  .operations-leading-grid { grid-template-columns: 1fr 1fr; }
   .operations-overview-grid { grid-template-columns: 1fr; }
   .operations-command-rail { grid-template-columns: 1fr 1fr; }
   .operations-command-rail > section:first-child { grid-row: 1 / span 2; }
@@ -828,6 +836,7 @@ a {
   .fault-ledger-workspace { padding: 12px; }
   .operations-command-rail { grid-template-columns: 1fr; }
   .operations-summary-grid,
+  .operations-leading-grid,
   .incident-queue-summary { grid-template-columns: 1fr; }
   .operations-command-rail > section:first-child { grid-row: auto; }
   .ops-page,
@@ -2595,6 +2604,7 @@ select {
   }
 
   .operations-summary-grid,
+  .operations-leading-grid,
   .incident-queue-summary,
   .workbench-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));

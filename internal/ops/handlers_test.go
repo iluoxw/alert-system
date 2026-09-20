@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,9 @@ func newTestHandlers(settings *fakeSettingsRepo, teams *fakeTeamRepo, daily *fak
 	stale *fakeStaleAlertRepo, oncall *fakeOncallResolver, notifier *fakeOpsNotifier, sched *fakeOpsScheduler, now time.Time) *Handlers {
 	h := NewHandlers(settings, teams, daily, stale, oncall, notifier, sched)
 	h.clock = &settableClock{t: now}
+	h.queryIndicators = func(ctx context.Context, tx pgx.Tx) (Indicators, error) {
+		return Indicators{}, nil
+	}
 	return h
 }
 
@@ -187,6 +191,12 @@ func TestHandleDailyReport_NormalPath(t *testing.T) {
 	if len(daily.statsCalls) != 1 || !daily.statsCalls[0].dayStart.Equal(wantDayStart) || !daily.statsCalls[0].dayEnd.Equal(wantDayEnd) {
 		t.Fatalf("DailyStats 时间窗不正确: %+v, want [%v, %v)", daily.statsCalls, wantDayStart, wantDayEnd)
 	}
+	if !strings.Contains(notifier.calls[0].msg.Body, "先行指标：") {
+		t.Fatalf("日报应追加先行指标小节: %s", notifier.calls[0].msg.Body)
+	}
+	if !strings.Contains(notifier.calls[0].msg.Body, "firing 告警映射率：暂无数据") {
+		t.Fatalf("空指标应显示暂无数据而不是 0: %s", notifier.calls[0].msg.Body)
+	}
 }
 
 // TestHandleDailyReport_Disabled_NoRenewal 覆盖禁用：不发送、不续期，链路自然断掉。
@@ -226,6 +236,28 @@ func TestHandleDailyReport_MissingSettings_NoRenewal(t *testing.T) {
 
 // TestHandleDailyReport_StatsError_PropagatesAndDoesNotRenew 覆盖统计查询异常：
 // 整体报错（回滚重投语义），且不应先斩后奏地调度发送/续期。
+func TestHandleDailyReport_IndicatorsError_PropagatesAndDoesNotRenew(t *testing.T) {
+	settings := &fakeSettingsRepo{byTeam: map[string]Settings{testTeamID: twoChannelSettings()}}
+	notifier := &fakeOpsNotifier{}
+	sched := &fakeOpsScheduler{}
+	h := newTestHandlers(settings, &fakeTeamRepo{name: "SRE"}, &fakeDailyStatsRepo{stats: DailyStats{BySeverity: map[string]int{}}}, &fakeStaleAlertRepo{}, &fakeOncallResolver{}, notifier, sched, time.Now())
+	h.queryIndicators = func(ctx context.Context, tx pgx.Tx) (Indicators, error) {
+		return Indicators{}, errors.New("indicators boom")
+	}
+
+	payload, _ := EncodePayload(time.Now())
+	err := h.HandleDailyReport(context.Background(), nil, testTeamID, payload)
+	if err == nil {
+		t.Fatal("HandleDailyReport() 应报错但未报错")
+	}
+	if !strings.Contains(err.Error(), "先行指标") {
+		t.Fatalf("错误应标明先行指标失败: %v", err)
+	}
+	if len(notifier.calls) != 0 || len(sched.calls) != 0 {
+		t.Fatalf("查询失败不得发送或续期: notifier=%d sched=%d", len(notifier.calls), len(sched.calls))
+	}
+}
+
 func TestHandleDailyReport_StatsError_PropagatesAndDoesNotRenew(t *testing.T) {
 	settings := &fakeSettingsRepo{byTeam: map[string]Settings{testTeamID: twoChannelSettings()}}
 	daily := &fakeDailyStatsRepo{statsErr: errors.New("db 挂了")}

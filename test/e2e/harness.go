@@ -17,6 +17,7 @@ import (
 	"alert-system/internal/domain"
 	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
+	"alert-system/internal/ops"
 	"alert-system/internal/pipeline"
 	"alert-system/internal/runbook"
 	"alert-system/internal/scheduler"
@@ -174,6 +175,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterOpsIndicatorsRoutes(ops.QueryIndicators)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)

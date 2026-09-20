@@ -6,12 +6,20 @@ import {
   ApartmentOutlined,
   ArrowRightOutlined,
   BellOutlined,
+  ClockCircleOutlined,
+  IdcardOutlined,
+  NotificationOutlined,
+  PartitionOutlined,
+  UserDeleteOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import { Link } from 'react-router-dom'
-import { getInfrastructureOverview, listTeamsLite } from '../api/client'
+import { getInfrastructureOverview, getOpsIndicators, listTeamsLite, me, type OpsIndicators } from '../api/client'
 import {
   faultDisplayID,
+  formatIndicatorCount,
+  formatIndicatorRate,
+  formatIndicatorSeconds,
   incidentDisplayID,
   ownerTeam,
   relativeTime,
@@ -24,12 +32,29 @@ const layerLabel = {
   application: '应用服务',
 } as const
 
+function leadingCards(lead: OpsIndicators) {
+  return [
+    { key: 'map', icon: <PartitionOutlined />, label: 'firing 告警映射率', value: formatIndicatorRate(lead.firing_mapping_rate), hint: lead.firing_mapping_rate == null ? '当前没有 firing 告警' : '已关联 Fault 的 firing 占比', nodata: lead.firing_mapping_rate == null, danger: false },
+    { key: 'owner', icon: <UserDeleteOutlined />, label: '无 owner 的 active Fault', value: formatIndicatorCount(lead.active_faults_without_owner), hint: '需要补齐归属', nodata: false, danger: lead.active_faults_without_owner > 0 },
+    { key: 'ack', icon: <ClockCircleOutlined />, label: 'Fault 认领时长中位', value: formatIndicatorSeconds(lead.fault_ack_duration_median_seconds), hint: lead.fault_ack_duration_median_seconds == null ? '尚无认领样本' : 'acked_at − first_detected_at', nodata: lead.fault_ack_duration_median_seconds == null, danger: false },
+    { key: 'nudge', icon: <NotificationOutlined />, label: '恢复提醒发出次数', value: formatIndicatorCount(lead.recovery_nudge_fired_count), hint: 'incident_recovery_nudge 已发出', nodata: false, danger: false },
+    { key: 'unresolved', icon: <IdcardOutlined />, label: '未对齐身份', value: formatIndicatorCount(lead.unresolved_identity_count), hint: lead.unresolved_identity_count == null ? '尚未成功同步 ccloud' : '最近一次成功同步仍未解析', nodata: lead.unresolved_identity_count == null, danger: false },
+  ]
+}
+
 export function OperationsOverview() {
   const overviewQuery = useQuery({
     queryKey: ['infrastructure-overview'], queryFn: getInfrastructureOverview, refetchInterval: 15_000,
   })
   const teamsQuery = useQuery({
     queryKey: ['teams-lite'], queryFn: async () => (await listTeamsLite()).teams,
+  })
+  const { data: meData } = useQuery({ queryKey: ['me'], queryFn: me })
+  const indicatorsQuery = useQuery({
+    queryKey: ['ops-indicators'],
+    queryFn: getOpsIndicators,
+    enabled: Boolean(meData?.is_admin),
+    refetchInterval: 15_000,
   })
   const teamByID = useMemo(() => new Map((teamsQuery.data ?? []).map((team) => [team.id, team.name])), [teamsQuery.data])
 
@@ -71,6 +96,23 @@ export function OperationsOverview() {
           <div><small>响应中事故</small><strong>{activeIncidents.length}</strong><span>已进入跨角色协作</span></div>
         </article>
       </section>
+
+      {meData?.is_admin && (
+        <section className="operations-leading-grid" aria-label="先行指标">
+          {indicatorsQuery.isLoading && <div className="operations-leading-grid__span"><Skeleton active paragraph={{ rows: 2 }} /></div>}
+          {indicatorsQuery.error && (
+            <div className="operations-leading-grid__span">
+              <Alert type="warning" showIcon message="先行指标加载失败" description={indicatorsQuery.error instanceof Error ? indicatorsQuery.error.message : '请稍后重试'} />
+            </div>
+          )}
+          {indicatorsQuery.data && leadingCards(indicatorsQuery.data).map((card) => (
+            <article key={card.key} className={`operations-summary-card${card.danger ? ' is-danger' : ''}${card.nodata ? ' is-nodata' : ''}`}>
+              <span className="operations-summary-card__icon">{card.icon}</span>
+              <div><small>{card.label}</small><strong>{card.value}</strong><span>{card.hint}</span></div>
+            </article>
+          ))}
+        </section>
+      )}
 
       <div className="operations-overview-grid">
         <section className="ops-ledger-panel operations-priority-panel">

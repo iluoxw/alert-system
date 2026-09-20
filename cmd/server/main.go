@@ -28,6 +28,7 @@ import (
 	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
 	"alert-system/internal/notify"
+	"alert-system/internal/ops"
 	"alert-system/internal/runbook"
 	"alert-system/internal/store"
 )
@@ -190,6 +191,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterOpsIndicatorsRoutes(ops.QueryIndicators)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)

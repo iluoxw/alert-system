@@ -68,7 +68,7 @@ const maxLongOpenListed = 20
 
 // BuildDailyReport 构建团队日报文案。date 是报告所指的自然日（通常是"昨天"），
 // longOpen 是超过 24 小时仍未关闭的告警清单（由 store.ListOpenLongerThan 传入）。
-func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpen []domain.Alert) notify.Message {
+func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpen []domain.Alert, lead Indicators) notify.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "昨日新增 %d 条，恢复 %d 条。\n\n", stats.NewCount, stats.ResolvedCount)
 
@@ -121,6 +121,13 @@ func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpe
 		}
 	}
 
+	b.WriteString("\n\n先行指标：\n")
+	fmt.Fprintf(&b, "- firing 告警映射率：%s\n", formatOptionalRate(lead.FiringMappingRate))
+	fmt.Fprintf(&b, "- 无 owner 的 active Fault：%d\n", lead.ActiveFaultsWithoutOwner)
+	fmt.Fprintf(&b, "- Fault 认领时长中位：%s\n", formatOptionalDurationSeconds(lead.FaultAckMedianSeconds))
+	fmt.Fprintf(&b, "- 恢复提醒发出次数：%d\n", lead.RecoveryNudgeFiredCount)
+	fmt.Fprintf(&b, "- 未对齐身份：%s", formatOptionalCount(lead.UnresolvedIdentityCount))
+
 	return notify.Message{
 		Severity:   string(domain.SeverityInfo),
 		Title:      fmt.Sprintf("%s 团队日报 %s", teamName, date.Format("2006-01-02")),
@@ -167,4 +174,25 @@ func BuildOncallBroadcast(teamName string, oncallNames []string, date time.Time)
 		Body:       body,
 		OccurredAt: date,
 	}
+}
+
+func formatOptionalRate(p *float64) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return fmt.Sprintf("%.1f%%", *p*100)
+}
+
+func formatOptionalDurationSeconds(p *float64) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return humanizeDuration(time.Duration(*p * float64(time.Second)))
+}
+
+func formatOptionalCount(p *int) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return fmt.Sprintf("%d", *p)
 }
