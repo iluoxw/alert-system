@@ -367,26 +367,39 @@ func (r *TopologyRepo) SetEntityLifecycle(ctx context.Context, tx pgx.Tx, id, ac
 		if strings.TrimSpace(actorID) == "" {
 			return domain.ResourceNode{}, false, ErrEntityLifecycleActorRequired
 		}
-		if _, err := tx.Exec(ctx, `
+		// 条件 UPDATE 而不是无条件写：上面的读与这里的写之间没有行锁，两个并发下线
+		// 会双双读到 active，后者把前者的操作人与原因覆盖掉，而审计正是 R1.2 的全部意义。
+		// 带上状态条件后判定与写入在同一条语句里原子完成，抢输的一方 RowsAffected=0。
+		tag, err := tx.Exec(ctx, `
 			UPDATE resource_nodes
 			SET lifecycle_state = 'decommissioned',
 			    decommissioned_at = $2,
 			    decommissioned_by = $3::uuid,
 			    decommission_reason = $4
-			WHERE id = $1
-		`, id, at, actorID, strings.TrimSpace(reason)); err != nil {
+			WHERE id = $1 AND lifecycle_state <> 'decommissioned'
+		`, id, at, actorID, strings.TrimSpace(reason))
+		if err != nil {
 			return domain.ResourceNode{}, false, fmt.Errorf("store: 下线实体失败: %w", err)
 		}
+		if tag.RowsAffected() == 0 {
+			node, err := r.GetByID(ctx, tx, id)
+			return node, false, err
+		}
 	case domain.EntityLifecycleActive:
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE resource_nodes
 			SET lifecycle_state = 'active',
 			    decommissioned_at = NULL,
 			    decommissioned_by = NULL,
 			    decommission_reason = NULL
-			WHERE id = $1
-		`, id); err != nil {
+			WHERE id = $1 AND lifecycle_state <> 'active'
+		`, id)
+		if err != nil {
 			return domain.ResourceNode{}, false, fmt.Errorf("store: 恢复实体失败: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			node, err := r.GetByID(ctx, tx, id)
+			return node, false, err
 		}
 	}
 	node, err := r.GetByID(ctx, tx, id)
