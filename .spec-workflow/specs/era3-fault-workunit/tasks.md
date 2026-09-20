@@ -323,7 +323,7 @@
 
 ## P5 先行指标 + 可靠性
 
-- [ ] 37. 先行指标接口
+- [x] 37. 先行指标接口
   - File: internal/ops/indicators.go, internal/api/ops.go, internal/api/router.go
   - GET /api/v1/ops/indicators（admin only）：firing 告警映射率、无 owner 的 active Fault 数、Fault 认领时长中位数、恢复提醒拦截数、未对齐身份数
   - Purpose: 在 MTTR 数据够用之前提供可看的先行指标
@@ -331,7 +331,7 @@
   - _Requirements: R10.1_
   - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: Go 后端工程师 | Task: 实现五个先行指标查询与端点，聚合在 SQL 层完成 | Restrictions: admin only；空集合返 []；不得为指标新建表或物化视图 | Success: 单测覆盖各指标的 SQL 与空数据情形（返回 0 或 null 语义需明确且不崩页） | 完成后按工作流标记状态并 log-implementation_
 
-- [ ] 38. 日报与运行总览展示指标
+- [x] 38. 日报与运行总览展示指标
   - File: internal/ops/report.go, web/src/pages/Overview/Overview.tsx
   - 日报追加一节；运行总览增加对应卡片
   - Purpose: 让指标进入既有可见路径而非只活在 API 里
