@@ -5,6 +5,67 @@
 
 ## [Unreleased]
 
+## [v0.3.1] 2026-09-20 — 实体生命周期；修复 v0.3.0 实体详情 500
+
+> 规格 `.spec-workflow/specs/entity-lifecycle/`（10 个任务全部交付）。
+> 核心变化：受管实体可被人工标记「已下线」，与 stale 彻底分开；下线在 SQL
+> 递归里断爆炸半径、cascade 收口关联 Fault、**不关闭 Incident**。
+> 同时修复 v0.3.0 已发到 uat 的实体详情 / Impact 重算缺陷——**不要把 0.3.0
+> 当成实体详情可用的基线**。
+
+### 行为变更（升级前必读）
+
+- **默认实体列表与爆炸半径遍历只含 `lifecycle_state=active`**。下线实体及其下游
+  不再出现在实时计算里；从下线根出发的遍历只含自身。依赖边留在库中，不删除历史。
+- **下线是人工终态**（不变量 25）。遥测、平台同步、告警映射、`last_observed_at`
+  过期**永远不能**自动把实体置为 `decommissioned`；过期只表达 stale。
+- **下线不关 Incident**（不变量 11 / D3）。cascade 只把关联 Fault 推到 `resolved`
+  并在 Fault / Incident 时间线写明原因是下线（不是恢复）。Incident 仍须按双重门槛
+  人工关闭。
+
+### 新增能力
+
+- **实体生命周期列**（迁移 `000029`）：`lifecycle_state`、`decommissioned_at`、
+  `decommissioned_by`、`decommission_reason`。默认 `active`，既有行为不变。
+- **Admin API**：`GET /api/v1/admin/entities/:id/lifecycle-preview`（未收口
+  Fault / Incident / firing 证据，空集合返 `[]`）；
+  `PATCH /api/v1/admin/entities/:id/lifecycle`（下线原因必填；存在 active Fault
+  且未 `cascade_faults` 时 409；重复下线按当前状态短路 200）。
+- **Impact 自动降级**：下线实体的自动化结论一律 `ruled_out` / 「实体已下线」；
+  人工 `confirmed` / 人工 `ruled_out` 永不覆盖（不变量 16）。
+- **前端**：实体详情展示生命周期与下线/恢复入口（admin；preview 先于提交）；
+  服务目录可按 `active` / `decommissioned` / `all` 筛选。
+- **恢复提醒补出口**：nudge 文案增加「到控制中心标记下线」的可执行步骤；
+  全部证据实体已下线时再加一句明示。不推进 Incident 状态。
+
+### 修复：v0.3.0 实体详情端点是坏的
+
+era3 的 `da95e0d` 给 `scanFault` 加了 owner/ack 五个扫描目标，却没同步
+`qualifiedFaultColumns`。从那以后 `ListForNode` 一直
+`number of field descriptions must equal number of destinations, got 17 and 22`。
+
+受影响路径：
+
+- `GET /api/v1/infrastructure/nodes/:id`（实体详情页，点开即 500）
+- `RebuildForProviderNodeIDs` / `RebuildUpstreamForConsumer`（服务依赖或应用
+  证据变化时的影响重算）
+
+uat 当时没被触发，只是因为迁移后还没人点开过实体详情。v0.3.1 补齐列清单，
+并加了 `TestListForNode_RoundTripsEra3OwnerAndAckColumns`（真实 SQL 读回）。
+**v0.3.0 的实体详情与这条 Impact 重算路径不可用。**
+
+### 迁移
+
+`000029`（`resource_nodes` 生命周期四列 + 索引）。`000028` 仍预留给
+era3-fault-workunit 健康证据任务，本版未占用。
+
+### 验收
+
+`go build` + `go vet`（含 integration tag）零错误；
+`go test -tags=integration ./internal/... -race` 全绿；
+`test/e2e` 含下线收口场景（Fault 收口、Incident 仍开、爆炸半径断链）；
+`web` build 与 oxlint 通过。
+
 ## [v0.3.0] 2026-09-20 — Fault 成为一等工作单元
 
 > 规格 `.spec-workflow/specs/era3-fault-workunit/`（45 个任务，本版交付 30 个），ADR-0006。
@@ -69,6 +130,13 @@
 
 `go build` + `go vet`（含 integration tag）零错误；`go test -tags=integration ./internal/... -race` 19 个包全绿；
 `test/e2e` 通过（约 65s）；`web` build 与 oxlint 通过。
+
+### 已知缺陷（v0.3.1 修复）
+
+- **实体详情端点不可用**：`GET /api/v1/infrastructure/nodes/:id` 与
+  `RebuildForProviderNodeIDs` / `RebuildUpstreamForConsumer` 因
+  `qualifiedFaultColumns` 漏了 owner/ack 五列而 500（`got 17 and 22`）。
+  不要把 v0.3.0 当成实体详情可用的基线；修复见 [v0.3.1]。
 
 ## [v0.2.0] 2026-09-17 — Infrastructure-first 事故响应发布基线
 
