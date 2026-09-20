@@ -138,3 +138,21 @@ func TestFaultIDFromNotifyGroupKey(t *testing.T) {
 		t.Fatalf("非 fault GroupKey 应为空，got %q", got)
 	}
 }
+
+// 回归：fallback 与原目标相同时，元告警的 notify_send refID 必须与原意图不同，
+// 否则两者在 pending 收敛里互相覆盖 payload，后注册的一方被静默丢掉。
+func TestScheduleNotifyFailureMetaAlert_SameTargetStillDistinctRefID(t *testing.T) {
+	const fbChannel, fbTarget = "lark_webhook", "https://fallback.example/hook"
+	sched := &fakeStormScheduler{}
+	original := notify.SendRequest{AlertID: "alert-1", ChannelKind: fbChannel, Target: fbTarget, Round: 7}
+
+	if err := scheduleNotifyFailureMetaAlert(context.Background(), nil, sched, nil, fbChannel, fbTarget, time.Now(), original); err != nil {
+		t.Fatalf("调度元告警失败: %v", err)
+	}
+	if len(sched.scheduleCalls) != 1 {
+		t.Fatalf("期望调度 1 条，实际 %d", len(sched.scheduleCalls))
+	}
+	if got, orig := sched.scheduleCalls[0].refID, notifySendRefID(original); got == orig {
+		t.Fatalf("元告警 refID 与原意图相同（%q），pending 收敛会互相覆盖", got)
+	}
+}

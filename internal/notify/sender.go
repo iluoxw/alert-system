@@ -151,6 +151,12 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 // 重试多少次、进程崩溃后重投多少次，都能算出同一个键，从而命中 notification_log 的
 // UNIQUE(idempotency_key) 去重；而下一轮 repeat/升级会带上不同的 Round，天然算出
 // 不同的键，不会被误判为重投。
+//
+// MetaAlert 必须参与键：Fault 通知在 owner team 无渠道时本来就发往 fallback 目标，
+// 它失败后的元告警又发往同一 channel+target，若不加这一维，元告警会命中原记录的
+// 幂等键，把"从未送达"的那条 notification_log 改写成 sent（实测复现），既抹掉了
+// 要暴露的失败，也让送达类指标把失败计成成功。只在 MetaAlert 为真时追加尾段，
+// 在途旧 payload 反序列化出 false，键与改动前逐字节一致。
 func idempotencyKey(req SendRequest) string {
 	resourceKey := req.AlertID
 	if resourceKey == "" {
@@ -163,7 +169,11 @@ func idempotencyKey(req SendRequest) string {
 	if req.Step != nil {
 		step = strconv.Itoa(*req.Step)
 	}
-	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target, strconv.FormatInt(req.Round, 10)}, idempotencyKeySep)
+	parts := []string{resourceKey, step, req.ChannelKind, req.Target, strconv.FormatInt(req.Round, 10)}
+	if req.MetaAlert {
+		parts = append(parts, "meta")
+	}
+	return strings.Join(parts, idempotencyKeySep)
 }
 
 // Send 执行一次可靠发送。流程：

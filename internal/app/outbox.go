@@ -116,7 +116,14 @@ func notifySendRefID(req notify.SendRequest) string {
 	if req.Step != nil {
 		step = strconv.Itoa(*req.Step)
 	}
-	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target}, "\x1e")
+	parts := []string{resourceKey, step, req.ChannelKind, req.Target}
+	if req.MetaAlert {
+		// 元告警必须与原意图分属不同 refID：fallback 目标常常就是原通知失败的那个
+		// 目标（owner team 无渠道时本来就回落到它），共用 refID 会让两者在 pending
+		// 收敛里互相覆盖 payload——后注册的一方被静默丢掉。
+		parts = append(parts, "meta")
+	}
+	return strings.Join(parts, "\x1e")
 }
 
 // NotifyEscalation 实现 oncall.Notifier：人员升级链推进到 level 级，给每个目标责任人

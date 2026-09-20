@@ -714,3 +714,56 @@ func TestSender_SameRoundRetry_OnFinalFailureUsesOriginalRound(t *testing.T) {
 		t.Fatalf("两次都应沿用原始 round=1000，got %v", rounds)
 	}
 }
+
+// 回归：fallback 目标与原通知目标相同时（Fault 通知在 owner team 无渠道时本来就
+// 发往 fallback），元告警必须有自己的 notification_log 记录，不能命中原记录的幂等键
+// 把"从未送达"的那条改写成 sent。
+func TestSender_MetaAlertToSameTarget_DoesNotOverwriteOriginalLog(t *testing.T) {
+	const fbChannel, fbTarget = "lark_webhook", "https://fallback.example/hook"
+	ctx := context.Background()
+
+	var attempt int
+	ch := &fakeChannel{kind: fbChannel, fn: func(int) error {
+		attempt++
+		if attempt <= 3 {
+			return errors.New("boom") // 原通知重试耗尽
+		}
+		return nil // 元告警发送成功
+	}}
+	logs := newFakeLogStore()
+	s := newSenderForTest(logs, &fakeTimeline{}, ch)
+	s.MaxAttempts = 3
+
+	original := SendRequest{AlertID: "alert-1", ChannelKind: fbChannel, Target: fbTarget, Round: 7}
+	var meta SendRequest
+	s.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, req SendRequest) error {
+		meta = req
+		meta.ChannelKind, meta.Target, meta.MetaAlert = fbChannel, fbTarget, true
+		return nil
+	}
+
+	if err := s.Send(ctx, original); err == nil {
+		t.Fatal("期望原通知重试耗尽失败")
+	}
+	if idempotencyKey(original) == idempotencyKey(meta) {
+		t.Fatal("元告警与原通知算出了同一个幂等键，会共用 notification_log 记录")
+	}
+	if err := s.Send(ctx, meta); err != nil {
+		t.Fatalf("元告警发送失败: %v", err)
+	}
+
+	entry, err := logs.GetByIdempotencyKey(ctx, nil, idempotencyKey(original))
+	if err != nil {
+		t.Fatalf("查询原通知记录失败: %v", err)
+	}
+	if entry.Status != "failed" {
+		t.Fatalf("原通知从未送达，记录状态应保持 failed，实际 %q", entry.Status)
+	}
+	metaEntry, err := logs.GetByIdempotencyKey(ctx, nil, idempotencyKey(meta))
+	if err != nil {
+		t.Fatalf("元告警应有独立的 notification_log 记录: %v", err)
+	}
+	if metaEntry.Status != "sent" {
+		t.Fatalf("元告警记录状态应为 sent，实际 %q", metaEntry.Status)
+	}
+}
