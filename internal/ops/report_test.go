@@ -139,7 +139,7 @@ func TestBuildOncallBroadcast_无排班明示(t *testing.T) {
 func TestBuildDailyReport_先行指标空数据显示暂无数据(t *testing.T) {
 	stats := DailyStats{BySeverity: map[string]int{}}
 	msg := BuildDailyReport("SRE", time.Now(), stats, nil, Indicators{})
-	if !strings.Contains(msg.Body, "先行指标：") {
+	if !strings.Contains(msg.Body, "先行指标（平台级，非本团队）：") {
 		t.Fatalf("日报应追加先行指标小节: %s", msg.Body)
 	}
 	if !strings.Contains(msg.Body, "firing 告警映射率：暂无数据") {

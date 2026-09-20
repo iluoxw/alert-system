@@ -125,7 +125,7 @@ type Handlers struct {
 	AlertListURL func(teamID string) string
 
 	// queryIndicators 默认 ops.QueryIndicators。单测注入 stub，避免在 nil tx 上跑 SQL。
-	queryIndicators func(ctx context.Context, tx pgx.Tx) (Indicators, error)
+	queryIndicators func(ctx context.Context, tx pgx.Tx, window IndicatorWindow) (Indicators, error)
 }
 
 // NewHandlers 构造 Handlers，clock 默认为真实时钟（测试可直接覆盖 h.clock 字段）。
@@ -219,7 +219,8 @@ func (h *Handlers) HandleDailyReport(ctx context.Context, tx pgx.Tx, teamID stri
 		return fmt.Errorf("ops: 查询团队名称失败: %w", err)
 	}
 
-	lead, err := h.queryIndicators(ctx, tx)
+	// 恢复提醒发出次数取"昨日"窗口，与本小节其余"昨日"口径一致；存量型指标不受影响。
+	lead, err := h.queryIndicators(ctx, tx, IndicatorWindow{From: dayStart, To: dayEnd})
 	if err != nil {
 		return fmt.Errorf("ops: 查询先行指标失败: %w", err)
 	}

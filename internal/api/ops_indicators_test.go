@@ -25,7 +25,7 @@ func TestOpsIndicators_AdminOK_Member403_Unauthenticated401(t *testing.T) {
 	rate := 0.5
 	median := 1800.0
 	unresolved := 3
-	router.RegisterOpsIndicatorsRoutes(func(ctx context.Context, tx pgx.Tx) (ops.Indicators, error) {
+	router.RegisterOpsIndicatorsRoutes(func(ctx context.Context, tx pgx.Tx, window ops.IndicatorWindow) (ops.Indicators, error) {
 		return ops.Indicators{
 			FiringMappingRate:        &rate,
 			ActiveFaultsWithoutOwner: 2,
@@ -78,7 +78,7 @@ func TestOpsIndicators_NullFieldsSerializeAsNull(t *testing.T) {
 	addTestUser(users, "admin-1", "admin", "correct-password", true)
 	memberships.admins["admin-1"] = true
 	cookie := doLogin(t, router, "admin", "correct-password")
-	router.RegisterOpsIndicatorsRoutes(func(ctx context.Context, tx pgx.Tx) (ops.Indicators, error) {
+	router.RegisterOpsIndicatorsRoutes(func(ctx context.Context, tx pgx.Tx, window ops.IndicatorWindow) (ops.Indicators, error) {
 		return ops.Indicators{}, nil
 	})
 

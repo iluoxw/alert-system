@@ -628,6 +628,8 @@ export interface OpsIndicators {
   active_faults_without_owner: number
   fault_ack_duration_median_seconds: number | null
   recovery_nudge_fired_count: number
+  /** 上一字段的统计窗口（小时），由后端给出，前端不写死 */
+  recovery_nudge_window_hours: number
   unresolved_identity_count: number | null
 }
 

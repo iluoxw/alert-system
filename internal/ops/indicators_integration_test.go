@@ -94,12 +94,20 @@ func applyMigrations(t *testing.T, ctx context.Context, st *store.Store) {
 	}
 }
 
+// query 用一个足够宽的窗口取指标：多数用例不关心流量型指标的窗口边界，
+// 边界本身由 TestQueryIndicators_NudgeFiredCountRespectsWindow 专门覆盖。
 func query(t *testing.T, st *store.Store) Indicators {
+	t.Helper()
+	now := time.Now()
+	return queryWindow(t, st, IndicatorWindow{From: now.Add(-24 * time.Hour), To: now.Add(time.Hour)})
+}
+
+func queryWindow(t *testing.T, st *store.Store, w IndicatorWindow) Indicators {
 	t.Helper()
 	var got Indicators
 	if err := st.WithTx(context.Background(), func(tx pgx.Tx) error {
 		var err error
-		got, err = QueryIndicators(context.Background(), tx)
+		got, err = QueryIndicators(context.Background(), tx, w)
 		return err
 	}); err != nil {
 		t.Fatalf("QueryIndicators: %v", err)
@@ -306,5 +314,27 @@ func TestQueryIndicators_UnresolvedIgnoresStaleRowsAndNeedsSuccessfulSync(t *tes
 	}
 	if *got.UnresolvedIdentityCount != 0 {
 		t.Fatalf("全部 last_seen 早于最新成功同步时应为 0，got %d", *got.UnresolvedIdentityCount)
+	}
+}
+
+// 回归：恢复提醒发出次数是流量型指标，必须只统计窗口内 fire_at 的行。
+// 没有窗口时这个数字既不是历史总量也不是某段时间的流量——timers 的 fired 行会被
+// retention_sweep 按保留天数删除，全表计数会先涨后落，且随保留配置变化。
+func TestQueryIndicators_NudgeFiredCountRespectsWindow(t *testing.T) {
+	st := setupTestStore(t)
+	_, err := st.Pool.Exec(context.Background(), `
+		INSERT INTO timers (kind, ref_id, fire_at, payload, status) VALUES
+			('incident_recovery_nudge', 'in-window',  now() - interval '2 hours', '{}', 'fired'),
+			('incident_recovery_nudge', 'too-old',    now() - interval '40 hours', '{}', 'fired'),
+			('incident_recovery_nudge', 'in-future',  now() + interval '2 hours', '{}', 'fired')
+	`)
+	if err != nil {
+		t.Fatalf("插入 timers 失败: %v", err)
+	}
+
+	now := time.Now()
+	got := queryWindow(t, st, IndicatorWindow{From: now.Add(-24 * time.Hour), To: now})
+	if got.RecoveryNudgeFiredCount != 1 {
+		t.Fatalf("窗口内 nudge 数 = %d, want 1（窗口外的历史行与未来行都不计）", got.RecoveryNudgeFiredCount)
 	}
 }

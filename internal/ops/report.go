@@ -121,11 +121,13 @@ func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpe
 		}
 	}
 
-	b.WriteString("\n\n先行指标：\n")
+	// 日报按团队发送，但先行指标是平台级口径（任务 38 裁决）：各团队收到同一组数字，
+	// 标题必须显式说明，否则团队会把平台数字误读成本团队的。
+	b.WriteString("\n\n先行指标（平台级，非本团队）：\n")
 	fmt.Fprintf(&b, "- firing 告警映射率：%s\n", formatOptionalRate(lead.FiringMappingRate))
 	fmt.Fprintf(&b, "- 无 owner 的 active Fault：%d\n", lead.ActiveFaultsWithoutOwner)
 	fmt.Fprintf(&b, "- Fault 认领时长中位：%s\n", formatOptionalDurationSeconds(lead.FaultAckMedianSeconds))
-	fmt.Fprintf(&b, "- 恢复提醒发出次数：%d\n", lead.RecoveryNudgeFiredCount)
+	fmt.Fprintf(&b, "- 昨日恢复提醒发出次数：%d\n", lead.RecoveryNudgeFiredCount)
 	fmt.Fprintf(&b, "- 未对齐身份：%s", formatOptionalCount(lead.UnresolvedIdentityCount))
 
 	return notify.Message{

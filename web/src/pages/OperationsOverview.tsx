@@ -36,8 +36,8 @@ function leadingCards(lead: OpsIndicators) {
   return [
     { key: 'map', icon: <PartitionOutlined />, label: 'firing 告警映射率', value: formatIndicatorRate(lead.firing_mapping_rate), hint: lead.firing_mapping_rate == null ? '当前没有 firing 告警' : '已关联 Fault 的 firing 占比', nodata: lead.firing_mapping_rate == null, danger: false },
     { key: 'owner', icon: <UserDeleteOutlined />, label: '无 owner 的 active Fault', value: formatIndicatorCount(lead.active_faults_without_owner), hint: '需要补齐归属', nodata: false, danger: lead.active_faults_without_owner > 0 },
-    { key: 'ack', icon: <ClockCircleOutlined />, label: 'Fault 认领时长中位', value: formatIndicatorSeconds(lead.fault_ack_duration_median_seconds), hint: lead.fault_ack_duration_median_seconds == null ? '尚无认领样本' : 'acked_at − first_detected_at', nodata: lead.fault_ack_duration_median_seconds == null, danger: false },
-    { key: 'nudge', icon: <NotificationOutlined />, label: '恢复提醒发出次数', value: formatIndicatorCount(lead.recovery_nudge_fired_count), hint: 'incident_recovery_nudge 已发出', nodata: false, danger: false },
+    { key: 'ack', icon: <ClockCircleOutlined />, label: 'Fault 认领时长中位', value: formatIndicatorSeconds(lead.fault_ack_duration_median_seconds), hint: lead.fault_ack_duration_median_seconds == null ? '尚无认领样本' : '从首次发现到认领', nodata: lead.fault_ack_duration_median_seconds == null, danger: false },
+    { key: 'nudge', icon: <NotificationOutlined />, label: '恢复提醒发出次数', value: formatIndicatorCount(lead.recovery_nudge_fired_count), hint: `近 ${lead.recovery_nudge_window_hours} 小时发出`, nodata: false, danger: false },
     { key: 'unresolved', icon: <IdcardOutlined />, label: '未对齐身份', value: formatIndicatorCount(lead.unresolved_identity_count), hint: lead.unresolved_identity_count == null ? '尚未成功同步 ccloud' : '最近一次成功同步仍未解析', nodata: lead.unresolved_identity_count == null, danger: false },
   ]
 }

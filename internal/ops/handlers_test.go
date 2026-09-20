@@ -130,7 +130,7 @@ func newTestHandlers(settings *fakeSettingsRepo, teams *fakeTeamRepo, daily *fak
 	stale *fakeStaleAlertRepo, oncall *fakeOncallResolver, notifier *fakeOpsNotifier, sched *fakeOpsScheduler, now time.Time) *Handlers {
 	h := NewHandlers(settings, teams, daily, stale, oncall, notifier, sched)
 	h.clock = &settableClock{t: now}
-	h.queryIndicators = func(ctx context.Context, tx pgx.Tx) (Indicators, error) {
+	h.queryIndicators = func(ctx context.Context, tx pgx.Tx, window IndicatorWindow) (Indicators, error) {
 		return Indicators{}, nil
 	}
 	return h
@@ -191,7 +191,7 @@ func TestHandleDailyReport_NormalPath(t *testing.T) {
 	if len(daily.statsCalls) != 1 || !daily.statsCalls[0].dayStart.Equal(wantDayStart) || !daily.statsCalls[0].dayEnd.Equal(wantDayEnd) {
 		t.Fatalf("DailyStats 时间窗不正确: %+v, want [%v, %v)", daily.statsCalls, wantDayStart, wantDayEnd)
 	}
-	if !strings.Contains(notifier.calls[0].msg.Body, "先行指标：") {
+	if !strings.Contains(notifier.calls[0].msg.Body, "先行指标（平台级，非本团队）：") {
 		t.Fatalf("日报应追加先行指标小节: %s", notifier.calls[0].msg.Body)
 	}
 	if !strings.Contains(notifier.calls[0].msg.Body, "firing 告警映射率：暂无数据") {
@@ -241,7 +241,7 @@ func TestHandleDailyReport_IndicatorsError_PropagatesAndDoesNotRenew(t *testing.
 	notifier := &fakeOpsNotifier{}
 	sched := &fakeOpsScheduler{}
 	h := newTestHandlers(settings, &fakeTeamRepo{name: "SRE"}, &fakeDailyStatsRepo{stats: DailyStats{BySeverity: map[string]int{}}}, &fakeStaleAlertRepo{}, &fakeOncallResolver{}, notifier, sched, time.Now())
-	h.queryIndicators = func(ctx context.Context, tx pgx.Tx) (Indicators, error) {
+	h.queryIndicators = func(ctx context.Context, tx pgx.Tx, window IndicatorWindow) (Indicators, error) {
 		return Indicators{}, errors.New("indicators boom")
 	}
 
