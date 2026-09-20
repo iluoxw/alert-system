@@ -1,6 +1,6 @@
 # 交接说明 — era3-fault-workunit
 
-> 交接时点：2026-09-19（第二次交接）。第 1–4 批（P0–P3，26 / 45）已提交、review 修复，并**快进合入 main（`63efc10`）**。下一步是第 5 批 P5（37–40），见 §3。
+> 交接时点：2026-09-20（第三次交接）。P0–P3 已合入 main（`63efc10`）。第 5 批 A 线（39、40）已在 era3 完成、review 修复并推送（`638a3fd`），进度 **28 / 45**。**下一棒是 B 线：任务 37 → 38**，见 §3.2 与 §3.4。
 > 接手 Agent 负责实现，原主对话负责后续 review。**开工前完整读完本文件，再读 `tasks.md` 与 `Implementation Logs/`。**
 > 本文件记录的是 `requirements.md` / `design.md` / `tasks.md` 之外、在实现过程中做出的裁决与踩过的坑；三份规格与 ADR-0006 仍是权威，冲突时以本文件的"实现裁决"为准（它们晚于规格、已被用户确认）。
 
@@ -13,7 +13,7 @@
 | 分支 | 位置 | 说明 |
 |---|---|---|
 | `main` | `63efc10`（P0–P3 已合入；上一个 tag 仍是 `v0.2.0`，v0.3.0 在任务 42 打） | 已实现并验证的现实 |
-| `era3` | `63efc10` 起（最新以 `git log origin/era3` 为准） | 集成分支，继续在这里做第 5 批及之后 |
+| `era3` | `638a3fd`（最新以 `git log origin/era3` 为准） | 集成分支，继续在这里做 B 线及之后。比 main 多：A 线 39/40 + 元告警键修复 |
 
 合并策略（用户已确认）：**每个阶段完成并全量验证后，era3 连同 CHANGELOG 快进合入 main**；合并需用户明确同意。第一次合并（P0–P3）已于 2026-09-19 完成。P1 在未配置 `CCLOUD_BASE_URL` 时完全不生效。
 
@@ -30,16 +30,17 @@
 | P1 | 9 syncer、10 待对齐 API/Tab、11 P1 验收闸门 | 第 3/4 批提交（见 `git log`） |
 | P2 | 18 REST ack、20 Web 认领、21 P2 E2E | 第 3/4 批提交 |
 | P3 | 23 Grafana 适配器、24 对账路径、25 幂等键、26 E2E、27 冻结标注 | 第 3/4 批提交 |
+| P5 | 39 readyz 心跳、40 通知失败元告警 | `9fb8166` + review 修复 `638a3fd` |
 
 每个任务的接口签名与**跨任务警告**都在 `Implementation Logs/` 里，开工前必读对应上游任务的记录。
 
-### 1.3 最后一次全量验证（第 3+4 批 review 修复后，即合入 main 的版本）
+### 1.3 最后一次全量验证（A 线 review 修复后，即 `638a3fd`）
 
 - `go build ./... && go vet ./... && go vet -tags=integration ./...`：零错误
-- `go test -tags=integration ./internal/... -race -count=1`：21 个包全绿（store 约 235s）
-- `test/e2e`：全绿（约 65s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
-- `cd web && npm run build && npx oxlint`：通过
-- 本批无新迁移；000028 仍预留给任务 28
+- `go test -tags=integration ./internal/... -race -count=1`：21 个包全绿（store 约 313s）
+- `test/e2e`：全绿（约 66s，含 Fault 通知 + Grafana 权威链；本地编排场景已改走 generic）
+- `cd web && npm run build && npx oxlint`：通过（A 线未动前端，最后一次跑在 P3 收口时）
+- A 线无新迁移；000028 仍预留给任务 28
 
 ### 1.4 迁移编号
 
@@ -77,7 +78,8 @@
 | 批次 | 内容 | 前置 | 备注 |
 |---|---|---|---|
 | 第 3、4 批 | P2 18/20/21、P1 9–11、P3 23–27 | — | 已完成并合入 main |
-| **第 5 批（下一步）** | P5：A 线 39→40 ∥ B 线 37→38 | 无 | 39（readyz）与 40（发送失败兜底）直接对应漏报风险 M2/M3，**A 线优先** |
+| 第 5 批 A 线 | P5：39、40 | — | 已完成并 review（含一处元告警幂等键修复） |
+| **第 5 批 B 线（下一棒）** | P5：37 → 38（必须串行，38 依赖 37） | 无 | 做完 P5 收口，再整体合入 main |
 | 第 6 批 | P4：28–33、35、36 | P1 + P2 完成，**且拿到 `CCLOUD_HEALTH_WINDOW`** | 29 规定该值必填、无默认，只能由平台团队提供 |
 | 延后 | 19、34、45 | uat 公网回调入口 | 见 D7 |
 | 收尾 | 41、42、43、44 | 各自前置 | 43、44、45 为人工动作，需用户确认后执行 |
@@ -85,17 +87,19 @@
 ### 3.2 并行度与文件边界
 
 - 每条并行线**一次派 2–3 个相邻任务**，做完一批验收合并再派下一批；**同时最多 2 条线**（3 条并行时出现过共享文件冲突）
-- 第 5 批两条线的文件边界：
-  - A 线（39→40）：`internal/api/directory.go`、`internal/scheduler/scheduler.go`、`internal/pipeline/pipeline.go`、`internal/notify/sender.go`、`internal/app/outbox.go`、`cmd/server/main.go`（ready func 装配）、`test/e2e/harness.go`
-  - B 线（37→38）：`internal/ops/indicators.go`（新）、`internal/ops/report.go`、`internal/api/ops.go`、`internal/api/router.go`、`web/src/pages/Overview/*`、`web/src/api/client.ts`
-  - **冲突点**：`cmd/server/main.go` 与 `test/e2e/harness.go`（若 37 需要新装配）。两处装配必须同步修改，合并时由主对话核对
+- A 线已完成，占用的文件已全部合入 era3，B 线与其无重叠。
+- B 线（37→38）的文件边界（**tasks.md 里的路径有两处与仓库现状不符，以此处为准**）：
+  - 新建 `internal/ops/indicators.go` + `internal/ops/indicators_test.go`
+  - 端点挂载：`internal/api/ops_settings.go`（**没有 `ops.go`**，沿用该文件的 Register 模式）或新建 `internal/api/ops_indicators.go`；装配在 `cmd/server/main.go` 与 `test/e2e/harness.go` **两处同步**
+  - 日报：`internal/ops/report.go`（`DailyStats` 结构体 + `BuildDailyReport`，`report.go:14` / `report.go:71`）
+  - 前端：`web/src/pages/OperationsOverview.tsx`（**不是 `Overview/Overview.tsx`，仓库里没有 Overview 目录**）、`web/src/pages/operationsHelpers.ts`、`web/src/api/client.ts`
 
 ### 3.3 各待办任务的上游警告（摘自 Implementation Logs）
 
 | 任务 | 必须知道的事 |
 |---|---|
-| 37 | "未对齐身份数"按 D11 只统计当前仍未解析的行，不能 count(*)；"通知是否送达"按 D4 查 `notification_log`，不能用 `owner_notified_at`；admin only，集合字段空返回 `[]`，比率在分母为 0 时返回 null 并在前端显示"暂无数据"，不能返回 NaN |
-| 38 | 总览只加卡片，不新增一级导航或页面（不变量 19）；日报追加小节要有空数据文案 |
+| 37 | 见 §3.4 的逐指标口径。**五个指标里有四个的口径都不是字面可推的**，动手前先读 §3.4；"恢复提醒拦截数"口径存疑，**必须先问主对话再实现** |
+| 38 | 总览只加卡片，不新增一级导航或页面（不变量 19）；日报追加小节要有空数据文案。`DailyStats` 已有 `MTTAAvgValid` / `Prev7DayAvgNew` 这类"无数据"处理先例（`report.go:14`），新指标照抄该模式，不要用 0 冒充"无数据" |
 | 39 | 现有 `RegisterHealthRoutes` 注入 ready func（`internal/api/directory.go:104`），扩展它而不是另起路由。scheduler（`scheduler.go:534` Run）与 pipeline（`pipeline.go:187` Run）在**每次轮询成功**后用 `atomic.Int64` 记录时间戳，**空轮询（没取到任务）也算成功**，否则低峰期会误报 503。只看进程内状态、不查外部系统：ccloud、Alertmanager 不可用都不得导致 503。503 响应体不得含 DSN 或错误原文（现有测试 `directory_test.go:178` 已在查）。任务 43 的 k8s 探针切换是人工动作，不在本任务内 |
 | 40 | `notify_send` 是事务外执行的 DetachedHandler（不变量 3），最终失败在 `Sender.markFailed`（`sender.go:286`）。建议：在写 failed 的同一短事务里 **Schedule 一条新的 `notify_send`** 发给 `FAULT_NOTIFY_FALLBACK_TARGET`，payload 带 `meta_alert=true`；元告警自身最终失败时**只记日志与时间线、不再 Schedule**，从根上杜绝递归。不要在 markFailed 里同步发 HTTP（绕过幂等与租约）。幂等键沿用不变量 4 口径，round 取原始意图的 round，保证原通知重投时不会重复发元告警。fallback target 为空时写时间线说明"无兜底目标"，不能静默（D5）。元告警内容不得包含原始目标 URL（不变量 13） |
 | 18 | `store.FaultRepo.Ack` **只写 faults 表、不写时间线**。必须在同一事务内配对：`domain.AckFault` 产出条目 → `FaultRepo.Ack` → `FaultRepo.AppendTimeline`，靠 `AckFault` 返回的 `ok` 判断是否写时间线（不要比较 struct）。重复认领按不变量 6 返回 200 + 当前状态 |
@@ -104,6 +108,27 @@
 | 23 | `internal/ingest/server.go` 与 `alertmanager_api.go` 仍只对 `alertmanagerKind` 做"权威来源必须带 fingerprint"校验，Grafana 适配器必须一并覆盖；`alerts.source` 已改为写 `event.Source`，适配器必须设为 `grafana` |
 | 33 | 影响外播需**新增方法**，不得复用 `QueueFaultActivated`；GroupKey 用不同后缀（如 `fault:{id}:impact_confirmed`）避免 refID 冲突；目标解析建议抽出 `resolveTeamChannels` 与任务 16 复用 |
 | 40 | 区分"真正发送成功"须查 `notification_log`，不能用 `owner_notified_at`（D4） |
+
+---
+
+### 3.4 任务 37 的逐指标口径（动手前必读）
+
+五个指标的名字都很短，但口径大多不是字面意思。**按下表实现，有疑问先问，不要自行推断**：
+
+| 指标 | 口径 | 坑 |
+|---|---|---|
+| firing 告警映射率 | 分母：`source_state='firing'` 的 Alert 数；分子：其中已命中 AlertMappingPolicy 或受信任标准标签、已关联 Fault 的数量 | 分母为 0 时返回 **null**（前端显示"暂无数据"），**不得返回 0 或 NaN**。不变量 17：未映射告警进待治理队列，这个比率就是它的可见化 |
+| 无 owner 的 active Fault 数 | `faults` 中 `status='active' AND owner_team_id IS NULL` | 有现成索引 `faults_status_owner_team_idx`（000026），照用 |
+| Fault 认领时长中位数 | `acked_at - created_at` 的中位数，只取 `acked_at IS NOT NULL` 的 Fault | 列在 000026：`acked_at`、`acked_by`、`acked_by_name`。用 `percentile_cont` 在 SQL 层算，别捞回 Go 里排序。无样本时返回 null |
+| 恢复提醒拦截数 | **口径存疑，先问主对话**。字面可理解成"发出的 nudge 次数"，也可理解成"被 nudge 拦下的误判恢复数"。可取的确定性数据源是 `timers` 中 `kind='incident_recovery_nudge' AND status='fired'` 的计数 | 不变量 11：nudge **永不推进状态**，所以不存在"拦截了一次自动关闭"这种事件。**不要自己编一个语义** |
+| 未对齐身份数 | 只统计**当前仍未对齐**的：`unresolved_identities` 的行在别名补齐后**不会被删除**（D11），必须按 `last_seen >= 最近一次成功同步的 observed_at` 过滤——syncer 每轮只 UPSERT 仍未解析的身份，已解析的自然停止刷新 | 直接 `count(*)` 会把历史上所有对齐过的身份全算进去，指标只增不减。最近一次成功同步取 `topology_sync_runs` 中 `source='ccloud' AND status='completed'` 的最新 `observed_at`；**没有任何成功同步记录时返回 null**，不是 0（uat 当前没开 ccloud，这是常态） |
+
+其他约束：端点 admin only（`/api/v1/ops/indicators`）；集合字段即使为空也返回 `[]`（不变量 13）；聚合全部在 SQL 层完成；不得为指标新建表或物化视图。
+
+### 3.5 A 线遗留的两个观察（不阻塞，B 线不必处理）
+
+1. **pipeline 的心跳记在 Dequeue 成功处**，所以"每个批次都失败"时 `/readyz` 仍是绿的。这是有意取舍：真返回 503 会让 pod 被摘出服务、告警 webhook 直接收不进来，比继续跑更糟。代价是 readyz 只能发现"停摆"，发现不了"一直失败"——**后者正是任务 37 指标要补的盲区**。
+2. **任务 43 切探针时**：HTTP 服务比 worker 早几毫秒起来，首轮轮询前 `/readyz` 返回 503。k8s 默认 `initialDelaySeconds` 足以覆盖，不用改代码。
 
 ---
 
@@ -128,6 +153,7 @@
 | **"不发通知"的分支静默返回** | 任务 16 冷却分支原先不写时间线 | 所有 early return 检查是否留有可追溯记录 |
 | 并发与去重 | pipeline 与对账可能同时触发同一 Fault | 靠 `notify_send` 的 refID 不含 round 收敛，任务 16 已有测试；任务 21 E2E 需再断言"恰好一条" |
 | 并行线合并后的交汇 | 任务 16 的拓扑抑制调用了任务 8 刚改的遍历查询 | 合并后必须跑一次全量，不能只信各自的测试 |
+| **测试把"当前实现"当成预期写死** | 任务 24 的对账测试断言"快照首次出现不触发"，而正确行为是必须触发（漏报）；任务 40 的全部测试都把 fallback 目标设成与原目标不同的值，恰好绕开了唯一会出事的那条路径 | 看测试时先问"这个断言是从需求推出来的，还是从实现读出来的"；**边界值要专门挑与生产配置一致的那个**（如 fallback 目标 == 原目标） |
 
 ---
 
