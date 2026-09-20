@@ -31,19 +31,24 @@ var (
 	ErrResourceNodeNotFound           = errors.New("store: 资源节点不存在")
 	ErrManagedEntityReadOnly          = errors.New("store: 自动发现实体不可通过登记接口修改")
 	ErrManagedEntityIdentityImmutable = errors.New("store: canonical entity key 与 layer 创建后不可修改")
+	ErrEntityLifecycleReasonRequired  = errors.New("store: 下线原因不能为空")
+	ErrEntityLifecycleInvalid         = errors.New("store: 非法生命周期状态")
+	ErrEntityLifecycleActorRequired   = errors.New("store: 下线操作人不能为空")
 )
 
 const resourceNodeColumns = `
 		id, entity_key, layer, managed, source, external_ref, kind, name, provider, environment,
 		COALESCE(owner_team_id::text, ''), labels, attributes,
-	last_observed_at, created_at, updated_at
+	last_observed_at, created_at, updated_at,
+	lifecycle_state, decommissioned_at, COALESCE(decommissioned_by::text, ''), COALESCE(decommission_reason, '')
 `
 
 // resourceNodeColumnsQualified 用于 JOIN 查询，避免 id/source 等列与 CTE 字段歧义。
 const resourceNodeColumnsQualified = `
 		n.id, n.entity_key, n.layer, n.managed, n.source, n.external_ref, n.kind, n.name, n.provider, n.environment,
 	COALESCE(n.owner_team_id::text, ''), n.labels, n.attributes,
-	n.last_observed_at, n.created_at, n.updated_at
+	n.last_observed_at, n.created_at, n.updated_at,
+	n.lifecycle_state, n.decommissioned_at, COALESCE(n.decommissioned_by::text, ''), COALESCE(n.decommission_reason, '')
 `
 
 type topologyRowScanner interface {
@@ -58,6 +63,7 @@ func scanResourceNode(row topologyRowScanner, extra ...any) (domain.ResourceNode
 		&node.Source, &node.ExternalRef, &node.Kind, &node.Name,
 		&node.Provider, &node.Environment, &node.OwnerTeamID, &labelsRaw,
 		&attributesRaw, &node.LastObservedAt, &node.CreatedAt, &node.UpdatedAt,
+		&node.LifecycleState, &node.DecommissionedAt, &node.DecommissionedBy, &node.DecommissionReason,
 	}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
@@ -337,6 +343,59 @@ func (r *TopologyRepo) UpdateManagedEntity(ctx context.Context, tx pgx.Tx, id st
 	return r.GetByID(ctx, tx, id)
 }
 
+// SetEntityLifecycle 是下线 / 恢复的唯一写入入口（D2：不混进 UpdateManagedEntity）。
+// 已处于目标状态则短路返回 changed=false，不重写审计列。下线写三列；恢复清空三列。
+func (r *TopologyRepo) SetEntityLifecycle(ctx context.Context, tx pgx.Tx, id, actorID, reason string, state domain.EntityLifecycleState, at time.Time) (domain.ResourceNode, bool, error) {
+	if !state.IsValid() {
+		return domain.ResourceNode{}, false, ErrEntityLifecycleInvalid
+	}
+	current, err := r.GetByID(ctx, tx, id)
+	if err != nil {
+		return domain.ResourceNode{}, false, err
+	}
+	if current.LifecycleState == state {
+		return current, false, nil
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	switch state {
+	case domain.EntityLifecycleDecommissioned:
+		if strings.TrimSpace(reason) == "" {
+			return domain.ResourceNode{}, false, ErrEntityLifecycleReasonRequired
+		}
+		if strings.TrimSpace(actorID) == "" {
+			return domain.ResourceNode{}, false, ErrEntityLifecycleActorRequired
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE resource_nodes
+			SET lifecycle_state = 'decommissioned',
+			    decommissioned_at = $2,
+			    decommissioned_by = $3::uuid,
+			    decommission_reason = $4
+			WHERE id = $1
+		`, id, at, actorID, strings.TrimSpace(reason)); err != nil {
+			return domain.ResourceNode{}, false, fmt.Errorf("store: 下线实体失败: %w", err)
+		}
+	case domain.EntityLifecycleActive:
+		if _, err := tx.Exec(ctx, `
+			UPDATE resource_nodes
+			SET lifecycle_state = 'active',
+			    decommissioned_at = NULL,
+			    decommissioned_by = NULL,
+			    decommission_reason = NULL
+			WHERE id = $1
+		`, id); err != nil {
+			return domain.ResourceNode{}, false, fmt.Errorf("store: 恢复实体失败: %w", err)
+		}
+	}
+	node, err := r.GetByID(ctx, tx, id)
+	if err != nil {
+		return domain.ResourceNode{}, false, err
+	}
+	return node, true, nil
+}
+
 // ListAliases 返回实体的全部 Entity Alias；entity_aliases 不区分创建来源，
 // 受管实体与应用服务共用同一张表和同一套 ResolveAlias 语义。
 func (r *TopologyRepo) ListAliases(ctx context.Context, tx pgx.Tx, entityID string) ([]domain.EntityAlias, error) {
@@ -488,15 +547,28 @@ func (r *TopologyRepo) ListDependenciesForSource(ctx context.Context, tx pgx.Tx,
 	return listEntityDependencies(ctx, tx, source, entityID)
 }
 
-func (r *TopologyRepo) ListNodes(ctx context.Context, tx pgx.Tx, kind domain.ResourceNodeKind, limit int) ([]domain.ResourceNode, error) {
+func (r *TopologyRepo) ListNodes(ctx context.Context, tx pgx.Tx, kind domain.ResourceNodeKind, lifecycle domain.EntityLifecycleState, limit int) ([]domain.ResourceNode, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	query := `SELECT ` + resourceNodeColumns + ` FROM resource_nodes`
 	args := []any{}
+	var clauses []string
 	if kind != "" {
-		query += ` WHERE kind = $1`
+		clauses = append(clauses, fmt.Sprintf("kind = $%d", len(args)+1))
 		args = append(args, kind)
+	}
+	switch lifecycle {
+	case "", domain.EntityLifecycleActive:
+		clauses = append(clauses, "lifecycle_state = 'active'")
+	case domain.EntityLifecycleDecommissioned:
+		clauses = append(clauses, "lifecycle_state = 'decommissioned'")
+	case domain.EntityLifecycleAll:
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrEntityLifecycleInvalid, lifecycle)
+	}
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 	query += fmt.Sprintf(` ORDER BY CASE kind WHEN 'infrastructure_capability' THEN 1 WHEN 'business_system' THEN 2 ELSE 3 END, name LIMIT $%d`, len(args)+1)
 	args = append(args, limit)
@@ -572,9 +644,10 @@ func (r *TopologyRepo) Overview(ctx context.Context, tx pgx.Tx) (InfrastructureO
 			(SELECT count(DISTINCT i.node_id) FROM fault_impacts i
 			 JOIN resource_nodes n ON n.id = i.node_id
 			 JOIN faults f ON f.id = i.fault_id
-			 WHERE i.state = 'confirmed' AND n.kind = 'business_system' AND f.status <> 'resolved'),
+			 WHERE i.state = 'confirmed' AND n.kind = 'business_system' AND n.lifecycle_state = 'active' AND f.status <> 'resolved'),
 			max(last_observed_at)
 		FROM resource_nodes
+		WHERE lifecycle_state = 'active'
 	`).Scan(&overview.ResourceCount, &overview.CapabilityCount, &overview.BusinessSystemCount,
 		&overview.ActiveFaultCount, &overview.CriticalFaultCount, &overview.ConfirmedBusinessImpact,
 		&lastObserved)
@@ -601,14 +674,18 @@ func (r *TopologyRepo) ListBlastRadius(ctx context.Context, tx pgx.Tx, source, r
 
 			UNION ALL
 
-			SELECT e.from_node_id, i.depth + 1, i.path || e.from_node_id
+			SELECT nxt.id, i.depth + 1, i.path || nxt.id
 			FROM impacted i
+			JOIN resource_nodes cur
+			  ON cur.id = i.id AND cur.lifecycle_state = 'active'
 			JOIN dependency_edges e
 			  ON e.source = $1
 			 AND e.to_node_id = i.id
 			 AND e.relation = 'depends_on'
+			JOIN resource_nodes nxt
+			  ON nxt.id = e.from_node_id AND nxt.lifecycle_state = 'active'
 			WHERE i.depth < $3
-			  AND NOT e.from_node_id = ANY(i.path)
+			  AND NOT nxt.id = ANY(i.path)
 		), shortest AS (
 			SELECT DISTINCT ON (id) id, depth, path
 			FROM impacted
@@ -684,12 +761,14 @@ func (r *TopologyRepo) listCanonicalTraversal(ctx context.Context, tx pgx.Tx, ro
 
 			UNION ALL
 
-			SELECT %[1]s, i.depth + 1, i.path || %[1]s,
+			SELECT nxt.id, i.depth + 1, i.path || nxt.id,
 			       i.stale OR (e.origin = 'observed' AND e.observed_at < now() - ($3 * interval '1 second'))
 			       OR e.no_recent_traffic
 			FROM reached i
-			JOIN dependency_edges e ON %[2]s AND e.relation = 'depends_on'
-			WHERE i.depth < $2 AND NOT %[1]s = ANY(i.path)
+			JOIN resource_nodes cur ON cur.id = i.id AND cur.lifecycle_state = 'active'
+			JOIN dependency_edges e ON %[1]s AND e.relation = 'depends_on'
+			JOIN resource_nodes nxt ON nxt.id = %[2]s AND nxt.lifecycle_state = 'active'
+			WHERE i.depth < $2 AND NOT nxt.id = ANY(i.path)
 		), shortest AS (
 			SELECT DISTINCT ON (id) id, depth, path, stale
 			FROM reached ORDER BY id, depth, stale
@@ -698,7 +777,7 @@ func (r *TopologyRepo) listCanonicalTraversal(ctx context.Context, tx pgx.Tx, ro
 		       ARRAY(SELECT p::text FROM unnest(s.path) AS p), s.stale
 		FROM shortest s JOIN resource_nodes n ON n.id = s.id
 		ORDER BY s.depth, n.name
-	`, nextNode, edgeJoin)
+	`, edgeJoin, nextNode)
 	rows, err := tx.Query(ctx, query, rootNodeID, maxDepth, staleSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("store: canonical relation 遍历失败: %w", err)

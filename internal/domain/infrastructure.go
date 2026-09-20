@@ -40,6 +40,20 @@ func (l EntityLayer) IsValid() bool {
 	return l == EntityLayerInfrastructure || l == EntityLayerPlatform || l == EntityLayerApplication
 }
 
+// EntityLifecycleState 是受管实体的人工终态。只有人能置位；遥测过期只表达 stale。
+type EntityLifecycleState string
+
+const (
+	EntityLifecycleActive         EntityLifecycleState = "active"
+	EntityLifecycleDecommissioned EntityLifecycleState = "decommissioned"
+	// EntityLifecycleAll 只用于列表筛选，不是落库取值。
+	EntityLifecycleAll EntityLifecycleState = "all"
+)
+
+func (s EntityLifecycleState) IsValid() bool {
+	return s == EntityLifecycleActive || s == EntityLifecycleDecommissioned
+}
+
 // DependencyRelation 采用“from 消费/依赖 to”的方向。爆炸半径从故障节点出发，
 // 沿 dependency_edges.to_node_id -> from_node_id 反向遍历。
 type DependencyRelation string
@@ -89,22 +103,26 @@ func (c DependencyCriticality) IsValid() bool {
 
 // ResourceNode 是 CMDB/运行时发现数据在事故响应域内的只读投影。
 type ResourceNode struct {
-	ID             string            `json:"id,omitempty"`
-	EntityKey      string            `json:"entity_key"`
-	Layer          EntityLayer       `json:"layer"`
-	Managed        bool              `json:"managed"`
-	Source         string            `json:"source,omitempty"`
-	ExternalRef    string            `json:"external_ref"`
-	Kind           ResourceNodeKind  `json:"kind"`
-	Name           string            `json:"name"`
-	Provider       string            `json:"provider,omitempty"`
-	Environment    string            `json:"environment,omitempty"`
-	OwnerTeamID    string            `json:"owner_team_id,omitempty"`
-	Labels         map[string]string `json:"labels,omitempty"`
-	Attributes     map[string]any    `json:"attributes,omitempty"`
-	LastObservedAt time.Time         `json:"last_observed_at,omitempty"`
-	CreatedAt      time.Time         `json:"created_at,omitempty"`
-	UpdatedAt      time.Time         `json:"updated_at,omitempty"`
+	ID                 string               `json:"id,omitempty"`
+	EntityKey          string               `json:"entity_key"`
+	Layer              EntityLayer          `json:"layer"`
+	Managed            bool                 `json:"managed"`
+	Source             string               `json:"source,omitempty"`
+	ExternalRef        string               `json:"external_ref"`
+	Kind               ResourceNodeKind     `json:"kind"`
+	Name               string               `json:"name"`
+	Provider           string               `json:"provider,omitempty"`
+	Environment        string               `json:"environment,omitempty"`
+	OwnerTeamID        string               `json:"owner_team_id,omitempty"`
+	Labels             map[string]string    `json:"labels,omitempty"`
+	Attributes         map[string]any       `json:"attributes,omitempty"`
+	LastObservedAt     time.Time            `json:"last_observed_at,omitempty"`
+	LifecycleState     EntityLifecycleState `json:"lifecycle_state"`
+	DecommissionedAt   *time.Time           `json:"decommissioned_at,omitempty"`
+	DecommissionedBy   string               `json:"decommissioned_by,omitempty"`
+	DecommissionReason string               `json:"decommission_reason,omitempty"`
+	CreatedAt          time.Time            `json:"created_at,omitempty"`
+	UpdatedAt          time.Time            `json:"updated_at,omitempty"`
 }
 
 // DependencyEdge 表示 FromExternalRef 依赖 ToExternalRef。

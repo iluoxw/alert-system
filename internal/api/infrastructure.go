@@ -249,7 +249,7 @@ func (h *infrastructureHandlers) overview(c *gin.Context) {
 		if err != nil {
 			return err
 		}
-		nodes, err = h.topology.ListNodes(ctx, tx, "", 200)
+		nodes, err = h.topology.ListNodes(ctx, tx, "", domain.EntityLifecycleActive, 200)
 		if err != nil {
 			return err
 		}
@@ -293,11 +293,16 @@ func (h *infrastructureHandlers) listNodes(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
+	lifecycle := domain.EntityLifecycleState(c.DefaultQuery("lifecycle", string(domain.EntityLifecycleActive)))
+	if lifecycle != domain.EntityLifecycleAll && !lifecycle.IsValid() {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid lifecycle"})
+		return
+	}
 	ctx := c.Request.Context()
 	var items []domain.ResourceNode
 	err := h.router.tx.WithTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		items, err = h.topology.ListNodes(ctx, tx, kind, limit)
+		items, err = h.topology.ListNodes(ctx, tx, kind, lifecycle, limit)
 		return err
 	})
 	if err != nil {

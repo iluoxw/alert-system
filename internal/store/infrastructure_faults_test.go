@@ -180,6 +180,173 @@ func TestManagedServiceRelationCrossSourceTraversalAndStale(t *testing.T) {
 	}
 }
 
+func TestCanonicalTraversalSkipsDecommissionedAndDownstream(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	team := mustTeam(t, ctx, st, "decom-traversal-owner")
+	actor := mustUser(t, ctx, st, "decom-traversal-sre")
+	topology := NewTopologyRepo()
+	services := NewServiceCatalogRepo()
+
+	var root, mid, bypass domain.ResourceNode
+	var blocked, live domain.ServiceRegistration
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		root, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
+			EntityKey: "infra/e2b-node/prod", Layer: domain.EntityLayerInfrastructure,
+			Name: "e2b-root", Environment: "prod", OwnerTeamID: team.ID,
+		}, nil, nil)
+		if err != nil {
+			return err
+		}
+		mid, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
+			EntityKey: "platform/e2b-agent/prod", Layer: domain.EntityLayerPlatform,
+			Name: "e2b-mid", Environment: "prod", OwnerTeamID: team.ID,
+		}, nil, []domain.DependencyEdge{{
+			ToNodeID: root.ID, Relation: domain.DependencyRelationDependsOn,
+			Criticality: domain.DependencyCriticalityHigh,
+		}})
+		if err != nil {
+			return err
+		}
+		bypass, err = topology.CreateManagedEntity(ctx, tx, domain.ResourceNode{
+			EntityKey: "platform/e2b-live/prod", Layer: domain.EntityLayerPlatform,
+			Name: "e2b-bypass", Environment: "prod", OwnerTeamID: team.ID,
+		}, nil, []domain.DependencyEdge{{
+			ToNodeID: root.ID, Relation: domain.DependencyRelationDependsOn,
+			Criticality: domain.DependencyCriticalityHigh,
+		}})
+		if err != nil {
+			return err
+		}
+		blocked, err = services.Create(ctx, tx, domain.ServiceRegistration{
+			Entity:      domain.ResourceNode{EntityKey: "service/blocked/prod", Name: "Blocked App", Environment: "prod", OwnerTeamID: team.ID},
+			OwnerTeamID: team.ID, Tier: domain.ServiceTier1, Enabled: true,
+			Dependencies: []domain.DependencyEdge{{
+				ToNodeID: mid.ID, Relation: domain.DependencyRelationDependsOn,
+				Criticality: domain.DependencyCriticalityCritical,
+			}},
+		})
+		if err != nil {
+			return err
+		}
+		live, err = services.Create(ctx, tx, domain.ServiceRegistration{
+			Entity:      domain.ResourceNode{EntityKey: "service/live/prod", Name: "Live App", Environment: "prod", OwnerTeamID: team.ID},
+			OwnerTeamID: team.ID, Tier: domain.ServiceTier1, Enabled: true,
+			Dependencies: []domain.DependencyEdge{{
+				ToNodeID: bypass.ID, Relation: domain.DependencyRelationDependsOn,
+				Criticality: domain.DependencyCriticalityCritical,
+			}},
+		})
+		if err != nil {
+			return err
+		}
+		_, _, err = topology.SetEntityLifecycle(ctx, tx, mid.ID, actor.ID, "节点已剔除", domain.EntityLifecycleDecommissioned, time.Now())
+		return err
+	})
+	if err != nil {
+		t.Fatalf("构造图失败: %v", err)
+	}
+
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		radius, err := topology.ListBlastRadiusByNodeID(ctx, tx, root.ID, 8, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		got := map[string]int{}
+		for _, item := range radius {
+			got[item.Node.ID] = item.Depth
+		}
+		if _, ok := got[mid.ID]; ok {
+			return fmt.Errorf("下线节点自己不应出现在下游遍历里: %+v", radius)
+		}
+		if _, ok := got[blocked.Entity.ID]; ok {
+			return fmt.Errorf("下线节点的下游仍被遍历出来（D1：必须在 SQL 递归里断链）: %+v", radius)
+		}
+		if got[root.ID] != 0 || got[bypass.ID] != 1 || got[live.Entity.ID] != 2 {
+			return fmt.Errorf("active 路径被破坏: %+v", radius)
+		}
+		if len(got) != 3 {
+			return fmt.Errorf("爆炸半径=%d want=3: %+v", len(got), radius)
+		}
+
+		fromBlocked, err := topology.ListDependencyProvidersByNodeID(ctx, tx, blocked.Entity.ID, 8, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if len(fromBlocked) != 1 || fromBlocked[0].Node.ID != blocked.Entity.ID {
+			return fmt.Errorf("从下游反查不应穿过下线节点: %+v", fromBlocked)
+		}
+
+		edges, err := topology.ListEdgesForNode(ctx, tx, mid.ID)
+		if err != nil {
+			return err
+		}
+		if len(edges) == 0 {
+			return fmt.Errorf("下线不得删除依赖边")
+		}
+
+		self, err := topology.ListBlastRadiusByNodeID(ctx, tx, mid.ID, 8, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if len(self) != 1 || self[0].Node.ID != mid.ID {
+			return fmt.Errorf("从下线节点出发应只含自身、不含下游: %+v", self)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListBlastRadius_SourceScopedAlsoStopsAtDecommissioned(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	actor := mustUser(t, ctx, st, "blast-decom-sre")
+	repo := NewTopologyRepo()
+	snapshot := testBlastRadiusTopologySnapshot()
+
+	var imported TopologyImportResult
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		imported, err = repo.ImportSnapshot(ctx, tx, snapshot)
+		if err != nil {
+			return err
+		}
+		_, _, err = repo.SetEntityLifecycle(ctx, tx, imported.NodeIDs["shared.client-proxy"], actor.ID, "采集目标已消失", domain.EntityLifecycleDecommissioned, time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("导入或下线失败: %v", err)
+	}
+
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		radius, err := repo.ListBlastRadius(ctx, tx, snapshot.Source, "shared.orchestrator.pool", 8)
+		if err != nil {
+			return err
+		}
+		got := map[string]int{}
+		for _, item := range radius {
+			got[item.Node.ExternalRef] = item.Depth
+		}
+		if _, ok := got["shared.client-proxy"]; ok {
+			return fmt.Errorf("同源遍历仍含下线节点: %+v", radius)
+		}
+		if _, ok := got["shared.runtime"]; ok {
+			return fmt.Errorf("同源遍历仍穿过下线节点到 runtime: %+v", radius)
+		}
+		if _, ok := got["preview.app"]; ok {
+			return fmt.Errorf("同源遍历仍穿过下线节点到 preview.app: %+v", radius)
+		}
+		if got["shared.orchestrator.pool"] != 0 || got["shared.api"] != 1 {
+			return fmt.Errorf("同源 active 前缀被破坏: %+v", radius)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFaultRepoPreservesHumanEvidenceAndMonotonicActivation(t *testing.T) {
 	st := setupTestStore(t)
 	ctx := context.Background()
