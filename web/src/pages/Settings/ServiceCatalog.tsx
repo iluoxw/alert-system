@@ -13,8 +13,9 @@ import type {
 } from '../../api/client'
 import {
   createManagedEntity, createService, getInfrastructureNode, listInfrastructureNodes, listServices, listTeamsLite,
-  listUnresolvedIdentities, updateManagedEntity, updateServiceRegistration,
+  listUnresolvedIdentities, me, updateManagedEntity, updateServiceRegistration,
 } from '../../api/client'
+import { DecommissionModal, RestoreModal } from '../EntityLifecycleModals'
 
 const { Text } = Typography
 
@@ -55,6 +56,9 @@ export function ServiceCatalog() {
   const [alignEntityID, setAlignEntityID] = useState('')
   const [aligningSaving, setAligningSaving] = useState(false)
   const [lifecycleFilter, setLifecycleFilter] = useState<EntityLifecycleState>('active')
+  const [lifecycleTarget, setLifecycleTarget] = useState<ResourceNode | null>(null)
+  const [lifecycleAction, setLifecycleAction] = useState<'decommission' | 'restore' | null>(null)
+  const { data: meData } = useQuery({ queryKey: ['me'], queryFn: me })
   const serviceQuery = useQuery({ queryKey: ['services'], queryFn: async () => (await listServices(500)).services })
   const teamQuery = useQuery({ queryKey: ['teams-lite'], queryFn: async () => (await listTeamsLite(500)).teams })
   const entityQuery = useQuery({
@@ -321,8 +325,15 @@ export function ServiceCatalog() {
       render: (_, entity) => <span>{services.filter((service) => service.dependencies.some((dependency) => dependency.to_node_id === entity.id)).length} 个服务</span>,
     },
     {
-      title: '', key: 'actions', width: 60, align: 'right',
-      render: (_, entity) => <Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${entity.name}`} onClick={() => openEntityEdit(entity)} />,
+      title: '', key: 'actions', width: 168, align: 'right',
+      render: (_, entity) => (
+        <Space size={0}>
+          <Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${entity.name}`} onClick={() => openEntityEdit(entity)} />
+          {meData?.is_admin && (entity.lifecycle_state === 'decommissioned'
+            ? <Button type="link" onClick={() => { setLifecycleTarget(entity); setLifecycleAction('restore') }}>恢复运行</Button>
+            : <Button type="link" onClick={() => { setLifecycleTarget(entity); setLifecycleAction('decommission') }}>标记下线</Button>)}
+        </Space>
+      ),
     },
   ]
 
@@ -345,7 +356,7 @@ export function ServiceCatalog() {
           },
           {
             key: 'entities', label: `基础设施 / 平台 ${managedProviders.length}`,
-            children: <><div className="catalog-tab-toolbar"><div><strong>受管依赖实体</strong><span>登记可被多个应用共享的基础设施或平台能力；自动发现实体保持只读。默认只看运行中。</span></div><Space><Select aria-label="按生命周期筛选" value={lifecycleFilter} onChange={setLifecycleFilter} style={{ width: 140 }} options={[{ value: 'active', label: '仅运行中' }, { value: 'decommissioned', label: '仅已下线' }, { value: 'all', label: '全部' }]} /><Button type="primary" icon={<PlusOutlined />} onClick={openEntityCreate}>登记依赖实体</Button></Space></div><Table rowKey="id" columns={entityColumns} dataSource={managedProviders} loading={entityQuery.isLoading} pagination={false} scroll={{ x: 1000 }} locale={{ emptyText: lifecycleFilter === 'decommissioned' ? '当前没有已下线的受管实体。' : '尚未登记共享依赖实体。可先登记 Kubernetes、数据库、Kafka 等平台能力。' }} /></>,
+            children: <><div className="catalog-tab-toolbar"><div><strong>受管依赖实体</strong><span>登记可被多个应用共享的基础设施或平台能力；自动发现实体保持只读。默认只看运行中。名称进入详情，行内可标记下线。</span></div><Space><Select aria-label="按生命周期筛选" value={lifecycleFilter} onChange={setLifecycleFilter} style={{ width: 140 }} options={[{ value: 'active', label: '仅运行中' }, { value: 'decommissioned', label: '仅已下线' }, { value: 'all', label: '全部' }]} /><Button type="primary" icon={<PlusOutlined />} onClick={openEntityCreate}>登记依赖实体</Button></Space></div><Table rowKey="id" columns={entityColumns} dataSource={managedProviders} loading={entityQuery.isLoading} pagination={false} scroll={{ x: 1120 }} locale={{ emptyText: lifecycleFilter === 'decommissioned' ? '当前没有已下线的受管实体。' : '尚未登记共享依赖实体。可先登记 Kubernetes、数据库、Kafka 等平台能力。' }} /></>,
           },
           {
             key: 'unresolved', label: `待对齐身份 ${unresolved.length}`,
@@ -501,6 +512,33 @@ export function ServiceCatalog() {
           }))}
         />
       </Modal>
+
+      {lifecycleTarget && (
+        <>
+          <DecommissionModal
+            open={lifecycleAction === 'decommission'}
+            node={lifecycleTarget}
+            onCancel={() => { setLifecycleTarget(null); setLifecycleAction(null) }}
+            onSuccess={async (cascaded) => {
+              setLifecycleTarget(null)
+              setLifecycleAction(null)
+              await queryClient.invalidateQueries({ queryKey: ['infrastructure-nodes'] })
+              messageApi.success(cascaded > 0 ? `实体已下线，已收口 ${cascaded} 个 Fault` : '实体已下线')
+            }}
+          />
+          <RestoreModal
+            open={lifecycleAction === 'restore'}
+            node={lifecycleTarget}
+            onCancel={() => { setLifecycleTarget(null); setLifecycleAction(null) }}
+            onSuccess={async () => {
+              setLifecycleTarget(null)
+              setLifecycleAction(null)
+              await queryClient.invalidateQueries({ queryKey: ['infrastructure-nodes'] })
+              messageApi.success('实体已恢复为运行中')
+            }}
+          />
+        </>
+      )}
     </div>
   )
 }

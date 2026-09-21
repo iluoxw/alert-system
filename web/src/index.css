@@ -2066,7 +2066,13 @@ select {
   font-size: 13px;
   font-weight: 650;
 }
-.catalog-primary-cell strong a { color: inherit; }
+.catalog-primary-cell strong a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.catalog-primary-cell strong a:hover { color: #1d3348; }
 
 .catalog-primary-cell code,
 .catalog-settings-page code {
