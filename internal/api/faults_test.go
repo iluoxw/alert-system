@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 
 	"alert-system/internal/domain"
@@ -162,5 +166,23 @@ func TestFaultsAck_StoreErrorDoesNotWriteTimeline(t *testing.T) {
 	w := doFaultsRequest(router, http.MethodPost, "/api/v1/faults/f1/ack", cookie)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRespondAckError_EmptyActorName_Returns400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &faultHandlers{router: &Router{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	cases := []error{
+		domain.ErrAckActorNameRequired,
+		store.ErrAckActorNameRequired,
+		fmt.Errorf("tx: %w", domain.ErrAckActorNameRequired),
+	}
+	for _, err := range cases {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		handler.respondAckError(ctx, err)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("respondAckError(%v) status = %d, want 400 body=%s", err, recorder.Code, recorder.Body.String())
+		}
 	}
 }

@@ -18,8 +18,9 @@ type FaultRepo struct{}
 func NewFaultRepo() *FaultRepo { return &FaultRepo{} }
 
 var (
-	ErrFaultNotFound       = errors.New("store: Fault 不存在")
-	ErrFaultImpactNotFound = errors.New("store: Fault Impact 不存在")
+	ErrFaultNotFound        = errors.New("store: Fault 不存在")
+	ErrFaultImpactNotFound  = errors.New("store: Fault Impact 不存在")
+	ErrAckActorNameRequired = errors.New("store: ack 的 actorName 不能为空")
 )
 
 // faultColumns 覆盖迁移 000026 新增的五个归属/认领列（owner_team_id / acked_by /
@@ -495,7 +496,7 @@ func (r *FaultRepo) RemoveAutomatedEvidenceForAlertExcept(ctx context.Context, t
 // 时间线，而不是把"重复认领"当错误处理。
 func (r *FaultRepo) Ack(ctx context.Context, tx pgx.Tx, id, actorID, actorName string, at time.Time) (domain.Fault, bool, error) {
 	if strings.TrimSpace(actorName) == "" {
-		return domain.Fault{}, false, fmt.Errorf("store: ack 的 actorName 不能为空")
+		return domain.Fault{}, false, ErrAckActorNameRequired
 	}
 	row := tx.QueryRow(ctx, `
 		UPDATE faults

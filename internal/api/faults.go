@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -95,7 +94,7 @@ func (h *faultHandlers) respondAckError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, store.ErrFaultNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource not found"})
-	case strings.Contains(err.Error(), "actorName 不能为空"):
+	case errors.Is(err, domain.ErrAckActorNameRequired), errors.Is(err, store.ErrAckActorNameRequired):
 		c.JSON(http.StatusBadRequest, gin.H{"error": "actorName 不能为空"})
 	default:
 		h.router.logger.Error("api: Fault 认领失败", "err", err)

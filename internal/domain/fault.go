@@ -216,7 +216,11 @@ const (
 	FaultTransitionEnteredActive FaultTransition = "entered_active"
 )
 
-var ErrInvalidFaultTransition = errors.New("domain: 非法 Fault 状态转移")
+var (
+	ErrInvalidFaultTransition = errors.New("domain: 非法 Fault 状态转移")
+	// ErrAckActorNameRequired 表示认领人可读名称为空。时间线不能留下一条不知道是谁做的 ack。
+	ErrAckActorNameRequired = errors.New("domain: ack 的 actorName 不能为空")
+)
 
 func ValidateFaultTransition(from, to FaultStatus) error {
 	if (from == FaultStatusCandidate && to == FaultStatusActive) ||
@@ -240,7 +244,7 @@ func ValidateFaultTransition(from, to FaultStatus) error {
 func AckFault(fault Fault, actorID, actorName string, now time.Time) (Fault, FaultTimelineEntry, bool, error) {
 	// 纯空白与空串同样视为缺失，口径与 incident.Actor.valid 的 TrimSpace 一致。
 	if strings.TrimSpace(actorName) == "" {
-		return fault, FaultTimelineEntry{}, false, fmt.Errorf("domain: ack 的 actorName 不能为空")
+		return fault, FaultTimelineEntry{}, false, ErrAckActorNameRequired
 	}
 	if fault.IsAcked() {
 		return fault, FaultTimelineEntry{}, false, nil

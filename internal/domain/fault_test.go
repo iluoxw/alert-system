@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -88,8 +89,8 @@ func TestAckFault(t *testing.T) {
 		t.Parallel()
 		for _, name := range []string{"", "   "} {
 			_, _, ok, err := AckFault(base, "user-1", name, now)
-			if err == nil {
-				t.Fatalf("AckFault(actorName=%q) error = nil, want 非空 actorName 校验错误", name)
+			if !errors.Is(err, ErrAckActorNameRequired) {
+				t.Fatalf("AckFault(actorName=%q) error = %v, want ErrAckActorNameRequired", name, err)
 			}
 			if ok {
 				t.Fatalf("AckFault(actorName=%q) ok = true, want false", name)
