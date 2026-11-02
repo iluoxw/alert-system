@@ -1,6 +1,6 @@
 # alert-system
 
-Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/trace 归一），经管道处理后按策略通知、升级、自愈预留。架构大量借鉴 Alertmanager / PagerTree 实践。规格与任务由 spec-workflow 管理（`.spec-workflow/specs/alert-system-mvp/`，dashboard 用 5001 端口，5000 被 macOS AirPlay 占用）。交付时间线与接手须知见 `CHANGELOG.md`。
+Infrastructure-first 的事故响应系统（Go）：从 Alertmanager / Grafana 同步已触发的 Alert，绑定实体后形成 Fault、Impact 与 Incident，支撑响应与恢复；定位与边界见下方「产品定位与领域边界」。规格与任务由 spec-workflow 管理（`.spec-workflow/specs/<特性>/`，每个特性一个目录；dashboard 用 5001 端口，5000 被 macOS AirPlay 占用）。交付时间线与接手须知见 `CHANGELOG.md`。
 
 ## 产品定位与领域边界
 
@@ -37,7 +37,7 @@ Go 告警管理系统（MVP）：接入已触发的告警事件（metric/log/tra
 - `internal/domain/` 纯函数领域层（状态机、matcher、指纹）；`internal/store/` 仓储（所有方法带 `tx pgx.Tx` 参数，事务由调用方开）
 - `internal/pipeline/` 管道 stage；`internal/ingest/` webhook 接入 + AM/Grafana 适配器；`internal/scheduler/` 统一定时器；`internal/oncall/` 值班与人员升级链；`internal/notify/` 通知策略/渠道/生命周期；`internal/api/` HTTP 层
 - `internal/ccloud/` 平台拓扑接入：`client.go` HTTP 客户端（接口路径可配置）、`importer.go` 平台响应 → 快照/边/待对齐身份的纯映射、`syncer.go` 独立周期 loop。**外部 IO 只在本包发生**（事务外 fetch → 短事务写入，不变量 23），禁止把平台调用塞进 timer handler 或管道 stage
-- `migrations/` golang-migrate 格式，编号顺延（当前到 000029；000028 预留给 era3 任务 28）；`test/e2e/` docker-compose 真实 PG，覆盖 Alertmanager 权威同步与服务目录映射等通用场景
+- `migrations/` golang-migrate 格式，新迁移取现有最大编号 +1；`000028` 预留给 era3-fault-workunit 任务 28，不得占用；`test/e2e/` docker-compose 真实 PG，覆盖 Alertmanager 权威同步与服务目录映射等通用场景
 
 ## 核心架构不变量（改代码前必读）
 
@@ -84,7 +84,7 @@ cd web && npm run build && npx oxlint  # 前端验证（tsc -b 为准，编辑�
 cd test/e2e && docker compose up -d    # E2E 依赖的真实 PG（initdb 自动跑 migrations）
 ```
 
-`test/e2e` 使用固定 Compose project/端口，任何时刻只能运行一轮。终端命令返回 `session_id` 时必须用 `write_stdin(session_id)` 读取到真实结束；外层工具的 cell id 不能替代终端 session，禁止在未确认前一轮结束时补跑第二轮。
+`test/e2e` 使用固定 Compose project/端口，任何时刻只能运行一轮：确认上一轮真实结束（进程已退出、结果已完整输出）后才能启动下一轮。后台运行时以进程退出为准，工具调用返回或任务状态通知都不能替代——会话恢复或 fork 后，后台任务可能脱离跟踪，但进程仍在运行。
 
 本机有 rtk 命令代理 hook（token 优化）；rg 传含 `|` 的模式时用 `grep -nE 'a|b'` 风格，避免未转义括号被解析为分组。
 
@@ -98,5 +98,3 @@ cd test/e2e && docker compose up -d    # E2E 依赖的真实 PG（initdb 自动�
 ## 已知悬置（不阻塞）
 
 - alerts.team_id / acked_by 补 FK 迁移
-- web npm audit 2 个 high（发布前处理）
-- AlertList 与 AppLayout 双登出按钮视觉冗余（后续 polish）
