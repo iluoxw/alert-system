@@ -155,8 +155,12 @@ func TestFetchAppHealth_NullAndZeroHealth(t *testing.T) {
 
 func TestFetch_TimeoutIsDistinguishable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(50 * time.Millisecond)
-		serveFixture(t, w, "testdata/fulllink_topology.json")
+		// 超时后客户端已断开，不再写 fixture，避免预期的 broken pipe 使测试失败。
+		// 保留有界等待：客户端若未取消请求，测试仍能退出并报告断言失败。
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
 	}))
 	defer srv.Close()
 
