@@ -1,0 +1,48 @@
+# 供没有迁移 initContainer 的平台部署使用；不参与任何 kustomization。
+# 复制到仓库外，替换 namespace、镜像、拉取凭据与数据库 Secret 后再执行。
+# 迁移镜像版本须以 CHANGELOG 为准；v0.3.2 仅发布 Web，迁移镜像沿用 v0.3.1。
+# 每次迁移使用独立 Job 名，成功后核对日志与 schema_migrations 再更新应用。
+# DB_DSN 通过 Secret 注入；migrate 的 -database 参数仍会出现在容器进程参数中，
+# 诊断时禁止输出完整 argv。既有数据库必须先确认 migration ledger 正确。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sre-control-migrate-0-3-1
+  namespace: replace-namespace
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: replace-image-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: registry.example.com/sre-control-migrate:0.3.1
+          args: ["-path=/migrations", "-database=$(DB_DSN)", "up"]
+          env:
+            - name: DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: replace-database-secret
+                  key: DB_DSN
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi

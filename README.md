@@ -1,11 +1,8 @@
 # alert-system
 
-当前可部署基线：**SRE Control v0.1.0**（版本源见 [`VERSION`](VERSION)）。
+当前发布基线：**SRE Control v0.3.2**（版本源见 [`VERSION`](VERSION)，发布记录见 [`CHANGELOG.md`](CHANGELOG.md)）。v0.3.2 仅发布 Web，API 与迁移镜像沿用 v0.3.1；发布后的修复列在 CHANGELOG 的 Unreleased 节，不代表已部署。
 
-Go 编写的告警管理系统（MVP）：接入已触发的告警事件（metric/log/trace 归一为统一
-事件模型），经过 去重 -> 路由 -> 分组 -> 静默 -> 抑制 五段管道处理后，按值班排班与
-升级策略通知责任人（飞书卡片为主要通知渠道），支持处置（Ack/Resolve）与自愈预留。
-架构大量借鉴 Alertmanager 与 PagerTree 的实践。
+Go 编写的 Infrastructure-first 事故响应系统：从 Alertmanager / Grafana 同步已触发的 Alert，绑定实体后形成 Fault、Impact 与 Incident，支撑故障认领、通知、协作处置与恢复。Alertmanager / Grafana 是各自 Alert 生命周期的权威来源；本地路由、分组、静默、抑制仅对 generic 来源生效，相关能力已冻结。
 
 ## 技术栈
 
@@ -95,8 +92,8 @@ Grafana 是 Alert 生命周期权威来源，不经过这套本地编排。
 
 ```bash
 go build ./... && go vet ./...          # 必须零错误
-go test ./... -race -count=1            # 全量单测（store 用 testcontainers 需 Docker）
-cd test/e2e && docker compose up -d --wait && cd - && go test ./test/e2e/...   # 真实 PG 场景化 E2E
+go test -tags=integration ./... -race -count=1  # 含 store 集成测试与 E2E，需 Docker
+go test ./test/e2e/...                 # 自动管理测试专用 PG；同一时刻只运行一轮
 cd web && npm run build && npx oxlint   # 前端构建 + lint
 ```
 
@@ -119,9 +116,11 @@ make release-check
 
 | 镜像 | 默认标签 | 用途 |
 |---|---|---|
-| API | `sre-control-api:0.1.0` | Go API、后台 worker，并携带一次性 `seed-admin` 工具 |
-| Web | `sre-control-web:0.1.0` | 静态 SPA 与运行时 `API_BASE_URL` 配置 |
-| Migrate | `sre-control-migrate:0.1.0` | golang-migrate + 当前版本 SQL |
+| API | `sre-control-api:$(VERSION)` | Go API、后台 worker，并携带一次性 `seed-admin` 工具 |
+| Web | `sre-control-web:$(VERSION)` | 静态 SPA 与运行时 `API_BASE_URL` 配置 |
+| Migrate | `sre-control-migrate:$(VERSION)` | golang-migrate + 当前版本 SQL |
+
+上表是 Makefile 的本地构建默认值，`VERSION` 取根目录版本文件；已发布镜像的版本组合以 CHANGELOG 为准。仓库 Kubernetes 示例仍固定为 `0.1.0`，使用前须显式设置镜像仓库与版本，不能直接视为当前发布配置。
 
 ```bash
 make docker-build
@@ -185,6 +184,8 @@ local overlay 将 Web 的 `API_BASE_URL` 设为 `http://localhost:8080/api`，�
 `deploy/k8s/overlays/production`，先将镜像名改为真实仓库，并通过 External Secrets、
 Sealed Secrets 或平台 Secret 管理能力创建 `sre-control-secrets`。示例字段见
 `secret.example.yaml`，该文件不参与 kustomization。
+
+若平台托管的 Deployment 没有迁移 initContainer，使用 [`deploy/k8s/jobs/migrate.example.yaml`](deploy/k8s/jobs/migrate.example.yaml) 准备一次性迁移 Job。先复制到仓库外，填写 namespace、镜像、拉取凭据和数据库 Secret，再人工执行并核对结果；该模板不参与 overlay，不会随应用自动部署。环境专用的 `uat-migrate-0-3-1.yaml` 保留为本地运维文件，不作为通用部署基线。
 
 应用 Pod 包含 Web 与 API 两个容器，Service 分别暴露 `80`（Web）与 `8081`（API），
 路径路由由集群入口层完成；数据库迁移由 initContainer 在业务启动前执行。

@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+- Fault 认领使用哨兵错误判断空操作人，包装后的 domain/store 错误仍返回 400，并补充回归测试（`395a081`）。
+- 修复 ccloud 超时测试的偶发失败：客户端断开后不再写 fixture，避免预期的 `broken pipe` 被误判为客户端缺陷。
+- 同步 README 的发布版本、产品定位与集成测试命令，补充独立迁移 Job 模板；实际 UAT 配置与部署状态仍需单独核验。
+
 ## [v0.3.2] 2026-09-21 — 实体下线入口的可达性修复（仅 Web）
 
 > **纯前端发布**：API 与 migrate 镜像保持 `0.3.1`，无迁移、无后端改动，只需更新 Web deployment。
@@ -83,7 +87,7 @@ era3-fault-workunit 健康证据任务，本版未占用。
 
 ## [v0.3.0] 2026-09-20 — Fault 成为一等工作单元
 
-> 规格 `.spec-workflow/specs/era3-fault-workunit/`（45 个任务，本版交付 30 个），ADR-0006。
+> 规格 `.spec-workflow/specs/era3-fault-workunit/`（45 个任务，含发布收尾共完成 32 个），ADR-0006。
 > 核心变化：Fault 从"告警的聚合产物"变成有归属、可认领、会主动通知的工作单元；
 > Alert 生命周期层收敛到 Alertmanager 与 Grafana；新增平台拓扑接入与一组先行指标。
 > 实现分 P0–P5 六批，由 coder 子代理执行、主对话逐批 review，每批全量验证后合入。
@@ -135,7 +139,7 @@ era3-fault-workunit 健康证据任务，本版未占用。
 - **恢复提醒指标没有统计窗口**：`timers` 的 fired 行会被 retention 清理，全表计数先涨后落、含义随保留配置变化。
 - ccloud syncer 误把项目 ID 当作实体 environment 写入。
 
-### 未完成（15 个任务，规格内）
+### 未完成（13 个任务，规格内）
 
 - 健康证据与影响外播（P4，任务 28–33、35、36）：阻塞于平台团队提供 `CCLOUD_HEALTH_WINDOW` 与真实接口路径。
 - 飞书交互卡片（任务 19、34、45）：阻塞于 uat 的公网回调入口。P2 通知走纯文本 + 详情链接，认领在 Web 完成。

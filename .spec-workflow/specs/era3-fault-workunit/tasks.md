@@ -375,7 +375,8 @@
 
 - [ ] 43. k8s 探针切换（人工动作，需用户确认）
   - File: deploy/k8s/（配置建议）, ccloud 平台（实际执行方）
-  - API 的 liveness 与 readiness 均改为 /readyz（当前两者都打恒 200 的 /healthz，未经过任何依赖检查）
+  - API 的 liveness 与 readiness 均改为 /readyz；平台实际配置须单独核验，不能从仓库配置推断已生效
+  - 仓库复核（2026-11-06）：`deploy/k8s/base/deployment.yaml` 的 readiness 已为 `/readyz`，startup/liveness 仍为 `/healthz`。本次未变更平台配置，任务保持未完成
   - Purpose: 让探针真正起作用
   - _Leverage: 任务 39 实现的新 readyz_
   - _Requirements: R10.5_
