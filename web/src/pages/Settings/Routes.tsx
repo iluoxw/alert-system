@@ -51,6 +51,7 @@ export function RoutesPage() {
       updateFn={updateRoute}
       deleteFn={deleteRoute}
       columns={columns}
+      extraToolbar={<span className="resource-toolbar__hint">仅对 generic 来源生效。Alertmanager / Grafana 权威来源不经过本地路由与分组。</span>}
       renderFields={() => (
         <>
           <Form.Item
@@ -104,7 +105,12 @@ export function RoutesPage() {
           <Form.Item name="group_interval_seconds" label="同组通知间隔（秒）" initialValue={60}>
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
-          <Form.Item name="repeat_interval_seconds" label="重复提醒间隔（秒）" initialValue={3600}>
+          <Form.Item
+            name="repeat_interval_seconds"
+            label="重复提醒间隔（秒）"
+            initialValue={0}
+            extra="0 表示使用全局默认；仅影响此后新启动的重复提醒链，已在运行的链沿用启动时的间隔"
+          >
             <InputNumber style={{ width: '100%' }} min={0} />
           </Form.Item>
           <Form.Item

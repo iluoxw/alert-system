@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,6 +24,10 @@ const idleBackoff = 200 * time.Millisecond
 // errorBackoff 避免数据库或事务级错误形成无等待的重试风暴。单条事件的 stage
 // 失败会在保存点回滚后标记 failed，不会进入这里；这里处理的是批次本身无法完成。
 const errorBackoff = time.Second
+
+// readinessPollFloor 是 /readyz 判定 pipeline 停摆用的最小轮询间隔。空转退避只有
+// 200ms，3× 仅 600ms，短暂调度抖动就会误报 503；空轮询仍记成功，窗口按至少 1s 计。
+const readinessPollFloor = time.Second
 
 // Stage 是管道处理阶段的统一接口。去重/路由/分组/静默/抑制（实际执行顺序，见
 // cmd/server/main.go 装配处的注释）等具体 stage（internal/pipeline/stage_*.go，
@@ -105,6 +110,10 @@ type Pipeline struct {
 	store     *store.Store
 	queue     *store.EventQueue
 	batchSize int
+
+	// lastPollUnixNano 是最近一次成功轮询的时间戳（Unix nano）。空轮询（队列为空）
+	// 也算成功，避免业务低峰时 /readyz 误报 503。0 表示从未成功轮询过。
+	lastPollUnixNano atomic.Int64
 }
 
 // New 构造 Pipeline。stages 按传入顺序依次执行（典型顺序：去重 -> 分组 -> 静默 ->
@@ -118,6 +127,28 @@ func New(st *store.Store, queue *store.EventQueue, hooks *hook.Registry, stages 
 		queue:     queue,
 		batchSize: defaultBatchSize,
 	}
+}
+
+func (p *Pipeline) recordPollSuccess() {
+	p.lastPollUnixNano.Store(time.Now().UnixNano())
+}
+
+// LastPollSuccessAt 返回最近一次成功轮询的本地时间；从未成功轮询过时为零值。
+func (p *Pipeline) LastPollSuccessAt() time.Time {
+	ns := p.lastPollUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// PollInterval 供 /readyz 按 3× 间隔判定停摆。空转间隔是 idleBackoff，但 readiness
+// 窗口至少按 1s 计，避免 200ms 空转在短暂调度抖动下误报。
+func (p *Pipeline) PollInterval() time.Duration {
+	if idleBackoff > readinessPollFloor {
+		return idleBackoff
+	}
+	return readinessPollFloor
 }
 
 // process 依序执行 stages，每个 stage 前后触发 hook.Registry.Fire。
@@ -153,6 +184,9 @@ func (p *Pipeline) pollOnce(ctx context.Context) (int, error) {
 			return err
 		}
 		n = len(batch)
+		// Dequeue 成功（含空批次）即证明 worker 仍在转，先记一笔心跳，避免本轮
+		// 处理事件较久时 /readyz 把"正在干活"误判成停摆。
+		p.recordPollSuccess()
 		for _, ev := range batch {
 			eventTx, err := tx.Begin(ctx)
 			if err != nil {
@@ -202,6 +236,7 @@ func (p *Pipeline) Run(ctx context.Context) {
 			}
 			continue
 		}
+		p.recordPollSuccess()
 		if n == 0 {
 			select {
 			case <-ctx.Done():

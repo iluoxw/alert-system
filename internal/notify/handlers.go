@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -23,6 +24,16 @@ const TimerKindAlertTTL = "alert_ttl"
 // "personnel_escalation"（oncall 包，人员升级链）、"group_wait"（pipeline 包，
 // 分组）分属不同命名空间；任务 22 的渠道升级将使用 "channel_escalation"。
 const TimerKindAlertRepeat = "alert_repeat"
+
+// RepeatPayload 是 TimerKindAlertRepeat 定时器的 payload 格式：装配层（app 包）在
+// "意图时刻"（NotifyGroup 注册首个定时器时）按告警 RouteID 解析出路由级
+// repeat_interval_seconds 并写入，随后每一轮 HandleRepeat 续约都原样带到下一轮——
+// 路由配置修改只影响之后新启动的 repeat 链，已在运行的链沿用启动时捕获的间隔
+// （与不变量 4"round 在意图时刻捕获"同一口径）。IntervalSeconds<=0 视为未设置，
+// 续约时回落调用方注入的全局默认值（NewLifecycleHandlers 的 repeatInterval 参数）。
+type RepeatPayload struct {
+	IntervalSeconds int `json:"interval_seconds"`
+}
 
 // lifecycleActorTTL 是 TTL 自动恢复动作的 actor 标识，取 domain.Resolve 文档注释
 // 里给系统自动触发场景建议的示例值，与 pipeline.resolveActorSource
@@ -151,6 +162,12 @@ func (h *LifecycleHandlers) HandleTTL(ctx context.Context, tx pgx.Tx, refID stri
 //
 // 首个 repeat 定时器的注册不归本 handler：由任务 22 的首次通知编排在发出首次
 // 通知时负责注册，本 handler 只处理"已经到期一次之后"的后续续约。
+//
+// payload 按 RepeatPayload 解析出本轮应使用的间隔：缺失（升级前遗留的 nil
+// payload）、无法解析或 IntervalSeconds<=0 时一律回落 h.repeatInterval（全局默认，
+// 与升级前行为逐字节一致）。续约时把同一份 payload 原样传给下一轮 Schedule——
+// 不在这里重新编码，保证多轮续挂间 payload 不变（路由级间隔一旦在意图时刻捕获，
+// 整条链持续沿用，不随后续路由配置修改而漂移）。
 func (h *LifecycleHandlers) HandleRepeat(ctx context.Context, tx pgx.Tx, refID string, payload []byte) error {
 	alert, err := h.alerts.GetByID(ctx, tx, refID)
 	if err != nil {
@@ -165,8 +182,15 @@ func (h *LifecycleHandlers) HandleRepeat(ctx context.Context, tx pgx.Tx, refID s
 	if err := h.repeatNotifier.NotifyRepeat(ctx, tx, alert); err != nil {
 		return fmt.Errorf("notify: 记录 repeat 通知意图失败: %w", err)
 	}
-	fireAt := h.clock.Now().Add(h.repeatInterval)
-	if err := h.scheduler.Schedule(ctx, tx, TimerKindAlertRepeat, alert.ID, fireAt, nil); err != nil {
+	interval := h.repeatInterval
+	if len(payload) > 0 {
+		var rp RepeatPayload
+		if err := json.Unmarshal(payload, &rp); err == nil && rp.IntervalSeconds > 0 {
+			interval = time.Duration(rp.IntervalSeconds) * time.Second
+		}
+	}
+	fireAt := h.clock.Now().Add(interval)
+	if err := h.scheduler.Schedule(ctx, tx, TimerKindAlertRepeat, alert.ID, fireAt, payload); err != nil {
 		return fmt.Errorf("notify: 续约 repeat 定时器失败: %w", err)
 	}
 	return nil

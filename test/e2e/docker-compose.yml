@@ -2,9 +2,9 @@
 # （000001-000005 的 up 脚本），不 mock 存储/scheduler，只用短时长配置压缩时钟。
 #
 # 用法：
-#   docker compose -f test/e2e/docker-compose.yml up -d --wait
+#   docker compose -p firebreak-e2e -f test/e2e/docker-compose.yml up -d --wait
 #   go test ./test/e2e/...
-#   docker compose -f test/e2e/docker-compose.yml down -v
+#   docker compose -p firebreak-e2e -f test/e2e/docker-compose.yml down -v
 #
 # TestMain（e2e_test.go）会自动执行上面前后两步，本文件本身不含任何应用代码，
 # 仅用于启动依赖服务。
@@ -23,7 +23,9 @@ services:
       - ../../migrations:/migrations:ro
       - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U alert_system -d alert_system"]
+      # initdb 阶段的临时 PostgreSQL 也会响应 pg_isready；只有迁移脚本最后
+      # 创建容器内标记后才算真正可供应用连接。
+      test: ["CMD-SHELL", "test -f /tmp/e2e-init-ready && pg_isready -U alert_system -d alert_system"]
       interval: 1s
       timeout: 3s
       retries: 30

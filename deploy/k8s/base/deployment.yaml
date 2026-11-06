@@ -109,6 +109,9 @@ spec:
         - name: web
           image: sre-control-web:0.1.0
           imagePullPolicy: IfNotPresent
+          env:
+            - name: API_BASE_URL
+              value: "/api"
           ports:
             - name: http
               containerPort: 8080

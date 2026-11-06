@@ -75,6 +75,7 @@ type App struct {
 	IncidentOutbox   *IncidentOutbox
 	AlertProjector   *alertmapping.Projector
 	ImpactProjector  *impactprojection.Projector
+	FaultOutbox      *FaultOutbox
 }
 
 // Build 组装唯一的 scheduler 实例、notify.Sender、outbox、oncall.Chain/notify.Engine/
@@ -97,6 +98,11 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 任务 9：到人发送在 Sender.Send 第 0 段解析 TargetUserID -> 实际渠道地址，
 	// 具体解析实现见下方 userContactResolver（基于 UserRepo 的薄适配器）。
 	sender.Resolver = userContactResolver{users: repos.Users}
+	// 任务 40：发送最终失败在写 failed 的同一短事务里 Schedule 元告警（只 Schedule，
+	// 不在 markFailed 里做 HTTP）。元告警自身失败不再进入这里（Sender 见 MetaAlert）。
+	sender.OnFinalFailure = func(ctx context.Context, tx pgx.Tx, original notify.SendRequest) error {
+		return scheduleNotifyFailureMetaAlert(ctx, tx, sched, repos.Faults, cfg.FaultNotify.FallbackChannel, cfg.FaultNotify.FallbackTarget, time.Now(), original)
+	}
 
 	// outbox 依赖 chain/engine，chain/engine 又依赖 outbox 作为通知意图的实现——
 	// 用零值字段构造 outbox 打破这个环：NotifyEscalation/NotifyRepeat/DispatchStep
@@ -104,11 +110,12 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 被调用，那时 engine/chain 已经赋值完毕。
 	outbox := &notifyOutbox{
 		scheduler:        sched,
+		routes:           repos.Routes,
 		repeatInterval:   cfg.RepeatInterval,
 		personnelChannel: cfg.PersonnelChannel,
 		now:              time.Now,
 	}
-	incidentOutbox := &IncidentOutbox{scheduler: sched, now: time.Now}
+	incidentOutbox := &IncidentOutbox{scheduler: sched, nudgeInterval: cfg.IncidentNudgeInterval, now: time.Now}
 
 	resolver := oncall.NewResolver(repos.Schedules, repos.Shifts)
 	chain := oncall.NewChain(repos.Alerts, repos.Timeline, repos.EscalationPolicies, resolver, sched, outbox)
@@ -150,7 +157,14 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	dedupStage := pipeline.NewDedupStage(repos.Alerts, repos.Timeline, sched, nil, cfg.FlapWindowSeconds, cfg.FlapThreshold)
 	impactProjector := impactprojection.NewProjector(repos.Topology, repos.Faults)
 	projector := alertmapping.NewProjector(repos.AlertMappings, repos.ServiceCatalog, repos.Topology, repos.Faults, impactProjector)
-	mappingStage := pipeline.NewMappingStage(projector)
+
+	// ---- Fault 级通知 outbox（R5）：拓扑抑制判定复用 impactProjector.ProviderNodeIDs
+	// 既有的 maxDepth/staleAfter 裁决，不在这里重复定义遍历参数。
+	// TriggerFromMappingResult 是 pipeline.MappingStage 与 alertsource.Reconciler
+	// 两个 Project 调用方共用的触发入口（R5.10/R5.11），见该方法文档 ----
+	faultOutbox := NewFaultOutbox(sched, repos.Faults, repos.Ops, impactProjector,
+		cfg.FaultNotify.Cooldown, cfg.FaultNotify.FallbackChannel, cfg.FaultNotify.FallbackTarget, cfg.WebBaseURL)
+	mappingStage := pipeline.NewMappingStage(projector).WithFaultActivation(faultOutbox.TriggerFromMappingResult)
 	routeStage := pipeline.NewRouteStage(repos.Routes, repos.Alerts, defaultTeamID)
 	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox, repos.Routes, stormState)
 	silenceStage := pipeline.NewSilenceStage(repos.Silences, repos.Alerts)
@@ -169,20 +183,28 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 触发这里注册的 handler ----
 	storm := newStormHandler(stormState, repos.Routes, repos.Alerts, sched)
 
+	// ---- Incident 恢复提醒 handler（第 12 个 kind）：证据全部解除却无人收尾时
+	// 周期性提醒，绝不自动推进 Incident 状态（不变量 11）----
+	incidentNudge := newIncidentNudgeHandler(repos.Incidents, repos.Faults, repos.Alerts, repos.Topology, incidentOutbox, sched, cfg.IncidentNudgeInterval)
+
 	// ---- 六个既有 scheduler kind + 三个 ops kind + retention_sweep + storm_summary
-	// 全部在这里绑定；未注册的 kind 到期会被标 failed 不重试，新增 kind 务必在此
-	// 登记全（CLAUDE.md 不变量 2）----
+	// + incident_recovery_nudge 全部在这里绑定；未注册的 kind 到期会被标 failed
+	// 不重试，新增 kind 务必在此登记全（CLAUDE.md 不变量 2）----
 	sched.RegisterHandler(notify.TimerKindAlertTTL, lifecycle.HandleTTL)
 	sched.RegisterHandler(notify.TimerKindAlertRepeat, lifecycle.HandleRepeat)
 	sched.RegisterHandler(oncall.TimerKindPersonnelEscalation, chain.Handle)
 	sched.RegisterHandler(groupTimerKind, groupStage.Handle)
 	sched.RegisterHandler(notify.TimerKindChannelEscalation, engine.Handle)
-	sched.RegisterHandler(notifySendTimerKind, notifySendPayloadHandler(sender))
+	// notify_send 是唯一注册成「事务外执行」模式的 kind：它内部必然做外部 IO
+	// （HTTP/SMTP + 退避重试），不能占着 scheduler 的事务与 timers 行锁执行。
+	// 语义见 notifySendPayloadHandler 与 scheduler.DetachedHandler 的文档。
+	sched.RegisterDetachedHandler(notifySendTimerKind, notifySendPayloadHandler(sender))
 	sched.RegisterHandler(ops.TimerKindDailyReport, opsHandlers.HandleDailyReport)
 	sched.RegisterHandler(ops.TimerKindStaleSweep, opsHandlers.HandleStaleSweep)
 	sched.RegisterHandler(ops.TimerKindOncallBroadcast, opsHandlers.HandleOncallBroadcast)
 	sched.RegisterHandler(TimerKindRetentionSweep, retention.Handle)
 	sched.RegisterHandler(TimerKindStormSummary, storm.Handle)
+	sched.RegisterHandler(IncidentRecoveryNudgeTimerKind, incidentNudge.Handle)
 
 	return &App{
 		Scheduler:        sched,
@@ -194,6 +216,7 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 		IncidentOutbox:   incidentOutbox,
 		AlertProjector:   projector,
 		ImpactProjector:  impactProjector,
+		FaultOutbox:      faultOutbox,
 	}
 }
 
@@ -388,6 +411,11 @@ func ReconcileOpsTimers(ctx context.Context, st *store.Store, opsRepo *store.Ops
 // timers 表）时补建一条。retention_sweep 是全局单例任务（固定 refID="global"），
 // 不像 ops 三个 kind 那样需要按团队枚举 settings，因此不需要查表，直接对账即可。
 func ReconcileRetentionTimer(ctx context.Context, st *store.Store, sched *scheduler.Scheduler, cfg config.RetentionConfig) error {
+	// 调用方可能绕过 config.Load 直接构造配置（如 E2E 结构体字面量），零值配置一旦
+	// 注册就会立即触发清理并空转续期，必须在注册前拦住。
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("app: retention 配置非法，拒绝注册 retention_sweep: %w", err)
+	}
 	return st.WithTx(ctx, func(tx pgx.Tx) error {
 		fireAt := time.Now().Add(cfg.SweepInterval)
 		if _, err := sched.ScheduleIfAbsent(ctx, tx, TimerKindRetentionSweep, retentionSweepRefID, fireAt, nil); err != nil {

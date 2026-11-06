@@ -58,6 +58,7 @@ type ConfigUserStore interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id string) (*store.User, error)
 	List(ctx context.Context, tx pgx.Tx, limit int) ([]store.User, error)
 	Update(ctx context.Context, tx pgx.Tx, id, displayName, email string, enabled bool) error
+	UpdateLarkOpenID(ctx context.Context, tx pgx.Tx, id, openID string) error
 	Delete(ctx context.Context, tx pgx.Tx, id string) error
 }
 
@@ -363,14 +364,14 @@ func (h *configHandlers) createIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == "alertmanager" {
+	if domain.IsAuthoritativeSourceKind(req.Kind) {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
 			return
 		}
 		if cfg.APIURL != "" {
-			if err := alertsource.ValidateConfig(cfg); err != nil {
+			if err := alertsource.ValidateConfig(req.Kind, cfg); err != nil {
 				unprocessable(c, err.Error())
 				return
 			}
@@ -473,14 +474,14 @@ func (h *configHandlers) updateIntegration(c *gin.Context) {
 		unprocessable(c, "非法 default_severity: "+req.DefaultSeverity)
 		return
 	}
-	if req.Kind == "alertmanager" {
+	if domain.IsAuthoritativeSourceKind(req.Kind) {
 		cfg, err := store.ParseAlertmanagerSourceConfig(req.Config)
 		if err != nil {
 			unprocessable(c, err.Error())
 			return
 		}
 		if cfg.APIURL != "" {
-			if err := alertsource.ValidateConfig(cfg); err != nil {
+			if err := alertsource.ValidateConfig(req.Kind, cfg); err != nil {
 				unprocessable(c, err.Error())
 				return
 			}
@@ -533,8 +534,8 @@ func (h *configHandlers) rotateHook(c *gin.Context, alertmanagerOnly bool) {
 		if getErr != nil {
 			return getErr
 		}
-		if alertmanagerOnly && in.Kind != "alertmanager" {
-			return &validationError{msg: "该 integration 不是 Alertmanager 数据源"}
+		if alertmanagerOnly && !domain.IsAuthoritativeSourceKind(in.Kind) {
+			return &validationError{msg: "该 integration 不是权威告警数据源"}
 		}
 		return h.deps.Integrations.RotateHookIDHash(ctx, tx, id, hashIntegrationHookID(hookID))
 	})
@@ -677,6 +678,7 @@ func userJSON(u store.User) gin.H {
 		"username":     u.Username,
 		"display_name": u.DisplayName,
 		"email":        u.Email,
+		"lark_open_id": u.LarkOpenID,
 		"enabled":      u.Enabled,
 		"created_at":   u.CreatedAt,
 		"updated_at":   u.UpdatedAt,
@@ -778,9 +780,10 @@ func (h *configHandlers) getUser(c *gin.Context) {
 }
 
 type updateUserRequest struct {
-	DisplayName string `json:"display_name"`
-	Email       string `json:"email"`
-	Enabled     bool   `json:"enabled"`
+	DisplayName string  `json:"display_name"`
+	Email       string  `json:"email"`
+	Enabled     bool    `json:"enabled"`
+	LarkOpenID  *string `json:"lark_open_id"`
 }
 
 func (h *configHandlers) updateUser(c *gin.Context) {
@@ -795,7 +798,13 @@ func (h *configHandlers) updateUser(c *gin.Context) {
 	ctx := c.Request.Context()
 	id := c.Param("id")
 	err := h.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		return h.deps.Users.Update(ctx, tx, id, req.DisplayName, req.Email, req.Enabled)
+		if err := h.deps.Users.Update(ctx, tx, id, req.DisplayName, req.Email, req.Enabled); err != nil {
+			return err
+		}
+		if req.LarkOpenID == nil {
+			return nil
+		}
+		return h.deps.Users.UpdateLarkOpenID(ctx, tx, id, *req.LarkOpenID)
 	})
 	if err != nil {
 		h.handleStoreErr(c, err, "更新用户")
@@ -868,9 +877,11 @@ func normalizedGroupMode(m string) string {
 // target_team_id 是否存在；不要求 matchers 非空——留白 matchers 在当前领域模型下
 // 恒不匹配（domain.MatcherSet.Matches），是否应该在 API 层拒绝这种"实质上的死配置"
 // 不在本任务裁决范围内，按 brief 要求只做了列出的三类校验，这里不新增。
-// 另外校验 group_mode（R1/C1）与 storm_threshold_per_min（R3/C3）：group_mode 提供
-// 时只能是 label/window；group_mode=window 与 group_by 语义互斥（window 是固定组键，
-// 不使用 group_by 计算分组），二者同时非空即 422；storm_threshold_per_min 不能为负。
+// 另外校验 group_mode（R1/C1）、storm_threshold_per_min（R3/C3）与
+// repeat_interval_seconds：group_mode 提供时只能是 label/window；group_mode=window
+// 与 group_by 语义互斥（window 是固定组键，不使用 group_by 计算分组），二者同时
+// 非空即 422；storm_threshold_per_min、repeat_interval_seconds 均不能为负——0 是
+// 合法值（表示不覆盖路由级间隔，续用 outbox 注入的全局默认，缺陷 1 修复的一部分）。
 // group_by 本身（含保留键 __template__，R2/C2）在这里不做格式校验——现有实现从未
 // 校验过 group_by 的元素格式（只有 matchers/target_team_id 两类语义校验），因此
 // __template__ 无需任何放行改动即可直接使用。
@@ -898,6 +909,9 @@ func (h *configHandlers) validateRoute(ctx context.Context, tx pgx.Tx, req route
 	}
 	if req.StormThresholdPerMin < 0 {
 		return "storm_threshold_per_min 不能为负数", false, nil
+	}
+	if req.RepeatIntervalSeconds < 0 {
+		return "repeat_interval_seconds 不能为负数", false, nil
 	}
 	return "", true, nil
 }

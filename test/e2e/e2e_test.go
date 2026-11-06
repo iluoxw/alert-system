@@ -19,6 +19,8 @@ import (
 // testDSN 与 docker-compose.yml 里 postgres 服务暴露的宿主机端口一致（15432）。
 const testDSN = "postgres://alert_system:alert_system@localhost:15432/alert_system?sslmode=disable"
 
+const composeProject = "firebreak-e2e"
+
 var (
 	sys        *system
 	seedResult *seedConfigResult
@@ -38,6 +40,9 @@ func TestMain(m *testing.M) {
 // runTestMain 是 TestMain 的主体：用 error 返回值代替到处手写 os.Exit(1)，defer 也就
 // 能正常执行（docker compose down、system.close）。
 func runTestMain(m *testing.M) (int, error) {
+	// E2E 数据目录是测试专用 tmpfs；先清理上一次异常退出遗留的容器，
+	// 再强制重建，避免固定种子名称与旧容器数据冲突。
+	composeDown()
 	if err := composeUp(); err != nil {
 		return 0, fmt.Errorf("启动 docker compose 失败: %w", err)
 	}
@@ -59,6 +64,11 @@ func runTestMain(m *testing.M) (int, error) {
 		// 会让 userContactResolver.Resolve 的 channelKind switch 落进 default 分支报错
 		// （任务 9：人员升级到人发送依赖这个字段，与生产 config.Load() 的默认值 "email" 对齐）。
 		PersonnelChannel: "email",
+		// 结构体字面量不经过 config.Load，必须显式给出与生产默认一致的合法留存配置；
+		// 首轮清理在 1h 后，不会在用例运行期间删除断言依赖的数据。
+		Retention: config.RetentionConfig{TimersDays: 7, NotificationLogDays: 90, SweepInterval: time.Hour, BatchSize: 1000},
+		// P2 Fault 通知冷却必须 >0，否则 QueueFaultActivated 跳过 R5.3 判定。
+		FaultNotify: config.FaultNotifyConfig{Cooldown: 30 * time.Minute},
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -88,14 +98,14 @@ func runTestMain(m *testing.M) (int, error) {
 }
 
 func composeUp() error {
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "up", "-d", "--wait")
+	cmd := exec.Command("docker", "compose", "-p", composeProject, "-f", "docker-compose.yml", "up", "-d", "--wait", "--force-recreate", "--remove-orphans")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func composeDown() {
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "down", "-v")
+	cmd := exec.Command("docker", "compose", "-p", composeProject, "-f", "docker-compose.yml", "down", "-v")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	_ = cmd.Run() // 清理失败不应该掩盖测试本身的结果，只记录不 panic
@@ -115,18 +125,6 @@ func newLoggedInClient(t *testing.T) *apiClient {
 	return client
 }
 
-func newLoggedInApproverClient(t *testing.T) *apiClient {
-	t.Helper()
-	client, err := newAPIClient(sys.Server.URL)
-	if err != nil {
-		t.Fatalf("e2e: 创建审批人 HTTP 客户端失败: %v", err)
-	}
-	if err := client.login(seedApproverUsername, seedApproverPassword); err != nil {
-		t.Fatalf("e2e: 审批人登录失败: %v", err)
-	}
-	return client
-}
-
 // ---- 场景①：Alertmanager webhook -> 去重 -> 路由 -> 分组 -> mock 飞书收到组通知 ->
 // Ack -> 人员/渠道升级定时器被取消 ----
 func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {
@@ -135,7 +133,7 @@ func TestScenario1_WebhookNotifyAckCancelsEscalation(t *testing.T) {
 	alertname := "e2e-s1-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -233,7 +231,7 @@ func TestScenario2_SilenceSuppressesThenResumesRepeat(t *testing.T) {
 	alertname := "e2e-s2-" + uniqueSuffix()
 	startsAt := time.Now()
 	post := func() {
-		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+		if _, _, err := client.postManagedHook(seedResult.GenericWebhookPath,
 			compatibleWebhookPayload(alertname, "critical", "firing", startsAt, nil)); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}
@@ -321,7 +319,7 @@ func TestScenarioR13_ChannelEscalationEmailThenLark(t *testing.T) {
 	alertname := "e2e-r13-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "warning", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}
@@ -371,7 +369,7 @@ func TestScenario5_UngroupedRouteStillNotifies(t *testing.T) {
 	alertname := "e2e-s5-" + uniqueSuffix()
 	payload := compatibleWebhookPayload(alertname, "critical", "firing", time.Now(), nil)
 
-	status, body, err := client.postManagedHook(seedResult.GrafanaWebhookPath, payload)
+	status, body, err := client.postManagedHook(seedResult.GenericWebhookPath, payload)
 	if err != nil {
 		t.Fatalf("e2e: ingest 请求失败: %v", err)
 	}

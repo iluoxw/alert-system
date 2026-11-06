@@ -120,7 +120,7 @@ func (s *DedupStage) Process(ctx context.Context, pctx *PipelineContext) error {
 		return fmt.Errorf("dedup: severity 兜底失败: %w", err)
 	}
 	pctx.Event = event
-	if event.Source == "alertmanager" && event.UpstreamFingerprint != "" && pctx.IntegrationID != "" {
+	if domain.IsAuthoritativeSourceKind(event.Source) && event.UpstreamFingerprint != "" && pctx.IntegrationID != "" {
 		return s.processAuthoritative(ctx, pctx, event)
 	}
 

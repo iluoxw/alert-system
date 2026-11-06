@@ -32,6 +32,14 @@ func (a Actor) valid() bool { return a.UserID != "" && strings.TrimSpace(a.Displ
 
 type NotificationOutbox interface {
 	QueueIncidentNotification(ctx context.Context, tx pgx.Tx, notification domain.IncidentNotification) error
+	// ScheduleRecoveryNudge 在同一事务内注册（若不存在）incident_recovery_nudge
+	// 定时器，供 Declare 建 Incident 时启动周期性恢复提醒。是否真的调度、调度到
+	// 何时由实现根据配置的提醒周期决定（<=0 表示关闭，直接 no-op）——Service 本身
+	// 不持有周期配置，只负责在正确的生命周期时点触发这个意图。
+	ScheduleRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error
+	// CancelRecoveryNudge 在同一事务内取消 incident_recovery_nudge 定时器，Incident
+	// 推进到 resolved 时调用——已关闭的 Incident 不需要再被提醒收尾。
+	CancelRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error
 }
 
 type Service struct {
@@ -127,6 +135,9 @@ func (s *Service) Declare(ctx context.Context, command DeclareCommand, actor Act
 			return err
 		}
 		if err := s.queueNotification(ctx, tx, incident, domain.IncidentNotificationDeclared, now); err != nil {
+			return err
+		}
+		if err := s.scheduleRecoveryNudge(ctx, tx, incident.ID); err != nil {
 			return err
 		}
 		created = true
@@ -425,83 +436,111 @@ func (s *Service) Transition(ctx context.Context, incidentID string, to domain.I
 		return incident, ErrInvalidInput
 	}
 	err = s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		current, getErr := s.incidents.GetByIDForUpdate(ctx, tx, incidentID)
-		if getErr != nil {
-			return getErr
-		}
-		criteria, listErr := s.incidents.ListRecoveryCriteria(ctx, tx, incidentID)
-		if listErr != nil {
-			return listErr
-		}
-		tasks, listErr := s.incidents.ListTasks(ctx, tx, incidentID)
-		if listErr != nil {
-			return listErr
-		}
-		if err := domain.ValidateIncidentTransition(current.Status, to, criteria, tasks); err != nil {
-			return err
-		}
-
-		links, listErr := s.incidents.ListFaultLinks(ctx, tx, incidentID)
-		if listErr != nil {
-			return listErr
-		}
-		linkedFaults := make([]domain.Fault, 0, len(links))
-		lifecycles := make([]domain.IncidentFaultLifecycle, 0, len(links))
-		for _, link := range links {
-			fault, faultErr := s.faults.GetByID(ctx, tx, link.FaultID)
-			if faultErr != nil {
-				return faultErr
-			}
-			linkedFaults = append(linkedFaults, fault)
-			lifecycles = append(lifecycles, domain.IncidentFaultLifecycle{
-				FaultID: fault.ID, Disposition: link.Disposition, Status: fault.Status,
-			})
-		}
-		if to == domain.IncidentStatusResolved {
-			if err := domain.ValidateIncidentFaultsForResolution(lifecycles); err != nil {
-				return err
-			}
-		}
-
-		now := s.now()
-		incident, getErr = s.incidents.UpdateStatus(ctx, tx, incidentID, current.Status, to, now)
-		if getErr != nil {
-			return getErr
-		}
-		transitionedFaultIDs := make([]string, 0, len(links))
-		for index, link := range links {
-			if link.Disposition != domain.IncidentFaultIncluded {
-				continue
-			}
-			fault := linkedFaults[index]
-			var target domain.FaultStatus
-			switch {
-			case to == domain.IncidentStatusMonitoring && fault.Status == domain.FaultStatusActive:
-				target = domain.FaultStatusMonitoring
-			case to == domain.IncidentStatusResolved && fault.Status == domain.FaultStatusMonitoring:
-				target = domain.FaultStatusResolved
-			default:
-				continue
-			}
-			if _, faultErr := s.faults.UpdateLifecycleStatus(ctx, tx, fault.ID, fault.Status, target, now); faultErr != nil {
-				return faultErr
-			}
-			transitionedFaultIDs = append(transitionedFaultIDs, fault.ID)
-		}
-		if err := s.appendTimeline(ctx, tx, incidentID, actor, domain.IncidentTimelineStatusChange,
-			"推进 Incident 状态", map[string]any{"from": current.Status, "to": to, "transitioned_fault_ids": transitionedFaultIDs}, now); err != nil {
-			return err
-		}
-		switch to {
-		case domain.IncidentStatusMonitoring:
-			return s.queueNotification(ctx, tx, incident, domain.IncidentNotificationMitigated, now)
-		case domain.IncidentStatusResolved:
-			return s.queueNotification(ctx, tx, incident, domain.IncidentNotificationResolved, now)
-		default:
-			return nil
-		}
+		var transitionErr error
+		incident, transitionErr = s.TransitionInTx(ctx, tx, incidentID, to, actor)
+		return transitionErr
 	})
 	return incident, err
+}
+
+// TransitionInTx 与 Transition 使用完全相同的状态机，但复用调用方事务，供飞书
+// 卡片等外部交互入口把幂等占位、状态转移、通报 outbox 和时间线绑定为一个原子提交。
+func (s *Service) TransitionInTx(ctx context.Context, tx pgx.Tx, incidentID string, to domain.IncidentStatus, actor Actor) (incident domain.Incident, err error) {
+	if !actor.valid() || incidentID == "" || !to.IsValid() {
+		return incident, ErrInvalidInput
+	}
+	current, getErr := s.incidents.GetByIDForUpdate(ctx, tx, incidentID)
+	if getErr != nil {
+		return incident, getErr
+	}
+	criteria, listErr := s.incidents.ListRecoveryCriteria(ctx, tx, incidentID)
+	if listErr != nil {
+		return incident, listErr
+	}
+	tasks, listErr := s.incidents.ListTasks(ctx, tx, incidentID)
+	if listErr != nil {
+		return incident, listErr
+	}
+	if err := domain.ValidateIncidentTransition(current.Status, to, criteria, tasks); err != nil {
+		return incident, err
+	}
+
+	links, listErr := s.incidents.ListFaultLinks(ctx, tx, incidentID)
+	if listErr != nil {
+		return incident, listErr
+	}
+	linkedFaults := make([]domain.Fault, 0, len(links))
+	lifecycles := make([]domain.IncidentFaultLifecycle, 0, len(links))
+	for _, link := range links {
+		fault, faultErr := s.faults.GetByID(ctx, tx, link.FaultID)
+		if faultErr != nil {
+			return incident, faultErr
+		}
+		linkedFaults = append(linkedFaults, fault)
+		lifecycles = append(lifecycles, domain.IncidentFaultLifecycle{FaultID: fault.ID, Disposition: link.Disposition, Status: fault.Status})
+	}
+	if to == domain.IncidentStatusResolved {
+		if err := domain.ValidateIncidentFaultsForResolution(lifecycles); err != nil {
+			return incident, err
+		}
+	}
+
+	now := s.now()
+	incident, updateErr := s.incidents.UpdateStatus(ctx, tx, incidentID, current.Status, to, now)
+	if updateErr != nil {
+		return incident, updateErr
+	}
+	transitionedFaultIDs := make([]string, 0, len(links))
+	for index, link := range links {
+		if link.Disposition != domain.IncidentFaultIncluded {
+			continue
+		}
+		fault := linkedFaults[index]
+		var target domain.FaultStatus
+		switch {
+		case to == domain.IncidentStatusMonitoring && fault.Status == domain.FaultStatusActive:
+			target = domain.FaultStatusMonitoring
+		case to == domain.IncidentStatusResolved && fault.Status == domain.FaultStatusMonitoring:
+			target = domain.FaultStatusResolved
+		default:
+			continue
+		}
+		if _, faultErr := s.faults.UpdateLifecycleStatus(ctx, tx, fault.ID, fault.Status, target, now); faultErr != nil {
+			return incident, faultErr
+		}
+		transitionedFaultIDs = append(transitionedFaultIDs, fault.ID)
+	}
+	if err := s.appendTimeline(ctx, tx, incidentID, actor, domain.IncidentTimelineStatusChange,
+		"推进 Incident 状态", map[string]any{"from": current.Status, "to": to, "transitioned_fault_ids": transitionedFaultIDs}, now); err != nil {
+		return incident, err
+	}
+	switch to {
+	case domain.IncidentStatusMonitoring:
+		return incident, s.queueNotification(ctx, tx, incident, domain.IncidentNotificationMitigated, now)
+	case domain.IncidentStatusResolved:
+		if err := s.queueNotification(ctx, tx, incident, domain.IncidentNotificationResolved, now); err != nil {
+			return incident, err
+		}
+		// 已关闭的 Incident 不再需要恢复提醒——取消 pending 的
+		// incident_recovery_nudge 定时器，避免它继续无意义地续期。
+		return incident, s.cancelRecoveryNudge(ctx, tx, incident.ID)
+	default:
+		return incident, nil
+	}
+}
+
+func (s *Service) scheduleRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error {
+	if s.notifier == nil {
+		return fmt.Errorf("incident: 未配置通知 outbox")
+	}
+	return s.notifier.ScheduleRecoveryNudge(ctx, tx, incidentID)
+}
+
+func (s *Service) cancelRecoveryNudge(ctx context.Context, tx pgx.Tx, incidentID string) error {
+	if s.notifier == nil {
+		return fmt.Errorf("incident: 未配置通知 outbox")
+	}
+	return s.notifier.CancelRecoveryNudge(ctx, tx, incidentID)
 }
 
 func (s *Service) queueNotification(ctx context.Context, tx pgx.Tx, incident domain.Incident, event domain.IncidentNotificationEvent, at time.Time) error {

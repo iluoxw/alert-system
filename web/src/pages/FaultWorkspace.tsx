@@ -10,7 +10,7 @@ import {
 } from '@ant-design/icons'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import type { EvidenceRole, FaultEvidence, FaultImpact, ResourceNode, Severity } from '../api/client'
-import { decideFaultEvidence, decideFaultImpact, declareIncident, getFault, listTeamsLite } from '../api/client'
+import { ackFault, decideFaultEvidence, decideFaultImpact, declareIncident, getFault, listTeamsLite } from '../api/client'
 
 const evidenceRoleLabel: Record<EvidenceRole, string> = {
   direct_impact: '直接证据', cause_candidate: '根因候选', trigger: '触发因素', amplifier: '放大因素',
@@ -57,6 +57,8 @@ export function FaultWorkspace() {
   if (faultQuery.error || !faultQuery.data) return <div className="fault-ledger-workspace"><Alert showIcon type="error" message="Fault 工作区加载失败" description={faultQuery.error instanceof Error ? faultQuery.error.message : 'Fault 不存在'} /></div>
 
   const data = faultQuery.data
+  const ownerName = data.fault.owner_team_id ? (teamByID.get(data.fault.owner_team_id) || data.fault.owner_team_id) : '未登记团队'
+  const acked = Boolean(data.fault.acked_at)
   const hasLegacyEvidence = data.evidence.some(({ alert }) => !alert.authoritative)
   const confirmedApplicationImpacts = data.impacts.filter(({ impact, node }) => impact.state === 'confirmed' && node.kind === 'business_system')
   const gateReady = data.fault.status === 'active' && confirmedApplicationImpacts.length > 0
@@ -122,6 +124,24 @@ export function FaultWorkspace() {
     setDeclareOpen(true)
   }
 
+  const submitAck = async () => {
+    if (acked) return
+    setSubmitting(true)
+    try {
+      const response = await ackFault(id)
+      queryClient.setQueryData(['fault', id], (current: typeof data | undefined) => (
+        current ? { ...current, fault: { ...current.fault, ...response.fault } } : current
+      ))
+      messageApi.success('Fault 已认领')
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['fault', id] }),
+        queryClient.invalidateQueries({ queryKey: ['infrastructure-overview'] }),
+      ])
+    } catch (ackError) {
+      messageApi.error(ackError instanceof Error ? ackError.message : '认领失败')
+    } finally { setSubmitting(false) }
+  }
+
   const submitIncident = async () => {
     const values = await declareForm.validateFields()
     setSubmitting(true)
@@ -148,8 +168,14 @@ export function FaultWorkspace() {
           <small>{faultDisplayID(data.fault.id)} · {data.fault.status.toUpperCase()}</small>
           <h2>{data.fault.title}</h2>
           <p>{data.fault.entity_ref || data.fault.kind} · {data.fault.scope} · 已持续 {duration(data.fault.first_detected_at)}</p>
+          <p>负责团队 {ownerName} · {acked ? `已由 ${data.fault.acked_by_name || '值班'} 认领` : '尚未认领'}</p>
         </div>
-        <Link className="ledger-secondary-action" to="/"><ArrowLeftOutlined />返回总览</Link>
+        <div>
+          <Button type="primary" disabled={acked} loading={submitting} onClick={() => void submitAck()}>
+            {acked ? '已认领' : '认领'}
+          </Button>
+          <Link className="ledger-secondary-action" to="/"><ArrowLeftOutlined />返回总览</Link>
+        </div>
       </section>
 
       <div className="fault-workspace-layout">

@@ -5,9 +5,8 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    // 后端地址（cmd/server 装配的 Router）；开发态同源代理省去 CORS 配置。除管理
-    // API 外必须代理 /ingest，否则数据源页面按 window.location.origin 生成的
-    // Webhook URL 会落到 Vite 自己并返回 404。
+    // 仅供 Vite 本地开发：public/runtime-config.js 使用 /api，开发服务器把请求转到
+    // 后端。生产镜像不使用这段配置，路径分流由集群入口层负责。
     proxy: {
       '/api': {
         target: 'http://localhost:8080',

@@ -18,14 +18,20 @@ type FaultRepo struct{}
 func NewFaultRepo() *FaultRepo { return &FaultRepo{} }
 
 var (
-	ErrFaultNotFound       = errors.New("store: Fault 不存在")
-	ErrFaultImpactNotFound = errors.New("store: Fault Impact 不存在")
+	ErrFaultNotFound        = errors.New("store: Fault 不存在")
+	ErrFaultImpactNotFound  = errors.New("store: Fault Impact 不存在")
+	ErrAckActorNameRequired = errors.New("store: ack 的 actorName 不能为空")
 )
 
+// faultColumns 覆盖迁移 000026 新增的五个归属/认领列（owner_team_id / acked_by /
+// acked_by_name / acked_at / owner_notified_at），所有读 Fault 的查询共用同一列表，
+// 避免个别查询漏读导致 API 层拿不到 owner/ack 字段（R4.7）。
 const faultColumns = `
 	id, correlation_key, scope, status, severity, kind, title, summary,
 	COALESCE(resource_node_id::text, ''), entity_ref, confidence, metadata,
-	first_detected_at, last_evaluated_at, resolved_at, created_at, updated_at
+	first_detected_at, last_evaluated_at, resolved_at, created_at, updated_at,
+	COALESCE(owner_team_id::text, ''), COALESCE(acked_by::text, ''),
+	COALESCE(acked_by_name, ''), acked_at, owner_notified_at
 `
 
 type faultRowScanner interface {
@@ -35,17 +41,24 @@ type faultRowScanner interface {
 func scanFault(row faultRowScanner) (domain.Fault, error) {
 	var fault domain.Fault
 	var metadataRaw []byte
-	var resolvedAt *time.Time
+	var resolvedAt, ackedAt, ownerNotifiedAt *time.Time
 	if err := row.Scan(
 		&fault.ID, &fault.CorrelationKey, &fault.Scope, &fault.Status, &fault.Severity,
 		&fault.Kind, &fault.Title, &fault.Summary, &fault.ResourceNodeID, &fault.EntityRef,
 		&fault.Confidence, &metadataRaw, &fault.FirstDetected, &fault.LastEvaluated,
 		&resolvedAt, &fault.CreatedAt, &fault.UpdatedAt,
+		&fault.OwnerTeamID, &fault.AckedBy, &fault.AckedByName, &ackedAt, &ownerNotifiedAt,
 	); err != nil {
 		return domain.Fault{}, err
 	}
 	if resolvedAt != nil {
 		fault.ResolvedAt = *resolvedAt
+	}
+	if ackedAt != nil {
+		fault.AckedAt = *ackedAt
+	}
+	if ownerNotifiedAt != nil {
+		fault.OwnerNotifiedAt = *ownerNotifiedAt
 	}
 	if err := json.Unmarshal(metadataRaw, &fault.Metadata); err != nil {
 		return domain.Fault{}, fmt.Errorf("store: 反序列化 Fault metadata 失败: %w", err)
@@ -69,11 +82,11 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 		INSERT INTO faults (
 			correlation_key, scope, status, severity, kind, title, summary,
 			resource_node_id, entity_ref, confidence, metadata,
-			first_detected_at, last_evaluated_at, resolved_at
+			first_detected_at, last_evaluated_at, resolved_at, owner_team_id
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
 			NULLIF($8, '')::uuid, $9, $10, $11,
-			$12, $13, $14
+			$12, $13, $14, NULLIF($15, '')::uuid
 		)
 		ON CONFLICT (correlation_key) WHERE status <> 'resolved' DO UPDATE SET
 			status = CASE
@@ -88,11 +101,14 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 			confidence = GREATEST(faults.confidence, EXCLUDED.confidence),
 			metadata = EXCLUDED.metadata,
 			first_detected_at = LEAST(faults.first_detected_at, EXCLUDED.first_detected_at),
-			last_evaluated_at = GREATEST(faults.last_evaluated_at, EXCLUDED.last_evaluated_at)
+			last_evaluated_at = GREATEST(faults.last_evaluated_at, EXCLUDED.last_evaluated_at),
+			-- 本轮解析不到 owner（EXCLUDED.owner_team_id 为 NULL）时保留已有值，
+			-- 避免实体登记暂时性缺失把已经生效的归属冲成 NULL（R3.2/不变量 15）。
+			owner_team_id = COALESCE(EXCLUDED.owner_team_id, faults.owner_team_id)
 		RETURNING `+faultColumns+`, (xmax = 0) AS created
 	`, fault.CorrelationKey, fault.Scope, fault.Status, fault.Severity, fault.Kind,
 		fault.Title, fault.Summary, fault.ResourceNodeID, fault.EntityRef, fault.Confidence,
-		metadata, fault.FirstDetected, fault.LastEvaluated, nullableTime(fault.ResolvedAt))
+		metadata, fault.FirstDetected, fault.LastEvaluated, nullableTime(fault.ResolvedAt), fault.OwnerTeamID)
 
 	var created bool
 	stored, err := scanFaultWithExtra(row, &created)
@@ -105,12 +121,13 @@ func (r *FaultRepo) Upsert(ctx context.Context, tx pgx.Tx, fault domain.Fault) (
 func scanFaultWithExtra(row faultRowScanner, extra ...any) (domain.Fault, error) {
 	var fault domain.Fault
 	var metadataRaw []byte
-	var resolvedAt *time.Time
+	var resolvedAt, ackedAt, ownerNotifiedAt *time.Time
 	dest := []any{
 		&fault.ID, &fault.CorrelationKey, &fault.Scope, &fault.Status, &fault.Severity,
 		&fault.Kind, &fault.Title, &fault.Summary, &fault.ResourceNodeID, &fault.EntityRef,
 		&fault.Confidence, &metadataRaw, &fault.FirstDetected, &fault.LastEvaluated,
 		&resolvedAt, &fault.CreatedAt, &fault.UpdatedAt,
+		&fault.OwnerTeamID, &fault.AckedBy, &fault.AckedByName, &ackedAt, &ownerNotifiedAt,
 	}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
@@ -118,6 +135,12 @@ func scanFaultWithExtra(row faultRowScanner, extra ...any) (domain.Fault, error)
 	}
 	if resolvedAt != nil {
 		fault.ResolvedAt = *resolvedAt
+	}
+	if ackedAt != nil {
+		fault.AckedAt = *ackedAt
+	}
+	if ownerNotifiedAt != nil {
+		fault.OwnerNotifiedAt = *ownerNotifiedAt
 	}
 	if err := json.Unmarshal(metadataRaw, &fault.Metadata); err != nil {
 		return domain.Fault{}, fmt.Errorf("store: 反序列化 Fault metadata 失败: %w", err)
@@ -285,7 +308,88 @@ func qualifiedFaultColumns(alias string) string {
 		alias + `.severity, ` + alias + `.kind, ` + alias + `.title, ` + alias + `.summary, ` +
 		`COALESCE(` + alias + `.resource_node_id::text, ''), ` + alias + `.entity_ref, ` +
 		alias + `.confidence, ` + alias + `.metadata, ` + alias + `.first_detected_at, ` +
-		alias + `.last_evaluated_at, ` + alias + `.resolved_at, ` + alias + `.created_at, ` + alias + `.updated_at`
+		alias + `.last_evaluated_at, ` + alias + `.resolved_at, ` + alias + `.created_at, ` + alias + `.updated_at, ` +
+		`COALESCE(` + alias + `.owner_team_id::text, ''), COALESCE(` + alias + `.acked_by::text, ''), ` +
+		`COALESCE(` + alias + `.acked_by_name, ''), ` + alias + `.acked_at, ` + alias + `.owner_notified_at`
+}
+
+// ListOpenRelatedToNode 一次取回挂在该实体上的 active/monitoring Fault：
+// resource_node_id 命中，或 fault_impacts.node_id 命中。resolved / candidate 不进预览。
+func (r *FaultRepo) ListOpenRelatedToNode(ctx context.Context, tx pgx.Tx, nodeID string, limit int) ([]domain.Fault, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT `+qualifiedFaultColumns("f")+`
+		FROM faults f
+		LEFT JOIN fault_impacts i ON i.fault_id = f.id
+		WHERE (f.resource_node_id = $1 OR i.node_id = $1)
+		  AND f.status IN ('active', 'monitoring')
+		ORDER BY f.last_evaluated_at DESC
+		LIMIT $2
+	`, nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询实体关联未收口 Fault 失败: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.Fault, 0)
+	for rows.Next() {
+		item, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// HasActiveRelatedToNode 只看 status='active'。409 用这条，不能拿预览里的
+// monitoring 一并挡下线（R3.2 只约束 active）。
+func (r *FaultRepo) HasActiveRelatedToNode(ctx context.Context, tx pgx.Tx, nodeID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM faults f
+			LEFT JOIN fault_impacts i ON i.fault_id = f.id
+			WHERE (f.resource_node_id = $1 OR i.node_id = $1)
+			  AND f.status = 'active'
+		)
+	`, nodeID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: 查询实体 active Fault 失败: %w", err)
+	}
+	return exists, nil
+}
+
+// ResolveByDecommission 是下线收口专用路径：不走 ValidateFaultTransition
+// （active→resolved 被通用状态机禁止）。已 resolved 则 changed=false，不重写。
+func (r *FaultRepo) ResolveByDecommission(ctx context.Context, tx pgx.Tx, id string, at time.Time) (domain.Fault, bool, error) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	row := tx.QueryRow(ctx, `
+		UPDATE faults
+		SET status = 'resolved',
+		    last_evaluated_at = GREATEST(last_evaluated_at, $2),
+		    resolved_at = $2
+		WHERE id = $1 AND status <> 'resolved'
+		RETURNING `+faultColumns, id, at)
+	fault, err := scanFault(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, getErr := r.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return domain.Fault{}, false, getErr
+		}
+		return existing, false, nil
+	}
+	if err != nil {
+		return domain.Fault{}, false, fmt.Errorf("store: 按下线收口 Fault 失败: %w", err)
+	}
+	return fault, true, nil
 }
 
 func (r *FaultRepo) HasConfirmedBusinessImpact(ctx context.Context, tx pgx.Tx, faultID string) (bool, error) {
@@ -384,6 +488,96 @@ func (r *FaultRepo) RemoveAutomatedEvidenceForAlertExcept(ctx context.Context, t
 		  AND ($2 = '' OR fault_id <> $2::uuid)
 	`, alertID, exceptFaultID)
 	return err
+}
+
+// Ack 认领 Fault：仅在尚未认领（acked_at IS NULL）时写入 acked_by/acked_by_name/
+// acked_at；已认领时不覆盖既有认领人，返回当前状态且 ok=false——与
+// domain.AckFault 的幂等短路语义一致（不变量 6），调用方据此判断是否需要追加
+// 时间线，而不是把"重复认领"当错误处理。
+func (r *FaultRepo) Ack(ctx context.Context, tx pgx.Tx, id, actorID, actorName string, at time.Time) (domain.Fault, bool, error) {
+	if strings.TrimSpace(actorName) == "" {
+		return domain.Fault{}, false, ErrAckActorNameRequired
+	}
+	row := tx.QueryRow(ctx, `
+		UPDATE faults
+		SET acked_by = NULLIF($2, '')::uuid, acked_by_name = $3, acked_at = $4
+		WHERE id = $1 AND acked_at IS NULL
+		RETURNING `+faultColumns, id, actorID, actorName, at)
+	fault, err := scanFault(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 0 行受影响：要么已认领，要么 Fault 不存在，两种情况都需要回查当前状态
+		// 才能区分（GetByID 在不存在时返回 ErrFaultNotFound）。
+		existing, getErr := r.GetByID(ctx, tx, id)
+		if getErr != nil {
+			return domain.Fault{}, false, getErr
+		}
+		return existing, false, nil
+	}
+	if err != nil {
+		return domain.Fault{}, false, fmt.Errorf("store: 认领 Fault 失败: %w", err)
+	}
+	return fault, true, nil
+}
+
+// SetOwnerNotified 记录 Fault owner 团队通知意图已产生的时刻（R5.6）。语义取舍见
+// app.FaultOutbox.QueueFaultActivated 的文档：这里是"意图已调度"而非"确认发送
+// 成功"，因为拓扑抑制需要在意图时刻就能看到"已通知"。
+func (r *FaultRepo) SetOwnerNotified(ctx context.Context, tx pgx.Tx, id string, at time.Time) error {
+	ct, err := tx.Exec(ctx, `UPDATE faults SET owner_notified_at = $2 WHERE id = $1`, id, at)
+	if err != nil {
+		return fmt.Errorf("store: 记录 Fault owner 通知时间失败: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrFaultNotFound
+	}
+	return nil
+}
+
+// AppendTimeline 是 fault_timeline_entries 的唯一写入方法（append-only）。
+// entry.ActorID 可空（系统动作无用户），entry.Actor 必填。
+func (r *FaultRepo) AppendTimeline(ctx context.Context, tx pgx.Tx, entry domain.FaultTimelineEntry) (string, error) {
+	if entry.FaultID == "" || strings.TrimSpace(entry.Actor) == "" || entry.Action == "" || entry.At.IsZero() {
+		return "", fmt.Errorf("store: Fault 时间线字段非法")
+	}
+	detail, err := marshalJSONObject(entry.Detail)
+	if err != nil {
+		return "", fmt.Errorf("store: 序列化 Fault 时间线 detail 失败: %w", err)
+	}
+	var id string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO fault_timeline_entries (fault_id, actor_id, actor_name, action, detail, at)
+		VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6)
+		RETURNING id::text
+	`, entry.FaultID, entry.ActorID, entry.Actor, entry.Action, detail, entry.At).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("store: 写入 Fault 时间线失败: %w", err)
+	}
+	return id, nil
+}
+
+// ListRecentlyResolvedByCorrelationKey 查询同一 correlation_key 在 since 之后
+// resolved 的 Fault（冷却窗口判定用，R5.3）：非空即表示冷却窗口内刚恢复，本轮
+// 不应重新通知。correlation_key 的部分唯一索引只约束未 resolved 的行，因此同一
+// key 的历史 resolved 行可能有多条，这里按 resolved_at 倒序返回全部匹配。
+func (r *FaultRepo) ListRecentlyResolvedByCorrelationKey(ctx context.Context, tx pgx.Tx, correlationKey string, since time.Time) ([]domain.Fault, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT `+faultColumns+` FROM faults
+		WHERE correlation_key = $1 AND status = 'resolved' AND resolved_at >= $2
+		ORDER BY resolved_at DESC
+	`, correlationKey, since)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询近期 resolved Fault 失败: %w", err)
+	}
+	defer rows.Close()
+	var result []domain.Fault
+	for rows.Next() {
+		item, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 func (r *FaultRepo) ListEvidence(ctx context.Context, tx pgx.Tx, faultID string) ([]domain.FaultEvidence, error) {

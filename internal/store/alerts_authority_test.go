@@ -200,6 +200,92 @@ func TestAlertmanagerAuthority_ReconcileLifecycle(t *testing.T) {
 	assertAuthorityAxes(t, st, alertID, domain.SourceStateResolved, domain.ResponseStateAcknowledged, domain.SuppressionStateSilenced, 0)
 }
 
+// TestGrafanaOccurrenceIdempotentReplay 证明 Grafana 载荷沿用同一 occurrence
+// 幂等键（source_id + upstream_fingerprint + starts_at）：重复投递不产生第二行。
+func TestGrafanaOccurrenceIdempotentReplay(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	alerts := NewAlertRepo()
+	integrations := NewIntegrationRepo()
+
+	var sourceID string
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		created, err := integrations.Create(ctx, tx, Integration{
+			Kind:            domain.SourceKindGrafana,
+			Name:            "grafana-idempotency-test",
+			HookIDHash:      "test-grafana-hook-hash",
+			DefaultSeverity: string(domain.SeverityWarning),
+			Enabled:         true,
+			Config:          json.RawMessage(`{"api_url":"http://grafana.test"}`),
+		})
+		if err != nil {
+			return err
+		}
+		sourceID = created.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("创建 Grafana source 失败: %v", err)
+	}
+
+	startsAt := time.Now().UTC().Truncate(time.Millisecond)
+	event := domain.AlertEvent{
+		UpstreamFingerprint: "gf-fingerprint-01",
+		RuleID:              "HighMemoryUsage",
+		SignalKind:          domain.SignalKindMetric,
+		Severity:            domain.SeverityWarning,
+		Status:              domain.StatusFiring,
+		Title:               "HighMemoryUsage",
+		Labels:              map[string]string{"alertname": "HighMemoryUsage"},
+		Source:              domain.SourceKindGrafana,
+		ResolvePolicy:       domain.ResolvePolicySource,
+		StartsAt:            startsAt,
+		SourceUpdatedAt:     startsAt,
+		SuppressionState:    domain.SuppressionStateNone,
+	}
+
+	var firstID string
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		alert, created, _, err := alerts.UpsertAuthoritativeOccurrence(ctx, tx, event, sourceID, startsAt, 0)
+		if err != nil {
+			return err
+		}
+		if !created {
+			t.Fatal("首次 Grafana occurrence 应创建")
+		}
+		firstID = alert.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("首次写入失败: %v", err)
+	}
+
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		alert, created, _, err := alerts.UpsertAuthoritativeOccurrence(ctx, tx, event, sourceID, startsAt.Add(time.Second), 0)
+		if err != nil {
+			return err
+		}
+		if created {
+			t.Fatal("同 fingerprint+starts_at 重复投递不得新建行")
+		}
+		if alert.ID != firstID {
+			t.Fatalf("重复投递落到不同 ID: %s vs %s", alert.ID, firstID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("重复写入失败: %v", err)
+	}
+
+	var count int
+	if err := st.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM alerts WHERE source_integration_id = $1::uuid AND upstream_fingerprint = $2`,
+		sourceID, event.UpstreamFingerprint,
+	).Scan(&count); err != nil {
+		t.Fatalf("计数失败: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("Grafana occurrence 行数 = %d, want 1", count)
+	}
+}
+
 func assertAuthorityAxes(
 	t *testing.T,
 	st *Store,

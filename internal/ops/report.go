@@ -68,7 +68,7 @@ const maxLongOpenListed = 20
 
 // BuildDailyReport 构建团队日报文案。date 是报告所指的自然日（通常是"昨天"），
 // longOpen 是超过 24 小时仍未关闭的告警清单（由 store.ListOpenLongerThan 传入）。
-func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpen []domain.Alert) notify.Message {
+func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpen []domain.Alert, lead Indicators) notify.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "昨日新增 %d 条，恢复 %d 条。\n\n", stats.NewCount, stats.ResolvedCount)
 
@@ -121,6 +121,15 @@ func BuildDailyReport(teamName string, date time.Time, stats DailyStats, longOpe
 		}
 	}
 
+	// 日报按团队发送，但先行指标是平台级口径（任务 38 裁决）：各团队收到同一组数字，
+	// 标题必须显式说明，否则团队会把平台数字误读成本团队的。
+	b.WriteString("\n\n先行指标（平台级，非本团队）：\n")
+	fmt.Fprintf(&b, "- firing 告警映射率：%s\n", formatOptionalRate(lead.FiringMappingRate))
+	fmt.Fprintf(&b, "- 无 owner 的 active Fault：%d\n", lead.ActiveFaultsWithoutOwner)
+	fmt.Fprintf(&b, "- Fault 认领时长中位：%s\n", formatOptionalDurationSeconds(lead.FaultAckMedianSeconds))
+	fmt.Fprintf(&b, "- 昨日恢复提醒发出次数：%d\n", lead.RecoveryNudgeFiredCount)
+	fmt.Fprintf(&b, "- 未对齐身份：%s", formatOptionalCount(lead.UnresolvedIdentityCount))
+
 	return notify.Message{
 		Severity:   string(domain.SeverityInfo),
 		Title:      fmt.Sprintf("%s 团队日报 %s", teamName, date.Format("2006-01-02")),
@@ -167,4 +176,25 @@ func BuildOncallBroadcast(teamName string, oncallNames []string, date time.Time)
 		Body:       body,
 		OccurredAt: date,
 	}
+}
+
+func formatOptionalRate(p *float64) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return fmt.Sprintf("%.1f%%", *p*100)
+}
+
+func formatOptionalDurationSeconds(p *float64) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return humanizeDuration(time.Duration(*p * float64(time.Second)))
+}
+
+func formatOptionalCount(p *int) string {
+	if p == nil {
+		return "暂无数据"
+	}
+	return fmt.Sprintf("%d", *p)
 }

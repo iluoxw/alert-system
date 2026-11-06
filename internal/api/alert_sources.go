@@ -103,7 +103,7 @@ func alertSourceJSON(source store.AlertSource, now time.Time) gin.H {
 		"missing_confirmations":      source.Config.MissingConfirmations,
 	}
 	return gin.H{
-		"id": source.ID, "name": source.Name, "enabled": source.Enabled,
+		"id": source.ID, "kind": source.Kind, "name": source.Name, "enabled": source.Enabled,
 		"default_severity": source.DefaultSeverity, "config": config,
 		"health": source.Health(now), "last_error": source.LastError,
 		"consecutive_failures": source.ConsecutiveFailures,

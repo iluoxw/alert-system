@@ -6,7 +6,7 @@ import (
 )
 
 func TestValidateIncidentTransitionRequiresRecoveryGates(t *testing.T) {
-	criteria := DefaultE2BRecoveryCriteria("incident-1")
+	criteria := DefaultRecoveryCriteria("incident-1")
 	if err := ValidateIncidentTransition(IncidentStatusDeclared, IncidentStatusMonitoring, criteria, nil); !errors.Is(err, ErrRecoveryGateNotSatisfied) {
 		t.Fatalf("未满足 mitigation gate 应拒绝 monitoring, got %v", err)
 	}
@@ -30,7 +30,7 @@ func TestValidateIncidentTransitionRequiresRecoveryGates(t *testing.T) {
 }
 
 func TestValidateIncidentTransitionRequiresResponseTasksClosed(t *testing.T) {
-	criteria := DefaultE2BRecoveryCriteria("incident-1")
+	criteria := DefaultRecoveryCriteria("incident-1")
 	for i := range criteria {
 		criteria[i].Status = RecoveryCriterionPassed
 	}
@@ -45,13 +45,13 @@ func TestValidateIncidentTransitionRequiresResponseTasksClosed(t *testing.T) {
 }
 
 func TestValidateIncidentTransitionRejectsBackwardMove(t *testing.T) {
-	criteria := DefaultE2BRecoveryCriteria("incident-1")
+	criteria := DefaultRecoveryCriteria("incident-1")
 	if err := ValidateIncidentTransition(IncidentStatusMonitoring, IncidentStatusMitigating, criteria, nil); !errors.Is(err, ErrInvalidIncidentTransition) {
 		t.Fatalf("状态回退应被拒绝, got %v", err)
 	}
 }
 
-func TestDefaultRecoveryCriteriaForFaultKeepsE2BProfileIsolated(t *testing.T) {
+func TestDefaultRecoveryCriteriaForFaultUsesGenericProfile(t *testing.T) {
 	t.Parallel()
 
 	generic := DefaultRecoveryCriteriaForFault("incident-generic", Fault{Kind: "database_connection_exhausted"})
@@ -59,9 +59,9 @@ func TestDefaultRecoveryCriteriaForFaultKeepsE2BProfileIsolated(t *testing.T) {
 		t.Fatalf("通用 Fault 应使用通用恢复判据，got %+v", generic)
 	}
 
-	e2b := DefaultRecoveryCriteriaForFault("incident-e2b", Fault{Kind: "sandbox_placement_degradation"})
-	if len(e2b) != 6 || e2b[0].Key != "user_create_slo_recovered" {
-		t.Fatalf("E2B 黄金场景应保留专用恢复判据，got %+v", e2b)
+	placement := DefaultRecoveryCriteriaForFault("incident-placement", Fault{Kind: "sandbox_placement_degradation"})
+	if len(placement) != 3 || placement[0].Key != "application_impact_recovered" {
+		t.Fatalf("专用 Fault kind 也不应再注入业务硬编码判据，got %+v", placement)
 	}
 }
 
@@ -79,6 +79,6 @@ func TestValidateIncidentFaultsForResolution(t *testing.T) {
 
 	faults[1].Status = FaultStatusMonitoring
 	if err := ValidateIncidentFaultsForResolution(faults); err != nil {
-		t.Fatalf("已缓解或明确排除的 Fault 不应阻止关闭: %v", err)
+		t.Fatalf("included active Fault 全部缓解后应允许关闭, got %v", err)
 	}
 }

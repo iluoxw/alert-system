@@ -142,48 +142,17 @@ func (r *ServiceCatalogRepo) Update(ctx context.Context, tx pgx.Tx, id string, s
 	return r.GetByID(ctx, tx, id)
 }
 
+// serviceRegistrySource 是应用服务依赖边的写入来源；replaceEntityAliases/
+// replaceEntityDependencies 定义在 infrastructure.go，供 ServiceCatalogRepo 与
+// TopologyRepo（受管实体）共用，避免同一段 DELETE+INSERT 逻辑抄两份。
+const serviceRegistrySource = "service_registry"
+
 func (r *ServiceCatalogRepo) replaceAliases(ctx context.Context, tx pgx.Tx, entityID string, aliases []domain.EntityAlias) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM entity_aliases WHERE entity_id = $1`, entityID); err != nil {
-		return fmt.Errorf("store: 清理 Entity Alias 失败: %w", err)
-	}
-	for _, alias := range aliases {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO entity_aliases (namespace, alias_value, entity_id, enabled)
-			VALUES ($1, $2, $3, $4)
-		`, strings.TrimSpace(alias.Namespace), strings.TrimSpace(alias.Value), entityID, alias.Enabled); err != nil {
-			return fmt.Errorf("store: 保存 Entity Alias 失败: %w", err)
-		}
-	}
-	return nil
+	return replaceEntityAliases(ctx, tx, entityID, aliases)
 }
 
 func (r *ServiceCatalogRepo) replaceDependencies(ctx context.Context, tx pgx.Tx, entityID, environment string, dependencies []domain.DependencyEdge) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM dependency_edges WHERE source = 'service_registry' AND from_node_id = $1`, entityID); err != nil {
-		return fmt.Errorf("store: 清理服务依赖失败: %w", err)
-	}
-	topology := NewTopologyRepo()
-	for _, dependency := range dependencies {
-		target, err := topology.GetByID(ctx, tx, dependency.ToNodeID)
-		if err != nil {
-			return err
-		}
-		if target.ID == entityID {
-			return fmt.Errorf("%w: 服务不能依赖自身", ErrServiceDependencyInvalid)
-		}
-		if target.Environment != "" && target.Environment != "global" && target.Environment != environment {
-			return fmt.Errorf("%w: 服务与依赖实体环境不一致", ErrServiceDependencyInvalid)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO dependency_edges (
-				source, from_node_id, to_node_id, relation, criticality,
-				evidence, observed_at, sync_run_id, origin
-			) VALUES ('service_registry', $1, $2, 'depends_on', $3,
-				'{"authority":"service_registration"}'::jsonb, now(), NULL, 'declared')
-		`, entityID, target.ID, dependency.Criticality); err != nil {
-			return fmt.Errorf("store: 保存服务依赖失败: %w", err)
-		}
-	}
-	return nil
+	return replaceEntityDependencies(ctx, tx, serviceRegistrySource, entityID, environment, dependencies)
 }
 
 const serviceSelect = `
@@ -277,56 +246,11 @@ func (r *ServiceCatalogRepo) List(ctx context.Context, tx pgx.Tx, limit int) ([]
 }
 
 func (r *ServiceCatalogRepo) ListDependencies(ctx context.Context, tx pgx.Tx, entityID string) ([]domain.DependencyEdge, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT e.id::text, e.source, e.from_node_id::text, e.to_node_id::text,
-		       fn.external_ref, tn.external_ref, fn.name, tn.name, e.relation,
-		       e.criticality, e.origin, e.evidence, e.observed_at
-		FROM dependency_edges e
-		JOIN resource_nodes fn ON fn.id = e.from_node_id
-		JOIN resource_nodes tn ON tn.id = e.to_node_id
-		WHERE e.source = 'service_registry' AND e.from_node_id = $1
-		ORDER BY e.criticality DESC, tn.name
-	`, entityID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	dependencies := []domain.DependencyEdge{}
-	for rows.Next() {
-		var edge domain.DependencyEdge
-		var evidenceRaw []byte
-		if err := rows.Scan(&edge.ID, &edge.Source, &edge.FromNodeID, &edge.ToNodeID,
-			&edge.FromExternalRef, &edge.ToExternalRef, &edge.FromNodeName, &edge.ToNodeName,
-			&edge.Relation, &edge.Criticality, &edge.Origin, &evidenceRaw, &edge.ObservedAt); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(evidenceRaw, &edge.Evidence); err != nil {
-			return nil, err
-		}
-		dependencies = append(dependencies, edge)
-	}
-	return dependencies, rows.Err()
+	return listEntityDependencies(ctx, tx, serviceRegistrySource, entityID)
 }
 
 func (r *ServiceCatalogRepo) ListAliases(ctx context.Context, tx pgx.Tx, entityID string) ([]domain.EntityAlias, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT id::text, namespace, alias_value, entity_id::text, enabled, created_at, updated_at
-		FROM entity_aliases WHERE entity_id = $1 ORDER BY namespace, alias_value
-	`, entityID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	aliases := []domain.EntityAlias{}
-	for rows.Next() {
-		var alias domain.EntityAlias
-		if err := rows.Scan(&alias.ID, &alias.Namespace, &alias.Value, &alias.EntityID,
-			&alias.Enabled, &alias.CreatedAt, &alias.UpdatedAt); err != nil {
-			return nil, err
-		}
-		aliases = append(aliases, alias)
-	}
-	return aliases, rows.Err()
+	return listEntityAliases(ctx, tx, entityID)
 }
 
 func (r *ServiceCatalogRepo) ResolveEntityKey(ctx context.Context, tx pgx.Tx, entityKey string) ([]domain.ResourceNode, error) {

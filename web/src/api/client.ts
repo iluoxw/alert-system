@@ -8,6 +8,8 @@
 // （{"error":"unauthenticated"}）时，通过 onUnauthorized 回调统一处理跳转登录页
 // （见 setUnauthorizedHandler），调用方不需要每处自行判断 401。
 
+import { apiV1Url } from '../config/runtime'
+
 export type Severity = 'critical' | 'warning' | 'info'
 export type Status = 'firing' | 'acknowledged' | 'resolved'
 export type SourceState = 'firing' | 'resolved' | 'unknown'
@@ -110,7 +112,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api/v1${path}`, {
+  const res = await fetch(apiV1Url(path), {
     credentials: 'include',
     headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
     ...init,
@@ -620,6 +622,21 @@ export function updateOpsSettings(teamId: string, body: OpsSettingsRequest): Pro
   return request(`/admin/teams/${teamId}/ops-settings`, { method: 'PUT', body: JSON.stringify(body) })
 }
 
+// 先行指标（任务 37/38，R10.1）。admin only；null 表示无数据（不是 0）。
+export interface OpsIndicators {
+  firing_mapping_rate: number | null
+  active_faults_without_owner: number
+  fault_ack_duration_median_seconds: number | null
+  recovery_nudge_fired_count: number
+  /** 上一字段的统计窗口（小时），由后端给出，前端不写死 */
+  recovery_nudge_window_hours: number
+  unresolved_identity_count: number | null
+}
+
+export function getOpsIndicators(): Promise<OpsIndicators> {
+  return request('/ops/indicators')
+}
+
 // ---- users ----
 //
 // 创建接受明文 password（服务端 bcrypt 哈希后落库）；更新不支持改用户名/密码
@@ -631,6 +648,7 @@ export interface User {
   username: string
   display_name: string
   email: string
+  lark_open_id?: string
   enabled: boolean
   created_at: string
   updated_at: string
@@ -648,6 +666,7 @@ export interface UpdateUserRequest {
   display_name: string
   email?: string
   enabled: boolean
+  lark_open_id?: string
 }
 
 export function listUsers(limit?: number): Promise<{ users: User[] }> {
@@ -1066,6 +1085,7 @@ export function deleteSilence(id: string): Promise<void> {
 // ============================================================
 
 export type ResourceNodeKind = 'resource' | 'infrastructure_capability' | 'business_system'
+export type EntityLifecycleState = 'active' | 'decommissioned' | 'all'
 export type FaultStatus = 'candidate' | 'active' | 'monitoring' | 'resolved'
 export type FaultScope = 'instance' | 'capability'
 export type EvidenceRole = 'direct_impact' | 'cause_candidate' | 'trigger' | 'amplifier' | 'symptom' | 'supporting' | 'excluded'
@@ -1086,6 +1106,10 @@ export interface ResourceNode {
   labels?: Record<string, string>
   attributes?: Record<string, unknown>
   last_observed_at?: string
+  lifecycle_state?: Exclude<EntityLifecycleState, 'all'>
+  decommissioned_at?: string
+  decommissioned_by?: string
+  decommission_reason?: string
 }
 
 export interface DependencyEdge {
@@ -1117,6 +1141,11 @@ export interface Fault {
   entity_ref: string
   confidence: number
   metadata: Record<string, unknown>
+  owner_team_id?: string
+  acked_by?: string
+  acked_by_name?: string
+  acked_at?: string
+  owner_notified_at?: string
   first_detected_at: string
   last_evaluated_at: string
   resolved_at?: string
@@ -1157,6 +1186,8 @@ export interface InfrastructureNodeDetailResponse {
   node: ResourceNode
   edges: DependencyEdge[]
   faults: Fault[]
+  aliases: EntityAlias[]
+  dependencies: DependencyEdge[]
 }
 
 export interface FaultEvidence {
@@ -1193,8 +1224,8 @@ export function getInfrastructureOverview(): Promise<InfrastructureOverviewRespo
   return request('/infrastructure/overview')
 }
 
-export function listInfrastructureNodes(kind?: ResourceNodeKind): Promise<{ items: ResourceNode[] }> {
-  return request(`/infrastructure/nodes${withQuery({ kind })}`)
+export function listInfrastructureNodes(kind?: ResourceNodeKind, lifecycle?: EntityLifecycleState): Promise<{ items: ResourceNode[] }> {
+  return request(`/infrastructure/nodes${withQuery({ kind, lifecycle })}`)
 }
 
 export function getInfrastructureNode(id: string): Promise<InfrastructureNodeDetailResponse> {
@@ -1209,14 +1240,59 @@ export interface ManagedEntityRequest {
   environment: string
   owner_team_id: string
   labels?: Record<string, string>
+  aliases?: Array<Pick<EntityAlias, 'namespace' | 'value' | 'enabled'>>
+  dependencies?: ServiceDependencyRequest[]
 }
 
-export function createManagedEntity(body: ManagedEntityRequest): Promise<ResourceNode> {
+// 实体字段平铺在顶层以保持向后兼容，只追加 aliases/dependencies。
+export type ManagedEntityDetailResponse = ResourceNode & {
+  aliases: EntityAlias[]
+  dependencies: DependencyEdge[]
+}
+
+export function createManagedEntity(body: ManagedEntityRequest): Promise<ManagedEntityDetailResponse> {
   return request('/admin/entities', { method: 'POST', body: JSON.stringify(body) })
 }
 
-export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ResourceNode> {
+export function updateManagedEntity(id: string, body: ManagedEntityRequest): Promise<ManagedEntityDetailResponse> {
   return request(`/admin/entities/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+}
+
+export interface EntityLifecyclePreview {
+  active_faults: Fault[]
+  open_incidents: Incident[]
+  firing_alerts: Alert[]
+}
+
+export interface EntityLifecycleChangeResponse {
+  entity: ResourceNode
+  cascaded_faults: Fault[]
+}
+
+export function getEntityLifecyclePreview(id: string): Promise<EntityLifecyclePreview> {
+  return request(`/admin/entities/${id}/lifecycle-preview`)
+}
+
+export function patchEntityLifecycle(id: string, body: {
+  state: Exclude<EntityLifecycleState, 'all'>
+  reason?: string
+  cascade_faults?: boolean
+}): Promise<EntityLifecycleChangeResponse> {
+  return request(`/admin/entities/${id}/lifecycle`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+
+export interface UnresolvedIdentity {
+  namespace: string
+  value: string
+  host_port: string
+  service_type: string
+  first_seen: string
+  last_seen: string
+  sample_app: string
+}
+
+export function listUnresolvedIdentities(): Promise<{ items: UnresolvedIdentity[] }> {
+  return request('/admin/topology/unresolved')
 }
 
 export function listFaults(status?: FaultStatus): Promise<{ items: Fault[] }> {
@@ -1225,6 +1301,10 @@ export function listFaults(status?: FaultStatus): Promise<{ items: Fault[] }> {
 
 export function getFault(id: string): Promise<FaultDetailResponse> {
   return request(`/faults/${id}`)
+}
+
+export function ackFault(id: string): Promise<{ fault: Fault }> {
+  return request(`/faults/${id}/ack`, { method: 'POST' })
 }
 
 export function decideFaultEvidence(faultId: string, alertId: string, body: {
@@ -1455,18 +1535,5 @@ export async function listRunbookRuns(incidentId: string): Promise<{ items: Runb
 export function executeRunbook(incidentId: string, actionKey: string, parameters: Record<string, unknown>): Promise<RunbookRun> {
   return request(`/incidents/${incidentId}/runbook-runs`, {
     method: 'POST', body: JSON.stringify({ action_key: actionKey, parameters }),
-  })
-}
-
-export function approveRunbook(incidentId: string, runId: string, planSHA256: string, comment: string): Promise<void> {
-  return request(`/incidents/${incidentId}/runbook-runs/${runId}/approval`, {
-    method: 'POST', body: JSON.stringify({ plan_sha256: planSHA256, decision: 'approved', comment }),
-  })
-}
-
-export function applyRunbook(incidentId: string, planRunId: string, confirmPlanSHA256: string): Promise<RunbookRun> {
-  return request(`/incidents/${incidentId}/runbook-apply`, {
-    method: 'POST',
-    body: JSON.stringify({ plan_run_id: planRunId, confirm_plan_sha256: confirmPlanSHA256, retries_stopped: true }),
   })
 }

@@ -76,7 +76,7 @@ func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events
 				return err
 			}
 		}
-		if len(events) > 0 && events[0].Source == alertmanagerKind {
+		if len(events) > 0 && domain.IsAuthoritativeSourceKind(events[0].Source) {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO alert_source_status (integration_id, last_webhook_at)
 				VALUES ($1::uuid, now())
@@ -266,10 +266,10 @@ func normalizeAndValidate(e *domain.AlertEvent, integrationKind string) error {
 	if e.Source == "" {
 		e.Source = integrationKind
 	}
-	if e.Source == alertmanagerKind && e.UpstreamFingerprint == "" {
-		return errors.New("Alertmanager fingerprint 不能为空")
+	if domain.IsAuthoritativeSourceKind(e.Source) && e.UpstreamFingerprint == "" {
+		return fmt.Errorf("%s fingerprint 不能为空", e.Source)
 	}
-	if e.Source == alertmanagerKind {
+	if domain.IsAuthoritativeSourceKind(e.Source) {
 		if e.SuppressionState == "" {
 			e.SuppressionState = domain.SuppressionStateNone
 		}

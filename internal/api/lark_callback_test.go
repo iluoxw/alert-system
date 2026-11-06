@@ -13,6 +13,7 @@ import (
 	larkcard "github.com/larksuite/oapi-sdk-go/v3/card"
 
 	"alert-system/internal/domain"
+	"alert-system/internal/store"
 )
 
 // fakeAlertStore 是 AlertStore 的内存 fake，用 map 模拟告警仓储，不依赖真实 Postgres。
@@ -30,6 +31,44 @@ func (f *fakeAlertStore) GetByID(ctx context.Context, tx pgx.Tx, id string) (dom
 
 func (f *fakeAlertStore) UpdateStatus(ctx context.Context, tx pgx.Tx, alert domain.Alert) error {
 	f.alerts[alert.ID] = alert
+	return nil
+}
+
+type fakeLarkUserStore struct {
+	users map[string]*store.User
+}
+
+func (f *fakeLarkUserStore) GetByLarkOpenID(ctx context.Context, tx pgx.Tx, openID string) (*store.User, error) {
+	user, ok := f.users[openID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return user, nil
+}
+
+type fakeLarkActionStore struct {
+	seen    map[string]bool
+	actions []store.LarkCardAction
+	results map[string][]byte
+}
+
+func (f *fakeLarkActionStore) Insert(ctx context.Context, tx pgx.Tx, action store.LarkCardAction) (bool, error) {
+	if f.seen == nil {
+		f.seen = map[string]bool{}
+	}
+	if f.seen[action.RequestID] {
+		return false, nil
+	}
+	f.seen[action.RequestID] = true
+	f.actions = append(f.actions, action)
+	return true, nil
+}
+
+func (f *fakeLarkActionStore) UpdateResult(ctx context.Context, tx pgx.Tx, requestID string, result json.RawMessage) error {
+	if f.results == nil {
+		f.results = map[string][]byte{}
+	}
+	f.results[requestID] = append([]byte(nil), result...)
 	return nil
 }
 
@@ -76,6 +115,17 @@ func cardActionBody(openID, alertID, actionName string) []byte {
 				"action":   actionName,
 			},
 		},
+	})
+	return b
+}
+
+func cardActionBodyWithRequestID(openID, alertID, actionName, requestID string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"type": "card_action_trigger", "open_id": openID,
+		"action": map[string]any{"value": map[string]any{
+			"resource_type": "alert", "resource_id": alertID, "action": actionName,
+			"request_id": requestID, "version": 1,
+		}},
 	})
 	return b
 }
@@ -189,6 +239,44 @@ func TestHandleCardCallback_ValidSignature_AckCallback(t *testing.T) {
 	}
 	if timeline.entries[0].Actor != "ou_test_user" {
 		t.Errorf("timeline actor = %q, want ou_test_user", timeline.entries[0].Actor)
+	}
+}
+
+func TestHandleCardCallback_UnboundLarkUserRejected(t *testing.T) {
+	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-bound": newTestAlert("alert-bound", domain.StatusFiring)}}
+	timeline := &fakeTimelineStore{}
+	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil, nil, nil).
+		SetLarkIdentityStore(&fakeLarkUserStore{users: map[string]*store.User{}}).
+		SetLarkActionStore(&fakeLarkActionStore{})
+	req := signedRequest("verify-tok", cardActionBodyWithRequestID("ou-unbound", "alert-bound", "ack", "req-unbound"))
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code == http.StatusOK || alerts.alerts["alert-bound"].Status != domain.StatusFiring || len(timeline.entries) != 0 {
+		t.Fatalf("未绑定用户不应执行动作: status=%d alert=%v timeline=%d", w.Code, alerts.alerts["alert-bound"].Status, len(timeline.entries))
+	}
+}
+
+func TestHandleCardCallback_RequestIDIsIdempotent(t *testing.T) {
+	alerts := &fakeAlertStore{alerts: map[string]domain.Alert{"alert-idempotent": newTestAlert("alert-idempotent", domain.StatusFiring)}}
+	timeline := &fakeTimelineStore{}
+	actions := &fakeLarkActionStore{}
+	srv := NewServer(alerts, timeline, fakeTxRunner{}, "verify-tok", "", nil, nil, nil).
+		SetLarkIdentityStore(&fakeLarkUserStore{users: map[string]*store.User{"ou-bound": {ID: "u-1", Username: "alice", DisplayName: "Alice", Enabled: true}}}).
+		SetLarkActionStore(actions)
+	body := cardActionBodyWithRequestID("ou-bound", "alert-idempotent", "ack", "req-1")
+	for i := 0; i < 2; i++ {
+		req := signedRequest("verify-tok", body)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("第 %d 次回调 status=%d body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+	if len(timeline.entries) != 1 || len(actions.actions) != 1 || len(actions.results) != 1 {
+		t.Fatalf("重复 request_id 不应重复执行: timeline=%d actions=%d", len(timeline.entries), len(actions.actions))
+	}
+	if got := alerts.alerts["alert-idempotent"].AckedBy; got != "u-1" {
+		t.Fatalf("AckedBy=%q, want u-1", got)
 	}
 }
 

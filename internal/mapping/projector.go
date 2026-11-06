@@ -1,5 +1,5 @@
 // Package mapping implements the generic, deterministic Alert -> Entity -> Fault
-// projection. It contains no E2B/CCH branches: business semantics live in data.
+// projection. Business semantics live in data, not in core branches.
 package mapping
 
 import (
@@ -93,28 +93,20 @@ func (p *Projector) Project(ctx context.Context, tx pgx.Tx, alert domain.Alert) 
 	if firstDetected.IsZero() {
 		firstDetected = result.EvaluatedAt
 	}
-	fault, _, err := p.faults.Upsert(ctx, tx, domain.Fault{
-		CorrelationKey: correlationKey,
-		Scope:          contract.FaultScope,
-		Status:         faultStatus,
-		Severity:       alert.Severity,
-		Kind:           contract.FaultKind,
-		Title:          contract.Entity.Name + " · " + humanize(contract.FaultKind),
-		Summary:        "由确定性 Alert Mapping 投影：" + alert.Title,
-		ResourceNodeID: contract.Entity.ID,
-		EntityRef:      contract.Entity.EntityKey,
-		Confidence:     contract.Confidence,
-		Metadata: map[string]any{
-			"mapping_policy_id": policyID(contract.Policy),
-			"mapping_version":   policyVersion(contract.Policy),
-			"source":            "alert_mapping",
-		},
-		FirstDetected: firstDetected,
-		LastEvaluated: result.EvaluatedAt,
-	})
+
+	// 转移判定需要 Upsert 之前的状态：Upsert 的 (xmax=0) 只能告诉我们"是否新建"，
+	// 判断"candidate→active"还需要旧状态。GetByCorrelationKey 用 QueryRow（单行，
+	// 非流式 Rows），Scan 后连接即释放，与随后的 Upsert 不冲突（不变量 20）。
+	previous, err := p.faults.GetByCorrelationKey(ctx, tx, correlationKey)
+	if err != nil && !errors.Is(err, store.ErrFaultNotFound) {
+		return result, err
+	}
+
+	fault, created, err := p.faults.Upsert(ctx, tx, buildFaultUpsertInput(contract, alert, correlationKey, faultStatus, firstDetected, result.EvaluatedAt))
 	if err != nil {
 		return result, err
 	}
+	result.Transition = determineFaultTransition(created, previous.Status, fault.Status)
 	rationale := fmt.Sprintf("Alert 命中 %s，作为 %s 证据映射到 %s", policyDisplay(contract.Policy), contract.EvidenceRole, contract.Entity.EntityKey)
 	if err := p.faults.UpsertAutomatedEvidence(ctx, tx, fault.ID, domain.FaultEvidence{
 		AlertID: alert.ID, Role: contract.EvidenceRole, Rationale: rationale,
@@ -202,8 +194,63 @@ func (p *Projector) resolveContract(ctx context.Context, tx pgx.Tx, alert domain
 		domain.AlertMappingMapped, "mapped_standard_contract", "受信标准标签契约", nil
 }
 
+// buildFaultUpsertInput 组装待 Upsert 的 Fault：OwnerTeamID 只取
+// contract.Entity.OwnerTeamID（即 resource_nodes.owner_team_id，由 catalog/topology
+// 仓储在实体登记时权威写入），解析不到就是空字符串，交给 store 层 NULLIF 转 NULL。
+// 禁止依据 Alert 标签或平台数据推断 owner（不变量 15，R3.3）——本函数因此不读取
+// alert.Labels/ResourceRef 中的任何字段来决定 OwnerTeamID。
+// 纯函数：不做 I/O，便于覆盖"有 owner / 无 owner"两种情形（R3.2）。
+func buildFaultUpsertInput(contract resolvedContract, alert domain.Alert, correlationKey string, status domain.FaultStatus, firstDetected, evaluatedAt time.Time) domain.Fault {
+	return domain.Fault{
+		CorrelationKey: correlationKey,
+		Scope:          contract.FaultScope,
+		Status:         status,
+		Severity:       alert.Severity,
+		Kind:           contract.FaultKind,
+		Title:          contract.Entity.Name + " · " + humanize(contract.FaultKind),
+		Summary:        "由确定性 Alert Mapping 投影：" + alert.Title,
+		ResourceNodeID: contract.Entity.ID,
+		EntityRef:      contract.Entity.EntityKey,
+		OwnerTeamID:    contract.Entity.OwnerTeamID,
+		Confidence:     contract.Confidence,
+		Metadata: map[string]any{
+			"mapping_policy_id": policyID(contract.Policy),
+			"mapping_version":   policyVersion(contract.Policy),
+			"source":            "alert_mapping",
+		},
+		FirstDetected: firstDetected,
+		LastEvaluated: evaluatedAt,
+	}
+}
+
+// determineFaultTransition 判定本次 Upsert 是否让 Fault 进入 active（R5.1/R5.10），
+// 只关心这一件事：
+//   - created==true 且新状态是 active → 直接以 active 创建（R5.10 direct firing）；
+//   - created==false 且旧状态不是 active、新状态是 active → 任何"非 active → active"
+//     的转移都算，包括 candidate 升级为 active，也包括 monitoring 复发重新升级为
+//     active（Upsert 的 ON CONFLICT 允许这条路径：观察期内故障复发）；
+//   - 其余情况（含旧状态已是 active 的重复评估）均为 None，避免同一次 active 转移
+//     被多个调用入口（pipeline/对账两处）并发触发时重复产生通知意图（R5.11）。
+//
+// previous 为空值 FaultStatus("") 表示 correlation_key 此前不存在（配合 created
+// 使用；GetByCorrelationKey 命中 ErrFaultNotFound 时调用方就传零值）。
+// 纯函数：不做 I/O，便于表驱动测试覆盖 created / candidate→active / monitoring→active /
+// 已 active 不重复触发四种情形。
+func determineFaultTransition(created bool, previous, next domain.FaultStatus) domain.FaultTransition {
+	if next != domain.FaultStatusActive {
+		return domain.FaultTransitionNone
+	}
+	if created {
+		return domain.FaultTransitionCreatedActive
+	}
+	if previous == domain.FaultStatusActive {
+		return domain.FaultTransitionNone
+	}
+	return domain.FaultTransitionEnteredActive
+}
+
 func isAuthoritativeAlertmanager(alert domain.Alert) bool {
-	return alert.Source == "alertmanager" && strings.TrimSpace(alert.SourceIntegrationID) != "" && strings.TrimSpace(alert.UpstreamFingerprint) != ""
+	return domain.IsAuthoritativeSourceKind(alert.Source) && strings.TrimSpace(alert.SourceIntegrationID) != "" && strings.TrimSpace(alert.UpstreamFingerprint) != ""
 }
 
 func (p *Projector) resolvePolicyEntity(ctx context.Context, tx pgx.Tx, policy domain.AlertMappingPolicy, labels map[string]string) (domain.ResourceNode, domain.AlertMappingStatus, string, string, error) {

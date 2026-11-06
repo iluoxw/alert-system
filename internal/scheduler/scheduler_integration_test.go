@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,11 +30,21 @@ import (
 
 const migrationsDir = "../../migrations"
 
+// testDSNEnv 指向一个已经跑着的 PostgreSQL（URL 形式的管理连接串，库名任意）。
+// 设置了它就跳过 testcontainers，改为在该实例上为每个测试单独建库/删库——给没有
+// Docker 但有 PostgreSQL 的开发机与 CI 用，隔离级别与"每个测试一个容器"等价。
+const testDSNEnv = "ALERT_SYSTEM_TEST_DSN"
+
 // setupTestStore 起一个临时 postgres:15-alpine 容器、按文件名顺序执行
 // migrations/*.up.sql，返回连好的 Store；测试结束时自动清理容器与连接池。
+// 设置了 testDSNEnv 时走 setupTestStoreFromDSN，不需要 Docker。
 func setupTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	ctx := context.Background()
+
+	if dsn := os.Getenv(testDSNEnv); dsn != "" {
+		return setupTestStoreFromDSN(t, dsn)
+	}
 
 	req := testcontainers.ContainerRequest{
 		Image:        "postgres:15-alpine",
@@ -84,6 +95,68 @@ func setupTestStore(t *testing.T) *store.Store {
 
 	applyMigrations(t, ctx, st)
 	return st
+}
+
+// setupTestStoreFromDSN 在 adminDSN 指向的实例上新建一个本测试专属的数据库、跑完
+// migrations，返回连到该库的 Store；测试结束时先关连接池再删库。
+func setupTestStoreFromDSN(t *testing.T, adminDSN string) *store.Store {
+	t.Helper()
+	ctx := context.Background()
+
+	admin, err := store.New(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("连接 %s 指向的数据库失败: %v", testDSNEnv, err)
+	}
+
+	// 库名取测试名 + 纳秒时间戳：同一个实例上并行跑多个测试也不会撞库。
+	dbName := fmt.Sprintf("sched_test_%s_%d", sanitizeDBName(t.Name()), time.Now().UnixNano())
+	if _, err := admin.Pool.Exec(ctx, `CREATE DATABASE "`+dbName+`"`); err != nil {
+		admin.Close()
+		t.Fatalf("创建测试数据库 %s 失败: %v", dbName, err)
+	}
+
+	u, err := url.Parse(adminDSN)
+	if err != nil {
+		admin.Close()
+		t.Fatalf("解析 %s 失败（需要 URL 形式的 DSN）: %v", testDSNEnv, err)
+	}
+	u.Path = "/" + dbName
+
+	st, err := store.New(ctx, u.String())
+	if err != nil {
+		admin.Close()
+		t.Fatalf("连接测试数据库 %s 失败: %v", dbName, err)
+	}
+	t.Cleanup(func() {
+		st.Close()
+		// FORCE 断开残留连接：Run worker 的 goroutine 可能刚好还在收尾。
+		if _, err := admin.Pool.Exec(context.Background(), `DROP DATABASE IF EXISTS "`+dbName+`" WITH (FORCE)`); err != nil {
+			t.Logf("删除测试数据库 %s 失败: %v", dbName, err)
+		}
+		admin.Close()
+	})
+
+	applyMigrations(t, ctx, st)
+	return st
+}
+
+// sanitizeDBName 把测试名里 PostgreSQL 标识符不接受的字符换成下划线，并截断长度
+// （标识符上限 63 字节，还要给时间戳后缀留位置）。
+func sanitizeDBName(name string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		default:
+			return '_'
+		}
+	}, name)
+	if len(cleaned) > 24 {
+		cleaned = cleaned[:24]
+	}
+	return cleaned
 }
 
 func applyMigrations(t *testing.T, ctx context.Context, st *store.Store) {

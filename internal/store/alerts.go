@@ -189,6 +189,42 @@ func nullableTTL(event domain.AlertEvent) any {
 // ErrAlertNotFound 表示按 ID 查询/更新的告警不存在。
 var ErrAlertNotFound = errors.New("store: 告警不存在")
 
+// ListFiringEvidenceForFaultIDs 一次取回这些 Fault 仍在 firing 的证据告警。
+// 权威来源看 source_state='firing'；legacy 行看 status<>'resolved'。
+func (r *AlertRepo) ListFiringEvidenceForFaultIDs(ctx context.Context, tx pgx.Tx, faultIDs []string) ([]domain.Alert, error) {
+	if len(faultIDs) == 0 {
+		return []domain.Alert{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT `+alertColumns+`
+		FROM alerts
+		WHERE id IN (
+			SELECT l.alert_id FROM fault_alert_links l WHERE l.fault_id::text = ANY($1)
+		)
+		AND (
+			(upstream_fingerprint <> '' AND source_state = 'firing')
+			OR (upstream_fingerprint = '' AND status <> 'resolved')
+		)
+		ORDER BY last_seen_at DESC
+	`, faultIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 Fault 未解除证据告警失败: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.Alert, 0)
+	for rows.Next() {
+		alert, err := scanAlertRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, alert)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // GetByID 按 ID 查询单条告警；不存在返回 ErrAlertNotFound。
 func (r *AlertRepo) GetByID(ctx context.Context, tx pgx.Tx, id string) (domain.Alert, error) {
 	row := tx.QueryRow(ctx, `SELECT `+alertColumns+` FROM alerts WHERE id = $1`, id)

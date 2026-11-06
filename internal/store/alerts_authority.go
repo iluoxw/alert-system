@@ -80,7 +80,7 @@ func (r *AlertRepo) UpsertAuthoritativeOccurrence(
 			source_resolution_reason
 		) VALUES (
 			$1, $2, $3, $4, 'unacknowledged', $5, $6,
-			$7, $8, $9, 'alertmanager', $10, $11, $12,
+			$7, $8, $9, $21, $10, $11, $12,
 			'source', $13::uuid, $14, $15, $16,
 			$17, $18, $19, 0, $20
 		)
@@ -117,6 +117,7 @@ func (r *AlertRepo) UpsertAuthoritativeOccurrence(
 		event.Severity, event.SeverityFallback, event.Title, labels, resourceRef, signalContext,
 		sourceID, event.StartsAt, observedAt, endsAt, event.SourceUpdatedAt,
 		lastReconciledAt, generation, resolutionReason(sourceState, generation),
+		event.Source,
 	)
 	var created bool
 	alert, err := scanAlertRow(row, &created)

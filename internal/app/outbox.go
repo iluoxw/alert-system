@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +18,13 @@ import (
 	"alert-system/internal/oncall"
 	"alert-system/internal/ops"
 	"alert-system/internal/scheduler"
+	"alert-system/internal/store"
 )
+
+// groupMessageMaxTitles 是分组通知 Body 摘要里最多列出的成员标题数，超出部分折叠
+// 为"…另有 N 条"——避免组内成员很多时消息体过长，同时给值班人足够的影响面线索
+// （比缺陷 1 只显示第一条更有用）。
+const groupMessageMaxTitles = 5
 
 // notifySendTimerKind 是 outbox 定时器在 scheduler 里的 kind：六个注册 kind 里唯一
 // 由本包（而不是各业务包）定义的一个，因为它是纯装配层概念，不属于任何业务包的
@@ -32,9 +41,12 @@ const notifySendTimerKind = "notify_send"
 const teamNotifyChannel = "lark"
 
 // notifyOutboxScheduler 是 notifyOutbox 依赖的定时器子集，由 *scheduler.Scheduler 实现。
+// Cancel 是 IncidentOutbox.CancelRecoveryNudge 需要的额外能力（notifyOutbox 本身
+// 不用它，与 IncidentOutbox 共享同一个接口只是为了不再声明第二个几乎相同的接口）。
 type notifyOutboxScheduler interface {
 	Schedule(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) error
 	ScheduleIfAbsent(ctx context.Context, tx pgx.Tx, kind, refID string, fireAt time.Time, payload []byte) (bool, error)
+	Cancel(ctx context.Context, tx pgx.Tx, kind, refID string) error
 }
 
 // notifyOutboxChainStarter 抽象 oncall.Chain.Start，供 NotifyGroup 的"首次通知编排"
@@ -49,6 +61,14 @@ type notifyOutboxEngineStarter interface {
 	Start(ctx context.Context, tx pgx.Tx, alert domain.Alert, baseTime time.Time) error
 }
 
+// notifyOutboxRouteRepo 是 NotifyGroup 解析路由级 repeat_interval 依赖的仓储子集，
+// 由 store.RouteRepo 实现（结构化满足）。缺陷 1 修复：路由的 RepeatIntervalSeconds
+// 此前只写入 pipeline.RouteResult 却从未被消费，是一份死配置——这里在"意图时刻"
+// （首个 alert_repeat 定时器注册时）按告警的 RouteID 查一次路由，取其配置值。
+type notifyOutboxRouteRepo interface {
+	GetByID(ctx context.Context, tx pgx.Tx, id string) (*store.Route, error)
+}
+
 // notifyOutbox 同时实现四个"通知意图"接口。每个方法只做一件事：把意图翻译成一个
 // 或多个 scheduleSend 调用；NotifyGroup 额外承担"首次通知编排"职责（组首时间基准
 // 的渠道升级 + 首个 repeat 定时器 + 人员升级链启动），见该方法注释。
@@ -56,6 +76,7 @@ type notifyOutbox struct {
 	scheduler        notifyOutboxScheduler
 	engine           notifyOutboxEngineStarter
 	chain            notifyOutboxChainStarter
+	routes           notifyOutboxRouteRepo // 路由级 repeat_interval 查询，可为 nil（无路由仓储时全部走全局默认）
 	repeatInterval   time.Duration
 	personnelChannel string // 到人发送的渠道种类（config.PersonnelChannel，默认 "email"）
 	now              func() time.Time
@@ -95,7 +116,14 @@ func notifySendRefID(req notify.SendRequest) string {
 	if req.Step != nil {
 		step = strconv.Itoa(*req.Step)
 	}
-	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target}, "\x1e")
+	parts := []string{resourceKey, step, req.ChannelKind, req.Target}
+	if req.MetaAlert {
+		// 元告警必须与原意图分属不同 refID：fallback 目标常常就是原通知失败的那个
+		// 目标（owner team 无渠道时本来就回落到它），共用 refID 会让两者在 pending
+		// 收敛里互相覆盖 payload——后注册的一方被静默丢掉。
+		parts = append(parts, "meta")
+	}
+	return strings.Join(parts, "\x1e")
 }
 
 // NotifyEscalation 实现 oncall.Notifier：人员升级链推进到 level 级，给每个目标责任人
@@ -169,8 +197,16 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 		if err := o.engine.Start(ctx, tx, alert, baseTime); err != nil {
 			return fmt.Errorf("app: 启动渠道升级序列失败: %w", err)
 		}
-		fireAt := o.now().Add(o.repeatInterval)
-		if _, err := o.scheduler.ScheduleIfAbsent(ctx, tx, notify.TimerKindAlertRepeat, alert.ID, fireAt, nil); err != nil {
+		interval, err := o.resolveRepeatInterval(ctx, tx, alert.RouteID)
+		if err != nil {
+			return err
+		}
+		repeatPayload, err := json.Marshal(notify.RepeatPayload{IntervalSeconds: int(interval / time.Second)})
+		if err != nil {
+			return fmt.Errorf("app: 序列化 repeat payload 失败: %w", err)
+		}
+		fireAt := o.now().Add(interval)
+		if _, err := o.scheduler.ScheduleIfAbsent(ctx, tx, notify.TimerKindAlertRepeat, alert.ID, fireAt, repeatPayload); err != nil {
 			return fmt.Errorf("app: 注册首个 repeat 定时器失败: %w", err)
 		}
 		if err := o.chain.Start(ctx, tx, alert); err != nil {
@@ -178,6 +214,31 @@ func (o *notifyOutbox) NotifyGroup(ctx context.Context, tx pgx.Tx, groupKey stri
 		}
 	}
 	return nil
+}
+
+// resolveRepeatInterval 按告警的 RouteID 解析本条 repeat 链应使用的间隔：路由未
+// 命中过任何规则（RouteID 为空）、未注入路由仓储、路由已被删除，或路由的
+// RepeatIntervalSeconds<=0（未配置，沿用全局默认，对齐不变量 10"降噪一律
+// opt-in"同一口径）时，一律回落 o.repeatInterval。
+//
+// 只有"未找到"可以回落；其他查询错误必须上抛：同一 pgx.Tx 内一次失败的查询会让
+// 整个事务进入 aborted 状态，吞掉错误并不能让后续 ScheduleIfAbsent 成功，只会把
+// 真正根因换成"current transaction is aborted"（见不变量 21 同类教训）。
+func (o *notifyOutbox) resolveRepeatInterval(ctx context.Context, tx pgx.Tx, routeID string) (time.Duration, error) {
+	if o.routes == nil || routeID == "" {
+		return o.repeatInterval, nil
+	}
+	route, err := o.routes.GetByID(ctx, tx, routeID)
+	if errors.Is(err, store.ErrNotFound) {
+		return o.repeatInterval, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("app: 查询路由 repeat 间隔失败: %w", err)
+	}
+	if route.RepeatIntervalSeconds <= 0 {
+		return o.repeatInterval, nil
+	}
+	return time.Duration(route.RepeatIntervalSeconds) * time.Second, nil
 }
 
 // activeAlerts 过滤出 alerts 里当前未被任何静默命中的子集，顺序与输入一致。
@@ -263,26 +324,88 @@ func opsGroupKey(teamID, kind string) string {
 
 // buildAlertMessage 把单个告警组装成渠道无关的 Message（Sender/Channel 的载荷）。
 func buildAlertMessage(alert domain.Alert) notify.Message {
+	prefix := alert.ID
+	if !alert.UpdatedAt.IsZero() {
+		prefix += ":" + fmt.Sprint(alert.UpdatedAt.UnixNano())
+	}
 	return notify.Message{
-		AlertIDs:   []string{alert.ID},
-		Severity:   string(alert.Severity),
-		Title:      alert.Title,
-		Body:       alert.Title,
-		Labels:     alert.Labels,
-		OccurredAt: alert.StartsAt,
+		AlertIDs:     []string{alert.ID},
+		Severity:     string(alert.Severity),
+		Title:        alert.Title,
+		Body:         alert.Title,
+		Labels:       alert.Labels,
+		OccurredAt:   alert.StartsAt,
+		ResourceType: "alert", ResourceID: alert.ID, ActionRequestPrefix: prefix,
 	}
 }
 
 // buildGroupMessage 把一组告警组装成分组摘要 Message，OccurredAt 取组首时间。
+// Body 缺陷修复（此前恒为 alerts[0].Title，组内多条告警时值班人无法从消息判断
+// 影响面）：改为列出组内成员摘要，见 buildGroupBody。
 func buildGroupMessage(groupKey string, alerts []domain.Alert) notify.Message {
 	return notify.Message{
 		AlertIDs:   alertIDs(alerts),
 		GroupKey:   groupKey,
 		Severity:   string(alerts[0].Severity),
 		Title:      fmt.Sprintf("%d 条告警（分组 %s）", len(alerts), groupKey),
-		Body:       alerts[0].Title,
+		Body:       buildGroupBody(alerts),
 		OccurredAt: earliestStartsAt(alerts),
 	}
+}
+
+// groupSeverityRank 给严重程度定一个用于排序的权重：数值越小越严重。展示顺序
+// "严重程度从高到低"依赖这个显式权重，而不是 Severity 字符串本身的字典序
+// （"critical" < "info" < "warning" 的字典序与业务语义相反）。
+var groupSeverityRank = map[domain.Severity]int{
+	domain.SeverityCritical: 0,
+	domain.SeverityWarning:  1,
+	domain.SeverityInfo:     2,
+}
+
+// buildGroupBody 按"严重程度从高到低、同级按 StartsAt 从早到晚"排序后，最多列出
+// 前 groupMessageMaxTitles 条告警标题，超出部分折叠为"…另有 N 条"。只有 1 条时
+// 保持原样（不加多余格式），与升级前单条分组的展示一致。
+//
+// 排序在拷贝出的切片上进行（不修改调用方传入的 alerts 底层数组），排序键是
+// Severity → StartsAt → Title → ID 的全序：批量触发时同级同 StartsAt 很常见，
+// 若缺少 Title/ID 兜底，稳定排序会保留输入顺序，乱序到达就会产出不同 Body。
+func buildGroupBody(alerts []domain.Alert) string {
+	if len(alerts) == 1 {
+		return alerts[0].Title
+	}
+
+	sorted := make([]domain.Alert, len(alerts))
+	copy(sorted, alerts)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri, rj := groupSeverityRank[sorted[i].Severity], groupSeverityRank[sorted[j].Severity]
+		if ri != rj {
+			return ri < rj
+		}
+		if !sorted[i].StartsAt.Equal(sorted[j].StartsAt) {
+			return sorted[i].StartsAt.Before(sorted[j].StartsAt)
+		}
+		if sorted[i].Title != sorted[j].Title {
+			return sorted[i].Title < sorted[j].Title
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+
+	shown := sorted
+	remaining := 0
+	if len(shown) > groupMessageMaxTitles {
+		remaining = len(shown) - groupMessageMaxTitles
+		shown = shown[:groupMessageMaxTitles]
+	}
+
+	titles := make([]string, len(shown))
+	for i, a := range shown {
+		titles[i] = a.Title
+	}
+	body := strings.Join(titles, "；")
+	if remaining > 0 {
+		body += fmt.Sprintf("；…另有 %d 条", remaining)
+	}
+	return body
 }
 
 func alertIDs(alerts []domain.Alert) []string {
@@ -306,17 +429,127 @@ func earliestStartsAt(alerts []domain.Alert) time.Time {
 	return earliest
 }
 
-// notifySendPayloadHandler 构造 "notify_send" 的 scheduler.Handler：解码 payload 为
-// notify.SendRequest，交给 notify.Sender.Send。tx 是 processOneDue 传入的、已经把这条
-// notify_send 定时器标记为 fired 的事务，本 handler 不使用它——Sender.Send 内部按
-// R6.1/R6.3 的既有设计自己开独立事务做占位写入/状态回写（notify.Sender 的 txRunner，
-// 与 scheduler 的 tx 完全无关），期间夹着同步的外部 IO（HTTP/短信）与指数退避重试。
-// 这意味着外层 processOneDue 事务（持有该 notify_send 定时器行锁）在 Sender.Send
-// 整个执行期间都保持打开——已由 team-lead 确认接受这一 MVP 权衡（发送慢只阻塞
-// "notify_send" 这一个 kind 的 worker 槽位，不阻塞其余五个 kind），留待后续任务视
-// 吞吐需求把发送异步化。
-func notifySendPayloadHandler(sender *notify.Sender) scheduler.Handler {
-	return func(ctx context.Context, _ pgx.Tx, refID string, payload []byte) error {
+// scheduleNotifyFailureMetaAlert 在 notify_send 最终失败的同一短事务里登记一条
+// 元告警：发给 FAULT_NOTIFY_FALLBACK_* ，payload.meta_alert=true，round 沿用原意图。
+// fallback 为空时写时间线说明"无兜底目标"（D5），不静默、不 Schedule。
+// 本函数只 Schedule，绝不做 HTTP。
+func scheduleNotifyFailureMetaAlert(ctx context.Context, tx pgx.Tx, sched notifyOutboxScheduler, faults metaAlertFaultRepo, channel, target string, now time.Time, original notify.SendRequest) error {
+	if original.MetaAlert {
+		return nil
+	}
+	if channel == "" || target == "" {
+		return writeNoFallbackAudit(ctx, tx, faults, original, now)
+	}
+	if sched == nil {
+		return writeNoFallbackAudit(ctx, tx, faults, original, now)
+	}
+	meta := buildMetaAlertRequest(original, channel, target, now)
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("app: 序列化元告警 notify_send 失败: %w", err)
+	}
+	if err := sched.Schedule(ctx, tx, notifySendTimerKind, notifySendRefID(meta), now, payload); err != nil {
+		return fmt.Errorf("app: 注册元告警 notify_send 失败: %w", err)
+	}
+	return nil
+}
+
+type metaAlertFaultRepo interface {
+	AppendTimeline(ctx context.Context, tx pgx.Tx, entry domain.FaultTimelineEntry) (string, error)
+}
+
+func buildMetaAlertRequest(original notify.SendRequest, channel, target string, now time.Time) notify.SendRequest {
+	return notify.SendRequest{
+		AlertID:     original.AlertID,
+		GroupKey:    original.GroupKey,
+		IncidentID:  original.IncidentID,
+		Step:        original.Step,
+		ChannelKind: channel,
+		Target:      target,
+		Round:       original.Round,
+		MetaAlert:   true,
+		Msg: notify.Message{
+			AlertIDs:     original.Msg.AlertIDs,
+			GroupKey:     original.Msg.GroupKey,
+			Severity:     original.Msg.Severity,
+			Title:        "通知发送失败",
+			Body:         metaAlertBody(original),
+			DetailURL:    original.Msg.DetailURL,
+			ResourceType: original.Msg.ResourceType,
+			ResourceID:   original.Msg.ResourceID,
+			OccurredAt:   now,
+		},
+	}
+}
+
+// metaAlertBody 只描述资源身份，禁止带上原始通知目标 URL（不变量 13）。
+func metaAlertBody(original notify.SendRequest) string {
+	switch {
+	case original.AlertID != "":
+		return fmt.Sprintf("告警 %s 的通知在重试耗尽后仍未送达。", original.AlertID)
+	case original.IncidentID != "":
+		return fmt.Sprintf("Incident %s 的通报在重试耗尽后仍未送达。", original.IncidentID)
+	case original.GroupKey != "":
+		return fmt.Sprintf("分组 %s 的通知在重试耗尽后仍未送达。", original.GroupKey)
+	default:
+		return "一条通知在重试耗尽后仍未送达。"
+	}
+}
+
+func writeNoFallbackAudit(ctx context.Context, tx pgx.Tx, faults metaAlertFaultRepo, original notify.SendRequest, now time.Time) error {
+	faultID := ""
+	if original.Msg.ResourceType == "fault" {
+		faultID = original.Msg.ResourceID
+	}
+	if faultID == "" {
+		faultID = faultIDFromNotifyGroupKey(original.GroupKey)
+	}
+	if faultID != "" && faults != nil {
+		if _, err := faults.AppendTimeline(ctx, tx, domain.FaultTimelineEntry{
+			FaultID: faultID, Actor: "system", Action: domain.FaultTimelineActionNotifySkipped, At: now,
+			Detail: map[string]any{"reason": "notify_send_failed_no_fallback"},
+		}); err != nil {
+			return fmt.Errorf("app: 写入无兜底目标时间线失败: %w", err)
+		}
+		return nil
+	}
+	log.Printf("notify: 发送最终失败且无兜底目标，跳过元告警 alert=%s group=%s", original.AlertID, original.GroupKey)
+	return nil
+}
+
+func faultIDFromNotifyGroupKey(groupKey string) string {
+	const prefix = "fault:"
+	if !strings.HasPrefix(groupKey, prefix) {
+		return ""
+	}
+	rest := groupKey[len(prefix):]
+	if i := strings.LastIndex(rest, ":"); i > 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+// notifySendPayloadHandler 构造 "notify_send" 的 scheduler.DetachedHandler：解码
+// payload 为 notify.SendRequest，交给 notify.Sender.Send。
+//
+// 这是唯一一个注册成「事务外执行」模式的 kind（scheduler.RegisterDetachedHandler），
+// 因为它是唯一一个 handler 内部必然发生外部 IO 的 kind：Sender.Send 自己开独立小事务
+// 做占位写入/状态回写（notify.Sender 的 txRunner），中间夹着同步的 HTTP/SMTP 发送与
+// 指数退避重试。如果按默认模式在 scheduler 的 per-timer 事务内调用，那个事务会在整段
+// 外部 IO 期间保持打开、一直持有这条 notify_send 的 timers 行锁和一个连接池连接——
+// 慢渠道或超时渠道会把事务和行锁的持有时间拉到分钟级。
+//
+// 因此签名里没有 tx，也不需要：scheduler 先在短事务里把这条定时器 claim 下来（带租约）
+// 并提交、释放行锁，之后才调用本函数；执行结果由 scheduler 另开短事务回写。崩溃安全性
+// 由租约负责（claimed 不是终态，租约过期后重新领取）。
+//
+// 口径与改造前完全一致地保持 at-least-once：Sender 的 notification_log 幂等键（含随
+// payload 持久化的 Round）只收敛逻辑性的重复调度，**消除不了**「HTTP/SMTP 已经发出、
+// 结果还没确认就崩溃」的重发窗口——重投时看到的记录是 pending 而不是 sent，消息会真的
+// 再发一次。这是外部 IO 无法参与数据库事务的固有代价（CLAUDE.md 不变量 4 已裁决接受），
+// 租约机制换掉的只是「崩溃后永远不再重投、通知永久丢失」这个更坏的行为。
+func notifySendPayloadHandler(sender *notify.Sender) scheduler.DetachedHandler {
+	return func(ctx context.Context, _ string, payload []byte) error {
 		var req notify.SendRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return fmt.Errorf("app: 反序列化 notify_send payload 失败: %w", err)

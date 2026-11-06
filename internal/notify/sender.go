@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -88,6 +89,11 @@ type SendRequest struct {
 	// 没有这个字段时，重复提醒/组重复通知等"合法的下一轮发送"会被幂等键误判为
 	// "同一次发送的重投"而永久不再发送（R6.5 要求的 repeat_interval 重发）。
 	Round int64
+
+	// MetaAlert 为 true 表示这是发送最终失败后的兜底元告警。元告警自身最终失败
+	// 只记日志与时间线，不再 Schedule 下一条，从根上杜绝递归。旧 payload 反序列化
+	// 出的零值是 false，在途的普通 notify_send 不受影响。
+	MetaAlert bool `json:"meta_alert,omitempty"`
 }
 
 // Sender 是可靠发送的编排层（R6.1/R6.3/R13.6）：占位写入 notification_log 做幂等去重，
@@ -114,6 +120,12 @@ type Sender struct {
 	// 与 MaxAttempts 等三个可调字段同一约定。
 	Resolver ContactResolver
 
+	// OnFinalFailure 可选。在 markFailed 写 failed + 时间线的同一短事务里调用，
+	// 由 internal/app 注入：Schedule 一条 meta_alert=true 的 notify_send，或在
+	// fallback 为空时写"无兜底目标"时间线。req.MetaAlert 为 true 时不调用，避免递归。
+	// 禁止在这里做同步 HTTP——必须只 Schedule。
+	OnFinalFailure func(ctx context.Context, tx pgx.Tx, original SendRequest) error
+
 	// 以下三项均有默认值（见 defaultMaxAttempts 等常量），构造后可直接覆盖用于调参/测试。
 	MaxAttempts    int
 	InitialBackoff time.Duration
@@ -139,6 +151,12 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 // 重试多少次、进程崩溃后重投多少次，都能算出同一个键，从而命中 notification_log 的
 // UNIQUE(idempotency_key) 去重；而下一轮 repeat/升级会带上不同的 Round，天然算出
 // 不同的键，不会被误判为重投。
+//
+// MetaAlert 必须参与键：Fault 通知在 owner team 无渠道时本来就发往 fallback 目标，
+// 它失败后的元告警又发往同一 channel+target，若不加这一维，元告警会命中原记录的
+// 幂等键，把"从未送达"的那条 notification_log 改写成 sent（实测复现），既抹掉了
+// 要暴露的失败，也让送达类指标把失败计成成功。只在 MetaAlert 为真时追加尾段，
+// 在途旧 payload 反序列化出 false，键与改动前逐字节一致。
 func idempotencyKey(req SendRequest) string {
 	resourceKey := req.AlertID
 	if resourceKey == "" {
@@ -151,7 +169,11 @@ func idempotencyKey(req SendRequest) string {
 	if req.Step != nil {
 		step = strconv.Itoa(*req.Step)
 	}
-	return strings.Join([]string{resourceKey, step, req.ChannelKind, req.Target, strconv.FormatInt(req.Round, 10)}, idempotencyKeySep)
+	parts := []string{resourceKey, step, req.ChannelKind, req.Target, strconv.FormatInt(req.Round, 10)}
+	if req.MetaAlert {
+		parts = append(parts, "meta")
+	}
+	return strings.Join(parts, idempotencyKeySep)
 }
 
 // Send 执行一次可靠发送。流程：
@@ -283,6 +305,8 @@ func (s *Sender) placeholder(ctx context.Context, req SendRequest, key string) (
 
 // markFailed 把 notification_log 标记为 failed，并按 appendResultTimeline 的扇出规则
 // 补时间线记录（含分组通知——按 Msg.AlertIDs 逐条扇出，不再只处理单告警发送）。
+// 同一短事务里：普通发送失败会调用 OnFinalFailure 去 Schedule 元告警；元告警自身
+// 失败只记日志，不再 Schedule，避免递归。
 func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, totalAttempts int, sendErr error) error {
 	lastError := sendErr.Error()
 	// detail 里的 error 截断到 200 字符：时间线是给人看的摘要，不是错误堆栈全文；
@@ -295,7 +319,17 @@ func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, 
 		if err := s.logs.UpdateStatus(ctx, tx, logID, "failed", totalAttempts, lastError); err != nil {
 			return err
 		}
-		return s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifyFailed, totalAttempts, "failed", detailError)
+		if err := s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifyFailed, totalAttempts, "failed", detailError); err != nil {
+			return err
+		}
+		if req.MetaAlert {
+			log.Printf("notify: 元告警最终失败，不再调度新的 notify_send resource=%s group=%s", req.AlertID, req.GroupKey)
+			return nil
+		}
+		if s.OnFinalFailure == nil {
+			return nil
+		}
+		return s.OnFinalFailure(ctx, tx, req)
 	})
 	if updateErr != nil {
 		return fmt.Errorf("notify: 发送失败(%v)且回写状态失败: %w", sendErr, updateErr)

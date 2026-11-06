@@ -187,6 +187,31 @@ func TestGrafanaAdapter_Firing(t *testing.T) {
 	if got := signalContextField(t, e, "org_id"); got != float64(1) {
 		t.Errorf("signal_context.org_id = %v，期望 1", got)
 	}
+	if e.Source != domain.SourceKindGrafana {
+		t.Errorf("Source = %q，期望 grafana", e.Source)
+	}
+	if e.UpstreamFingerprint != "xyz789" {
+		t.Errorf("UpstreamFingerprint = %q，期望 payload.alerts[].fingerprint", e.UpstreamFingerprint)
+	}
+	if e.SourceUpdatedAt.IsZero() {
+		t.Error("SourceUpdatedAt 应与 Alertmanager 同口径写入")
+	}
+}
+
+func TestGrafanaAdapter_MissingFingerprintRejected(t *testing.T) {
+	adapter := NewGrafanaAdapter(domain.SeverityWarning)
+	events, err := adapter.Parse([]byte(`{
+		"status":"firing","alerts":[{
+			"status":"firing","startsAt":"2026-07-30T03:00:00Z",
+			"labels":{"alertname":"NoFP"},"annotations":{"summary":"no fingerprint"}
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("Parse 本身不因缺 fingerprint 失败: %v", err)
+	}
+	if err := normalizeAndValidate(&events[0], domain.SourceKindGrafana); err == nil {
+		t.Fatal("权威来源缺 fingerprint 应被拒绝")
+	}
 }
 
 func TestGrafanaAdapter_Resolved(t *testing.T) {
@@ -206,6 +231,12 @@ func TestGrafanaAdapter_Resolved(t *testing.T) {
 	want := mustParseTime(t, "2026-07-30T03:20:00Z")
 	if !e.EndsAt.Equal(want) {
 		t.Errorf("EndsAt = %v，期望 %v（resolved 状态应透传 endsAt）", e.EndsAt, want)
+	}
+	if e.UpstreamFingerprint != "xyz789" {
+		t.Errorf("resolved UpstreamFingerprint = %q，期望 xyz789", e.UpstreamFingerprint)
+	}
+	if !e.SourceUpdatedAt.Equal(want) {
+		t.Errorf("resolved SourceUpdatedAt = %v，期望与 EndsAt 同口径", e.SourceUpdatedAt)
 	}
 }
 

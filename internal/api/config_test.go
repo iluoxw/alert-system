@@ -139,6 +139,16 @@ func (s *cfgUserStore) Update(ctx context.Context, tx pgx.Tx, id, displayName, e
 	return nil
 }
 
+func (s *cfgUserStore) UpdateLarkOpenID(ctx context.Context, tx pgx.Tx, id, openID string) error {
+	u, ok := s.byID[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	u.LarkOpenID = openID
+	s.byID[id] = u
+	return nil
+}
+
 func (s *cfgUserStore) Delete(ctx context.Context, tx pgx.Tx, id string) error {
 	if _, ok := s.byID[id]; !ok {
 		return store.ErrNotFound
@@ -911,6 +921,35 @@ func TestCreateRoute_StormThresholdNegative_Returns422(t *testing.T) {
 	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// repeat_interval_seconds 为负数 → 422（缺陷 1 修复：0 表示不覆盖路由级间隔，
+// 沿用全局默认，负数无实际语义，与 storm_threshold_per_min 同一校验口径）。
+func TestCreateRoute_RepeatIntervalNegative_Returns422(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 8, "target_team_id": team.ID, "repeat_interval_seconds": -1,
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// repeat_interval_seconds = 0 → 201（0 是合法值，表示使用全局默认）。
+func TestCreateRoute_RepeatIntervalZero_Success(t *testing.T) {
+	env := newCfgTestEnv(t)
+	team, _ := env.teams.Create(context.Background(), nil, "sre")
+	body := map[string]any{
+		"priority": 9, "target_team_id": team.ID, "repeat_interval_seconds": 0,
+		"matchers": []map[string]string{{"name": "env", "op": "=", "value": "prod"}},
+	}
+	w := env.do(t, http.MethodPost, "/api/v1/admin/routes", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
 	}
 }
 

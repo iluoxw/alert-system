@@ -21,12 +21,14 @@ import (
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
+	"alert-system/internal/ccloud"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	"alert-system/internal/events"
 	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
 	"alert-system/internal/notify"
+	"alert-system/internal/ops"
 	"alert-system/internal/runbook"
 	"alert-system/internal/store"
 )
@@ -37,8 +39,6 @@ var version = "dev"
 func main() {
 	configPath := flag.String("config", "", "YAML 配置文件路径（可选）")
 	defaultTeamID := flag.String("default-team-id", "", "路由未命中任何规则时的兜底团队 ID（可选，留空表示不路由）")
-	fakeRunbookExecutor := flag.Bool("e2e-fake-runbooks", false, "仅用于隔离的本地 E2E：启用不修改外部状态的 Runbook 假执行器")
-	enableE2BUATRunbooks := flag.Bool("enable-e2b-uat-runbooks", false, "显式启用隔离 E2B UAT 生命周期 Runbook（需要专用 UAT 配置）")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -55,26 +55,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if *fakeRunbookExecutor && *enableE2BUATRunbooks {
-		fmt.Println("启动失败: -e2e-fake-runbooks 与 -enable-e2b-uat-runbooks 不能同时启用")
-		os.Exit(1)
-	}
-	uatRuntime, err := buildE2BUATRuntime(*enableE2BUATRunbooks)
-	if err != nil {
-		fmt.Printf("加载 E2B UAT Runbook 配置失败: %v\n", err)
-		os.Exit(1)
-	}
-	var runbookExecutor runbook.Executor = uatRuntime.Executor
-	if *fakeRunbookExecutor {
-		runbookExecutor = runbook.NewFakeExecutor()
-		logger.Warn("alert-system: 已启用本地 E2E Runbook 假执行器", "external_mutation", false)
-	}
-	if *enableE2BUATRunbooks {
-		logger.Warn("alert-system: 已启用隔离 E2B UAT 生命周期执行器",
-			"host", uatRuntime.Host, "allowed_template_count", uatRuntime.AllowedTemplateCount,
-			"authorization_expires_at", uatRuntime.AuthorizationExpires)
-	}
-	if err := run(ctx, cfg, *defaultTeamID, runbookExecutor, uatRuntime.Policy, logger); err != nil {
+	if err := run(ctx, cfg, *defaultTeamID, runbook.DisabledExecutor{}, logger); err != nil {
 		logger.Error("alert-system: 退出", "err", err)
 		os.Exit(1)
 	}
@@ -82,7 +63,7 @@ func main() {
 
 // run 组装全部依赖，启动 HTTP 服务与后台 worker，阻塞直到 ctx 被取消（收到中断信号）
 // 或 HTTP 服务异常退出。
-func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, uatPolicy runbook.UATPolicy, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, logger *slog.Logger) error {
 	st, err := store.New(ctx, cfg.DBDSN)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
@@ -148,6 +129,16 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	if err := app.ReconcileOpsTimers(ctx, st, opsRepo, sched); err != nil {
 		logger.Error("alert-system: ops 定时器启动对账失败", "err", err)
 	}
+	// ---- 同样的启动对账，补建所有 open Incident 缺失的 incident_recovery_nudge
+	// 定时器（INCIDENT_NUDGE_INTERVAL<=0 时函数内部直接跳过）----
+	if err := app.ReconcileIncidentNudgeTimers(ctx, st, incidents, sched, cfg.IncidentNudgeInterval); err != nil {
+		logger.Error("alert-system: Incident 恢复提醒定时器启动对账失败", "err", err)
+	}
+	// ---- retention_sweep 启动对账：此前从未被调用，retention_sweep 从未启动，
+	// timers / notification_log 留存清理实际没有运行 ----
+	if err := app.ReconcileRetentionTimer(ctx, st, sched, cfg.Retention); err != nil {
+		logger.Error("alert-system: retention_sweep 定时器启动对账失败", "err", err)
+	}
 
 	// ---- ingest：三个上游 adapter，兜底等级统一取 domain.SeverityWarning（与
 	// integrations.default_severity 列的 DEFAULT 对齐；每 integration 各自的
@@ -157,12 +148,16 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
-	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
+	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).
+		WithProjector(a.AlertProjector).WithFaultActivation(a.FaultOutbox.TriggerFromMappingResult)
 
 	// ---- 飞书卡片回调：Ack/Resolve 从卡片按钮触发，与下面 REST API
 	// （/api/v1/alerts/{id}/ack|resolve，RegisterAlertRoutes）共用同一套
 	// stopper/lifecycle，保证两条处置路径的"停止升级链/生命周期定时器"不变量一致。----
-	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
+	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle).
+		SetLarkIdentityStore(users).
+		SetLarkActionStore(store.NewLarkCardActionRepo()).
+		SetLarkFaultStore(faults)
 
 	// ---- 告警变更实时推送：PG 触发器 pg_notify（migrations/000011）→ 专用连接
 	// LISTEN → 进程内 Bus → SSE。RunListener 是常驻 goroutine，独立于 st 的连接池，
@@ -187,17 +182,25 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterAlertSourceRoutes(alertSources, alertSourceReconciler)
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
-	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor, runbook.WithUATPolicy(uatPolicy))
+	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterFaultRoutes(faults)
+	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterOpsIndicatorsRoutes(ops.QueryIndicators)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
-	router.RegisterHealthRoutes(st.Pool.Ping)
+	router.RegisterHealthRoutes(api.ComposeReady(
+		api.DatabaseReady(st.Pool.Ping),
+		api.WorkerReady("scheduler", sched),
+		api.WorkerReady("pipeline", pl),
+	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpServer := &http.Server{
@@ -214,6 +217,15 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	go sched.Run(ctx)
 	go pl.Run(ctx)
 	go alertSourceReconciler.Run(ctx)
+	// ccloud 拓扑同步：仅在 Enabled() 时启动（D1），失败不阻断进程（R2.9）。
+	if cfg.CCloud.Enabled() {
+		client := ccloud.NewClient(cfg.CCloud.BaseURL, cfg.CCloud.TokenEnv, nil).WithPaths(ccloud.ClientPaths{
+			FullLink: cfg.CCloud.PathFullLink,
+			Service:  cfg.CCloud.PathService,
+			Health:   cfg.CCloud.PathHealth,
+		})
+		go ccloud.NewSyncer(st, topology, client, cfg.CCloud.ProjectIDs, cfg.CCloud.Environment, cfg.CCloud.SyncInterval, logger).Run(ctx)
+	}
 
 	select {
 	case <-ctx.Done():

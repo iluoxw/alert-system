@@ -18,30 +18,22 @@ import (
 	"time"
 )
 
-// noisePayload 构造一条 kind=grafana 可接收的 template.Data 兼容 webhook，与
-// helpers_test.go 的 compatibleWebhookPayload 结构一致，唯一区别是 title 由调用方显式
-// 指定而非硬编码成 alertname——场景①需要"只差 IP"的标题才能验证模板归一化，
-// 共享 helper 做不到这一点，故在本文件内单独实现。
+// noisePayload 构造 generic 信封，title 由调用方指定（场景①需要"只差 IP"的标题
+// 才能验证模板归一化）。Grafana 已是权威来源，本地降噪场景改走 generic。
 func noisePayload(alertname, severity, status, title string, extraLabels map[string]string, startsAt time.Time) []byte {
 	labels := map[string]string{"alertname": alertname, "severity": severity}
 	for k, v := range extraLabels {
 		labels[k] = v
 	}
-	body := map[string]any{
-		"version":  "4",
-		"status":   status,
-		"receiver": "e2e",
-		"alerts": []map[string]any{
-			{
-				"status":      status,
-				"labels":      labels,
-				"annotations": map[string]string{"summary": title},
-				"startsAt":    startsAt.Format(time.RFC3339Nano),
-				"endsAt":      "0001-01-01T00:00:00Z",
-			},
-		},
-	}
-	return mustJSON(body)
+	return mustJSON(map[string]any{
+		"rule_id":        alertname,
+		"severity":       severity,
+		"status":         status,
+		"title":          title,
+		"labels":         labels,
+		"resolve_policy": "source",
+		"starts_at":      startsAt.Format(time.RFC3339Nano),
+	})
 }
 
 // sameIDSet 判断 got 与 want 是否是完全相同的 ID 集合（忽略顺序、不容忍重复或
@@ -96,7 +88,7 @@ func TestScenarioNoise1_TemplateFingerprintMerge(t *testing.T) {
 	startsAt := time.Now()
 	post := func() {
 		for _, ip := range instances {
-			if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+			if _, _, err := client.postManagedHook(seedResult.GenericWebhookPath,
 				noisePayload(alertname, "critical", "firing", "Ping timeout from "+ip, map[string]string{"instance": ip}, startsAt)); err != nil {
 				t.Fatalf("e2e: ingest 请求失败: %v", err)
 			}
@@ -168,11 +160,11 @@ func TestScenarioNoise2_WindowModeMergesAllFingerprints(t *testing.T) {
 	alertnameB := "e2e-noise2-b-" + suffix
 	startsAt := time.Now()
 	post := func() {
-		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+		if _, _, err := client.postManagedHook(seedResult.GenericWebhookPath,
 			compatibleWebhookPayload(alertnameA, "critical", "firing", startsAt, map[string]string{"noise_scenario": scenarioTag})); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}
-		if _, _, err := client.postManagedHook(seedResult.GrafanaWebhookPath,
+		if _, _, err := client.postManagedHook(seedResult.GenericWebhookPath,
 			compatibleWebhookPayload(alertnameB, "critical", "firing", startsAt, map[string]string{"noise_scenario": scenarioTag})); err != nil {
 			t.Fatalf("e2e: ingest 请求失败: %v", err)
 		}

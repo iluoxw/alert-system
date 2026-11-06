@@ -12,10 +12,12 @@ import (
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
+	"alert-system/internal/ccloud"
 	"alert-system/internal/config"
 	"alert-system/internal/domain"
 	incidentservice "alert-system/internal/incident"
 	"alert-system/internal/ingest"
+	"alert-system/internal/ops"
 	"alert-system/internal/pipeline"
 	"alert-system/internal/runbook"
 	"alert-system/internal/scheduler"
@@ -54,11 +56,11 @@ type system struct {
 	Runbooks             *store.RunbookRepo
 	Services             *store.ServiceCatalogRepo
 	AlertMappings        *store.AlertMappingRepo
-	RunbookExecutor      *runbook.FakeExecutor
 
-	scheduler  *scheduler.Scheduler
-	pipeline   *pipeline.Pipeline
-	reconciler *alertsource.Reconciler
+	scheduler    *scheduler.Scheduler
+	pipeline     *pipeline.Pipeline
+	reconciler   *alertsource.Reconciler
+	ccloudSyncer *ccloud.Syncer
 }
 
 // buildSystem 组装全部依赖并起一个 httptest.Server，但不启动 scheduler/pipeline
@@ -90,7 +92,6 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	topology := store.NewTopologyRepo()
 	incidents := store.NewIncidentRepo()
 	runbooks := store.NewRunbookRepo()
-	runbookExecutor := runbook.NewFakeExecutor()
 	serviceCatalog := store.NewServiceCatalogRepo()
 	alertMappings := store.NewAlertMappingRepo()
 
@@ -122,6 +123,15 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	if err := app.ReconcileOpsTimers(context.Background(), st, opsRepo, sched); err != nil {
 		return nil, fmt.Errorf("e2e: ops 定时器启动对账失败: %w", err)
 	}
+	// 与生产 main.go 共用同一个 app.ReconcileIncidentNudgeTimers；E2E 默认关闭
+	// INCIDENT_NUDGE_INTERVAL 时函数内部直接跳过，保留调用只是不让两处装配分叉。
+	if err := app.ReconcileIncidentNudgeTimers(context.Background(), st, incidents, sched, cfg.IncidentNudgeInterval); err != nil {
+		return nil, fmt.Errorf("e2e: Incident 恢复提醒定时器启动对账失败: %w", err)
+	}
+	// 与生产 main.go 保持同一装配：retention_sweep 必须启动对账，否则清理任务永远不会运行。
+	if err := app.ReconcileRetentionTimer(context.Background(), st, sched, cfg.Retention); err != nil {
+		return nil, fmt.Errorf("e2e: retention_sweep 定时器启动对账失败: %w", err)
+	}
 
 	// 既有本地路由/分组/通知场景改走 Grafana 兼容入口；Alertmanager 在新架构中
 	// 是唯一 Alert 权威来源，只镜像事实，不再重复执行本地路由/静默/通知。
@@ -131,9 +141,13 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
 	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
-	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).WithProjector(a.AlertProjector)
+	reconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).
+		WithProjector(a.AlertProjector).WithFaultActivation(a.FaultOutbox.TriggerFromMappingResult)
 
-	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle)
+	larkServer := api.NewServer(alerts, timeline, st, cfg.Lark.VerificationToken, cfg.Lark.EncryptKey, logger, stopper, lifecycle).
+		SetLarkIdentityStore(users).
+		SetLarkActionStore(store.NewLarkCardActionRepo()).
+		SetLarkFaultStore(faults)
 
 	auth := api.NewPasswordAuthenticator(users)
 	router := api.NewRouter(cfg, users, sessions, memberships, st, auth, larkServer.Handler(), logger)
@@ -152,19 +166,37 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.RegisterAlertRoutes(alerts, timeline, changeEvents, stopper, lifecycle)
 	router.RegisterAlertSourceRoutes(alertSources, reconciler)
 	incidentService := incidentservice.NewService(st, faults, incidents, a.IncidentOutbox)
+	larkServer.SetLarkIncidentTransitioner(incidentService)
 	router.RegisterIncidentRoutes(incidentService)
-	runbookService := runbook.NewService(st, incidents, runbooks, runbookExecutor)
+	runbookService := runbook.NewService(st, incidents, runbooks, runbook.DisabledExecutor{})
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
+	router.RegisterFaultRoutes(faults)
+	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
+	router.RegisterOpsIndicatorsRoutes(ops.QueryIndicators)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
-	router.RegisterHealthRoutes(st.Pool.Ping)
+	router.RegisterHealthRoutes(api.ComposeReady(
+		api.DatabaseReady(st.Pool.Ping),
+		api.WorkerReady("scheduler", sched),
+		api.WorkerReady("pipeline", pl),
+	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
 
 	httpSrv := httptest.NewServer(router)
+
+	var ccloudSyncer *ccloud.Syncer
+	if cfg.CCloud.Enabled() {
+		client := ccloud.NewClient(cfg.CCloud.BaseURL, cfg.CCloud.TokenEnv, nil).WithPaths(ccloud.ClientPaths{
+			FullLink: cfg.CCloud.PathFullLink,
+			Service:  cfg.CCloud.PathService,
+			Health:   cfg.CCloud.PathHealth,
+		})
+		ccloudSyncer = ccloud.NewSyncer(st, topology, client, cfg.CCloud.ProjectIDs, cfg.CCloud.Environment, cfg.CCloud.SyncInterval, logger)
+	}
 
 	return &system{
 		Store:                st,
@@ -187,10 +219,10 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		Runbooks:             runbooks,
 		Services:             serviceCatalog,
 		AlertMappings:        alertMappings,
-		RunbookExecutor:      runbookExecutor,
 		scheduler:            sched,
 		pipeline:             pl,
 		reconciler:           reconciler,
+		ccloudSyncer:         ccloudSyncer,
 	}, nil
 }
 
@@ -199,6 +231,9 @@ func (s *system) run(ctx context.Context) {
 	go s.scheduler.Run(ctx)
 	go s.pipeline.Run(ctx)
 	go s.reconciler.Run(ctx)
+	if s.ccloudSyncer != nil {
+		go s.ccloudSyncer.Run(ctx)
+	}
 }
 
 // close 关闭 httptest.Server 与数据库连接池。

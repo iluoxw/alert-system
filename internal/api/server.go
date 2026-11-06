@@ -44,6 +44,7 @@ type Router struct {
 	sessionTTL     time.Duration
 	sessionIdleTTL time.Duration
 	cookieSecure   bool
+	corsOrigins    []string
 
 	logger *slog.Logger
 }
@@ -74,6 +75,7 @@ func NewRouter(cfg config.Config, users UserStore, sessions SessionStore, member
 		sessionTTL:     cfg.SessionTTL,
 		sessionIdleTTL: cfg.SessionIdleTTL,
 		cookieSecure:   cfg.SessionCookieSecure,
+		corsOrigins:    cfg.CORSAllowedOrigins,
 		logger:         logger,
 	}
 	r.mount(larkHandler)
@@ -85,6 +87,7 @@ func (r *Router) mount(larkHandler http.Handler) {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	engine.Use(corsMiddleware(r.corsOrigins))
 
 	v1 := engine.Group("/api/v1")
 	v1.POST("/auth/login", r.handleLogin)
