@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,8 +47,17 @@ type Store interface {
 
 // PGStore 是 Store 的生产实现，包装 *store.Store 与 *store.EventQueue。
 type PGStore struct {
-	st     *store.Store
-	events *store.EventQueue
+	st          *store.Store
+	events      *store.EventQueue
+	recordBatch BatchRecorder
+}
+
+// BatchRecorder 在 managed hook 的原有事务中记录分组分析意图。
+type BatchRecorder func(context.Context, pgx.Tx, string, json.RawMessage, []domain.AlertEvent) error
+
+func (p *PGStore) WithBatchRecorder(record BatchRecorder) *PGStore {
+	p.recordBatch = record
+	return p
 }
 
 // NewPGStore 构造 PGStore。
@@ -70,6 +80,10 @@ func (p *PGStore) GetIntegrationByHookIDHash(ctx context.Context, hookIDHash str
 }
 
 func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events []domain.AlertEvent) error {
+	return p.EnqueueWebhookBatch(ctx, integrationID, nil, events)
+}
+
+func (p *PGStore) EnqueueWebhookBatch(ctx context.Context, integrationID string, raw json.RawMessage, events []domain.AlertEvent) error {
 	return p.st.WithTx(ctx, func(tx pgx.Tx) error {
 		for _, e := range events {
 			if _, err := p.events.Enqueue(ctx, tx, integrationID, e); err != nil {
@@ -84,6 +98,9 @@ func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events
 			`, integrationID); err != nil {
 				return fmt.Errorf("ingest: 更新 Alertmanager webhook 水位失败: %w", err)
 			}
+		}
+		if p.recordBatch != nil && raw != nil && len(events) > 0 && events[0].Source == domain.SourceKindAlertmanager {
+			return p.recordBatch(ctx, tx, integrationID, raw, events)
 		}
 		return nil
 	})
@@ -118,22 +135,21 @@ func (s *Server) handleManagedHook(w http.ResponseWriter, r *http.Request) {
 	hookID := r.PathValue("hook_id")
 	if !validManagedHookID(hookID) {
 		// hook UUID 是 bearer credential，非法与不存在必须保持同一响应，且日志不能记录它。
-		s.reject(w, "", "hook 不存在", http.StatusUnauthorized)
+		s.reject(w, "", "unknown_hook", http.StatusUnauthorized, 0, "hook 不存在")
 		return
 	}
 
 	integ, err := s.store.GetIntegrationByHookIDHash(ctx, hashHookID(hookID))
 	if err != nil {
 		if errors.Is(err, ErrIntegrationNotFound) {
-			s.reject(w, "", "hook 不存在", http.StatusUnauthorized)
+			s.reject(w, "", "unknown_hook", http.StatusUnauthorized, 0, "hook 不存在")
 			return
 		}
-		s.logger.Error("ingest: 按 managed hook 查询 integration 失败", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		s.reject(w, "", "source_lookup_failed", http.StatusInternalServerError, 0, "internal error")
 		return
 	}
 	if !integ.Enabled {
-		s.reject(w, integ.ID, "integration 已禁用", http.StatusUnauthorized)
+		s.reject(w, integ.ID, "source_disabled", http.StatusUnauthorized, 0, "integration 已禁用")
 		return
 	}
 	s.handleIntegration(w, r, integ)
@@ -144,25 +160,24 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request, integ
 	integrationID := integ.ID
 	adapter, ok := s.registry.Get(integ.Kind)
 	if !ok {
-		s.logger.Error("ingest: 未注册 adapter", "integration_id", integrationID, "kind", integ.Kind)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		s.reject(w, integrationID, "adapter_unavailable", http.StatusInternalServerError, 0, "internal error")
 		return
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		s.reject(w, integrationID, "body 超出大小限制或读取失败", http.StatusRequestEntityTooLarge)
+		s.reject(w, integrationID, "body_read_failed", http.StatusRequestEntityTooLarge, len(body), "body 超出大小限制或读取失败")
 		return
 	}
 
 	events, err := adapter.Parse(body)
 	if err != nil {
-		s.reject(w, integrationID, "payload 解析失败: "+err.Error(), http.StatusBadRequest, body)
+		s.reject(w, integrationID, "parse_failed", http.StatusBadRequest, len(body), "payload 解析失败: "+err.Error())
 		return
 	}
 	if len(events) == 0 {
-		s.reject(w, integrationID, "payload 不含任何事件", http.StatusBadRequest, body)
+		s.reject(w, integrationID, "empty_batch", http.StatusBadRequest, len(body), "payload 不含任何事件")
 		return
 	}
 
@@ -170,14 +185,20 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request, integ
 	// 与「WithTx 内全部 Enqueue」的落库语义保持一致（要么全成功，要么什么都不落）。
 	for i := range events {
 		if err := normalizeAndValidate(&events[i], integ.Kind); err != nil {
-			s.reject(w, integrationID, fmt.Sprintf("第 %d 条事件校验失败: %v", i, err), http.StatusBadRequest, body)
+			s.reject(w, integrationID, "validation_failed", http.StatusBadRequest, len(body), fmt.Sprintf("第 %d 条事件校验失败: %v", i, err))
 			return
 		}
 	}
 
-	if err := s.store.EnqueueBatch(ctx, integ.ID, events); err != nil {
-		s.logger.Error("ingest: 写入事件队列失败", "integration_id", integrationID, "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	if batchStore, ok := s.store.(interface {
+		EnqueueWebhookBatch(context.Context, string, json.RawMessage, []domain.AlertEvent) error
+	}); ok && integ.Kind == alertmanagerKind {
+		err = batchStore.EnqueueWebhookBatch(ctx, integ.ID, body, events)
+	} else {
+		err = s.store.EnqueueBatch(ctx, integ.ID, events)
+	}
+	if err != nil {
+		s.reject(w, integrationID, "enqueue_failed", http.StatusInternalServerError, len(body), "internal error")
 		return
 	}
 
@@ -211,15 +232,14 @@ func hashHookID(hookID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// reject 写入统一的错误响应，并按 R1.4 记录结构化拒绝日志：只记 integration_id 与
-// 原因，绝不记 token；body 只在与 payload 内容相关的拒绝路径上传入，且会被截断为摘要。
-func (s *Server) reject(w http.ResponseWriter, integrationID, reason string, status int, body ...[]byte) {
-	attrs := []any{"integration_id", integrationID, "reason", reason, "status", status}
-	if len(body) > 0 && len(body[0]) > 0 {
-		attrs = append(attrs, "body_snippet", truncateSnippet(body[0], 200))
+// response 可以包含上游传入的非法值。审计只记录稳定的分类与实际读取字节数。
+func (s *Server) reject(w http.ResponseWriter, integrationID, category string, status, bytesRead int, response string) {
+	level := slog.LevelWarn
+	if status >= http.StatusInternalServerError {
+		level = slog.LevelError
 	}
-	s.logger.Warn("ingest: 拒绝请求", attrs...)
-	http.Error(w, reason, status)
+	s.logger.Log(context.Background(), level, "ingest: 拒绝请求", "integration_id", integrationID, "reason", category, "status", status, "body_bytes_read", bytesRead)
+	http.Error(w, response, status)
 }
 
 // truncateSnippet 把 body 截断为最多 n 字节的摘要，用于拒绝日志（不落全量 payload）。

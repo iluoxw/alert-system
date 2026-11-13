@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"alert-system/internal/agentdelivery"
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
@@ -147,7 +148,21 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	registry.Register(ingest.NewAlertmanagerAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGrafanaAdapter(domain.SeverityWarning))
 	registry.Register(ingest.NewGenericAdapter())
-	ingestServer := ingest.NewServer(registry, ingest.NewPGStore(st), logger)
+	agentCfg, err := agentdelivery.LoadServerConfig(os.Getenv("AGENT_DELIVERY_CONFIG"))
+	if err != nil {
+		return fmt.Errorf("加载分析任务配置失败: %w", err)
+	}
+	pgIngest := ingest.NewPGStore(st)
+	var delivery *agentdelivery.Runtime
+	if agentCfg != nil {
+		workerCtx, stopWorkers := context.WithCancel(ctx)
+		delivery = agentdelivery.NewRuntime(agentCfg, st, cfg.DBDSN, logger, workerCtx)
+		delivery.AttachIngest(pgIngest)
+		done := make(chan struct{})
+		go func() { defer close(done); delivery.Run(workerCtx) }()
+		defer func() { stopWorkers(); <-done }()
+	}
+	ingestServer := ingest.NewServer(registry, pgIngest, logger)
 	alertSourceReconciler := alertsource.NewReconciler(st, alertSources, alerts, timeline, nil, logger).
 		WithProjector(a.AlertProjector).WithFaultActivation(a.FaultOutbox.TriggerFromMappingResult)
 
@@ -202,6 +217,9 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 		api.WorkerReady("pipeline", pl),
 	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
+	if delivery != nil {
+		delivery.Mount(router.MountUnauthenticated)
+	}
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),

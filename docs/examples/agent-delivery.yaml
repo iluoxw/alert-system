@@ -1,0 +1,24 @@
+# AGENT_DELIVERY_CONFIG 指向此文件。替换 source UUID、客户端标识和凭据摘要。
+routing:
+  source_ids: ["00000000-0000-4000-8000-000000000001"]
+  routes:
+    - name: critical-ops
+      source: alertmanager
+      severity: critical
+      labels: {team: infra}
+      role: ops
+      ttl: 15m
+      max_attempts: 3
+      priority: 10
+      ack_mode: on_receive
+  fallback:
+    name: triage
+    role: triage
+    ttl: 1h
+clients:
+  - client_id: ops-01
+    role: ops
+    token_sha256: REPLACE_WITH_SHA256_OF_OPS_TOKEN
+  - client_id: triage-01
+    role: triage
+    token_sha256: REPLACE_WITH_SHA256_OF_TRIAGE_TOKEN
