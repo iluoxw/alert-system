@@ -213,3 +213,32 @@ Sealed Secrets 或平台 Secret 管理能力创建 `sre-control-secrets`。示�
 | `deploy/k8s/` | Kubernetes base、local/production overlay 与管理员引导 Job |
 | `test/e2e/` | docker-compose + 真实 PG 的场景化 E2E |
 | `web/` | 前端（Vite + React + AntD） |
+
+## 外部分析客户端（M1）
+
+如需按角色把一组 Alertmanager 告警交给本地分析程序，在服务端设置 `AGENT_DELIVERY_CONFIG`，指向[分发配置](docs/examples/agent-delivery.yaml)。先应用数据库迁移，再填写已登记来源的稳定 source ID、匹配规则、每角色的 TTL 和客户端身份。配置在服务启动时加载。未设置此变量的实例按原有方式接入告警。
+
+为每个客户端分配独立的随机 bearer token。服务端配置只保存 token 的 SHA-256 十六进制摘要，客户端从配置引用的环境变量读取明文。轮换时可为同一客户端和角色短暂配置两个不同摘要，更新客户端后移除旧摘要并重启服务实例。生产部署通过 TLS 入口暴露 `/api/v1/agent/`。
+
+```bash
+go build -o ./agent-client ./cmd/agent-client
+./agent-client -config /etc/sre-control/agent-client.yaml
+```
+
+[客户端配置示例](cmd/agent-client/example.yaml)指定并发、匹配条件、固定可执行文件及超时。上游组数据和投递意图一起入库，客户端按空闲槽位领取，确认 ACK 后将脱敏的 Envelope JSON 通过 stdin 交给 handler。ACK 前断线会在租约到期后重新分配任务，ACK 后崩溃或 handler 超时可能漏掉该次分析。critical 告警仍通过独立通知渠道送达值班人。协议与验收见 [M1 设计](.spec-workflow/specs/agent-delivery/design.md)。
+
+客户端需要支持进程组的 Unix 环境。每次领取至多 8 条，每条租约最长 30 秒。handler 输入包含来源 ID、事件类型、接收器和告警组的标识摘要，以及各成员的标识摘要、告警名、状态、级别、起止时间和截断数量。同一来源的 firing 与 resolved 可通过 `group_ref` 对照。上游缺少 `groupKey` 时，组标识按已收到的成员计算。自由文本 annotations、任意 labels 和内部 URL 留在服务端。默认日志只记录消息 ID、退出码、耗时和输出字节数。需要查看输出时，配置仅运行用户可访问的 `result_dir`，每次执行分别保留 stdout 和 stderr 的前 8 KiB。
+
+排查积压或未执行的任务时，可使用只读数据库账号执行以下查询。终态任务及其审计事件保留 7 天。
+
+```sql
+SELECT role, status, count(*) AS messages, min(created_at) AS oldest_enqueued_at
+FROM agent_messages GROUP BY role, status ORDER BY role, status;
+
+SELECT status, count(*) AS batches, max(failures) AS most_failures
+FROM agent_batches GROUP BY status;
+
+-- $1 为客户端日志中的 message_id
+SELECT at, kind, from_status, to_status, actor, detail
+FROM agent_message_events WHERE message_id = $1 ORDER BY id;
+```
