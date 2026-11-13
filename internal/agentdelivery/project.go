@@ -72,6 +72,8 @@ type projectedMember struct {
 }
 
 type projectedPayload struct {
+	ReceiverRef     string            `json:"receiver_ref"`
+	GroupRef        string            `json:"group_ref"`
 	TruncatedAlerts int               `json:"truncatedAlerts"`
 	Alerts          []projectedMember `json:"alerts"`
 }
@@ -125,16 +127,22 @@ func projectGroup(sourceID string, raw json.RawMessage, events []domain.AlertEve
 			env.Labels[key] = value
 		}
 	}
-	parts := []string{sourceID, fields.Receiver, env.EventType, fields.GroupKey}
+	groupIdentity := []string{fields.GroupKey}
 	if fields.GroupKey == "" {
 		refs := make([]string, 0, len(events))
 		for _, m := range payload.Alerts {
 			refs = append(refs, m.Ref)
 		}
 		sort.Strings(refs)
-		parts = append(parts, refs...)
+		groupIdentity = append(groupIdentity, refs...)
 	}
-	env.DedupKey = digestFields(parts...)
+	payload.ReceiverRef = digestFields(sourceID, fields.Receiver)
+	groupFields := append([]string{sourceID, fields.Receiver}, groupIdentity...)
+	payload.GroupRef = digestFields(groupFields...)
+	// GroupRef relates lifecycle phases without disclosing receiver or groupKey.
+	// The queue still tracks firing and resolved messages independently.
+	dedupFields := append([]string{sourceID, fields.Receiver, env.EventType}, groupIdentity...)
+	env.DedupKey = digestFields(dedupFields...)
 	var err error
 	env.Payload, err = json.Marshal(payload)
 	return env, policies, err

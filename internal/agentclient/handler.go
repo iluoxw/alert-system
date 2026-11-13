@@ -47,8 +47,10 @@ func (c *Client) execute(parent context.Context, h Handler, d agentprotocol.Deli
 	cmd.WaitDelay = time.Second
 	start := time.Now()
 	err = cmd.Run()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		_ = killGroup(cmd)
+	// A wrapper may exit with any status while helpers still own its process
+	// group. Signal it immediately after Run returns, before releasing the slot.
+	if cleanupErr := killGroup(cmd); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrProcessDone) {
+		c.log.Error("clean up handler process group", "message_id", d.MessageID, "error", cleanupErr)
 	}
 	code := -1
 	if cmd.ProcessState != nil {

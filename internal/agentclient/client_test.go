@@ -174,6 +174,44 @@ func TestHandlerTimeoutKillsProcessGroup(t *testing.T) {
 	}
 }
 
+func TestWrapperExitKillsBackgroundGroup(t *testing.T) {
+	for _, tc := range []struct{ name, exit, streams string }{
+		{"success_detached_streams", "0", "redirect"},
+		{"failure_inherited_streams", "17", "inherit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// Confirm a child is running before the wrapper exits. It writes the marker
+			// only after execute returns (when the worker would release its slot).
+			script := `(
+                if [ "$3" = redirect ]; then exec >/dev/null 2>&1; fi
+                touch "$1/ready"
+                while [ ! -e "$1/release" ]; do sleep 0.02; done
+                touch "$1/escaped"
+            ) </dev/null &
+            while [ ! -e "$1/ready" ]; do sleep 0.02; done
+            exit "$2"`
+			h := Handler{Exec: []string{"/bin/sh", "-c", script, "handler", dir, tc.exit, tc.streams}, Timeout: 5 * time.Second}
+			h.Match.EventType = "*"
+			srv := httptest.NewTLSServer(http.NotFoundHandler())
+			defer srv.Close()
+			c := clientFor(t, srv, h)
+			c.execute(context.Background(), h, delivery())
+			if _, err := os.Stat(filepath.Join(dir, "ready")); err != nil {
+				t.Fatal("child never started", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			// An escaped child polls the release file every 20ms.
+			time.Sleep(250 * time.Millisecond)
+			if _, err := os.Stat(filepath.Join(dir, "escaped")); !os.IsNotExist(err) {
+				t.Fatal("child survived wrapper exit", err)
+			}
+		})
+	}
+}
+
 func TestResultCaptureIsPrivateAndBounded(t *testing.T) {
 	d := delivery()
 	dir := t.TempDir()

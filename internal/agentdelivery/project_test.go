@@ -70,6 +70,21 @@ func TestProjectionIdentitiesAndTruncatedFiring(t *testing.T) {
 	if a.EventType != "alert.firing" {
 		t.Fatal("a truncated firing group lost its upstream status")
 	}
+	getRefs := func(e Envelope) [2]string {
+		t.Helper()
+		var p projectedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil || p.GroupRef == "" || p.ReceiverRef == "" {
+			t.Fatal("missing group references", err)
+		}
+		return [2]string{p.ReceiverRef, p.GroupRef}
+	}
+	if getRefs(a) != getRefs(makeEnv("s1", strings.Replace(root, "firing", "resolved", 1))) {
+		t.Fatal("receiver and group references must survive a phase change")
+	}
+	refs, other := getRefs(a), getRefs(makeEnv("s2", root))
+	if refs[0] == other[0] || refs[1] == other[1] {
+		t.Fatal("receiver and group references must be scoped to the source")
+	}
 	for _, other := range []Envelope{makeEnv("s2", root), makeEnv("s1", strings.Replace(root, `"r"`, `"r2"`, 1)), makeEnv("s1", strings.Replace(root, "firing", "resolved", 1))} {
 		if a.DedupKey == other.DedupKey {
 			t.Fatal("source, receiver or phase namespace collision")
