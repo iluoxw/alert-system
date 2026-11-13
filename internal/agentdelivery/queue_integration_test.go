@@ -4,8 +4,10 @@ package agentdelivery
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"alert-system/internal/agentprotocol"
 	"alert-system/internal/store"
 )
 
@@ -49,6 +52,61 @@ func setupDeliveryTestStore(t *testing.T) *store.Store {
 		}
 	}
 	return st
+}
+
+func TestPollResponseByteBudget(t *testing.T) {
+	st := setupDeliveryTestStore(t)
+	ctx := t.Context()
+	queue := NewQueue(st)
+	api := testAPI(ctx, queue)
+	// Each repeat contributes 18 bytes on the wire after HTML/Unicode escaping.
+	// Two ordinary envelopes fit individually but exceed the budget together.
+	for _, row := range []struct {
+		key      string
+		priority int
+		repeats  int
+	}{{"oversized", 3, 940000}, {"first", 2, 475000}, {"second", 1, 475000}, {"small", 0, 1}} {
+		env := Envelope{SchemaVersion: 1, DedupKey: row.key}
+		p := Policy{Role: "ops", Priority: row.priority, TTL: time.Hour, MaxAttempts: 2}
+		if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+			if err := queue.Enqueue(ctx, tx, env, p); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE agent_messages SET envelope=jsonb_set(envelope,'{labels}',
+				jsonb_build_object('detail',repeat($2::text,$3::int))) WHERE dedup_key=$1`, row.key, "<&\u2028", row.repeats)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pollKeys := func(want ...string) {
+		t.Helper()
+		w := postAPI(api, "poll", "test-token", `{"client_id":"worker","wait":0,"max":8}`)
+		if w.Code != http.StatusOK || w.Body.Len() > agentprotocol.MaxPollResponseBytes {
+			t.Fatalf("HTTP %d, body bytes %d", w.Code, w.Body.Len())
+		}
+		var res struct {
+			Messages []Delivery `json:"messages"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil || len(res.Messages) != len(want) {
+			t.Fatalf("expected %d deliveries, got %d: %v", len(want), len(res.Messages), err)
+		}
+		for i, key := range want {
+			if res.Messages[i].Envelope.DedupKey != key || res.Messages[i].Attempt != 1 {
+				t.Fatalf("delivery %d key %q, attempt %d", i, res.Messages[i].Envelope.DedupKey, res.Messages[i].Attempt)
+			}
+		}
+	}
+	pollKeys("first")
+	var pending, audited int
+	err := st.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM agent_messages WHERE dedup_key IN ('second','small') AND status='pending' AND attempts=0 AND lease_id IS NULL),
+		(SELECT count(*) FROM agent_message_events e JOIN agent_messages m ON m.id=e.message_id
+		 WHERE m.dedup_key='oversized' AND m.status='dead' AND m.attempts=0 AND e.kind='poll_size_limit')`).Scan(&pending, &audited)
+	if err != nil || pending != 2 || audited != 1 {
+		t.Fatalf("remaining pending %d, oversized audit %d: %v", pending, audited, err)
+	}
+	pollKeys("second", "small")
 }
 
 func TestDeliveryQueue(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"alert-system/internal/agentprotocol"
 	"alert-system/internal/store"
 )
 
@@ -87,6 +88,10 @@ func (q *Queue) Enqueue(ctx context.Context, tx pgx.Tx, env Envelope, p Policy) 
 	return err
 }
 
+// UUID、代次、RFC3339 时间、固定字段名、逗号等占用的保守上界。
+const pollItemOverhead = 256
+const pollWrapperBytes = len("{\"messages\":[]}\n")
+
 // Claim 在一个短事务中完成心跳、竞争领取和审计。每条消息生成独立租约，
 // attempts 是领取代次。数据库游标和连接都在返回 HTTP 层之前释放。
 func (q *Queue) Claim(ctx context.Context, who Principal, version string, max int) ([]Delivery, error) {
@@ -102,18 +107,36 @@ func (q *Queue) Claim(ctx context.Context, who Principal, version string, max in
 		if err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `WITH next AS (
-            SELECT id FROM agent_messages WHERE role=$1 AND status='pending' AND visible_at<=now() AND expires_at>clock_timestamp()
+		// jsonb 文本含分隔空格；Go 编码还会把 <、>、& 和两个 Unicode 行分隔符
+		// 扩为六个 ASCII 字节。只统计已锁的候选，预算外的下一批不占租约。
+		rows, err := tx.Query(ctx, `WITH candidates AS MATERIALIZED (
+            SELECT id,priority,created_at,envelope::text AS body FROM agent_messages
+            WHERE role=$1 AND status='pending' AND visible_at<=now() AND expires_at>clock_timestamp()
             ORDER BY priority DESC,created_at,id LIMIT $3 FOR UPDATE SKIP LOCKED
+        ), measured AS MATERIALIZED (
+            SELECT id,priority,created_at,octet_length(body) + $5::bigint
+                + 5::bigint*(octet_length(body)-octet_length(translate(body,'<>&','')))
+                + (octet_length(body)-octet_length(translate(body,U&'\2028\2029',''))) AS item_bytes
+            FROM candidates
+        ), oversized AS (
+            UPDATE agent_messages m SET status='dead',settled_at=clock_timestamp()
+            FROM measured WHERE m.id=measured.id AND item_bytes>$4 RETURNING m.id,measured.item_bytes
+        ), oversized_audit AS (
+            INSERT INTO agent_message_events(message_id,kind,from_status,to_status,actor,detail)
+            SELECT id,'poll_size_limit','pending','dead',$2,jsonb_build_object('estimated_bytes',item_bytes) FROM oversized
+        ), budgeted AS (
+            SELECT id,sum(item_bytes) OVER (ORDER BY priority DESC,created_at,id ROWS UNBOUNDED PRECEDING) AS batch_bytes
+            FROM measured WHERE item_bytes<=$4
         ), claimed AS (
             UPDATE agent_messages m SET status='leased',lease_id=gen_random_uuid(),lease_owner=$2,
                 lease_expires_at=least(m.expires_at,clock_timestamp()+interval '30 seconds'),attempts=m.attempts+1
-            FROM next WHERE m.id=next.id AND m.expires_at>clock_timestamp()
+            FROM budgeted WHERE m.id=budgeted.id AND batch_bytes<=$4 AND m.expires_at>clock_timestamp()
             RETURNING m.id,m.lease_id,m.attempts,m.lease_expires_at,m.ack_mode,m.envelope,m.priority,m.created_at
         ), audit AS (
             INSERT INTO agent_message_events(message_id,kind,from_status,to_status,actor,detail)
             SELECT id,'claim','pending','leased',$2,jsonb_build_object('attempt',attempts) FROM claimed
-        ) SELECT id::text,lease_id::text,attempts,lease_expires_at,ack_mode,envelope FROM claimed ORDER BY priority DESC,created_at,id`, who.Role, who.ClientID, max)
+        ) SELECT id::text,lease_id::text,attempts,lease_expires_at,ack_mode,envelope FROM claimed ORDER BY priority DESC,created_at,id`,
+			who.Role, who.ClientID, max, agentprotocol.MaxPollResponseBytes-pollWrapperBytes, pollItemOverhead)
 		if err != nil {
 			return err
 		}

@@ -6,6 +6,9 @@ import (
 	"time"
 )
 
+// MaxPollResponseBytes includes the complete encoded poll response and its trailing newline.
+const MaxPollResponseBytes = 16 << 20
+
 type Envelope struct {
 	ID            string            `json:"id"`
 	SchemaVersion int               `json:"schema_version"`

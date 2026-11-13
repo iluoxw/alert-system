@@ -20,7 +20,6 @@ import (
 
 const version = "agent-client/1"
 const waitSeconds = 25
-const maxResponseBytes = 16 << 20
 
 var uuid = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
@@ -86,11 +85,11 @@ func (c *Client) post(ctx context.Context, op string, request, response any) err
 	if resp.StatusCode != http.StatusOK || response == nil {
 		return statusError(resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, agentprotocol.MaxPollResponseBytes+1))
 	if err != nil {
 		return err
 	}
-	if len(b) > maxResponseBytes {
+	if len(b) > agentprotocol.MaxPollResponseBytes {
 		return errors.New("poll response exceeds size limit")
 	}
 	if err := json.Unmarshal(b, response); err != nil {
