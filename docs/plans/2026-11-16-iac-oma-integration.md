@@ -19,7 +19,7 @@ flowchart LR
   G -->|完整范围快照对账| S
   G --> F[原飞书通知]
   S --> Q[PostgreSQL 分组投递队列]
-  Q --> W[独立 OMA worker]
+  Q --> W[SRE 进程内的分析执行器]
   W -->|持久执行意图后 ACK| Q
   W -->|创建会话 / 发送证据| O[OMA IAC Agent]
   O -->|SSE 事件订阅 / 历史事件补漏| W
@@ -39,7 +39,7 @@ OMA 原生工具关闭；模型只提交受控查询 ID。取证代理固定 PRO
 | 工单 | 交付 | 必须通过的验收 |
 |---|---|---|
 | #23 | Grafana Source 范围、原生分组、稳定 rule_id、对账补分析 | 混合业务隔离；scope 不完整或改变不误解除；同 occurrence 的 webhook/快照/重投不重复执行；Alertmanager 兼容 |
-| #24 | 常驻 OMA worker、持久阶段、事件订阅与报告 API | ACK 前后重启；POST 结果未知查回而不盲重发；SSE 重放/断连；报告幂等；角色及管理员读取隔离；不写领域状态 |
+| #24 | 常驻分析执行器、持久阶段、事件订阅与报告 API | ACK 前后重启；POST 结果未知查回而不盲重发；SSE 重放/断连；报告幂等；角色及管理员读取隔离；不写领域状态 |
 | #25 | IAC 取证代理、技能边界及可复现构建 | query_id 白名单；固定环境；超时/输出上限；凭据不输出；空值/错误 unknown；CLI 版本与二进制摘要可查 |
 | #22 | 联合发布、Grafana 路由与真实验收 | Grafana 自动触发真实 OMA、真实 IAC 证据、同会话报告落库；清理 canary 后保留常驻链路 |
 
@@ -67,11 +67,11 @@ Grafana Source 使用 `product=IAC` 与明确规则 ID 范围。稳定公开标�
 ## 发布与真实验收
 
 1. 合并通过审查/CI 的实现，记录联合源码 SHA、API/worker/migrate 镜像 digest 与 CLI SHA。迁移前核实实际账本，不猜测版本。
-2. 配置专用 OMA Agent/environment，禁用原生工具，记录版本及 prompt 摘要。凭据放运行时 Secret，不放 prompt、Git、日志或命令行。
-3. 在 Firebreak dev 部署 API 与独立 worker。新增 Grafana Source、IAC 目录和精确 mapping；原飞书 route/contact 保留，新增并行 SRE receiver。对账 token 单独绑定环境变量。
+2. 配置专用 OMA Agent/environment，禁用原生工具，记录版本及 prompt 摘要。复用现有平台配置和 OMA Vault 管理凭据，不放 prompt、Git、日志或命令行；不新增 Kubernetes Secret。现有管理员凭据不得在未经明确授权时转存到其他服务。
+3. 在 Firebreak dev 的现有 API 进程中启用有界分析执行器，沿用已有服务发布流程。新增 Grafana Source、IAC 目录和精确 mapping；原飞书 route/contact 保留，新增并行 SRE receiver。对账 token 单独绑定环境变量。独立 worker 命令仅保留为可选部署入口，本轮不新增该 workload。
 4. 使用独立 IAC canary 规则，实际经 Grafana 通知引擎投递。核对 webhook、Alert、分析投递、OMA session、真实查询证据及持久报告的关联；记录事件订阅及 final event ID。
 5. 测试重投、恢复、worker 重启和事件补漏。隔离测试覆盖模型错误、取证错误、超时及提交未知；生产 IAC 不制造真实故障，不修改正常业务阈值来强迫 firing。
-6. 删除/停用临时 canary、临时管理员和测试凭据，回读线上配置与 worker 健康，确认正常 10 条规则继续自动路由。保留脱敏审计证据。
+6. 删除/停用临时 canary、临时管理员和测试凭据，回读线上配置与分析执行器健康，确认正常 10 条规则继续自动路由。保留脱敏审计证据。
 
 回退先停 worker 并禁用新增 SRE 子路由，保留原飞书；数据库记录与分析证据保留，不自动执行 down 迁移。恢复前按持久状态查回会话，不能因回退重建重复 OMA 会话。
 

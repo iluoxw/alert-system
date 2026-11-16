@@ -1,0 +1,3 @@
+__pycache__/
+claude-lock.json
+*.private.json
