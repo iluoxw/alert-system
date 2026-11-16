@@ -2,6 +2,7 @@ package impact
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,5 +225,17 @@ func TestRuleOutDecommissionedImpacts_SkipsHumanRows(t *testing.T) {
 	kept := faults.rows[app.ID]
 	if kept.DecisionOrigin != domain.DecisionOriginHuman || kept.Rationale != "人工排除" {
 		t.Fatalf("人工 ruled_out 被覆盖: %+v", kept)
+	}
+}
+
+func TestCrossNodeConfirmedExplainsCausalUncertainty(t *testing.T) {
+	node := domain.ResourceNode{Layer: domain.EntityLayerApplication, LifecycleState: domain.EntityLifecycleActive}
+	state, rationale, _ := classifyAutomatedImpact(node, 1, false, true)
+	if state != domain.ImpactStateConfirmed || !strings.Contains(rationale, "尚未确认") {
+		t.Fatalf("必须区分退化事实与因果: %s %s", state, rationale)
+	}
+	state, _, _ = classifyAutomatedImpact(node, 1, true, true)
+	if state != domain.ImpactStatePotential {
+		t.Fatal("stale 关系即使有应用直接证据也不得确认上游影响")
 	}
 }

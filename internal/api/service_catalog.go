@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"alert-system/internal/domain"
+	"alert-system/internal/mapping"
 	"alert-system/internal/pipeline"
 	"alert-system/internal/store"
 )
@@ -52,6 +53,8 @@ func (r *Router) RegisterServiceCatalogRoutes(services *store.ServiceCatalogRepo
 	admin.PUT("/alert-mappings/:id", h.updatePolicy)
 	admin.DELETE("/alert-mappings/:id", h.deletePolicy)
 	admin.POST("/alert-mappings/preview", h.previewPolicy)
+	admin.POST("/alert-mapping/preview", h.previewMapping)
+	admin.GET("/alert-mapping/governance", h.currentFiringGovernance)
 	admin.POST("/alert-mapping/results/:alert_id/reprocess", h.reprocessAlert)
 	return r
 }
@@ -493,4 +496,65 @@ func (h *serviceCatalogHandlers) reprocessAlert(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// previewMapping 只读评估已发布策略，批量有界；不触发 Project 或通知链。
+func (h *serviceCatalogHandlers) previewMapping(c *gin.Context) {
+	var request struct {
+		AlertIDs []string `json:"alert_ids"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || len(request.AlertIDs) == 0 || len(request.AlertIDs) > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "alert_ids 必须包含 1 至 100 个告警 ID"})
+		return
+	}
+	for _, id := range request.AlertIDs {
+		if !uuidPattern.MatchString(id) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "告警 ID 格式非法"})
+			return
+		}
+	}
+	evaluator, ok := h.projector.(interface {
+		Evaluate(context.Context, pgx.Tx, domain.Alert) (mapping.Evaluation, error)
+	})
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "映射评估暂不可用"})
+		return
+	}
+	results := []mapping.Evaluation{}
+	err := h.router.tx.WithTx(c, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(c, "SET TRANSACTION READ ONLY"); err != nil {
+			return err
+		}
+		for _, id := range request.AlertIDs {
+			alert, err := h.alerts.GetByID(c, tx, id)
+			if err != nil {
+				return err
+			}
+			result, err := evaluator.Evaluate(c, tx, alert)
+			if err != nil {
+				return err
+			}
+			results = append(results, result)
+		}
+		return nil
+	})
+	if err != nil {
+		h.handleStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": results})
+}
+
+func (h *serviceCatalogHandlers) currentFiringGovernance(c *gin.Context) {
+	var items []store.MappingGovernanceBucket
+	err := h.router.tx.WithTx(c, func(tx pgx.Tx) error {
+		var err error
+		items, err = h.mappings.CurrentFiringGovernance(c, tx)
+		return err
+	})
+	if err != nil {
+		h.handleStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }

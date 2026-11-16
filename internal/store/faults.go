@@ -402,6 +402,7 @@ func (r *FaultRepo) HasConfirmedBusinessImpact(ctx context.Context, tx pgx.Tx, f
 			WHERE i.fault_id = $1
 			  AND i.state = 'confirmed'
 			  AND n.kind = 'business_system'
+			  AND n.lifecycle_state = 'active'
 		)
 	`, faultID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("store: 查询 Fault 已确认业务影响失败: %w", err)

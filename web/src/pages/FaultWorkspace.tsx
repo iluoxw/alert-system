@@ -60,7 +60,7 @@ export function FaultWorkspace() {
   const ownerName = data.fault.owner_team_id ? (teamByID.get(data.fault.owner_team_id) || data.fault.owner_team_id) : '未登记团队'
   const acked = Boolean(data.fault.acked_at)
   const hasLegacyEvidence = data.evidence.some(({ alert }) => !alert.authoritative)
-  const confirmedApplicationImpacts = data.impacts.filter(({ impact, node }) => impact.state === 'confirmed' && node.kind === 'business_system')
+  const confirmedApplicationImpacts = data.impacts.filter(({ impact, node }) => impact.state === 'confirmed' && node.kind === 'business_system' && node.lifecycle_state === 'active')
   const gateReady = data.fault.status === 'active' && confirmedApplicationImpacts.length > 0
   const gateCopy = data.fault.status !== 'active'
     ? `当前 Fault 为 ${data.fault.status}，只有 active Fault 可以宣布 Incident。`

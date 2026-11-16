@@ -517,3 +517,36 @@ func (r *AlertMappingRepo) Summary(ctx context.Context, tx pgx.Tx) (map[string]i
 	}
 	return result, rows.Err()
 }
+
+// MappingGovernanceBucket 仅统计当前 firing，ignored 单独列出，不计入 unmapped。
+type MappingGovernanceBucket struct {
+	Source              string `json:"source"`
+	SourceIntegrationID string `json:"source_integration_id"`
+	Severity            string `json:"severity"`
+	Status              string `json:"status"`
+	ReasonCode          string `json:"reason_code"`
+	Count               int    `json:"count"`
+}
+
+func (r *AlertMappingRepo) CurrentFiringGovernance(ctx context.Context, tx pgx.Tx) ([]MappingGovernanceBucket, error) {
+	rows, err := tx.Query(ctx, `SELECT a.source, COALESCE(a.source_integration_id::text,''), a.severity,
+ COALESCE(r.status, 'unmapped'), COALESCE(NULLIF(r.reason_code,''), 'not_evaluated'), count(*)
+ FROM alerts a LEFT JOIN alert_mapping_results r ON r.alert_id=a.id
+ WHERE (a.upstream_fingerprint <> '' AND a.source_state='firing')
+ OR (a.upstream_fingerprint = '' AND a.status <> 'resolved')
+ GROUP BY 1,2,3,4,5
+ ORDER BY 1,2,3,4,5`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []MappingGovernanceBucket{}
+	for rows.Next() {
+		var b MappingGovernanceBucket
+		if err := rows.Scan(&b.Source, &b.SourceIntegrationID, &b.Severity, &b.Status, &b.ReasonCode, &b.Count); err != nil {
+			return nil, err
+		}
+		result = append(result, b)
+	}
+	return result, rows.Err()
+}

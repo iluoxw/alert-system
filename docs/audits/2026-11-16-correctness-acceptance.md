@@ -1,0 +1,52 @@
+# 生命周期与映射正确性验收（Issue #13）
+
+日期：2026-11-16。基线：63778bf。独立实现目录：`/private/tmp/alert-failure-correctness`。
+
+## 交付行为
+
+- `FaultRepo.HasConfirmedBusinessImpact` 只认可 lifecycle active 的 business_system。总览既有 SQL 已使用同一过滤，保持不变；Fault 工作区的宣布门槛同步过滤下线应用。Impact 历史明细保留人工裁决，不把下线改写为恢复，不自动关闭历史 Incident。
+- `mapping.Projector.Evaluate` 提供只读评估，`Project` 复用同一解析/关联计算。显式策略或标准标签声明的关联维度缺少值（包括纯空白）返回 `unmapped / correlation_label_missing`，不创建或合并 Fault；未声明维度保留旧聚合方式。真实投影会移除该 Alert 的旧自动证据并持久化治理原因，预览没有任何写入。
+- 新增管理员 `POST /api/v1/admin/alert-mapping/preview`，批量 1–100 个 Alert UUID；返回 `items[].result`（实体、关联 key、已有 Fault、缺失原因）、`fault_kind` 和 `would_create_fault`。使用 PG READ ONLY 事务从数据库层阻断副作用。它评估已发布规则，现有 `/admin/alert-mappings/preview` 继续只预览草稿策略的匹配告警。
+- 新增管理员 `GET /api/v1/admin/alert-mapping/governance`。仅统计当前 firing，按 source、source_integration_id、severity、status、reason_code 分桶；未评估为 unmapped/not_evaluated，ignored 单独保留，空集为 `items: []`。已有 `/alert-mapping/summary` 仍为全历史映射汇总。
+- 跨节点 confirmed 文案表达应用退化已确认、Fault 归因未确认，不修改 direct evidence 规则或 ccloud trace 方向。stale 关系即使有直接证据也只得到 potential。
+- pipeline 注释修为 dedup→mapping→route→group→silence→inhibit；CLAUDE.md 迁移号遵循最大号 +1，不回填历史空缺，000032 留给通知迭代；本迭代无迁移。
+
+## 管理 API 调用
+
+以下命令使用管理员已登录的 cookie 文件；示例不包含真实会话或通知目标。
+
+```bash
+curl -b /tmp/admin-cookie.txt -H 'Content-Type: application/json' \
+  -X POST http://localhost:8080/api/v1/admin/alert-mapping/preview \
+  -d '{"alert_ids":["00000000-0000-0000-0000-000000000000"]}'
+curl -b /tmp/admin-cookie.txt \
+  http://localhost:8080/api/v1/admin/alert-mapping/governance
+```
+
+preview 不回放，真实回放仍使用既有管理员 `POST /api/v1/admin/alert-mapping/results/:alert_id/reprocess`。提交时重新评估，不信任旧预览；预览与执行之间策略或实体变化可改变结果。新响应只返回映射判断，不返回渠道目标或通知 payload。
+
+## 实测记录
+
+全部 Go 命令显式使用 `GOCACHE=/private/tmp/alert-correctness-gocache`。
+
+1. 修复前 `go test -tags=integration ./internal/incident -run TestService_DecommissionedConfirmedImpact -count=1`：真实 PostgreSQL **失败**，输出“下线应用不能满足准入”“唯一 confirmed 已下线应拒绝宣布: <nil>”，证明旧行为。
+2. 修复后 `go test -tags=integration ./internal/incident -run 'TestService_DecommissionedConfirmedImpact|TestMappingEvaluationReadOnlyAndGovernance' -count=1`：退出 0（8.893s）。
+3. `go test -tags=integration ./internal/incident -run TestExplicitAppGatewayDependencyLifecycle -count=1`：退出 0（5.754s）。
+4. 最终 `go test -tags=integration ./internal/incident -race -count=1`：退出 0（23.333s），包含新增显式策略路径和既有 Incident 全套集成测试。testcontainers 使用隔离 PostgreSQL，不共享固定 E2E DB。
+5. `go test ./internal/... ./cmd/... -count=1`：所有包退出 0。覆盖 API RBAC/批量上限/非法 UUID、关联维度纯函数和跨节点影响解释。
+6. `go build ./...`、`go vet ./...`：退出 0。
+7. 增补 Alert/Fault/Incident 全部时间线表计数后，`go test -tags=integration ./internal/incident -run TestMappingEvaluationReadOnlyAndGovernance -race -count=1`：退出 0（6.343s）。
+8. `cd web && npm run build && npx --cache /private/tmp/alert-correctness-npmcache oxlint`：退出 0；构建现有 bundle size 提示。安装使用 `npm ci --ignore-scripts --cache /private/tmp/alert-correctness-npmcache`，未改依赖或 lockfile。
+
+环境与操作异常：首次 Go 默认缓存权限被拒，改临时缓存；PG 新测试 fixture 缺 ResolvePolicy/Explanation 触发约束，补完整后重跑通过。一次 `go test ./...` 误进入无 tag 隔离的固定 E2E TestMain，发现后中断 exit 1，**不计为通过**；只读 PID/comm 确认没有 e2e.test 子进程，残留 firebreak-e2e-postgres-1 已交主 Agent 清理。该失误与后续范围收敛已记录在 `.learnings/2026-11-16-correctness.md`。
+
+## 验收矩阵与限制
+
+| 项 | 已执行证据 | 限制 |
+|---|---|---|
+| C1-C3 生命周期 | 真 PG：唯一 confirmed 下线拒绝、另有有效 confirmed 允许、历史 Incident 仍 declared | 用 SQL 构造生命周期状态，HTTP 下线链路沿用既有 E2E，由主 Agent 串行验证 |
+| C4 关联维度 | 标准契约与策略路径缺值均治理；完整维度拆分、空维度兼容单测 | 不对未声明维度推测业务含义 |
+| C5 只读预览 | READ ONLY 真 PG；预览前后 faults/mapping results/fault_alert_links/timers/timeline_entries/fault_timeline_entries/incident_timeline_entries 计数相同；投影 entity/key 一致、已有 Fault 正确 | 成功 HTTP 全栈调用由集成验收补；数据库只读同时禁止未逐表计数的其他写 |
+| C6 firing 治理 | legacy 空 fingerprint、权威 firing/unknown/resolved、ignored 与 mapped、空集真 PG | 同 kind 双 source_id 分桶由 SQL 明确实现，未另建双来源 fixture；状态为最近持久化映射判断，不自动补跑历史评估 |
+| C7 拓扑 | 真 PG 显式 App→Gateway 反向可达、过期边 stale、下线 Gateway 阻断；纯函数 stale+direct 不 confirmed | 不宣称真实平台采样或因果归因已验证 |
+| C8 权限/输出 | API 单测未登录 401、member 403、空批/超100/非法UUID 400；返回无通知目标字段 | 不涉及对外发送，不部署、不合并 |

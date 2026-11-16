@@ -66,7 +66,7 @@ func classifyAutomatedImpact(node domain.ResourceNode, depth int, stale, hasDire
 			return domain.ImpactStateConfirmed, "应用 direct_impact Alert 直接确认自身受影响", 0.95
 		}
 		return domain.ImpactStateConfirmed,
-			fmt.Sprintf("依赖图反向可达（%d 跳），且应用 direct_impact Alert 与 Fault 时间窗重叠", depth), 0.95
+			fmt.Sprintf("应用 direct_impact Alert 确认退化，依赖图反向可达（%d 跳）且时间窗重叠；此为影响事实，尚未确认该 Fault 是退化原因", depth), 0.95
 	}
 	return domain.ImpactStatePotential,
 		fmt.Sprintf("依赖图反向可达（%d 跳），尚无直接业务退化证据", depth), 0.65

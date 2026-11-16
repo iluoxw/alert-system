@@ -20,6 +20,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"alert-system/internal/domain"
+	"alert-system/internal/mapping"
 	"alert-system/internal/store"
 )
 
@@ -579,5 +580,308 @@ func TestService_TransitionLifecycle(t *testing.T) {
 	faultE := newFault(t, ctx, st, "lifecycle-after-close", domain.FaultStatusActive)
 	if _, _, err := svc.LinkFault(ctx, inc.ID, faultE.ID, who); !errors.Is(err, ErrIncidentClosed) {
 		t.Fatalf("对已关闭 Incident 关联 Fault 应拒绝, got %v", err)
+	}
+}
+
+func TestService_DecommissionedConfirmedImpact(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	actor := mustUser(t, ctx, st, "lifecycle-actor")
+	svc := newTestService(st, &fakeOutbox{})
+	fault := newFault(t, ctx, st, "lifecycle-provider", domain.FaultStatusActive)
+	confirmBusinessImpact(t, ctx, st, fault.ID, actor.ID)
+	who := Actor{UserID: actor.ID, Display: actor.DisplayName}
+	command := DeclareCommand{FaultID: fault.ID, Title: "历史影响", Severity: domain.SeverityCritical, CommunicationChannel: "lark_webhook", CommunicationTargetRef: "local-fake"}
+	historical, _, err := svc.Declare(ctx, command, who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE resource_nodes SET lifecycle_state='decommissioned' WHERE id IN (SELECT node_id FROM fault_impacts WHERE fault_id=$1)`, fault.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		valid, err := store.NewFaultRepo().HasConfirmedBusinessImpact(ctx, tx, fault.ID)
+		if err != nil {
+			return err
+		}
+		if valid {
+			t.Error("下线应用不能满足准入")
+		}
+		inc, err := store.NewIncidentRepo().GetByID(ctx, tx, historical.ID)
+		if err == nil && inc.Status != domain.IncidentStatusDeclared {
+			t.Error("下线不得自动关闭历史 Incident")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	other := newFault(t, ctx, st, "another-provider", domain.FaultStatusActive)
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO fault_impacts(fault_id,node_id,state,rationale,confidence,decision_origin) SELECT $1,node_id,state,rationale,confidence,decision_origin FROM fault_impacts WHERE fault_id=$2`, other.ID, fault.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	command.FaultID = other.ID
+	if _, _, err := svc.Declare(ctx, command, who); !errors.Is(err, ErrIncidentNotReady) {
+		t.Fatalf("唯一 confirmed 已下线应拒绝宣布: %v", err)
+	}
+	confirmBusinessImpact(t, ctx, st, other.ID, actor.ID)
+	if _, _, err := svc.Declare(ctx, command, who); err != nil {
+		t.Fatalf("另有有效 confirmed 应允许: %v", err)
+	}
+}
+
+func TestMappingEvaluationReadOnlyAndGovernance(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	policies := store.NewAlertMappingRepo()
+	faults := store.NewFaultRepo()
+	topology := store.NewTopologyRepo()
+	projector := mapping.NewProjector(policies, store.NewServiceCatalogRepo(), topology, faults, nil)
+	var alert domain.Alert
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		_, err := topology.ImportSnapshot(ctx, tx, domain.TopologySnapshot{SchemaVersion: 1, Source: "mapping-test", ObservedAt: now, Nodes: []domain.ResourceNode{{ExternalRef: "gateway", Name: "Gateway", Kind: domain.ResourceNodeKindBusinessSystem}}})
+		if err != nil {
+			return err
+		}
+		alert, _, err = store.NewAlertRepo().UpsertByFingerprint(ctx, tx, domain.AlertEvent{Fingerprint: "preview-test", ResolvePolicy: domain.ResolvePolicySource, RuleID: "test", Severity: domain.SeverityCritical, Status: domain.StatusFiring, Title: "test", Source: "generic", StartsAt: now, Labels: map[string]string{"sre.entity.key": "mapping-test:gateway", "sre.fault.kind": "unavailable", "sre.evidence.role": "direct_impact", "sre.correlation.labels": "cluster"}}, "")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 合法 occurrence 身份交给上层接入验证；这里驱动与 HTTP 相同的只读评估。
+	alert.Source = "alertmanager"
+	alert.SourceIntegrationID = "source"
+	alert.UpstreamFingerprint = "fp"
+	var evaluated mapping.Evaluation
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION READ ONLY"); err != nil {
+			return err
+		}
+		var err error
+		evaluated, err = projector.Evaluate(ctx, tx, alert)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluated.Result.ReasonCode != "correlation_label_missing" || evaluated.Result.CorrelationKey != "" {
+		t.Fatalf("缺维度应治理: %+v", evaluated)
+	}
+
+	// 切换到显式策略，同样不得让缺失维度静默并入共享 Fault。
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		_, err := policies.CreatePolicy(ctx, tx, domain.AlertMappingPolicy{Name: "明确关联维度", Priority: 1, Matchers: domain.MatcherSet{{Name: "severity", Op: domain.MatchEqual, Value: "critical"}}, TargetEntityID: evaluated.Result.EntityID, FaultKind: "unavailable", FaultScope: domain.FaultScopeCapability, EvidenceRole: domain.EvidenceRoleDirectImpact, CorrelationLabels: []string{"cluster"}, Confidence: 1, Enabled: true})
+		if err != nil {
+			return err
+		}
+		result, err := projector.Evaluate(ctx, tx, alert)
+		if err != nil {
+			return err
+		}
+		if result.Result.ReasonCode != "correlation_label_missing" || result.Result.PolicyID == "" {
+			t.Fatalf("策略缺维度必须治理: %+v", result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		actual, err := projector.Project(ctx, tx, alert)
+		if err != nil {
+			return err
+		}
+		if actual.Status != evaluated.Result.Status || actual.ReasonCode != evaluated.Result.ReasonCode {
+			t.Fatal("预览与投影不一致")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert.Labels["cluster"] = "prod"
+	var before, after string
+	counts := func(tx pgx.Tx) (string, error) {
+		var out string
+		err := tx.QueryRow(ctx, `SELECT json_build_array((SELECT count(*) FROM faults),(SELECT count(*) FROM alert_mapping_results),(SELECT count(*) FROM fault_alert_links),(SELECT count(*) FROM timers),(SELECT count(*) FROM timeline_entries),(SELECT count(*) FROM fault_timeline_entries),(SELECT count(*) FROM incident_timeline_entries))::text`).Scan(&out)
+		return out, err
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error { var err error; before, err = counts(tx); return err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION READ ONLY"); err != nil {
+			return err
+		}
+		var err error
+		evaluated, err = projector.Evaluate(ctx, tx, alert)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evaluated.WouldCreateFault || evaluated.Result.CorrelationKey == "" {
+		t.Fatalf("应预览拟建 Fault: %+v", evaluated)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error { var err error; after, err = counts(tx); return err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("预览写入: %s -> %s", before, after)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		actual, err := projector.Project(ctx, tx, alert)
+		if err != nil {
+			return err
+		}
+		if actual.CorrelationKey != evaluated.Result.CorrelationKey || actual.EntityID != evaluated.Result.EntityID {
+			t.Fatal("预览/投影目标不一致")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		existing, err := projector.Evaluate(ctx, tx, alert)
+		if err != nil {
+			return err
+		}
+		if existing.WouldCreateFault || existing.Result.FaultID == "" {
+			t.Fatal("已有 Fault 预览错误")
+		}
+		buckets, err := policies.CurrentFiringGovernance(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(buckets) != 1 || buckets[0].Count != 1 {
+			t.Fatalf("当前 firing 统计错误: %+v", buckets)
+		}
+		_, err = policies.UpsertResult(ctx, tx, domain.AlertMappingResult{AlertID: alert.ID, Status: domain.AlertMappingIgnored, ReasonCode: "ignored_by_test", Explanation: "测试忽略", EvaluatedAt: time.Now()})
+		if err != nil {
+			return err
+		}
+		buckets, err = policies.CurrentFiringGovernance(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if buckets[0].Status != "ignored" {
+			t.Fatalf("ignored 不得并入 unmapped: %+v", buckets)
+		}
+		// legacy 空 fingerprint 已在上面计入；权威 unknown 不应计入。
+		_, err = tx.Exec(ctx, `UPDATE alerts SET upstream_fingerprint='authoritative',source_state='unknown' WHERE id=$1`, alert.ID)
+		if err != nil {
+			return err
+		}
+		buckets, err = policies.CurrentFiringGovernance(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(buckets) != 0 {
+			t.Fatal("权威 unknown 不得统计")
+		}
+		_, err = tx.Exec(ctx, `UPDATE alerts SET source_state='firing' WHERE id=$1`, alert.ID)
+		if err != nil {
+			return err
+		}
+		buckets, err = policies.CurrentFiringGovernance(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(buckets) != 1 {
+			t.Fatal("权威 firing 必须统计")
+		}
+		_, err = tx.Exec(ctx, `UPDATE alerts SET status='resolved',source_state='resolved' WHERE id=$1`, alert.ID)
+		if err != nil {
+			return err
+		}
+		buckets, err = policies.CurrentFiringGovernance(ctx, tx)
+		if len(buckets) != 0 {
+			t.Fatalf("resolved 不得统计: %+v", buckets)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExplicitAppGatewayDependencyLifecycle(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	topology := store.NewTopologyRepo()
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		_, err := topology.ImportSnapshot(ctx, tx, domain.TopologySnapshot{SchemaVersion: 1, Source: "entry", ObservedAt: now,
+			Nodes: []domain.ResourceNode{{ExternalRef: "app", Name: "应用", Kind: domain.ResourceNodeKindBusinessSystem}, {ExternalRef: "gateway", Name: "网关", Kind: domain.ResourceNodeKindInfrastructureCapability}},
+			Edges: []domain.DependencyEdge{{FromExternalRef: "app", ToExternalRef: "gateway", Relation: domain.DependencyRelationDependsOn}},
+		})
+		if err != nil {
+			return err
+		}
+		app, err := topology.GetByExternalRef(ctx, tx, "entry", "app")
+		if err != nil {
+			return err
+		}
+		gateway, err := topology.GetByExternalRef(ctx, tx, "entry", "gateway")
+		if err != nil {
+			return err
+		}
+		radius, err := topology.ListBlastRadiusByNodeID(ctx, tx, gateway.ID, 8, time.Hour)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, node := range radius {
+			if node.Node.ID == app.ID {
+				found = true
+				if node.Stale {
+					t.Fatal("新鲜声明边不应 stale")
+				}
+			}
+		}
+		if !found {
+			t.Fatal("显式 App→Gateway 必须反向到达应用")
+		}
+		_, err = tx.Exec(ctx, `UPDATE dependency_edges SET observed_at=$1 WHERE from_node_id=$2`, now.Add(-2*time.Hour), app.ID)
+		if err != nil {
+			return err
+		}
+		radius, err = topology.ListBlastRadiusByNodeID(ctx, tx, gateway.ID, 8, time.Hour)
+		if err != nil {
+			return err
+		}
+		for _, node := range radius {
+			if node.Node.ID == app.ID && !node.Stale {
+				t.Fatal("过期边必须 stale")
+			}
+		}
+		_, err = tx.Exec(ctx, `UPDATE resource_nodes SET lifecycle_state='decommissioned' WHERE id=$1`, gateway.ID)
+		if err != nil {
+			return err
+		}
+		radius, err = topology.ListBlastRadiusByNodeID(ctx, tx, gateway.ID, 8, time.Hour)
+		if err != nil {
+			return err
+		}
+		for _, node := range radius {
+			if node.Node.ID == app.ID {
+				t.Fatal("下线网关必须阻断应用遍历")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

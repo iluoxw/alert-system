@@ -150,3 +150,26 @@ func TestDetermineFaultTransition(t *testing.T) {
 		})
 	}
 }
+
+func TestMissingCorrelationLabels(t *testing.T) {
+	for _, tc := range []struct {
+		keys   []string
+		labels map[string]string
+		want   int
+	}{
+		{[]string{"cluster", "instance"}, map[string]string{"cluster": "prod", "instance": " "}, 1},
+		{[]string{"cluster"}, map[string]string{}, 1},
+		{[]string{"cluster"}, map[string]string{"cluster": "prod"}, 0},
+		{nil, map[string]string{}, 0},
+	} {
+		if got := len(missingCorrelationLabels(tc.keys, tc.labels)); got != tc.want {
+			t.Fatalf("got %d want %d", got, tc.want)
+		}
+	}
+	if buildCorrelationKey("entity", "kind", nil, map[string]string{"cluster": "a"}) != buildCorrelationKey("entity", "kind", nil, map[string]string{"cluster": "b"}) {
+		t.Fatal("空维度须保留旧聚合行为")
+	}
+	if buildCorrelationKey("entity", "kind", []string{"cluster"}, map[string]string{"cluster": "a"}) == buildCorrelationKey("entity", "kind", []string{"cluster"}, map[string]string{"cluster": "b"}) {
+		t.Fatal("完整维度必须拆分")
+	}
+}
