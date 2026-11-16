@@ -125,6 +125,9 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 		Faults:               faults,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
+	if err := app.ReconcileFaultNotificationTimer(context.Background(), st, sched); err != nil {
+		logger.Error("Fault 通知启动对账失败", "err", err)
+	}
 
 	// ---- 启动对账（design.md R2）：补建已启用但缺失 pending 定时器的 ops 周期
 	// 任务；失败不阻断启动——下一次进程重启或任务 10 的保存端点仍会重试，见
@@ -205,6 +208,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
 	router.RegisterFaultRoutes(faults)
+	router.RegisterFaultNotificationRoutes(a.FaultOutbox)
 	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)

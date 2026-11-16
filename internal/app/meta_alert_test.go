@@ -156,3 +156,34 @@ func TestScheduleNotifyFailureMetaAlert_SameTargetStillDistinctRefID(t *testing.
 		t.Fatalf("元告警 refID 与原意图相同（%q），pending 收敛会互相覆盖", got)
 	}
 }
+
+func TestFaultMetaSourceIdentitySurvivesPayloadAndSeparatesTimers(t *testing.T) {
+	previous := notify.SendRequest{FaultNotificationID: "old-delivery", FaultNotificationGeneration: 1, GroupKey: "fault:same:activated", Round: 3}
+	current := notify.SendRequest{FaultNotificationID: "new-delivery", GroupKey: previous.GroupKey, Round: 3}
+	refs := map[string]bool{}
+	for _, original := range []notify.SendRequest{previous, current} {
+		meta := buildMetaAlertRequest(original, "lark_webhook", "secret-fallback", time.Now())
+		raw, e := json.Marshal(meta)
+		if e != nil {
+			t.Fatal(e)
+		}
+		var restored notify.SendRequest
+		if e = json.Unmarshal(raw, &restored); e != nil {
+			t.Fatal(e)
+		}
+		if restored.FaultNotificationID != "" || restored.MetaSourceDeliveryID != original.FaultNotificationID || restored.MetaSourceGeneration != original.FaultNotificationGeneration {
+			t.Fatal("元告警源身份错误或继承了主意图状态门槛")
+		}
+		ref := notifySendRefID(restored)
+		if refs[ref] || ref == notifySendRefID(original) {
+			t.Fatal("元告警timer身份冲突")
+		}
+		refs[ref] = true
+		if strings.Contains(ref, "secret-fallback") {
+			t.Fatal("元告警ref泄露目标")
+		}
+		if ref != notifySendRefID(meta) {
+			t.Fatal("序列化改变稳定身份")
+		}
+	}
+}

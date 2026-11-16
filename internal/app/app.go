@@ -168,6 +168,10 @@ func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string
 	// 两个 Project 调用方共用的触发入口（R5.10/R5.11），见该方法文档 ----
 	faultOutbox := NewFaultOutbox(sched, repos.Faults, repos.Ops, impactProjector,
 		cfg.FaultNotify.Cooldown, cfg.FaultNotify.FallbackChannel, cfg.FaultNotify.FallbackTarget, cfg.WebBaseURL)
+	faultOutbox.deliveries = store.NewFaultNotificationRepo()
+	sender.BeforeFaultSend = faultOutbox.BeforeSend
+	sender.OnFaultResult = faultOutbox.RecordResult
+	sched.RegisterHandler(FaultNotificationReconcileKind, faultOutbox.HandleReconcile)
 	mappingStage := pipeline.NewMappingStage(projector).WithFaultActivation(faultOutbox.TriggerFromMappingResult)
 	routeStage := pipeline.NewRouteStage(repos.Routes, repos.Alerts, defaultTeamID)
 	groupStage := pipeline.NewGroupStage(repos.Alerts, sched, outbox, repos.Routes, stormState)

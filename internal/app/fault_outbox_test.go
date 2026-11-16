@@ -164,18 +164,8 @@ func TestFaultOutboxQueueFaultActivated_UpstreamSuppressed(t *testing.T) {
 	if err := outbox.QueueFaultActivated(context.Background(), nil, testFault("f2", "corr-2", "consumer-node", "")); err != nil {
 		t.Fatalf("QueueFaultActivated 失败: %v", err)
 	}
-	if len(sched.scheduleCalls) != 0 {
-		t.Fatalf("拓扑抑制时不应产生 Schedule 调用，got %d", len(sched.scheduleCalls))
-	}
-	if len(faults.timeline) != 1 {
-		t.Fatalf("拓扑抑制应写一条时间线，got %d", len(faults.timeline))
-	}
-	entry := faults.timeline[0]
-	if entry.Action != domain.FaultTimelineActionNotifySuppressed {
-		t.Fatalf("时间线动作 = %q, want %q", entry.Action, domain.FaultTimelineActionNotifySuppressed)
-	}
-	if entry.Detail["upstream_fault_id"] != "upstream-fault" {
-		t.Fatalf("时间线 detail 未记录上游 Fault ID: %+v", entry.Detail)
+	if len(scheduleCallsOfKind(sched, notifySendTimerKind)) != 1 {
+		t.Fatal("历史 owner_notified_at 不能作为送达覆盖证明，下游必须入队")
 	}
 }
 
@@ -202,8 +192,8 @@ func TestFaultOutboxQueueFaultActivated_OwnerChannelFallback(t *testing.T) {
 	if req.ChannelKind != "lark_webhook" || req.Target != "https://fallback.example/hook" {
 		t.Fatalf("应回落到全局兜底渠道，got %+v", req)
 	}
-	if faults.notifiedAt["f3"].IsZero() {
-		t.Fatal("应回写 owner_notified_at")
+	if !faults.notifiedAt["f3"].IsZero() {
+		t.Fatal("入队不能回写 owner_notified_at")
 	}
 }
 

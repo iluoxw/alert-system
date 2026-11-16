@@ -105,6 +105,12 @@ func (o *notifyOutbox) scheduleSend(ctx context.Context, tx pgx.Tx, req notify.S
 // 制造出并行的多个定时器——这个"防抖折叠"的粒度必须停留在业务元组层面。Round 只
 // 影响 notify.Sender 的幂等键（sender.go），不影响这里的定时器去重粒度。
 func notifySendRefID(req notify.SendRequest) string {
+	if key := notify.FaultMetaIdentity(req); key != "" {
+		return key
+	}
+	if req.FaultNotificationID != "" && !req.MetaAlert {
+		return "fault-delivery:" + req.FaultNotificationID + ":" + strconv.Itoa(req.FaultNotificationGeneration)
+	}
 	resourceKey := req.AlertID
 	if resourceKey == "" {
 		resourceKey = req.IncidentID
@@ -460,14 +466,16 @@ type metaAlertFaultRepo interface {
 
 func buildMetaAlertRequest(original notify.SendRequest, channel, target string, now time.Time) notify.SendRequest {
 	return notify.SendRequest{
-		AlertID:     original.AlertID,
-		GroupKey:    original.GroupKey,
-		IncidentID:  original.IncidentID,
-		Step:        original.Step,
-		ChannelKind: channel,
-		Target:      target,
-		Round:       original.Round,
-		MetaAlert:   true,
+		MetaSourceDeliveryID: original.FaultNotificationID,
+		MetaSourceGeneration: original.FaultNotificationGeneration,
+		AlertID:              original.AlertID,
+		GroupKey:             original.GroupKey,
+		IncidentID:           original.IncidentID,
+		Step:                 original.Step,
+		ChannelKind:          channel,
+		Target:               target,
+		Round:                original.Round,
+		MetaAlert:            true,
 		Msg: notify.Message{
 			AlertIDs:     original.Msg.AlertIDs,
 			GroupKey:     original.Msg.GroupKey,
