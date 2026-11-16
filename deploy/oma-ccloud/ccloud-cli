@@ -1,0 +1,21 @@
+#!/bin/sh
+# Compatibility name for iacctl-go L4. This is a command guard, not server-side RBAC.
+set -eu
+if [ "$#" -ne 6 ] || [ "$1" != app ] || [ "$2" != pods ] || \
+   [ "$3" != --app-id ] || [ "$4" != 80beff42ab0b41819f9c1c3c3ac95413308e70eb ] || \
+   [ "$5" != --cluster-id ] || [ "$6" != 60 ]; then
+  printf '%s\n' '{"error":"Only fixed IAC PRO app pods is permitted"}' >&2
+  exit 64
+fi
+if [ -z "${CCLOUD_API_KEY:-}" ]; then
+  printf '%s\n' '{"error":"CCLOUD_API_KEY is unavailable; observation unknown"}' >&2
+  exit 2
+fi
+if [ "${CCLOUD_API_BASE_URL:-}" != https://sre-control.test.seewo.com/api/v1/iac-ccloud ]; then
+  printf '%s\n' '{"error":"Fixed read-only proxy base URL is required"}' >&2
+  exit 64
+fi
+export CCLOUD_API_BASE_URL
+export CCLOUD_API_MODE=real
+export CCLOUD_DISABLE_UPDATE_CHECK=1
+exec node /tmp/oma-ccloud/ccloud-cli/dist/ccloud-cli.js "$@"
