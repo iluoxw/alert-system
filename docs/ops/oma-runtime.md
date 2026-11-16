@@ -71,3 +71,5 @@
 ## 运行核验
 
 先核对迁移、worker ready、来源/角色白名单和 broker hash；用专用 canary 走 Grafana→SRE→OMA→受控 IAC 只读取证→同会话第二轮→结果 API。分别保存队列 ACK、运行阶段、OMA session、持久事件、证据 observed_at 与最终结果；只看 ACK、idle 或 worker 退出码都不能作为通过。真实故障/真实 IAC 故障归因不能由 synthetic canary 推导。
+
+新采集证据的 `evidence_id` 为当前运行内确定的 `ev_<query_id>`；同一 bundle 的 query_id 唯一。完整脱敏 payload 规范化 JSON 的 SHA-256（按 Go encoding/json 解析并以键名排序、紧凑序列化；不直接哈希 JSONB 或 HTTP 的空格/键序）单独保存在 `sha256` 中供审计，不能用作新证据的报告引用。不同 run 可以有相同短 ID，必须使用结果 API 同一 run 返回的 report 与 evidence 解析；不得把短 ID 当全局主键。旧持久记录的完整哈希 ID 与缺省 sha256 字段继续原样读取和严格校验，不回填、不重写已有 partial，不按错字或缺字猜补，不增加模型自动重试。

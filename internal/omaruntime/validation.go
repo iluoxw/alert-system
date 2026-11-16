@@ -96,7 +96,8 @@ func normalizeEvidence(raw json.RawMessage, queries []string) (EvidenceBundle, e
 			return out, e
 		}
 		sum := sha256.Sum256(clean)
-		header.ID = hex.EncodeToString(sum[:])
+		header.ID = "ev_" + header.QueryID
+		header.SHA256 = hex.EncodeToString(sum[:])
 		header.Payload = clean
 		out.Items = append(out.Items, header)
 		if header.Status != "ok" {
@@ -230,10 +231,15 @@ func latestRound(events []Event) (text string, done bool, err error) {
 
 func errorEvidence(ids []string) EvidenceBundle {
 	out := EvidenceBundle{Schema: "sre.analysis-evidence/v1", Items: []Evidence{}, Partial: true}
+	seen := map[string]bool{}
 	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		raw, _ := json.Marshal(map[string]any{"query_id": id, "status": "error", "reason_code": "evidence_collection_unavailable"})
 		sum := sha256.Sum256(raw)
-		out.Items = append(out.Items, Evidence{ID: hex.EncodeToString(sum[:]), QueryID: id, Status: "error", ObservedAt: time.Now().UTC(), Payload: raw})
+		out.Items = append(out.Items, Evidence{ID: "ev_" + id, SHA256: hex.EncodeToString(sum[:]), QueryID: id, Status: "error", ObservedAt: time.Now().UTC(), Payload: raw})
 	}
 	return out
 }
