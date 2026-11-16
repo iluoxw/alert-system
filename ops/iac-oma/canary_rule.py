@@ -81,9 +81,10 @@ def desired_rule(owner, firing):
 
 def check_rule(rule, owner):
     # 服务端可增加 id/orgID/provenance/updated；所有受控语义字段必须逐项相同。
-    allowed_extra = {'id', 'orgID', 'updated', 'provenance', 'keepFiringFor', 'notification_settings', 'record'}
+    allowed_extra = {'id', 'orgID', 'updated', 'provenance', 'keepFiringFor', 'keep_firing_for', 'notification_settings', 'record'}
     if (set(rule) - set(desired_rule(owner, True)) - allowed_extra
             or rule.get('keepFiringFor') not in (None, '', '0s')
+            or rule.get('keep_firing_for') not in (None, '', '0s')
             or rule.get('notification_settings') not in (None, {})
             or rule.get('record') not in (None, {})):
         raise ValueError('Unexpected canary semantics; refusing mutation')
