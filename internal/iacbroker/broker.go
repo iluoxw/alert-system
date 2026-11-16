@@ -65,6 +65,8 @@ type command struct{ source, expr string }
 
 var catalog = map[string]command{
 	"sources":        {},
+	"entry_coverage": {},
+	"vip_coverage":   {},
 	"freshness":      {"thanos", `max(time()-timestamp(iac_http_requests_total{` + selector + `}))`},
 	"traffic":        {"thanos", `sum(rate(iac_http_requests_total{` + business + `}[5m]))`},
 	"errors":         {"thanos", `100*sum(rate(iac_http_requests_total{` + business + `,result="system_error"}[5m]))/sum(rate(iac_http_requests_total{` + business + `}[5m]))`},
@@ -78,12 +80,18 @@ var catalog = map[string]command{
 
 // QueryIDs are the complete public command allowlist; a new ID needs code review.
 func QueryIDs() []string {
-	return []string{"sources", "freshness", "traffic", "errors", "latency", "commit_unknown", "audit_dead", "audit_lag", "redis_timeouts", "mysql_running"}
+	return []string{"sources", "freshness", "traffic", "errors", "latency", "commit_unknown", "audit_dead", "audit_lag", "redis_timeouts", "mysql_running", "entry_coverage", "vip_coverage"}
 }
 
 // Profile is advice for the worker prompt; Query independently enforces the allowlist.
 func Profile(rule string) []string {
 	switch rule {
+	case "iac-sre-oma-canary":
+		return []string{"sources", "freshness", "traffic", "errors"}
+	case "iac-api-probe-not-all-200", "iac-api-probe-delay-high":
+		return []string{"sources", "freshness", "traffic", "errors", "entry_coverage"}
+	case "iac-redis002-vip-ras-down":
+		return []string{"sources", "freshness", "traffic", "redis_timeouts", "vip_coverage"}
 	case "iac-go-system-errors":
 		return []string{"sources", "freshness", "traffic", "errors", "redis_timeouts", "mysql_running"}
 	case "iac-go-latency-p99":
@@ -162,6 +170,11 @@ func (b *Broker) Query(ctx context.Context, id string) (Evidence, error) {
 		return Evidence{}, fmt.Errorf("iacbroker: query ID is not allowed")
 	}
 	item := Evidence{Schema: Schema, QueryID: id, Scope: Scope{"pro", AppID, "prd60", "iac-pro-pro"}, ObservedAt: time.Now().UTC(), Status: "unknown", Data: json.RawMessage(`null`), Provenance: Provenance{b.hash, b.revision, spec.expr, "instant observation; fixed 5m PromQL rate/increase where applicable"}}
+	if id == "entry_coverage" || id == "vip_coverage" {
+		item.ReasonCode = "shared_probe_not_collected"
+		item.Data = json.RawMessage(`{"coverage":"not_collected","note":"Go PRO application metrics do not establish five-site probe or Redis VIP availability"}`)
+		return item, nil
+	}
 	if ctx.Err() != nil {
 		item.ReasonCode = "cancelled"
 		return item, nil

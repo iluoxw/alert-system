@@ -1,0 +1,34 @@
+name: iac-go
+version: 0.1.0
+service: iac-go
+description: >
+  IAC Go 版（auth-center）PRO 的只读巡检面。指标主源 thanos-inner
+  （CCloud psdcloud-app-monitor 抓取，按 app_id 选环境），OpenObserve
+  提供 mysql 指标与日志/trace SQL 检索。计数一律本地差分：
+  不用 increase()，不用子查询；计数查询多取一个 step；晚于取数时刻的
+  样本丢弃。阈值沿用 Python skill 的判定线，PRO 的噪声底待观测后重定
+  （known-items 第 22 条）。
+layers:
+  - l0.sample_age      # thanos 即时：最新样本年龄
+  - l0.stats_gap       # O2 SQL：service.stats 每实例每分钟连续性
+  - l1.qps             # thanos 差分：校验量/均值/峰谷
+  - l1.5xx             # 按路由 system_error 占比，≥0.1% 黄 ≥1% 红
+  - l1.401             # 校验 business_reject 占比（信息）
+  - l1.admission       # 准入拒绝差分 >0 黄
+  - l2.latency_a       # ≤25ms 占比 <99% 黄（桶差分）
+  - l2.latency_b       # ≤100ms 占比 <99.5% 黄
+  - l2.p99             # 本地 histogram_quantile 插值（信息）
+  - l3.redis_timeout   # 应用侧超时差分/校验，>0.5‰ 或 5 分钟 ≥2‰ 黄（临时线）
+  - l3.mysql_fallback  # 兜底被拒 >0 黄；过载跳过只报告
+  - l3.cache_untrusted # >0 黄
+  - l3.mysql_running   # O2 仪表：Threads_running ≥20 红（临时线）
+  - l4.replicas        # ccloud-cli 快照：ready < 期望 红
+  - l4.restarts        # >0 黄
+  - l4.cpu             # 单 Pod rate 最大（信息）
+  - l4.version         # 窗内有流量的 app_version_num（信息）
+  - l7.5xx             # O2 SQL：5xx 日志分组（仅当指标 5xx>0；0 行=未知）
+  - l8.streams         # O2 streams：日志/trace 流存量（信息）
+skills:
+  - iac-go-ops         # 嵌入 SKILL，skills sync 同步到 ~/.agents
+not_implemented:
+  - LP / L5 / L6  # 由 Python skill 覆盖（探测/压测/告警 SLO；PRO 不适用或 org 级未拆分）
