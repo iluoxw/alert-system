@@ -1,0 +1,9 @@
+name: sre-control-iac-alert-analysis
+description: 告警分析专用环境；原生工具关闭，证据由 sre-control 固定只读代理提供。
+config:
+  type: cloud
+  networking:
+    type: limited
+    allowed_hosts: []
+    allow_package_managers: false
+    allow_mcp_servers: false

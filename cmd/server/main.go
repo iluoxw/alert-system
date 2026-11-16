@@ -157,6 +157,14 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	if err != nil {
 		return fmt.Errorf("加载分析任务配置失败: %w", err)
 	}
+	analysis, err := configureAnalysis(os.Getenv, agentCfg, st)
+	if err != nil {
+		return fmt.Errorf("加载可选 OMA 分析配置失败: %w", err)
+	}
+	cloudProxy, err := configureCCloudProxy(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("加载可选 IAC 只读代理配置失败: %w", err)
+	}
 	pgIngest := ingest.NewPGStore(st)
 	var delivery *agentdelivery.Runtime
 	if agentCfg != nil {
@@ -221,6 +229,8 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
+	registerAnalysisRoutes(router, analysis)
+	registerCCloudProxy(router, cloudProxy)
 	router.RegisterHealthRoutes(api.ComposeReady(
 		api.DatabaseReady(st.Pool.Ping),
 		api.SchedulerReady(sched),
@@ -237,6 +247,8 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	}
 
 	errCh := make(chan error, 1)
+	analysisRun := startAnalysis(ctx, analysis)
+	defer analysisRun.stop()
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err

@@ -9,11 +9,11 @@
 - 专用 OMA agent、无原生工具的环境及 API key 由运维通过已有平台配置提供，不能复用旧 Demo 会话中的凭据。模型收到的只有公开告警投影与固定 broker 证据，不收到 API key 或 IAC 只读凭据。
 - 本次部署优先复用现有 SRE API 进程与平台配置，不新增 Kubernetes worker 或 Secret；API 镜像打包 IAC CLI。独立 cmd 只保留为可选运维入口。
 - 镜像构建与 IAC CLI 配置见 [IAC broker 说明](iac-broker-oma.md)、`deploy/iac-worker/Makefile`。默认将只读 CLI 放在 `/app/iacctl-go`，非 root、只读根文件系统和独立 `/tmp`。
-- 主 API 装配应调用 `router.RegisterAnalysisResultRoutes(omaruntime.NewRepository())`；这部分由主 Agent 联合装配。
+- 主 API 已注册 `router.RegisterAnalysisResultRoutes(omaruntime.NewRepository())`；关闭执行器后仍可查询既有分析历史。
 
 ## 复用现有 API 进程
 
-宿主显式启用分析后，调用 `omaruntime.LoadConfig(get)`，其中 `get` 是现有平台配置读取函数；再调用 `omaruntime.NewConfiguredWorker(st,cfg)` 复用已有 Store。构造不启动 goroutine、不创建基础设施、不读取凭据文件、不关闭共享 Store。宿主用受管理的 goroutine 调用 `worker.Run(ctx)`，取消后等待其返回；队列 Reap 沿用现有 API 的周期器。分析进度用 `worker.Ready()` 单独暴露，避免 OMA 服务故障影响既有必达通知 API 的就绪状态。
+宿主设置 `OMA_ENABLED=true` 后，调用 `omaruntime.LoadConfig(get)`，其中 `get` 是现有平台配置读取函数；再调用 `omaruntime.NewConfiguredWorker(st,cfg)` 复用已有 Store。构造不启动 goroutine、不创建基础设施、不读取凭据文件、不关闭共享 Store。宿主用受管理的 goroutine 调用 `worker.Run(ctx)`，取消后等待其返回；队列 Reap 沿用现有 API 的周期器。分析进度用 `worker.Ready()` 在 `/readyz/analysis` 单独暴露，未启用时该路径为 404，未实际成功轮询时为 503，避免 OMA 服务故障影响既有必达通知 API 的就绪状态。
 
 `cmd/oma-worker` 使用相同组装函数，额外负责独立进程的 DB_DSN、信号、健康监听与有界 Reap。`OMA_HEALTH_ADDR` 仅用于该可选独立入口，嵌入 API 时由宿主选择健康路由。
 
@@ -21,6 +21,7 @@
 
 | 环境变量 | 默认值 / 约束 |
 | --- | --- |
+| `OMA_ENABLED` | API 宿主默认 `false`；仅显式 `true` 启用，启用时要求 delivery Source 子集与角色路由匹配 |
 | `DB_DSN` | 必填；同一受控 PG，不打印 |
 | `OMA_API_KEY` | 必填；只放 HTTP header，不进 prompt / 报告 |
 | `OMA_BASE_URL` | `https://oma.test.seewo.com`；生产要求 HTTPS，不带用户信息或 query，不跟随重定向 |
