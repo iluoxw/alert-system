@@ -32,6 +32,7 @@ type Integration struct {
 	ID         string
 	Kind       string
 	Enabled    bool
+	Config     json.RawMessage
 	HookIDHash string // hex(sha256(hook_id))，数据库不保存 URL 中的明文凭据
 }
 
@@ -68,8 +69,8 @@ func NewPGStore(st *store.Store) *PGStore {
 func (p *PGStore) GetIntegrationByHookIDHash(ctx context.Context, hookIDHash string) (Integration, error) {
 	var integ Integration
 	err := p.st.Pool.QueryRow(ctx, `
-		SELECT id, kind, enabled, hook_id_hash FROM integrations WHERE hook_id_hash = $1
-	`, hookIDHash).Scan(&integ.ID, &integ.Kind, &integ.Enabled, &integ.HookIDHash)
+		SELECT id, kind, enabled, hook_id_hash, config FROM integrations WHERE hook_id_hash = $1
+	`, hookIDHash).Scan(&integ.ID, &integ.Kind, &integ.Enabled, &integ.HookIDHash, &integ.Config)
 	if err == nil {
 		return integ, nil
 	}
@@ -85,6 +86,28 @@ func (p *PGStore) EnqueueBatch(ctx context.Context, integrationID string, events
 
 func (p *PGStore) EnqueueWebhookBatch(ctx context.Context, integrationID string, raw json.RawMessage, events []domain.AlertEvent) error {
 	return p.st.WithTx(ctx, func(tx pgx.Tx) error {
+		var kind string
+		var config []byte
+		var enabled bool
+		if err := tx.QueryRow(ctx, `SELECT kind,config,enabled FROM integrations WHERE id=$1 FOR SHARE`, integrationID).Scan(&kind, &config, &enabled); err != nil {
+			return err
+		}
+		if !enabled {
+			return ErrIntegrationNotFound
+		}
+		if domain.IsAuthoritativeSourceKind(kind) {
+			cfg, err := store.ParseAlertmanagerSourceConfig(config)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateExistingScope(ctx, tx, integrationID, cfg, events); err != nil {
+				return err
+			}
+			events, err = cfg.FilterEvents(events)
+			if err != nil {
+				return err
+			}
+		}
 		for _, e := range events {
 			if _, err := p.events.Enqueue(ctx, tx, integrationID, e); err != nil {
 				return err
@@ -99,7 +122,7 @@ func (p *PGStore) EnqueueWebhookBatch(ctx context.Context, integrationID string,
 				return fmt.Errorf("ingest: 更新 Alertmanager webhook 水位失败: %w", err)
 			}
 		}
-		if p.recordBatch != nil && raw != nil && len(events) > 0 && events[0].Source == domain.SourceKindAlertmanager {
+		if p.recordBatch != nil && raw != nil && len(events) > 0 && domain.IsAuthoritativeSourceKind(events[0].Source) {
 			return p.recordBatch(ctx, tx, integrationID, raw, events)
 		}
 		return nil
@@ -190,12 +213,29 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request, integ
 		}
 	}
 
+	if domain.IsAuthoritativeSourceKind(integ.Kind) {
+		cfg, err := store.ParseAlertmanagerSourceConfig(integ.Config)
+		if err != nil {
+			s.reject(w, integrationID, "scope_invalid", http.StatusUnprocessableEntity, len(body), "来源范围配置非法")
+			return
+		}
+		_, err = cfg.FilterEvents(events)
+		if err != nil {
+			s.reject(w, integrationID, "scope_unverifiable", http.StatusUnprocessableEntity, len(body), "来源事件范围或规则引用无法验证")
+			return
+		}
+
+	}
 	if batchStore, ok := s.store.(interface {
 		EnqueueWebhookBatch(context.Context, string, json.RawMessage, []domain.AlertEvent) error
-	}); ok && integ.Kind == alertmanagerKind {
+	}); ok && domain.IsAuthoritativeSourceKind(integ.Kind) {
 		err = batchStore.EnqueueWebhookBatch(ctx, integ.ID, body, events)
 	} else {
 		err = s.store.EnqueueBatch(ctx, integ.ID, events)
+	}
+	if errors.Is(err, store.ErrSourceScopeUnverifiable) {
+		s.reject(w, integrationID, "scope_unverifiable", http.StatusUnprocessableEntity, len(body), "来源事件范围或规则引用无法验证")
+		return
 	}
 	if err != nil {
 		s.reject(w, integrationID, "enqueue_failed", http.StatusInternalServerError, len(body), "internal error")

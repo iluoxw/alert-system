@@ -37,6 +37,7 @@ type Rule struct {
 }
 
 type Routing struct {
+	PublicRuleIDs []string `yaml:"public_rule_ids,omitempty"`
 	SourceIDs     []string `yaml:"source_ids"`
 	Routes        []Rule   `yaml:"routes"`
 	Fallback      Rule     `yaml:"fallback"`

@@ -22,11 +22,13 @@ const (
 // AlertmanagerSourceConfig 是 integrations.config 中 Alertmanager 专属的受控部分。
 // 凭据只保存环境变量名，API 与数据库都不接触明文 secret。
 type AlertmanagerSourceConfig struct {
-	APIURL                   string `json:"api_url"`
-	BearerTokenEnv           string `json:"bearer_token_env,omitempty"`
-	ReconcileIntervalSeconds int    `json:"reconcile_interval_seconds"`
-	StaleAfterSeconds        int    `json:"stale_after_seconds"`
-	MissingConfirmations     int    `json:"missing_confirmations"`
+	LabelScope               domain.MatcherSet `json:"label_scope,omitempty"`
+	RuleIDAllowlist          []string          `json:"rule_id_allowlist,omitempty"`
+	APIURL                   string            `json:"api_url"`
+	BearerTokenEnv           string            `json:"bearer_token_env,omitempty"`
+	ReconcileIntervalSeconds int               `json:"reconcile_interval_seconds"`
+	StaleAfterSeconds        int               `json:"stale_after_seconds"`
+	MissingConfirmations     int               `json:"missing_confirmations"`
 }
 
 func (c AlertmanagerSourceConfig) WithDefaults() AlertmanagerSourceConfig {
@@ -51,7 +53,11 @@ func ParseAlertmanagerSourceConfig(raw json.RawMessage) (AlertmanagerSourceConfi
 			return AlertmanagerSourceConfig{}, fmt.Errorf("store: 解析 Alertmanager source config 失败: %w", err)
 		}
 	}
-	return cfg.WithDefaults(), nil
+	cfg = cfg.WithDefaults()
+	if err := cfg.ValidateScope(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 type AlertSourceHealth string

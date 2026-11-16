@@ -1,10 +1,14 @@
 package alertsource
 
 import (
+	"alert-system/internal/ingest"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,15 +28,16 @@ type ReconcileResult struct {
 }
 
 type Reconciler struct {
-	store     *store.Store
-	sources   *store.AlertSourceRepo
-	alerts    *store.AlertRepo
-	timeline  *store.TimelineRepo
-	client    *Client
-	logger    *slog.Logger
-	now       func() time.Time
-	tick      time.Duration
-	projector AlertProjector
+	recordBatch ingest.BatchRecorder
+	store       *store.Store
+	sources     *store.AlertSourceRepo
+	alerts      *store.AlertRepo
+	timeline    *store.TimelineRepo
+	client      *Client
+	logger      *slog.Logger
+	now         func() time.Time
+	tick        time.Duration
+	projector   AlertProjector
 	// faultActivation 在 projector.Project 返回后被无条件调用（若已配置），由
 	// 调用方（internal/app.Build）决定是否需要触发 Fault 通知（R5.10）。这是
 	// 「Alertmanager 曾不可用、恢复后重新出现告警」场景下 Fault 通知的唯一入口——
@@ -147,6 +152,10 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 	}
 	at := r.now()
 	events, fetchErr := r.client.Fetch(ctx, source)
+	originalEvents := events
+	if fetchErr == nil {
+		events, fetchErr = source.Config.FilterEvents(events)
+	}
 	if fetchErr != nil {
 		recordErr := r.store.WithTx(ctx, func(tx pgx.Tx) error {
 			return r.sources.RecordFailure(ctx, tx, sourceID, at, fetchErr)
@@ -159,6 +168,24 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 
 	result := ReconcileResult{SourceID: sourceID, Seen: len(events), CompletedAt: at}
 	err = r.store.WithTx(ctx, func(tx pgx.Tx) error {
+		// 网络IO时不持锁。提交前取得来源锁，再用新快照校验拉取期间没有变范围。
+		var currentKind string
+		var currentConfig []byte
+		var enabled bool
+		if err := tx.QueryRow(ctx, `SELECT kind,config,enabled FROM integrations WHERE id=$1 FOR SHARE`, sourceID).Scan(&currentKind, &currentConfig, &enabled); err != nil {
+			return err
+		}
+		cfg, err := store.ParseAlertmanagerSourceConfig(currentConfig)
+		if err != nil {
+			return err
+		}
+		if !enabled || currentKind != source.Kind || cfg.ScopeKey() != source.Config.ScopeKey() || cfg.APIURL != source.Config.APIURL || cfg.BearerTokenEnv != source.Config.BearerTokenEnv {
+			return store.ErrSourceScopeChanged
+		}
+		if err := store.ValidateExistingScope(ctx, tx, sourceID, source.Config, originalEvents); err != nil {
+			return err
+		}
+		var analysisEvents []domain.AlertEvent
 		version, err := r.sources.BeginSuccessfulSnapshot(ctx, tx, sourceID, at)
 		if err != nil {
 			return err
@@ -183,6 +210,9 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 			// 投影并触发 Fault 通知：对账本就是 webhook 的兜底（不变量 14），Fault 通知又由
 			// 本系统负责（不变量 22），漏掉这里等同漏报。webhook 先到时对账只会命中已有
 			// 行（created=false），不会重复投影。
+			if (recovered || created) && source.Kind == domain.SourceKindGrafana {
+				analysisEvents = append(analysisEvents, event)
+			}
 			if recovered || created {
 				if r.projector != nil {
 					mappingResult, err := r.projector.Project(ctx, tx, alert)
@@ -195,11 +225,26 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 				}
 			}
 		}
-		missing, err := r.alerts.MarkMissingAfterSnapshot(ctx, tx, sourceID, version, source.Config.MissingConfirmations, at)
+		var uncertainRules []string
+		if source.Kind == domain.SourceKindGrafana {
+			for _, event := range events {
+				if event.Status == domain.StatusFiring && (event.RuleID == "DatasourceNoData" || event.RuleID == "DatasourceError") {
+					id := event.Labels[store.StableRuleIDLabel]
+					if id == "" {
+						id = "*"
+					}
+					uncertainRules = append(uncertainRules, id)
+				}
+			}
+		}
+		missing, err := r.alerts.MarkMissingAfterSnapshot(ctx, tx, sourceID, version, source.Config.MissingConfirmations, at, uncertainRules...)
 		if err != nil {
 			return err
 		}
 		for _, alert := range missing {
+			if alert.SourceState == domain.SourceStateResolved && source.Kind == domain.SourceKindGrafana {
+				analysisEvents = append(analysisEvents, domain.AlertEvent{Source: source.Kind, RuleID: alert.Labels["alertname"], Labels: alert.Labels, Severity: alert.Severity, Status: domain.StatusResolved, UpstreamFingerprint: alert.UpstreamFingerprint, StartsAt: alert.StartsAt, EndsAt: at})
+			}
 			if r.projector != nil {
 				mappingResult, err := r.projector.Project(ctx, tx, alert)
 				if err != nil {
@@ -211,7 +256,7 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 			}
 			switch alert.SourceState {
 			case domain.SourceStateUnknown:
-				if alert.ReconcileMissCount == 1 {
+				if alert.ReconcileMissCount <= 1 {
 					result.Unknown++
 					if _, err := r.timeline.Append(ctx, tx, domain.TimelineEntry{
 						AlertID: alert.ID, Actor: "alertmanager-reconciler",
@@ -232,10 +277,56 @@ func (r *Reconciler) ReconcileSource(ctx context.Context, sourceID string) (Reco
 				}
 			}
 		}
+		if r.recordBatch != nil && len(analysisEvents) > 0 {
+			return r.recordAnalysis(ctx, tx, sourceID, analysisEvents)
+		}
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrSourceScopeUnverifiable) || errors.Is(err, store.ErrSourceScopeChanged) {
+			failureErr := r.store.WithTx(ctx, func(tx pgx.Tx) error { return r.sources.RecordFailure(ctx, tx, sourceID, at, err) })
+			if failureErr != nil {
+				return ReconcileResult{}, errors.Join(err, failureErr)
+			}
+		}
 		return ReconcileResult{}, fmt.Errorf("alertsource: 应用快照失败: %w", err)
 	}
 	return result, nil
+}
+
+// WithBatchRecorder 给快照补漏接入与 webhook 相同的持久分析意图事务。
+func (r *Reconciler) WithBatchRecorder(record ingest.BatchRecorder) *Reconciler {
+	r.recordBatch = record
+	return r
+}
+
+func (r *Reconciler) recordAnalysis(ctx context.Context, tx pgx.Tx, sourceID string, events []domain.AlertEvent) error {
+	groups := map[string][]domain.AlertEvent{}
+	for _, e := range events {
+		key := e.Labels[store.StableRuleIDLabel] + "\x00" + e.RuleID + "\x00" + string(e.Severity)
+		groups[key] = append(groups[key], e)
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		members := groups[key]
+		status := "resolved"
+		for _, e := range members {
+			if e.Status == domain.StatusFiring {
+				status = "firing"
+			}
+		}
+		digest := sha256.Sum256([]byte(key))
+		raw, err := json.Marshal(map[string]any{"status": status, "receiver": "sre-reconcile", "groupKey": fmt.Sprintf("grafana-reconcile:%x", digest[:]), "commonLabels": members[0].Labels})
+		if err != nil {
+			return err
+		}
+		if err := r.recordBatch(ctx, tx, sourceID, raw, members); err != nil {
+			return err
+		}
+	}
+	return nil
 }
