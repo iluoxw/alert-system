@@ -1,0 +1,469 @@
+{
+  "recorded_at": "2026-11-16T06:56:01.148311+00:00",
+  "environment": "CCloud Firebreak dev / cluster 50",
+  "revision": "fb505a2b2d1130407c319f7a4b2ff49cc52cec4a",
+  "product_tree_verified_against": "86eb2026fd4c1e16fe53f5c841f7eac24fa52291",
+  "ci": {
+    "run_id": 43816127760,
+    "conclusion": "success"
+  },
+  "images": [
+    {
+      "component": "api",
+      "image": "registry.gz.cvte.cn/ai-tools/sre-control-api:reliability-fb505a2",
+      "architecture": "amd64",
+      "digest": "registry.gz.cvte.cn/ai-tools/sre-control-api@sha256:eb0fbe718f7e44d9b3fc5a6737dd6f3bc5abc6ac5cfeb78f565326eb0e6a8db9",
+      "revision": "fb505a2b2d1130407c319f7a4b2ff49cc52cec4a"
+    },
+    {
+      "component": "web",
+      "image": "registry.gz.cvte.cn/ai-tools/sre-control-web:reliability-fb505a2",
+      "architecture": "amd64",
+      "digest": "registry.gz.cvte.cn/ai-tools/sre-control-web@sha256:8aa4e750b59bae7b898aa2e54ad01ad41b65a1999cf2561c6b88424174076be7",
+      "revision": "fb505a2b2d1130407c319f7a4b2ff49cc52cec4a"
+    },
+    {
+      "component": "migrate",
+      "image": "registry.gz.cvte.cn/ai-tools/sre-control-migrate:reliability-fb505a2",
+      "architecture": "amd64",
+      "digest": "registry.gz.cvte.cn/ai-tools/sre-control-migrate@sha256:b053d52ca3948d008d8bc16bc873d68a335f588515bfe439e47b5a3a8bfc2dc8",
+      "revision": "fb505a2b2d1130407c319f7a4b2ff49cc52cec4a"
+    },
+    {
+      "component": "ops",
+      "image": "registry.gz.cvte.cn/ai-tools/sre-control-ops:reliability-fb505a2",
+      "architecture": "amd64",
+      "digest": "registry.gz.cvte.cn/ai-tools/sre-control-ops@sha256:3db2a9220621a2d9747116d1ac1015a1c012e26b2315641ae005cdd2769556e3",
+      "revision": null
+    }
+  ],
+  "pods": [
+    {
+      "name": "app-8eaa009a01d04f669682bff6-1-6945577d8c-xtw4n",
+      "ready": true,
+      "restart_count": 0,
+      "image_id": "registry.gz.cvte.cn/ai-tools/sre-control-web@sha256:8aa4e750b59bae7b898aa2e54ad01ad41b65a1999cf2561c6b88424174076be7"
+    },
+    {
+      "name": "app-996058f6d07f4f8fae7d7c38-1-5878677b58-6pwdd",
+      "ready": true,
+      "restart_count": 0,
+      "image_id": "registry.gz.cvte.cn/ai-tools/sre-control-api@sha256:eb0fbe718f7e44d9b3fc5a6737dd6f3bc5abc6ac5cfeb78f565326eb0e6a8db9"
+    }
+  ],
+  "schema": {
+    "before": 31,
+    "after": 32,
+    "dirty": false,
+    "activation_trigger": true
+  },
+  "http": {
+    "web_root": 200,
+    "runtime_config": 200,
+    "anonymous_me": 401,
+    "authenticated_admin_ping": 200,
+    "healthz_via_pod_forward": 200,
+    "readyz_via_pod_forward": 200
+  },
+  "platform_probes": {
+    "readiness": "/healthz",
+    "liveness": "/healthz"
+  },
+  "scheduler_before": {
+    "pools": [
+      {
+        "pool": "normal",
+        "workers": 1,
+        "in_flight": 0,
+        "degraded": 0
+      },
+      {
+        "pool": "detached",
+        "workers": 2,
+        "in_flight": 0,
+        "degraded": 0
+      }
+    ],
+    "workers": [
+      {
+        "id": 1,
+        "pool": "normal",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:31:37.145053892+08:00",
+        "last_poll_success_at": "2026-11-16T14:31:37.148589739+08:00",
+        "last_progress_at": "2026-11-16T14:31:37.145038654+08:00",
+        "last_completed_at": "2026-11-16T14:31:37.145038654+08:00",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0.006006489,
+        "degraded": false
+      },
+      {
+        "id": 2,
+        "pool": "detached",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:31:37.087911305+08:00",
+        "last_poll_success_at": "2026-11-16T14:31:37.092046675+08:00",
+        "last_progress_at": "0001-01-01T00:00:00Z",
+        "last_completed_at": "0001-01-01T00:00:00Z",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0,
+        "degraded": false
+      },
+      {
+        "id": 3,
+        "pool": "detached",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:31:37.08789447+08:00",
+        "last_poll_success_at": "2026-11-16T14:31:37.091451535+08:00",
+        "last_progress_at": "0001-01-01T00:00:00Z",
+        "last_completed_at": "0001-01-01T00:00:00Z",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0,
+        "degraded": false
+      }
+    ],
+    "kinds": [
+      {
+        "kind": "fault_notification_reconcile",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "notify_send",
+        "pending": 0,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_daily_report",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_oncall_broadcast",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_stale_sweep",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "retention_sweep",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      }
+    ],
+    "execution_timeout_seconds": 120,
+    "lease_seconds": 300
+  },
+  "scheduler_after": {
+    "pools": [
+      {
+        "pool": "normal",
+        "workers": 1,
+        "in_flight": 0,
+        "degraded": 0
+      },
+      {
+        "pool": "detached",
+        "workers": 2,
+        "in_flight": 0,
+        "degraded": 0
+      }
+    ],
+    "workers": [
+      {
+        "id": 1,
+        "pool": "normal",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:50:58.286458078+08:00",
+        "last_poll_success_at": "2026-11-16T14:50:58.290269876+08:00",
+        "last_progress_at": "2026-11-16T14:50:38.269843878+08:00",
+        "last_completed_at": "2026-11-16T14:50:38.269843878+08:00",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0.006089893,
+        "degraded": false
+      },
+      {
+        "id": 2,
+        "pool": "detached",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:50:58.063820483+08:00",
+        "last_poll_success_at": "2026-11-16T14:50:58.067435078+08:00",
+        "last_progress_at": "2026-11-16T14:48:17.934752673+08:00",
+        "last_completed_at": "2026-11-16T14:48:17.934752673+08:00",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0.050753485,
+        "degraded": false
+      },
+      {
+        "id": 3,
+        "pool": "detached",
+        "running": true,
+        "last_poll_at": "2026-11-16T14:50:58.010896021+08:00",
+        "last_poll_success_at": "2026-11-16T14:50:58.014619736+08:00",
+        "last_progress_at": "0001-01-01T00:00:00Z",
+        "last_completed_at": "0001-01-01T00:00:00Z",
+        "started_at": "0001-01-01T00:00:00Z",
+        "duration_seconds": 0,
+        "last_duration_seconds": 0,
+        "degraded": false
+      }
+    ],
+    "kinds": [
+      {
+        "kind": "fault_notification_reconcile",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "notify_send",
+        "pending": 0,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_daily_report",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_oncall_broadcast",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "ops_stale_sweep",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      },
+      {
+        "kind": "retention_sweep",
+        "pending": 1,
+        "overdue": 0,
+        "claimed": 0,
+        "failed": 0,
+        "reclaimed": 0,
+        "oldest_wait_seconds": 0
+      }
+    ],
+    "execution_timeout_seconds": 120,
+    "lease_seconds": 300
+  },
+  "canary": {
+    "run_id": "rollout-20261116-3c7e1b",
+    "resources": {
+      "provider": {
+        "id": "6007dcda-fa1b-481c-bd68-716c5662512a",
+        "entity_key": "platform/rollout-20261116-3c7e1b/provider"
+      },
+      "consumer": {
+        "id": "5a12e634-b85e-4c40-9389-f179d10cbb59",
+        "entity_key": "platform/rollout-20261116-3c7e1b/consumer"
+      },
+      "source": {
+        "id": "c659d8f7-fc53-462d-b8d7-977b937d4aef"
+      },
+      "alert": {
+        "id": "ba81bb01-33d2-4988-83d8-8e8996921d37"
+      },
+      "policy": {
+        "id": "46ab0d7b-e357-46dd-86ea-2f98c65db917"
+      },
+      "fault": {
+        "id": "2dddb9b8-3437-4a21-94bd-7b9df01b6e6f"
+      }
+    },
+    "phases": [
+      "setup",
+      "ingest",
+      "map",
+      "preview",
+      "submit",
+      "repeat",
+      "ack",
+      "resolve",
+      "cleanup"
+    ],
+    "initial_reason": "no_policy",
+    "silent_reprocess": true,
+    "preview_db_before": {
+      "fault_id": "2dddb9b8-3437-4a21-94bd-7b9df01b6e6f",
+      "status": "active",
+      "epoch": 1,
+      "owner_notified": false,
+      "acked": false,
+      "watch_count": 0,
+      "delivery_count": 0,
+      "notify_timeline_count": 0,
+      "notify_timer_count": 14
+    },
+    "preview_db_after": {
+      "fault_id": "2dddb9b8-3437-4a21-94bd-7b9df01b6e6f",
+      "status": "active",
+      "epoch": 1,
+      "owner_notified": false,
+      "acked": false,
+      "watch_count": 0,
+      "delivery_count": 0,
+      "notify_timeline_count": 0,
+      "notify_timer_count": 14
+    },
+    "preview_global_timer_count_note": "notify_timer_count 是全局全部状态行数，测试Fault在预览前后watch/delivery/通知时间线均0",
+    "delivery_identity": {
+      "id": "127cb6a7-13e4-4d05-a5d4-a4a08be39fc3",
+      "epoch": 1,
+      "generation": 0
+    },
+    "final_deliveries": [
+      {
+        "id": "127cb6a7-13e4-4d05-a5d4-a4a08be39fc3",
+        "fault_id": "2dddb9b8-3437-4a21-94bd-7b9df01b6e6f",
+        "epoch": 1,
+        "channel": "webhook",
+        "target_hash": "e7c759e158be9b9af7782cb48277c1ea47519f2fd11bf05cf4d79d4b03c52fd2",
+        "status": "sent",
+        "generation": 0,
+        "updated_at": "2026-11-16T14:48:17.916981+08:00"
+      }
+    ],
+    "sink_accept_count": 1,
+    "same_fault_seen_in_sink": true,
+    "repeat_submit_count": 2,
+    "ack_idempotent": true,
+    "final_fault_status": "resolved",
+    "database_final": [
+      {
+        "fault_id": "2dddb9b8-3437-4a21-94bd-7b9df01b6e6f",
+        "status": "resolved",
+        "epoch": 1,
+        "owner_notified": true,
+        "acked": true,
+        "delivery_count": 1,
+        "delivery_statuses": [
+          "sent"
+        ],
+        "timeline": [
+          "notify_backfill",
+          "notify_sent"
+        ],
+        "pending_send_count": 0
+      },
+      {
+        "schema": {
+          "version": 32,
+          "dirty": false
+        }
+      }
+    ],
+    "cleanup": {
+      "run_id": "rollout-20261116-3c7e1b",
+      "entities": [
+        {
+          "id": "5a12e634-b85e-4c40-9389-f179d10cbb59",
+          "state": "decommissioned"
+        },
+        {
+          "id": "6007dcda-fa1b-481c-bd68-716c5662512a",
+          "state": "decommissioned"
+        }
+      ],
+      "source_disabled": true,
+      "policy_disabled": true,
+      "team_channels_removed": true,
+      "periodic_tasks_disabled": true,
+      "temporary_admin_disabled": true,
+      "authenticated_session_rejected_http": 401
+    },
+    "online_slow_send_injection": false,
+    "online_failure_injection": false
+  },
+  "current_firing_governance": {
+    "items": []
+  },
+  "sources": [
+    {
+      "consecutive_failures": 0,
+      "enabled": true,
+      "firing_count": 0,
+      "health": "healthy",
+      "id": "7df12b49-a44d-4ea7-affa-acd393dc62aa",
+      "last_reconcile_at": "2026-11-16T14:50:34.988978+08:00",
+      "last_success_at": "2026-11-16T14:50:34.988978+08:00",
+      "name": "205-alertmanager",
+      "unknown_count": 0
+    },
+    {
+      "consecutive_failures": 0,
+      "enabled": false,
+      "firing_count": 0,
+      "health": "disabled",
+      "id": "8b1bef42-2cbe-4d1a-8e71-9d3b10a8a527",
+      "last_reconcile_at": null,
+      "last_success_at": null,
+      "name": "issue9-e2e-f6ef46a2bac9",
+      "unknown_count": 0
+    },
+    {
+      "consecutive_failures": 0,
+      "enabled": false,
+      "firing_count": 0,
+      "health": "disabled",
+      "id": "c659d8f7-fc53-462d-b8d7-977b937d4aef",
+      "last_reconcile_at": null,
+      "last_success_at": null,
+      "name": "rollout-20261116-3c7e1b-source",
+      "unknown_count": 0
+    }
+  ],
+  "iac_entry_dependency_change": "deferred by user; separate IAC analysis only"
+}
