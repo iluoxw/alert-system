@@ -2,7 +2,7 @@
 
 已完成 Firebreak **dev** 发布与隔离通知端到端验收。API、Web 运行 `reliability-fb505a2`，数据库为 `32 / dirty=false`。本次没有发布 PRO，也没有改变 IAC、E2B 的业务关系或通知配置。
 
-跟踪：[Issue #20](https://github.com/iluoxw/alert-system/issues/20)。脱敏实测记录：[acceptance.json](evidence/2026-11-16-release/acceptance.json)，迁移回执：[migration.log](evidence/2026-11-16-release/migration.log)。
+跟踪：[Issue #20](https://github.com/iluoxw/alert-system/issues/20)。脱敏实测记录：[acceptance.json](evidence/2026-11-16-release/acceptance.json)，迁移回执：[migration.txt](evidence/2026-11-16-release/migration.txt)。
 
 ## 提交与发布
 
