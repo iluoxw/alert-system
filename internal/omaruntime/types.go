@@ -47,7 +47,10 @@ type Report struct {
 	ReasonCode      string   `json:"reason_code,omitempty"`
 }
 type Evidence struct {
-	ID         string          `json:"evidence_id"`
+	// ID is a reference within this run only; legacy records retain their full hash IDs.
+	ID string `json:"evidence_id"`
+	// SHA256 hashes the scrubbed payload after encoding/json canonical map serialization.
+	SHA256     string          `json:"sha256,omitempty"`
 	QueryID    string          `json:"query_id"`
 	Status     string          `json:"status"`
 	ObservedAt time.Time       `json:"observed_at"`

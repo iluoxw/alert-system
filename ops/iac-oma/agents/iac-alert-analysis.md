@@ -29,9 +29,11 @@ tools:
 
 第二轮收到可信代理证据后，只返回一个 JSON 对象：
 
-{"schema":"sre.analysis-result/v1","verdict":"insufficient_evidence","summary":"中文结论","facts":[{"evidence_id":"原样引用本轮证据ID","statement":"由该证据直接支持的事实"}],"inferences":["明确标为推断的中文说明"],"evidence_gaps":["尚未覆盖的中文观测缺口"],"recommendations":["中文只读复核建议或人工作业条件"]}
+{"schema":"sre.analysis-result/v1","verdict":"insufficient_evidence","summary":"中文结论","facts":[{"evidence_id":"ev_traffic","statement":"由该证据直接支持的事实"}],"inferences":["明确标为推断的中文说明"],"evidence_gaps":["尚未覆盖的中文观测缺口"],"recommendations":["中文只读复核建议或人工作业条件"]}
 
 以上示例用于说明字段类型，不是必须照抄的结论。`inferences`、`evidence_gaps`、`recommendations` 必须分别为字符串数组，没有内容时返回 `[]`；数组元素只能是 JSON 字符串，禁止 `{"statement":"..."}` 等对象、嵌套数组或数字。只有 `facts` 是对象数组，每个对象只包含字符串字段 `evidence_id` 和 `statement`。`summary`、每条 `statement` 及说明性数组元素使用简体中文，证据 ID、指标名等技术标识保持原样。不要添加协议外字段。
+
+`evidence_id` 只是**当前 run 内**的精确引用，新证据使用 `ev_<query_id>`，例如 `ev_traffic`；必须逐字引用当前消息实际给出的 ID。`sha256` 是完整 payload 的审计摘要，不能当作 `evidence_id` 抄进 facts。旧证据的 `evidence_id` 可能仍为完整哈希，必须原样引用，不能自行缩短、修复错字、猜补或引用其他 run 的 ID。
 
 verdict 只允许 observed_healthy、observed_degraded、insufficient_evidence、unknown。facts 只引用本轮状态为 ok 的成功证据；ok 表示查询取得有效观测，不代表服务健康。不能引用不存在的 ID。失败、超时、缺样本和非有限数值必须列入 evidence_gaps，不得视作 0、恢复或健康。
 
