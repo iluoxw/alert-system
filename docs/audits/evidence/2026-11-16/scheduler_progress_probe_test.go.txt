@@ -1,0 +1,37 @@
+//go:build integration
+package scheduler
+
+import (
+ "context"
+ "errors"
+ "testing"
+ "time"
+ "github.com/jackc/pgx/v5"
+)
+func TestReviewDetachedCompletionProgress(t *testing.T){
+ st:=setupTestStore(t)
+ for _,tc:=range []struct{name string;persisted bool}{{"sent",true},{"business_failed",true},{"cancelled",false},{"settle_db_failed",false},{"stale_fence",false}}{
+  t.Run(tc.name,func(t *testing.T){
+   ctx,cancel:=context.WithCancel(context.Background());defer cancel()
+   s:=New(st,10*time.Millisecond);w:=s.newWorker("detached")
+   renamed:=false
+   s.RegisterDetachedHandler("review_progress",func(hctx context.Context,_ string,_ []byte)error{
+    s.workersMu.Lock();w.StartedAt=time.Now().Add(-2*time.Second);w.LastPollSuccessAt=w.StartedAt;s.workersMu.Unlock()
+    switch tc.name{
+    case "business_failed":return errors.New("fake business failure")
+    case "cancelled":cancel();return hctx.Err()
+    case "settle_db_failed":if _,e:=st.Pool.Exec(context.Background(),"ALTER TABLE timers RENAME TO review_timers_hidden");e!=nil{return e};renamed=true
+    case "stale_fence":if _,e:=st.Pool.Exec(context.Background(),"UPDATE timers SET claim_count=claim_count+1 WHERE kind='review_progress' AND ref_id=$1",tc.name);e!=nil{return e}
+    }
+    return nil
+   })
+   if e:=st.WithTx(context.Background(),func(tx pgx.Tx)error{return s.Schedule(context.Background(),tx,"review_progress",tc.name,time.Now().Add(-time.Second),nil)});e!=nil{t.Fatal(e)}
+   _,e:=s.processOneDue(context.WithValue(ctx,workerKey{},w))
+   if renamed{if _,restoreErr:=st.Pool.Exec(context.Background(),"ALTER TABLE review_timers_hidden RENAME TO timers");restoreErr!=nil{t.Fatal(restoreErr)}}
+   if e!=nil{t.Fatal(e)}
+   row:=s.WorkerStatuses()[0]
+   if row.LastProgressAt.IsZero()==tc.persisted{t.Fatalf("persisted=%v,progress=%v",tc.persisted,row.LastProgressAt)}
+   if row.Degraded==tc.persisted{t.Fatalf("persisted=%v,degraded=%v",tc.persisted,row.Degraded)}
+  })
+ }
+}

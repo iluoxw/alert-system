@@ -28,7 +28,7 @@ Issue：[#11](https://github.com/iluoxw/alert-system/issues/11)。
 
 1. 写回归用例，复现「上游仅入队/最终失败，下游被永久抑制」和「补渠道后 active Fault 不再进入激活通知」。验证旧实现不能满足这些断言。
 2. 引入每个 Fault/通知目标的稳定意图与结果记录。至少区分等待、入队、成功、失败；成功是渠道接受，不是人阅读。历史 owner_notified_at 不能直接回填成已送达。通知目标原文不得经审计/API 输出。
-3. Sender 成功/最终失败在现有短事务中回写结果与 Fault 时间线。回调不得执行外部 IO。通知 key 与 round 必须持久稳定，重复扫描不能生成新意图。
+3. Sender 成功/最终失败在现有短事务中回写结果与 Fault 时间线。回调不得执行外部 IO。通知 key 与 round 必须持久稳定，重复扫描不能生成新意图。epoch 绑定数据库内真实激活版本，不能信任事务外/写入前推断的 Transition；静默重激活不自动补发，但显式提交必须区别上一轮 sent。
 4. 下游抑制检查真实送达与目标覆盖。仅 pending 时要么不抑制，要么使用显式配置的有限暂缓；缺省不得无限等待。不把未确认的响应 SLA 写成默认承诺。
 5. 对暂缓、冷却和无目标记录做有界持久对账。周期任务启动时必须 reconcile，崩溃后能恢复；每次批量有上限。成功记录不重复发送；失败重投必须显式或有次数上限，避免永续重试风暴。
 6. 提供管理员补投预览与提交入口。默认 reprocess 保持静默，预览不写任何状态；提交重新校验，不能信任客户端旧预览。已恢复/已认领对象不自动补投，补齐渠道后可触发一次有效通知。
@@ -44,7 +44,7 @@ Issue：[#11](https://github.com/iluoxw/alert-system/issues/11)。
 | N3 | 多渠道部分成功 | 各目标结果可解释；失败目标不因其他成功而丢失 |
 | N4 | 补规则→静默回放→预览→补投 | 预览无副作用；仍 active 未送达目标只产生一个稳定意图 |
 | N5 | 补渠道/冷却到期/进程重启 | 对账可恢复；已恢复/认领不被自动轰炸 |
-| N6 | 多实例同时补投 | PG 唯一性/锁保证逻辑意图不重复，外部 IO 的 at-least-once 边界明确 |
+| N6 | 多实例同时补投/并发激活；静默重激活后补投 | PG 唯一性/锁保证逻辑意图不重复；过期 Transition 不生成新轮次，新激活不复用旧 sent；外部 IO 的 at-least-once 边界明确 |
 | N7 | 从 29/31 升级，以及空库安装 | 新结构存在、已有数据保留；down/up 可往返，不回填 28 |
 
 ## I2：调度执行容量隔离
@@ -63,7 +63,7 @@ Issue：[#12](https://github.com/iluoxw/alert-system/issues/12)。
 6. readiness 区分主处理循环与慢通知。慢渠道不使持久化入口失去就绪；通知池异常有独立可见状态，不能直接忽略。共享心跳不能覆盖单个 worker 的停滞。
 7. 验证退出和竞态，输出 `docs/audits/2026-11-16-scheduler-acceptance.md`。
 
-**验收矩阵：** S1 通知池占满时普通 timer 在测试约定时限内执行（使用同步屏障，避免随机器负载抖动）；S2 在途不超过配置并发且无超领；S3 正常空闲不误报；S4 慢通知不打红接入 readiness、故障状态仍可查询；S5 租约过期重领、旧 token、失败、panic、取消、成功后取消全部回归；S6 race 通过。
+**验收矩阵：** S1 通知池占满时普通 timer 在测试约定时限内执行（使用同步屏障，避免随机器负载抖动）；S2 在途不超过配置并发且无超领；S3 正常空闲、合法长任务完成到下次取库之间不误报；持续 DB 失败不能伪造完成进度；S4 慢通知不打红接入 readiness、故障状态仍可查询；S5 租约过期重领、旧 token、失败、panic、取消、成功后取消全部回归；S6 race 通过。
 
 ## I3：生命周期与映射正确性
 
@@ -75,7 +75,7 @@ Issue：[#13](https://github.com/iluoxw/alert-system/issues/13)。
 
 1. 新增真实 PG 回归：provider 仍 active，唯一 confirmed 应用已下线；Declare 必须失败。补充仍有其他 active confirmed 时允许宣布，已有 Incident 不自动关闭。
 2. 在权威 store 判定加 lifecycle 过滤，核对总览/列表口径；保留人工历史裁决，不删除历史关系。
-3. 把映射匹配拆成可复用的只读评估。显式配置的 correlation labels 必须有值，否则产生稳定 reason_code，不自动建/合并 Fault；未配置维度沿用原聚合规则。
+3. 把映射匹配拆成可复用的只读评估。显式配置的 correlation labels 必须有值，否则产生稳定 reason_code，不自动建/合并 Fault；未配置维度沿用原聚合规则。升级前已绑定且缺维度的 occurrence 必须仍可沿历史绑定解除，保留人工证据；共享 Fault 还有未解除证据时不提前降级。
 4. 管理端提供只读预览：目标 entity、fault kind、correlation key、已有/拟创建 Fault、缺失原因。真实 Project 复用同一计算路径；HTTP 预览无 evidence、timeline、timer、mapping result 写入。
 5. 增加当前 firing 治理统计，按 source/severity/reason 区分；ignored 不能冒充 unmapped。集合为空返回 []，批量上限与管理员鉴权必测。
 6. 跨节点自动 confirmed 的解释明确应用退化事实与因果不确定性，不改 direct evidence 判定规则。测试显式 App→Gateway 依赖可达、stale 证据不误确认、下线阻断；不翻转 ccloud trace 方向。
@@ -101,7 +101,7 @@ Issue：[#13](https://github.com/iluoxw/alert-system/issues/13)。
 
 1. 三名 sol 实现 Agent 在独立 worktree 实施 I1/I2/I3，各自补测试和验收记录。配置/装配交叉改动由主 Agent 集成时处理。
 2. Agent 完成自测后，主 Agent 固化提交；轮换为另一名 sol 独立审查该提交的失败模式与验收覆盖。独立审查发现 P0/P1 或明确行为错误时退回修复，不用「测试绿」代替判断。
-3. 主 Agent 在临时集成分支合并三个实现提交，运行构建、vet、后端全量/race/集成，以及必要 E2E。E2E 使用固定 Compose 资源，整个会话只允许主 Agent 串行运行。
+3. 主 Agent 在临时集成分支合并三个实现提交，运行构建、vet、后端全量/race/集成，以及必要 E2E。E2E 使用固定 Compose 资源，整个会话只允许主 Agent 串行运行一个 E2E 测试进程。最终 Go 包级并发设为 2，普通包的随机命名 testcontainers 可并行，避免误把“不得同时启动两套固定 E2E”扩大为全仓所有包必须串行。
 4. 若修改前端，执行 `npm run build` 与 `npx oxlint`；未改前端时仍以 CI 完成已有前端回归。
 5. Issue、计划、PR 描述写清最终范围与测试结果。PR 发布后检查对应 HEAD 的 CI 到完成；失败修复后才交付。
 
@@ -110,8 +110,7 @@ Issue：[#13](https://github.com/iluoxw/alert-system/issues/13)。
 ```bash
 go build ./...
 go vet ./...
-go test ./... -count=1
-go test -tags=integration ./... -race -count=1 -p=1
+go test -tags=integration ./... -race -count=1 -p=2
 ```
 
 测试必须真实结束并退出 0；禁止把后台仍运行、skipped、缺少 integration tag 当成通过。若因环境失败，先记录错误和影响范围，修复环境或提供等价验证，不篡改测试阈值来掩盖产品失败。
@@ -121,11 +120,13 @@ go test -tags=integration ./... -race -count=1 -p=1
 ## 状态与证据
 
 - [x] 基线核对、用户范围确认、隔离 worktree 建立。
-- [-] I1 通知实现与自测。
-- [-] I2 调度实现与自测。
-- [-] I3 正确性实现与自测。
-- [ ] 交叉独立审查及问题修复。
-- [ ] 主 Agent 集成验收。
-- [ ] PR 发布、CI 收敛、Issue 与验收记录关联。
+- [x] I1 通知实现、自测、激活版本与兜底身份修复（PR #19）。
+- [x] I2 调度实现、自测与 readiness 审查修复（PR #17）。
+- [x] I3 正确性实现、自测与历史 occurrence 升级修复（PR #18）。
+- [x] 交叉独立审查及问题修复：4 项 P1、2 项 P2 均有红灯证据及固定 SHA 复验。
+- [x] 主 Agent 集成验收：`86eb202` 的 build、vet、全仓 integration/race（含 E2E）全部退出 0。
+- [x] 实现 PR 发布、产品 CI 收敛、Issue 与验收记录关联：#17 / #18 / #19，基于未合并的 #10。
 
 最终状态由主 Agent 按实际证据更新，不由实现 Agent 自行勾选。
+
+完成回执与最终固定提交见 [联合验收](../audits/2026-11-16-failure-mode-acceptance.md)。健康证据 #14、Agent inbox/report #15 按用户确认留待后续；本轮不合并、不部署。

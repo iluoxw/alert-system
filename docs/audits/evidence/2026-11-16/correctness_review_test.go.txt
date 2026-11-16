@@ -1,0 +1,76 @@
+//go:build integration
+package incident
+
+import (
+ "context"
+ "crypto/sha256"
+ "encoding/hex"
+ "testing"
+ "time"
+
+ "alert-system/internal/domain"
+ "alert-system/internal/mapping"
+ "alert-system/internal/store"
+ "github.com/jackc/pgx/v5"
+)
+
+func TestReviewResolvedMissingDimensionPreservesLifecycle(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background()
+ policies:=store.NewAlertMappingRepo();faults:=store.NewFaultRepo();topology:=store.NewTopologyRepo()
+ projector:=mapping.NewProjector(policies,store.NewServiceCatalogRepo(),topology,faults,nil)
+ var alert domain.Alert;var fault domain.Fault
+ err:=st.WithTx(ctx,func(tx pgx.Tx)error{
+  now:=time.Now().UTC()
+  _,err:=topology.ImportSnapshot(ctx,tx,domain.TopologySnapshot{SchemaVersion:1,Source:"review",ObservedAt:now,Nodes:[]domain.ResourceNode{{ExternalRef:"gateway",Name:"Gateway",Kind:domain.ResourceNodeKindInfrastructureCapability}}});if err!=nil{return err}
+  node,err:=topology.GetByExternalRef(ctx,tx,"review","gateway");if err!=nil{return err}
+  alert,_,err=store.NewAlertRepo().UpsertByFingerprint(ctx,tx,domain.AlertEvent{Fingerprint:"review-old-missing",ResolvePolicy:domain.ResolvePolicySource,RuleID:"test",Severity:domain.SeverityCritical,Status:domain.StatusFiring,Title:"test",Source:"generic",StartsAt:now,Labels:map[string]string{"sre.entity.key":"review:gateway","sre.fault.kind":"unavailable","sre.evidence.role":"direct_impact","sre.correlation.labels":"cluster"}},"");if err!=nil{return err}
+  // 精确模拟旧 Project 的空维度 key 与 active evidence。
+  sum:=sha256.Sum256([]byte("review:gateway\x00unavailable\x00cluster="))
+  key:="fault:review:gateway:unavailable:"+hex.EncodeToString(sum[:6])
+  fault,_,err=faults.Upsert(ctx,tx,domain.Fault{CorrelationKey:key,Scope:domain.FaultScopeCapability,Status:domain.FaultStatusActive,Severity:domain.SeverityCritical,Kind:"unavailable",Title:"old",ResourceNodeID:node.ID,EntityRef:node.EntityKey,Confidence:1,FirstDetected:now,LastEvaluated:now});if err!=nil{return err}
+  return faults.UpsertAutomatedEvidence(ctx,tx,fault.ID,domain.FaultEvidence{AlertID:alert.ID,Role:domain.EvidenceRoleDirectImpact,Rationale:"pre-upgrade mapping",Confidence:1,DecisionOrigin:domain.DecisionOriginAutomation})
+ });if err!=nil{t.Fatal(err)}
+ alert.Source="alertmanager";alert.SourceIntegrationID="source";alert.UpstreamFingerprint="fp";alert.SourceState=domain.SourceStateResolved
+ err=st.WithTx(ctx,func(tx pgx.Tx)error{
+  _,err:=projector.Project(ctx,tx,alert);if err!=nil{return err}
+  actual,err:=faults.GetByID(ctx,tx,fault.ID);if err!=nil{return err}
+  var evidenceCount int
+  if err:=tx.QueryRow(ctx,`SELECT count(*) FROM fault_alert_links WHERE fault_id=$1`,fault.ID).Scan(&evidenceCount);err!=nil{return err}
+  if actual.Status==domain.FaultStatusActive && evidenceCount==0 {t.Errorf("resolved旧occurrence后遗留无证据active Fault: status=%s links=%d",actual.Status,evidenceCount)}
+  return nil
+ });if err!=nil{t.Fatal(err)}
+}
+
+func TestReviewConcurrentFiringDoesNotGetMonitored(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background()
+ policies:=store.NewAlertMappingRepo();faults:=store.NewFaultRepo();topology:=store.NewTopologyRepo()
+ projector:=mapping.NewProjector(policies,store.NewServiceCatalogRepo(),topology,faults,nil)
+ var alert domain.Alert;var fault domain.Fault
+ err:=st.WithTx(ctx,func(tx pgx.Tx)error{
+  now:=time.Now().UTC()
+  _,err:=topology.ImportSnapshot(ctx,tx,domain.TopologySnapshot{SchemaVersion:1,Source:"review",ObservedAt:now,Nodes:[]domain.ResourceNode{{ExternalRef:"gateway",Name:"Gateway",Kind:domain.ResourceNodeKindInfrastructureCapability}}});if err!=nil{return err}
+  node,err:=topology.GetByExternalRef(ctx,tx,"review","gateway");if err!=nil{return err}
+  alert,_,err=store.NewAlertRepo().UpsertByFingerprint(ctx,tx,domain.AlertEvent{Fingerprint:"review-old-missing",ResolvePolicy:domain.ResolvePolicySource,RuleID:"test",Severity:domain.SeverityCritical,Status:domain.StatusFiring,Title:"test",Source:"generic",StartsAt:now,Labels:map[string]string{"sre.entity.key":"review:gateway","sre.fault.kind":"unavailable","sre.evidence.role":"direct_impact","sre.correlation.labels":"cluster"}},"");if err!=nil{return err}
+  // 精确模拟旧 Project 的空维度 key 与 active evidence。
+  sum:=sha256.Sum256([]byte("review:gateway\x00unavailable\x00cluster="))
+  key:="fault:review:gateway:unavailable:"+hex.EncodeToString(sum[:6])
+  fault,_,err=faults.Upsert(ctx,tx,domain.Fault{CorrelationKey:key,Scope:domain.FaultScopeCapability,Status:domain.FaultStatusActive,Severity:domain.SeverityCritical,Kind:"unavailable",Title:"old",ResourceNodeID:node.ID,EntityRef:node.EntityKey,Confidence:1,FirstDetected:now,LastEvaluated:now});if err!=nil{return err}
+  return faults.UpsertAutomatedEvidence(ctx,tx,fault.ID,domain.FaultEvidence{AlertID:alert.ID,Role:domain.EvidenceRoleDirectImpact,Rationale:"pre-upgrade mapping",Confidence:1,DecisionOrigin:domain.DecisionOriginAutomation})
+ });if err!=nil{t.Fatal(err)}
+
+ tx,err:=st.Pool.Begin(ctx);if err!=nil{t.Fatal(err)};defer tx.Rollback(ctx)
+ if _,err=tx.Exec(ctx,`UPDATE faults SET last_evaluated_at=last_evaluated_at+interval '1 second' WHERE id=$1`,fault.ID);err!=nil{t.Fatal(err)}
+ other,_,err:=store.NewAlertRepo().UpsertByFingerprint(ctx,tx,domain.AlertEvent{Fingerprint:"concurrent-new",ResolvePolicy:domain.ResolvePolicySource,RuleID:"test",Severity:domain.SeverityCritical,Status:domain.StatusFiring,Title:"other",Source:"generic",StartsAt:time.Now()},"");if err!=nil{t.Fatal(err)}
+ if err:=faults.UpsertAutomatedEvidence(ctx,tx,fault.ID,domain.FaultEvidence{AlertID:other.ID,Role:domain.EvidenceRoleDirectImpact,Rationale:"new firing",Confidence:1});err!=nil{t.Fatal(err)}
+ done:=make(chan error,1)
+ go func(){done<-st.WithTx(ctx,func(tx pgx.Tx)error{_,e:=faults.MonitorBoundFaultAfterResolvedOccurrence(ctx,tx,fault.ID,alert.ID,time.Now());return e})}()
+ deadline:=time.Now().Add(3*time.Second)
+ for {
+  var blocked bool
+  if err:=st.Pool.QueryRow(ctx,`SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'UPDATE faults f SET status=%')`).Scan(&blocked);err!=nil{t.Fatal(err)}
+  if blocked{break};if time.Now().After(deadline){t.Fatal("未观察到行锁屏障")};time.Sleep(5*time.Millisecond)
+ }
+ if err:=tx.Commit(ctx);err!=nil{t.Fatal(err)};if err:=<-done;err!=nil{t.Fatal(err)}
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{actual,e:=faults.GetByID(ctx,tx,fault.ID);if e==nil&&actual.Status!=domain.FaultStatusActive{t.Errorf("新firing已提交但共享Fault变成%s",actual.Status)};return e});err!=nil{t.Fatal(err)}
+ _=projector
+}

@@ -1,0 +1,12 @@
+package scheduler
+import("testing";"time")
+func TestReviewCompletedNormalTaskReadiness(t *testing.T){
+ s:=New(nil,10*time.Millisecond)
+ w:=s.newWorker("normal")
+ s.workerStart(w,"normal_job")
+ s.workersMu.Lock();w.StartedAt=time.Now().Add(-2*time.Second);w.LastPollSuccessAt=w.StartedAt;s.workersMu.Unlock()
+ if !s.NormalWorkersReady(){t.Fatal("合法在途任务应 ready")}
+ s.workerComplete(w)
+ if s.NormalWorkersReady(){t.Fatal("预期复现长任务完成后短暂 not-ready，但没有复现")}
+ t.Log("复现：合法长任务在途 ready，完成清除 StartedAt 后立即 not-ready，直到下轮成功取库")
+}
