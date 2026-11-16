@@ -104,7 +104,7 @@ type dueTimer struct {
 // Scheduler 是统一持久化定时器：Schedule/Cancel 由调用方在自己的事务里直接调用
 // （例如去重 stage 需要「写告警 + 注册定时器」在同一事务内原子提交），Run 则
 // 独立按 pollInterval 周期性开事务轮询到期定时器并分发给 RegisterHandler 注册的
-// 处理函数。可以同时启动多个 Run（同一进程内的多个 goroutine，或多个进程副本）：
+// 处理函数。每个实例只运行一个 Run，可运行多个 Scheduler 实例或多个进程副本：
 // 到期定时器的 FOR UPDATE SKIP LOCKED 查询保证同一条记录只会被其中一个 worker
 // 处理一次。
 type Scheduler struct {
@@ -113,6 +113,12 @@ type Scheduler struct {
 	pollInterval time.Duration
 	batchSize    int
 	leaseTTL     time.Duration
+	options      Options
+	configMu     sync.RWMutex
+	workersMu    sync.RWMutex
+	workers      map[int]*workerState
+	nextWorker   atomic.Int64
+	running      atomic.Bool
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
@@ -133,6 +139,8 @@ func New(st *store.Store, pollInterval time.Duration) *Scheduler {
 		pollInterval: pollInterval,
 		batchSize:    defaultBatchSize,
 		leaseTTL:     defaultLeaseTTL,
+		options:      DefaultOptions(),
+		workers:      make(map[int]*workerState),
 		handlers:     make(map[string]Handler),
 		detached:     make(map[string]DetachedHandler),
 	}
@@ -164,7 +172,7 @@ func (s *Scheduler) recordPollSuccess() {
 }
 
 // LastPollSuccessAt 返回最近一次成功轮询的本地时间；从未成功轮询过时为零值。
-// /readyz 用它判断 worker 是否停摆，不查外部系统。
+// 保留兼容监测用途；生产 /readyz 使用 NormalWorkersReady 的逐 worker 状态。
 func (s *Scheduler) LastPollSuccessAt() time.Time {
 	ns := s.lastPollUnixNano.Load()
 	if ns == 0 {
@@ -173,7 +181,7 @@ func (s *Scheduler) LastPollSuccessAt() time.Time {
 	return time.Unix(0, ns)
 }
 
-// PollInterval 是 Run 的固定 tick，供 /readyz 按 3× 间隔判定停摆。
+// PollInterval 是空闲或错误轮询的退避间隔。
 func (s *Scheduler) PollInterval() time.Duration {
 	return s.pollInterval
 }
@@ -295,15 +303,25 @@ func (s *Scheduler) HasFired(ctx context.Context, tx pgx.Tx, kind string, refID 
 //
 // 租约未过期的 claimed 行不在结果集里，所以正在被别的 worker 执行的定时器不会被抢走。
 func (s *Scheduler) fetchOneDue(ctx context.Context, tx pgx.Tx, now time.Time) (t dueTimer, found bool, err error) {
+	kinds := s.detachedKinds()
+	w, _ := ctx.Value(workerKey{}).(*workerState)
+	filter := 0
+	if w != nil {
+		filter = 1
+		if w.Pool == "detached" {
+			filter = 2
+		}
+	}
 	err = tx.QueryRow(ctx, `
 		SELECT id, kind, ref_id, payload
 		FROM timers
-		WHERE (status = 'pending' AND fire_at <= $1)
-		   OR (status = 'claimed' AND lease_expires_at <= $1)
+		WHERE ((status = 'pending' AND fire_at <= $1)
+		   OR (status = 'claimed' AND lease_expires_at <= $1))
+		AND ($3 = 0 OR ($3 = 1 AND NOT (kind = ANY($2::text[]))) OR ($3 = 2 AND kind = ANY($2::text[])))
 		ORDER BY fire_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, now).Scan(&t.id, &t.kind, &t.refID, &t.payload)
+	`, now, kinds, filter).Scan(&t.id, &t.kind, &t.refID, &t.payload)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return dueTimer{}, false, nil
@@ -437,6 +455,14 @@ func (s *Scheduler) pollOnce(ctx context.Context) error {
 // pollOnce 应当继续下一轮循环；more=false 表示当前已经没有到期定时器，本轮
 // pollOnce 可以结束。
 func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
+	w, _ := ctx.Value(workerKey{}).(*workerState)
+	if w != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.Options().ExecutionTimeout)
+		defer cancel()
+		s.workerPoll(w)
+		defer s.workerComplete(w)
+	}
 	var t dueTimer
 	var found bool
 	var detached DetachedHandler
@@ -452,7 +478,13 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 			return nil
 		}
 
+		s.workerStart(w, t.kind)
 		if h, ok := s.detachedHandlerFor(t.kind); ok {
+			// 运行中新增 detached 注册可能发生在领取过滤快照之后；普通槽不得执行它。
+			if w != nil && w.Pool == "normal" {
+				found = false
+				return nil
+			}
 			detached = h
 			claimCount, ferr = claimTimer(ctx, tx, t.id, s.clock.Now().Add(s.leaseTTL))
 			return ferr
@@ -466,6 +498,7 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 
 	if !found {
 		if txErr == nil {
+			s.workerPollSuccess(w)
 			// 空轮询也是成功心跳：没取到到期定时器说明 worker 仍在转，不能让
 			// /readyz 在业务低峰时误报 503。
 			s.recordPollSuccess()
@@ -475,6 +508,9 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 	// 取到了一条（无论随后 handler 成败）：本轮轮询本身是成功的。
 	s.recordPollSuccess()
 	if txErr != nil {
+		if ctx.Err() != nil {
+			return true, txErr
+		}
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 执行失败: %v", t.id, t.kind, t.refID, txErr)
 		if merr := s.store.WithTx(ctx, func(tx pgx.Tx) error {
 			return markFailed(ctx, tx, t.id)
@@ -557,31 +593,50 @@ func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int,
 	}
 }
 
-// Run 启动轮询 worker：按 pollInterval 周期性地把到期的 pending 定时器分发给已注册
-// 的 handler，直到 ctx 被取消为止（阻塞调用，通常配合 `go sched.Run(ctx)` 使用）。
-//
-// at-least-once 与 handler 幂等的约定见 Handler 类型的文档；可以同时运行多个 Run
-// （同进程多 goroutine，或多个进程副本），FOR UPDATE SKIP LOCKED 保证同一条定时器
-// 只会被其中一个 worker 处理一次。
+// Run 启动固定数量的同步执行者。每个执行者空闲时才领取一条任务，完成后才能再次领取。
+// 两池按 detached 注册表隔离；新增普通 kind 自动进入普通池。返回前等待全部执行者退出。
 func (s *Scheduler) Run(ctx context.Context) {
-	if err := s.pollOnce(ctx); err != nil {
-		log.Printf("scheduler: 轮询失败: %v", err)
-	} else {
-		s.recordPollSuccess()
+	s.configMu.Lock()
+	if !s.running.CompareAndSwap(false, true) {
+		s.configMu.Unlock()
+		log.Printf("scheduler: Run 已启动")
+		return
 	}
+	opts := s.options
+	s.configMu.Unlock()
+	defer s.running.Store(false)
+	s.workersMu.Lock()
+	s.workers = make(map[int]*workerState)
+	s.workersMu.Unlock()
+	var wg sync.WaitGroup
+	for _, pool := range []struct {
+		name string
+		size int
+	}{{"normal", opts.NormalWorkers}, {"detached", opts.DetachedWorkers}} {
+		for i := 0; i < pool.size; i++ {
+			w := s.newWorker(pool.name)
+			wg.Add(1)
+			go func() { defer wg.Done(); defer s.workerStopped(w); s.runWorker(context.WithValue(ctx, workerKey{}, w)) }()
+		}
+	}
+	wg.Wait()
+}
 
-	ticker := time.NewTicker(s.pollInterval)
-	defer ticker.Stop()
-	for {
+func (s *Scheduler) runWorker(ctx context.Context) {
+	for ctx.Err() == nil {
+		more, err := s.processOneDue(ctx)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("scheduler: worker 轮询失败: %v", err)
+		}
+		if more && err == nil {
+			continue
+		}
+		timer := time.NewTimer(s.pollInterval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			if err := s.pollOnce(ctx); err != nil {
-				log.Printf("scheduler: 轮询失败: %v", err)
-			} else {
-				s.recordPollSuccess()
-			}
+		case <-timer.C:
 		}
 	}
 }

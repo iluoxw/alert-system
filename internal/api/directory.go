@@ -10,7 +10,7 @@
 //
 // 健康检查两端点豁免鉴权，挂在 engine 根上，与 /callbacks/lark/card（server.go）
 // 同层：/healthz 是进程存活探针恒 200，不查任何依赖；/readyz 调用注入的 ready
-// 函数（main 传 ComposeReady(DatabaseReady(Ping), WorkerReady(scheduler),
+// 函数（main 传 ComposeReady(DatabaseReady(Ping), SchedulerReady(scheduler),
 // WorkerReady(pipeline))）。只看进程内状态：ccloud / Alertmanager 不可用不得导致
 // 503。错误文案只给概括句，不带 DSN/连接串/错误原文。
 //

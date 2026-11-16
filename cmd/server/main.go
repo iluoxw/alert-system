@@ -65,6 +65,8 @@ func main() {
 // run 组装全部依赖，启动 HTTP 服务与后台 worker，阻塞直到 ctx 被取消（收到中断信号）
 // 或 HTTP 服务异常退出。
 func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookExecutor runbook.Executor, logger *slog.Logger) error {
+	ctx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
 	st, err := store.New(ctx, cfg.DBDSN)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
@@ -207,13 +209,14 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)
 	router.RegisterOpsIndicatorsRoutes(ops.QueryIndicators)
+	router.RegisterSchedulerRoutes(sched.QueryStatus)
 	router.RegisterMemberRoutes(teams, users, memberships)
 	router.RegisterShiftRoutes(schedules, users, shifts)
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
 	router.RegisterHealthRoutes(api.ComposeReady(
 		api.DatabaseReady(st.Pool.Ping),
-		api.WorkerReady("scheduler", sched),
+		api.SchedulerReady(sched),
 		api.WorkerReady("pipeline", pl),
 	))
 	router.MountUnauthenticated(http.MethodPost, "/ingest/v1/hook/:hook_id", ingestServer.Handler())
@@ -232,7 +235,8 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 			errCh <- err
 		}
 	}()
-	go sched.Run(ctx)
+	schedulerDone := make(chan struct{})
+	go func() { defer close(schedulerDone); sched.Run(ctx) }()
 	go pl.Run(ctx)
 	go alertSourceReconciler.Run(ctx)
 	// ccloud 拓扑同步：仅在 Enabled() 时启动（D1），失败不阻断进程（R2.9）。
@@ -245,15 +249,27 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 		go ccloud.NewSyncer(st, topology, client, cfg.CCloud.ProjectIDs, cfg.CCloud.Environment, cfg.CCloud.SyncInterval, logger).Run(ctx)
 	}
 
+	var serveErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
-		return fmt.Errorf("HTTP 服务异常退出: %w", err)
+		serveErr = fmt.Errorf("HTTP 服务异常退出: %w", err)
 	}
+	cancelWorkers()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return httpServer.Shutdown(shutdownCtx)
+	shutdownErr := httpServer.Shutdown(shutdownCtx)
+	// Run 返回意味着所有在途任务已取消或完成，并完成有界 settle。
+	select {
+	case <-schedulerDone:
+	case <-time.After(20 * time.Second):
+		return fmt.Errorf("scheduler shutdown timed out")
+	}
+	if serveErr != nil {
+		return serveErr
+	}
+	return shutdownErr
 }
 
 // registerNotifyChannels 注册生产环境的通知渠道（R6.2 飞书为主力渠道 + webhook + 任务 9

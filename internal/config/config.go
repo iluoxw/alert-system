@@ -68,10 +68,13 @@ const (
 
 // Config 是服务启动所需的全部配置项。
 type Config struct {
-	HTTPPort              int
-	DBDSN                 string
-	SchedulerPollInterval time.Duration
-	Lark                  LarkConfig
+	HTTPPort                  int
+	DBDSN                     string
+	SchedulerPollInterval     time.Duration
+	SchedulerNormalWorkers    int
+	SchedulerNotifyWorkers    int
+	SchedulerExecutionTimeout time.Duration
+	Lark                      LarkConfig
 
 	SessionTTL          time.Duration // 会话固定过期时长
 	SessionIdleTTL      time.Duration // 会话滑动续期窗口
@@ -240,10 +243,13 @@ func maskSecret(s string) string {
 
 // fileConfig 对应 YAML 文件字段，均使用基础类型，便于与环境变量按同一套逻辑覆盖。
 type fileConfig struct {
-	HTTPPort              int            `yaml:"http_port"`
-	DBDSN                 string         `yaml:"db_dsn"`
-	SchedulerPollInterval string         `yaml:"scheduler_poll_interval"`
-	Lark                  fileLarkConfig `yaml:"lark"`
+	HTTPPort                  int            `yaml:"http_port"`
+	DBDSN                     string         `yaml:"db_dsn"`
+	SchedulerPollInterval     string         `yaml:"scheduler_poll_interval"`
+	SchedulerNormalWorkers    int            `yaml:"scheduler_normal_workers"`
+	SchedulerNotifyWorkers    int            `yaml:"scheduler_notify_workers"`
+	SchedulerExecutionTimeout string         `yaml:"scheduler_execution_timeout"`
+	Lark                      fileLarkConfig `yaml:"lark"`
 
 	SessionTTL          string   `yaml:"session_ttl"`
 	SessionIdleTTL      string   `yaml:"session_idle_ttl"`
@@ -313,14 +319,17 @@ type fileLarkConfig struct {
 // path 为空字符串或文件不存在时跳过文件加载。
 func Load(path string) (Config, error) {
 	fc := fileConfig{
-		HTTPPort:              defaultHTTPPort,
-		DBDSN:                 defaultDBDSN,
-		SchedulerPollInterval: defaultPollInterval.String(),
-		SessionTTL:            defaultSessionTTL.String(),
-		SessionIdleTTL:        defaultSessionIdleTTL.String(),
-		SessionCookieSecure:   defaultSessionCookieSecure,
-		RepeatInterval:        defaultRepeatInterval.String(),
-		IncidentNudgeInterval: defaultIncidentNudgeInterval.String(),
+		HTTPPort:                  defaultHTTPPort,
+		DBDSN:                     defaultDBDSN,
+		SchedulerPollInterval:     defaultPollInterval.String(),
+		SchedulerNormalWorkers:    1,
+		SchedulerNotifyWorkers:    2,
+		SchedulerExecutionTimeout: "120s",
+		SessionTTL:                defaultSessionTTL.String(),
+		SessionIdleTTL:            defaultSessionIdleTTL.String(),
+		SessionCookieSecure:       defaultSessionCookieSecure,
+		RepeatInterval:            defaultRepeatInterval.String(),
+		IncidentNudgeInterval:     defaultIncidentNudgeInterval.String(),
 		SMTP: fileSMTPConfig{
 			StartTLS: defaultSMTPStartTLS,
 		},
@@ -361,6 +370,16 @@ func Load(path string) (Config, error) {
 	poll, err := time.ParseDuration(fc.SchedulerPollInterval)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid scheduler_poll_interval %q: %w", fc.SchedulerPollInterval, err)
+	}
+	if poll < time.Millisecond || poll > time.Minute {
+		return Config{}, fmt.Errorf("scheduler_poll_interval must be within [1ms,1m]")
+	}
+	if fc.SchedulerNormalWorkers < 1 || fc.SchedulerNormalWorkers > 32 || fc.SchedulerNotifyWorkers < 1 || fc.SchedulerNotifyWorkers > 32 {
+		return Config{}, fmt.Errorf("scheduler workers must be within [1,32]")
+	}
+	executionTimeout, err := time.ParseDuration(fc.SchedulerExecutionTimeout)
+	if err != nil || executionTimeout < time.Second || executionTimeout > 240*time.Second {
+		return Config{}, fmt.Errorf("scheduler_execution_timeout must be within [1s,240s]")
 	}
 	sessionTTL, err := time.ParseDuration(fc.SessionTTL)
 	if err != nil {
@@ -420,9 +439,12 @@ func Load(path string) (Config, error) {
 	}
 
 	return Config{
-		HTTPPort:              fc.HTTPPort,
-		DBDSN:                 fc.DBDSN,
-		SchedulerPollInterval: poll,
+		HTTPPort:                  fc.HTTPPort,
+		DBDSN:                     fc.DBDSN,
+		SchedulerPollInterval:     poll,
+		SchedulerNormalWorkers:    fc.SchedulerNormalWorkers,
+		SchedulerNotifyWorkers:    fc.SchedulerNotifyWorkers,
+		SchedulerExecutionTimeout: executionTimeout,
 		Lark: LarkConfig{
 			AppID:             fc.Lark.AppID,
 			AppSecret:         fc.Lark.AppSecret,
@@ -469,6 +491,23 @@ func applyEnvOverrides(fc *fileConfig) {
 	}
 	if v := os.Getenv("SCHEDULER_POLL_INTERVAL"); v != "" {
 		fc.SchedulerPollInterval = v
+	}
+	if v, ok := os.LookupEnv("SCHEDULER_NORMAL_WORKERS"); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			n = -1
+		}
+		fc.SchedulerNormalWorkers = n
+	}
+	if v, ok := os.LookupEnv("SCHEDULER_NOTIFY_WORKERS"); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			n = -1
+		}
+		fc.SchedulerNotifyWorkers = n
+	}
+	if v, ok := os.LookupEnv("SCHEDULER_EXECUTION_TIMEOUT"); ok {
+		fc.SchedulerExecutionTimeout = v
 	}
 	if v := os.Getenv("LARK_APP_ID"); v != "" {
 		fc.Lark.AppID = v

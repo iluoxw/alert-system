@@ -90,6 +90,10 @@ type App struct {
 // system.run(ctx) 编排，通常等 seed 完成之后）。
 func Build(st *store.Store, repos Repos, cfg config.Config, defaultTeamID string) *App {
 	sched := scheduler.New(st, cfg.SchedulerPollInterval)
+	// Config.Load 已验证；直接构造 Config 的调用方也必须遵守相同容量边界。
+	if err := sched.Configure(scheduler.Options{NormalWorkers: cfg.SchedulerNormalWorkers, DetachedWorkers: cfg.SchedulerNotifyWorkers, ExecutionTimeout: cfg.SchedulerExecutionTimeout}); err != nil {
+		panic(err)
+	}
 
 	sender := notify.NewSender(st, repos.NotificationLogs, repos.Timeline)
 	if repos.Incidents != nil {
