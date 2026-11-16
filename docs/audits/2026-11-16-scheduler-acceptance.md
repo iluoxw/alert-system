@@ -69,3 +69,20 @@ GOCACHE=/private/tmp/alert-failure-gocache go vet ./internal/scheduler ./interna
 - 新故障回归使用 fake channel，但 Sender、PG、事务、租约和 fencing 均是真实实现；未验证真实飞书/邮件/公网超时，不宣称线上渠道送达率改善。
 - context 超时依赖 handler/底层 IO 遵守取消；Go 无法强制终止忽略 context 的同步 handler。本轮不通过 fire-and-forget 掩盖此限制。网络已发、settle 未提交时仍可能重发，保留 at-least-once 边界。
 - 管理聚合查询扫描当前留存 timers；已设置查询超时，尚未基于真实生产队列规模做容量基线或索引评估。最老等待、失败和重领可以查询，但外部监测采集与告警阈值尚未部署。
+
+## 独立审查 P2 修复：完成到下一轮查询的 readiness 边界
+
+独立审查发现：合法长任务完成后清空 StartedAt，idle 判断只使用任务开始时的 LastPollSuccessAt，会在下轮成功查询前短暂降级。确定性单测先在旧实现报「成功长任务完成后、下一轮查询前错误降级」，随后修复。
+
+新增 `last_progress_at` 表示任务结果已成功提交的完成时间。普通事务提交成功或 detached fencing settle 成功后才更新；idle 健康判定取最近成功 poll 与成功完成进度的较新值。LastCompletedAt 继续记录执行结束，不能冒充成功提交。真实 PG 回归分别验证合法长任务成功提交、事务已 aborted 而 handler 返回 nil 导致 Commit 失败、下一轮查询失败；后两者不更新成功完成进度，持续失败最终保持 not-ready。单测通过构造已过去两秒的开始时间验证边界，不依赖 sleep。
+
+追加验证均退出 0：
+
+```bash
+GOCACHE=/private/tmp/alert-failure-gocache go test -race ./internal/scheduler -count=1
+# ok，1.468s
+GOCACHE=/private/tmp/alert-failure-gocache go test -tags=integration -race ./internal/scheduler \
+  -run 'TestScheduler_CompletionProgress|TestScheduler_Run_|TestScheduler_RealSender|TestScheduler_DetachedHandler_(SuccessThenCancel|CancelDuringHandler)' -count=1 -v
+```
+
+第二条覆盖新增 DB 失败、满池隔离、deadline、真实 Sender、取消与成功后取消；详细日志 `/private/tmp/alert-scheduler-readiness-fix.log`。未重复固定 E2E、部署或 Git 操作。

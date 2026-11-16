@@ -59,6 +59,7 @@ type WorkerStatus struct {
 	Running             bool      `json:"running"`
 	LastPollAt          time.Time `json:"last_poll_at"`
 	LastPollSuccessAt   time.Time `json:"last_poll_success_at"`
+	LastProgressAt      time.Time `json:"last_progress_at"`
 	LastCompletedAt     time.Time `json:"last_completed_at"`
 	StartedAt           time.Time `json:"started_at"`
 	Kind                string    `json:"kind,omitempty"`
@@ -125,7 +126,7 @@ func (s *Scheduler) workerStart(w *workerState, kind string) {
 	w.StartedAt = time.Now()
 	w.Kind = kind
 }
-func (s *Scheduler) workerComplete(w *workerState) {
+func (s *Scheduler) workerComplete(w *workerState, persisted bool) {
 	if w == nil {
 		return
 	}
@@ -133,6 +134,9 @@ func (s *Scheduler) workerComplete(w *workerState) {
 	defer s.workersMu.Unlock()
 	if w.Kind != "" {
 		w.LastCompletedAt = time.Now()
+		if persisted {
+			w.LastProgressAt = w.LastCompletedAt
+		}
 		w.LastDurationSeconds = time.Since(w.StartedAt).Seconds()
 		w.StartedAt = time.Time{}
 		w.Kind = ""
@@ -168,7 +172,11 @@ func (s *Scheduler) WorkerStatuses() []WorkerStatus {
 			row.DurationSeconds = time.Since(row.StartedAt).Seconds()
 			row.Degraded = time.Since(row.StartedAt) > opts.ExecutionTimeout+settleTimeout
 		} else {
-			row.Degraded = row.LastPollSuccessAt.IsZero() || time.Since(row.LastPollSuccessAt) > limit
+			last := row.LastPollSuccessAt
+			if row.LastProgressAt.After(last) {
+				last = row.LastProgressAt
+			}
+			row.Degraded = last.IsZero() || time.Since(last) > limit
 		}
 		row.Degraded = row.Degraded || !row.Running
 		out = append(out, row)

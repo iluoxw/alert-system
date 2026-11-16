@@ -456,12 +456,13 @@ func (s *Scheduler) pollOnce(ctx context.Context) error {
 // pollOnce 可以结束。
 func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 	w, _ := ctx.Value(workerKey{}).(*workerState)
+	persisted := false
 	if w != nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.Options().ExecutionTimeout)
 		defer cancel()
 		s.workerPoll(w)
-		defer s.workerComplete(w)
+		defer func() { s.workerComplete(w, persisted) }()
 	}
 	var t dueTimer
 	var found bool
@@ -522,7 +523,9 @@ func (s *Scheduler) processOneDue(ctx context.Context) (more bool, err error) {
 
 	// 到这里 claim 已经提交、行锁已经释放，才开始执行外部 IO。
 	if detached != nil {
-		s.runDetached(ctx, t, claimCount, detached)
+		persisted = s.runDetached(ctx, t, claimCount, detached)
+	} else {
+		persisted = true
 	}
 	return true, nil
 }
@@ -558,13 +561,13 @@ func detachedOutcome(ctx context.Context, handlerErr error) (status string, sett
 //
 // 真实业务失败收口对齐 processOneDue：结构化日志 + 标记 failed、不自动重试。
 // 轮询 ctx 取消不能这么收口——见 detachedOutcome。
-func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int, h DetachedHandler) {
+func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int, h DetachedHandler) bool {
 	handlerErr := invokeDetached(ctx, h, t)
 	status, settle := detachedOutcome(ctx, handlerErr)
 	if handlerErr != nil {
 		if !settle {
 			log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 事务外执行被取消，保持 claimed 待租约过期后重领: %v", t.id, t.kind, t.refID, handlerErr)
-			return
+			return false
 		}
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 事务外执行失败: %v", t.id, t.kind, t.refID, handlerErr)
 	}
@@ -585,12 +588,13 @@ func (s *Scheduler) runDetached(ctx context.Context, t dueTimer, claimCount int,
 		// 与「claim 之后进程崩溃」是同一条恢复路径（at-least-once）。
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 回写终态 %s 失败，租约到期后将被重新领取: %v",
 			t.id, t.kind, t.refID, status, err)
-		return
+		return false
 	}
 	if !settled {
 		log.Printf("scheduler: 定时器 id=%s kind=%s ref_id=%s 的租约已在执行期间被其他 worker 重新领取，本次 %s 结果不回写",
 			t.id, t.kind, t.refID, status)
 	}
+	return settled
 }
 
 // Run 启动固定数量的同步执行者。每个执行者空闲时才领取一条任务，完成后才能再次领取。

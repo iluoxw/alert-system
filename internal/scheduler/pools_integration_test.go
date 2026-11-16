@@ -161,3 +161,65 @@ func TestScheduler_Run_DeadlineLeavesClaimRecoverable(t *testing.T) {
 		t.Fatalf("reclaim聚合: %+v", status.Kinds)
 	}
 }
+
+func TestScheduler_CompletionProgressRequiresDatabaseSuccess(t *testing.T) {
+	st := setupTestStore(t)
+	ctx := context.Background()
+	for _, failCommit := range []bool{false, true} {
+		s := New(st, 10*time.Millisecond)
+		w := s.newWorker("normal")
+		s.RegisterHandler("completion", func(ctx context.Context, tx pgx.Tx, _ string, _ []byte) error {
+			// 不睡眠，确定性构造合法长任务刚完成的时序。
+			s.workersMu.Lock()
+			w.StartedAt = time.Now().Add(-2 * time.Second)
+			w.LastPollSuccessAt = w.StartedAt
+			s.workersMu.Unlock()
+			if failCommit {
+				_, _ = tx.Exec(ctx, "SELECT 1/0")
+			}
+			return nil
+		})
+		if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+			return s.Schedule(ctx, tx, "completion", fmt.Sprint(failCommit), time.Now(), nil)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		workerCtx := context.WithValue(ctx, workerKey{}, w)
+		if _, err := s.processOneDue(workerCtx); err != nil {
+			t.Fatal(err)
+		}
+		row := s.WorkerStatuses()[0]
+		if (failCommit && !row.LastProgressAt.IsZero()) || (!failCommit && row.LastProgressAt.IsZero()) {
+			t.Fatalf("commit failure=%v progress=%s", failCommit, row.LastProgressAt)
+		}
+		if s.NormalWorkersReady() == failCommit {
+			t.Fatalf("commit failure=%v ready=%v", failCommit, s.NormalWorkersReady())
+		}
+		if failCommit {
+			// failed补偿事务成功也不把原业务事务的完成失败冒充成功进度。
+			var status string
+			if err := st.Pool.QueryRow(ctx, `SELECT status FROM timers WHERE kind='completion' AND ref_id=$1`, fmt.Sprint(failCommit)).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "failed" {
+				t.Fatal("fixture未触发事务完成失败")
+			}
+		}
+	}
+	s := New(st, 10*time.Millisecond)
+	w := s.newWorker("normal")
+	s.workersMu.Lock()
+	w.LastPollSuccessAt = time.Now().Add(-2 * time.Second)
+	s.workersMu.Unlock()
+	before := s.WorkerStatuses()[0].LastPollSuccessAt
+	if _, err := st.Pool.Exec(ctx, "ALTER TABLE timers RENAME TO timers_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.processOneDue(context.WithValue(ctx, workerKey{}, w)); err == nil {
+		t.Fatal("fixture未触发查询失败")
+	}
+	row := s.WorkerStatuses()[0]
+	if !row.LastPollSuccessAt.Equal(before) || !row.LastProgressAt.IsZero() || s.NormalWorkersReady() {
+		t.Fatal("失败查询伪造成功进度")
+	}
+}
