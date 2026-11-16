@@ -6,7 +6,7 @@
 
 - 官方安装包 `@cvte/ccloud-cli` 2.2.1，Node>=18.15，env `CCLOUD_API_BASE_URL` 优先于 config apiBaseUrl，`CCLOUD_API_KEY` 优先于 credentials apiKey。只复制 package.json/dist/node_modules 的文件，不打包用户凭据、配置或 native addon。
 - 离线包 2,618,568 字节/3447文件，SHA-256 `df4b64b268017e3e5a94fa20741e94ca0d3d26fc591abe5e841f2437c3fb1e87`。内含逐文件清单并在安装时校验。当前包未包含 Node；主流程提供的安全原生探测事件证实已有 Node v24.18.0/x86_64，本机安装验证使用 Node v22.23.0。
-- 本机凭据只安全投影字段与认证状态；GET auth/me 显示 admin=true，currentKey 没有可证明只读的 scope/role 字段。因此现有 key 只驻留 SRE API，不授权 OMA bash 直接持有。安全 expiresAt 元数据为 1805417609000（2027-03-19T00:53:29Z）。没有打印或复制 key 到材料。
+- 本机凭据只安全投影字段与认证状态；GET auth/me 显示 admin=true，currentKey 没有可证明只读的 scope/role 字段。因此不授权 OMA bash 直接持有该 key。本轮尚未向 SRE API 转存；自动审批已拒绝该转存，线上代理保持关闭。安全 expiresAt 元数据为 1805417609000（2027-03-19T00:53:29Z）。没有打印或复制 key 到材料。
 - 现有日报资源为 config RO memory、state RW memory、iacctl-go file，现有 OBS_AUTH Vault 与工作日08:30 cron。安全 GET 投影在 [evidence](evidence/2026-11-16-oma-ccloud/deployment.json)；渲染程序保留这些及额外已有资源、metadata、初始事件、预算。没有读取私有完整部署备份。
 
 ## 实际验证命令与结果
@@ -30,6 +30,6 @@ python3 deploy/oma-ccloud/scripts/l4_validate.py
 
 ## 待线上验收
 
-主流程完成 API 挂线与 Secret、代理窄令牌 Vault、env host白名单追加、旧 Go Agent 新版本、deployment追加资源与 GET readback。随后用 `l4_validation_only` 真实原生工具核对 source、数量/Ready/重启及最终JSON一致，同时回查没有飞书和ledger/memory副作用；正常日报能力仍需原模式实测。当前 desired 副本不在该接口范围内，始终 unknown。未执行固定E2E或写任何线上资源。
+主流程完成默认关闭的 API 挂线。用户明确不新增 Kubernetes Secret；CCloud 上游身份尚未配置，本机管理员 key 转存也未获授权。待获得适用的受控身份与明确授权后，再配置代理窄令牌 Vault、env host白名单追加、旧 Go Agent 新版本、deployment追加资源与 GET readback。随后用 `l4_validation_only` 真实原生工具核对 source、数量/Ready/重启及最终JSON一致，同时回查没有飞书和ledger/memory副作用；正常日报能力仍需原模式实测。当前 desired 副本不在该接口范围内，始终 unknown。未执行固定E2E或写任何线上资源。
 
 部署步骤与真实文件名详见 [operator README](../../deploy/oma-ccloud/README.md)。上传 File ID 有有效期，由操作员作为render参数输入，不写死在源码模板。

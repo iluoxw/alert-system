@@ -58,6 +58,11 @@ def desired_routes(policies):
     desired = copy.deepcopy(policies)
     assert policies.get('receiver'), 'Missing root receiver'
     original = [r for r in policies.get('routes', []) if r.get('receiver') != RECEIVER]
+    # Matching a new child prevents fallback to the root receiver, even with
+    # continue=true. Require the existing explicit IAC path before any writes.
+    if not any(r.get('receiver') and r.get('object_matchers') == [['product', '=', 'IAC']]
+               for r in original):
+        raise ValueError('An existing explicit product=IAC notification route is required')
     # Canary must stop before the preserved real Feishu routes.
     common = {'receiver': RECEIVER, 'group_by': ['alertname', 'severity'],
               'group_interval': '5m', 'repeat_interval': '2h'}

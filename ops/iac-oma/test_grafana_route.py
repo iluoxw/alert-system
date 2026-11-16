@@ -33,6 +33,14 @@ class GrafanaRouteTests(unittest.TestCase):
             self.assertEqual(labels, {'product': 'IAC', 'sre.rule.id': old['uid']})
             self.assertEqual(new, {k: v for k, v in old.items() if k != 'labels'})
 
+    def test_root_fallback_cannot_be_silently_replaced(self):
+        with self.assertRaises(ValueError):
+            desired_routes({'receiver': 'IAC-feishu'})
+        with self.assertRaises(ValueError):
+            desired_routes({'receiver': 'IAC-feishu', 'routes': [
+                {'receiver': 'other', 'object_matchers': [['product', '=', 'OTHER']]},
+            ]})
+
     def test_missing_or_paused_rules_stop_before_writes(self):
         with self.assertRaises(ValueError):
             desired_rules([])

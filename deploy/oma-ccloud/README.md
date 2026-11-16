@@ -4,7 +4,7 @@
 
 ## 服务端接入
 
-`internal/iacccloudproxy.New(Options{ProxyToken: ..., CloudAPIKey: ...})` 返回 `http.Handler`。服务端从 `IAC_CCLOUD_PROXY_TOKEN` 和 `IAC_CCLOUD_UPSTREAM_KEY` 读取两个独立值。前者至少 32 字节，仅作为固定代理令牌；后者是原始 CCloud key（不带 Bearer），只留在 SRE API 服务端。
+`internal/iacccloudproxy.New(Options{ProxyToken: ..., CloudAPIKey: ...})` 返回 `http.Handler`。服务端从 `IAC_CCLOUD_PROXY_TOKEN` 和 `IAC_CCLOUD_UPSTREAM_KEY` 读取两个独立值。前者至少 32 字节，仅作为固定代理令牌；后者是授权给服务端的 CCloud key（不带 Bearer）。`IAC_CCLOUD_PROXY_ENABLED` 默认关闭；只有明确启用且两个配置都存在时才挂载代理。不得自行读取或转存本机管理员 key，不新增 Kubernetes Secret，也不能改换环境变量或 Vault 绕过未获授权的凭据转存。当前线上代理尚未启用。
 
 在现有 SRE API 注册以下三个 GET 到同一个 handler（例如 Gin 的 MountUnauthenticated 方法）；此处的“未经过用户登录”不绕过 handler 自身的 Bearer 校验。其他 method 不注册，框架 404 即拒绝，不需要 Any 路由。
 

@@ -8,7 +8,7 @@
 - 当前 IAC 为 Go PRO：appId `80beff42ab0b41819f9c1c3c3ac95413308e70eb`，cluster `60`，namespace `iac-pro-pro`。CCloud 归属团队为“IT-平台-IAC”；其平台 ID 不能当 SRE UUID 使用。
 - Grafana 已启用 7 条 Go 与 3 条共享规则，5 条旧 Node 规则暂停。接入前实时活跃告警为 0，不能沿用旧的映射覆盖率分母。
 - `itapis.cvte.com` 的 `/iac` 前缀路由指向该 Go 应用；整个域名有 19 条路由，其中另外 18 条不属于本次 IAC 范围。
-- 11 月 14 日 Demo 已验证固定 JSON 取证请求、程序代查和同会话第二轮分析；未完成常驻执行与持久报告。原生沙箱工具曾失败，本轮使用已验证的固定代理取证方式。
+- 11 月 14 日 Demo 已验证固定 JSON 取证请求、程序代查和同会话第二轮分析；未完成常驻执行与持久报告。原生沙箱工具曾失败；本轮重新探测已验证 Node 与 bash 可用。告警主链仍沿用已设计和测试的固定代理取证方式，日报补 CLI 另由 #27 跟踪。
 - 本机 Go CLI 源码位于 `iacctl/golang/iacctl`；Node CLI 的旧 VM/PM2 图不能代表当前 Go 拓扑。Go pack 的历史期望副本数 5 不是当前运行实测。
 
 ## 运行链路
@@ -66,7 +66,7 @@ Grafana Source 使用 `product=IAC` 与明确规则 ID 范围。稳定公开标�
 
 ## 发布与真实验收
 
-1. 合并通过审查/CI 的实现，记录联合源码 SHA、API/worker/migrate 镜像 digest 与 CLI SHA。迁移前核实实际账本，不猜测版本。
+1. 合并通过审查/CI 的实现，记录联合源码 SHA、API/migrate 镜像 digest 与 CLI SHA。迁移前核实实际账本，不猜测版本。
 2. 配置专用 OMA Agent/environment，禁用原生工具，记录版本及 prompt 摘要。复用现有平台配置和 OMA Vault 管理凭据，不放 prompt、Git、日志或命令行；不新增 Kubernetes Secret。现有管理员凭据不得在未经明确授权时转存到其他服务。
 3. 在 Firebreak dev 的现有 API 进程中启用有界分析执行器，沿用已有服务发布流程。新增 Grafana Source、IAC 目录和精确 mapping；原飞书 route/contact 保留，新增并行 SRE receiver。对账 token 单独绑定环境变量。独立 worker 命令仅保留为可选部署入口，本轮不新增该 workload。
 4. 使用独立 IAC canary 规则，实际经 Grafana 通知引擎投递。核对 webhook、Alert、分析投递、OMA session、真实查询证据及持久报告的关联；记录事件订阅及 final event ID。
