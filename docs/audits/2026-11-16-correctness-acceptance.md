@@ -68,3 +68,25 @@ preview 不回放，真实回放仍使用既有管理员 `POST /api/v1/admin/ale
 PR #18 backend CI 的 `TestGrafanaAuthority_FullChain` 失败根因：通用固定目标策略帮助函数声明了 `cluster` 关联维度，而 Grafana webhook 和对账 mock 都未提供值。此为新 guard 正确拒绝，不放宽产品约束。Grafana webhook 与 mock 现在显式携带相同 `cluster=prod-a`，并新增对账/解除后仍引用初始 Fault ID 的断言。其他 mock 不凭空增加维度。
 
 已执行 `go test -c -o /private/tmp/alert-iteration-issues/correctness-e2e-compile.test ./test/e2e` 仅编译，退出 0；未执行 TestMain、未启动固定 Compose。真实 E2E 由主 Agent 串行执行，不能把本次编译当成 Grafana E2E 通过。
+
+## 并发收口 P1 修复：等待行锁后的新快照
+
+独立复核在 `2bc9b1d` 发现：单条 UPDATE 在等待 Fault 行锁期间，NOT EXISTS 仍使用语句开始时的 READ COMMITTED 快照，漏看等待期间新提交的 firing 证据，错误推进 monitoring。
+
+修复先通过独立 `SELECT id FROM faults WHERE id=$1 FOR UPDATE` 取得父行锁，获得锁后再发下一条 SQL 检查证据并更新。自动/人工 evidence 新增及替换先取其单个 Fault 锁。删除旧自动证据保持原路径，不追加多个旧 Fault 父锁：Project 已持新 Fault 锁，额外锁旧 Fault 会让反向改映射产生跨 Fault 锁倒序；删除本身不会新增被漏看的 firing 证据。没有按空维度猜测新关联，也没有新增自动关闭 Incident。
+
+新增 `TestMappingUpgradeConcurrentFiringDoesNotGetMonitored`：Tx1 锁 Fault 并新增 firing occurrence/evidence；Tx2 发起解除，按其独立 `pg_backend_pid()` 在 `pg_stat_activity` 观察 `wait_event_type='Lock'` 同步屏障；Tx1 提交后 Tx2 重新检查必须保持 active。屏障不依赖 SQL 文本或固定睡眠，整个场景带 10 秒 context 上界。
+
+实际命令（均使用临时 GOCACHE）：
+
+```bash
+go test -tags=integration -race ./internal/incident \
+  -run 'TestMappingUpgrade|TestMappingEvaluation' -count=1
+# 退出0，13.901s，含新增并发屏障、旧升级生命周期及只读预览
+```
+
+本轮没有执行固定 E2E 或 Git操作。原始独立并发复现日志由审查者保留在 `/private/tmp/alert-iteration-issues/correctness-fixed-concurrency.log`；新实现对应回归已进入仓库，不依赖外部 overlay。
+
+最终范围：只对新增/替换 evidence 的单个目标 Fault 与解除判定建立父锁屏障；不扩大 Remove 到跨 Fault 锁协议。`go test -tags=integration -race ./internal/store -run TestFaultRepoPreservesHumanEvidenceAndMonotonicActivation -count=1` 退出 0（6.840s）；mapping/impact/api race 再次退出 0（1.457s/1.892s/6.593s）；全包 build 与 store/mapping/incident vet 退出 0。
+
+收敛锁范围后，最终 `go test -tags=integration -race ./internal/incident -run TestMappingUpgradeConcurrentFiringDoesNotGetMonitored -count=1` 退出 0（5.581s）。

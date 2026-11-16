@@ -180,3 +180,104 @@ func TestMappingUpgradeMissingDimensionPreservesBoundLifecycle(t *testing.T) {
 		t.Fatalf("缺维度重复firing不得重开: %s", got)
 	}
 }
+
+func TestMappingUpgradeConcurrentFiringDoesNotGetMonitored(t *testing.T) {
+	st := setupTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	policies := store.NewAlertMappingRepo()
+	faults := store.NewFaultRepo()
+	topology := store.NewTopologyRepo()
+	projector := mapping.NewProjector(policies, store.NewServiceCatalogRepo(), topology, faults, nil)
+	var alert domain.Alert
+	var fault domain.Fault
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		_, err := topology.ImportSnapshot(ctx, tx, domain.TopologySnapshot{SchemaVersion: 1, Source: "review", ObservedAt: now, Nodes: []domain.ResourceNode{{ExternalRef: "gateway", Name: "Gateway", Kind: domain.ResourceNodeKindInfrastructureCapability}}})
+		if err != nil {
+			return err
+		}
+		node, err := topology.GetByExternalRef(ctx, tx, "review", "gateway")
+		if err != nil {
+			return err
+		}
+		alert, _, err = store.NewAlertRepo().UpsertByFingerprint(ctx, tx, domain.AlertEvent{Fingerprint: "review-old-missing", ResolvePolicy: domain.ResolvePolicySource, RuleID: "test", Severity: domain.SeverityCritical, Status: domain.StatusFiring, Title: "test", Source: "generic", StartsAt: now, Labels: map[string]string{"sre.entity.key": "review:gateway", "sre.fault.kind": "unavailable", "sre.evidence.role": "direct_impact", "sre.correlation.labels": "cluster"}}, "")
+		if err != nil {
+			return err
+		}
+		// 精确模拟旧 Project 的空维度 key 与 active evidence。
+		sum := sha256.Sum256([]byte("review:gateway\x00unavailable\x00cluster="))
+		key := "fault:review:gateway:unavailable:" + hex.EncodeToString(sum[:6])
+		fault, _, err = faults.Upsert(ctx, tx, domain.Fault{CorrelationKey: key, Scope: domain.FaultScopeCapability, Status: domain.FaultStatusActive, Severity: domain.SeverityCritical, Kind: "unavailable", Title: "old", ResourceNodeID: node.ID, EntityRef: node.EntityKey, Confidence: 1, FirstDetected: now, LastEvaluated: now})
+		if err != nil {
+			return err
+		}
+		return faults.UpsertAutomatedEvidence(ctx, tx, fault.ID, domain.FaultEvidence{AlertID: alert.ID, Role: domain.EvidenceRoleDirectImpact, Rationale: "pre-upgrade mapping", Confidence: 1, DecisionOrigin: domain.DecisionOriginAutomation})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := st.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `UPDATE faults SET last_evaluated_at=last_evaluated_at+interval '1 second' WHERE id=$1`, fault.ID); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := store.NewAlertRepo().UpsertByFingerprint(ctx, tx, domain.AlertEvent{Fingerprint: "concurrent-new", ResolvePolicy: domain.ResolvePolicySource, RuleID: "test", Severity: domain.SeverityCritical, Status: domain.StatusFiring, Title: "other", Source: "generic", StartsAt: time.Now()}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := faults.UpsertAutomatedEvidence(ctx, tx, fault.ID, domain.FaultEvidence{AlertID: other.ID, Role: domain.EvidenceRoleDirectImpact, Rationale: "new firing", Confidence: 1}); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := st.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Rollback(context.Background())
+	var readerPID int32
+	if err := reader.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&readerPID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, e := faults.MonitorBoundFaultAfterResolvedOccurrence(ctx, reader, fault.ID, alert.ID, time.Now())
+		if e == nil {
+			e = reader.Commit(ctx)
+		}
+		done <- e
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var blocked bool
+		if err := st.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')`, readerPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("未观察到行锁屏障")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		actual, e := faults.GetByID(ctx, tx, fault.ID)
+		if e == nil && actual.Status != domain.FaultStatusActive {
+			t.Errorf("新firing已提交但共享Fault变成%s", actual.Status)
+		}
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = projector
+}
