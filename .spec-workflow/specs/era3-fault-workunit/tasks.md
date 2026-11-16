@@ -2,7 +2,7 @@
 
 > **依赖顺序：P0 文档固化 → P1 身份对齐/拓扑导入 → P2 Fault 工作单元 → P3 Grafana 权威源 → P4 健康证据与影响 → P5 指标与可靠性。**
 > `P1 ∥ P2 ∥ P3` 可并行；`P4` 依赖 `P1 + P2`；`P5` 依赖 `P2`。
-> 迁移编号由主对话统一分配，本 spec 占用 **000026 / 000027 / 000028**，并行分支不得自行占号。
+> 迁移编号由主对话统一分配。**2026-11-16 修订**：000026 / 000027 已使用；旧 000028 预留作废，保持历史空缺，不得回填。当前最大已发布号为 000031，000032 分配给通知可靠性（Issue #11）；任务 28 实施时使用最大号 +1。存量库升级必须使用真实 migration ledger 验证。
 > 所有任务遵守 `design.md` 的目录结构与依赖方向，以及 `requirements.md` 的「硬约束」表。
 > 每阶段收尾必跑：`go build ./... && go vet ./... && go vet -tags=integration ./...`、`go test -tags=integration ./... -race -count=1`、`cd web && npm run build && npx oxlint`。
 
@@ -248,13 +248,13 @@
 
 ## P4 健康证据 + 自伤消歧 + 影响外播
 
-- [ ] 28. 迁移 000028：健康证据与影响标记
-  - File: migrations/000028_fault_health_evidence.up.sql, migrations/000028_fault_health_evidence.down.sql
+- [ ] 28. 健康证据与影响标记迁移（实施时最大编号 +1）
+  - File: migrations/<实施时最大编号+1>_fault_health_evidence.up.sql, migrations/<实施时最大编号+1>_fault_health_evidence.down.sql
   - 建 fault_health_evidence(fault_id, node_id, observed_at, health, sla, window_seconds, source, baseline) + 索引 (fault_id, observed_at DESC)；fault_impacts 增 flags JSONB 默认 '{}'
   - Purpose: 承载 R7/R8 的证据与标记
   - _Leverage: 现有迁移风格_
   - _Requirements: R7.1, R8.4_
-  - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: PostgreSQL DBA | Task: 编写 000028 迁移 | Restrictions: 编号必须为 000028；up/down 可往返；flags 默认 '{}' 非 NULL；不得修改既有迁移 | Success: 迁移往返通过，索引可用于取最新样本 | 完成后按工作流标记状态并 log-implementation_
+  - _Prompt: Implement the task for spec era3-fault-workunit, first run spec-workflow-guide to get the workflow guide then implement the task: Role: PostgreSQL DBA | Task: 编写新递增编号的健康证据迁移 | Restrictions: 编号由主对话按现有最大号+1分配；禁止回填000028；验证空库及存量ledger升级；up/down 可往返；flags 默认 '{}' 非 NULL；不得修改既有迁移 | Success: 迁移往返通过，索引可用于取最新样本 | 完成后按工作流标记状态并 log-implementation_
 
 - [ ] 29. config：健康探测配置与必填校验
   - File: internal/config/config.go, internal/config/config_test.go
