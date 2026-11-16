@@ -1,0 +1,32 @@
+HEAD: 86eb2026fd4c1e16fe53f5c841f7eac24fa52291
+Command: GOCACHE=/private/tmp/alert-integration-gocache go test -tags=integration ./... -race -count=1 -p=2
+Exit code: 0
+
+?   	alert-system/cmd/agent-client	[no test files]
+?   	alert-system/cmd/seed-admin	[no test files]
+?   	alert-system/cmd/server	[no test files]
+ok  	alert-system/internal/action	5.475s
+ok  	alert-system/internal/agentclient	4.517s
+ok  	alert-system/internal/agentdelivery	25.850s
+?   	alert-system/internal/agentprotocol	[no test files]
+ok  	alert-system/internal/alertsource	7.505s
+ok  	alert-system/internal/api	6.518s
+ok  	alert-system/internal/app	69.638s
+ok  	alert-system/internal/ccloud	1.554s
+ok  	alert-system/internal/config	1.472s
+ok  	alert-system/internal/domain	1.459s
+?   	alert-system/internal/enrich	[no test files]
+ok  	alert-system/internal/events	6.172s
+?   	alert-system/internal/hook	[no test files]
+ok  	alert-system/internal/impact	1.467s
+ok  	alert-system/internal/incident	28.402s
+ok  	alert-system/internal/ingest	1.479s
+ok  	alert-system/internal/mapping	1.491s
+ok  	alert-system/internal/notify	1.653s
+ok  	alert-system/internal/oncall	1.474s
+ok  	alert-system/internal/ops	27.299s
+ok  	alert-system/internal/pipeline	3.487s
+ok  	alert-system/internal/runbook	1.467s
+ok  	alert-system/internal/scheduler	82.007s
+ok  	alert-system/internal/store	326.316s
+ok  	alert-system/test/e2e	79.175s

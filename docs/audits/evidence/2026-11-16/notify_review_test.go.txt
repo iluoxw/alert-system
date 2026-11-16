@@ -1,0 +1,108 @@
+//go:build integration
+package app
+
+import (
+ "context"
+ "crypto/sha256"
+ "encoding/hex"
+ "encoding/json"
+ "strings"
+ "testing"
+ "time"
+
+ "alert-system/internal/domain"
+ "alert-system/internal/mapping"
+ "alert-system/internal/notify"
+ "alert-system/internal/scheduler"
+ "alert-system/internal/store"
+ "github.com/jackc/pgx/v5"
+)
+
+type notifyReviewTx struct {pgx.Tx; selected chan struct{}; release chan struct{}; once bool}
+type notifyReviewRow struct {pgx.Row; gate func()}
+func(r notifyReviewRow)Scan(out ...any)error{e:=r.Row.Scan(out...);if e==nil{r.gate()};return e}
+func(tx *notifyReviewTx)QueryRow(ctx context.Context,sql string,args ...any)pgx.Row{
+ row:=tx.Tx.QueryRow(ctx,sql,args...)
+ if !tx.once&&strings.Contains(sql,"FROM faults WHERE correlation_key = $1") {tx.once=true;return notifyReviewRow{row,func(){close(tx.selected);<-tx.release}}};return row
+}
+
+func TestReviewConcurrentActivationDoesNotSendTwice(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background();faults:=store.NewFaultRepo();topology:=store.NewTopologyRepo();repo:=store.NewFaultNotificationRepo()
+ p:=mapping.NewProjector(store.NewAlertMappingRepo(),store.NewServiceCatalogRepo(),topology,faults,nil)
+ sched:=scheduler.New(st,time.Millisecond);o:=NewFaultOutbox(sched,faults,&fakeFaultOutboxOpsRepo{},nil,0,"fault-test","secret","");o.deliveries=repo
+ var alert domain.Alert;var f domain.Fault
+ err:=st.WithTx(ctx,func(tx pgx.Tx)error{
+  now:=time.Now().UTC();_,e:=topology.ImportSnapshot(ctx,tx,domain.TopologySnapshot{SchemaVersion:1,Source:"review",ObservedAt:now,Nodes:[]domain.ResourceNode{{ExternalRef:"gateway",Name:"Gateway",Kind:domain.ResourceNodeKindInfrastructureCapability}}});if e!=nil{return e}
+  node,e:=topology.GetByExternalRef(ctx,tx,"review","gateway");if e!=nil{return e}
+  alert,_,e=store.NewAlertRepo().UpsertByFingerprint(ctx,tx,domain.AlertEvent{Fingerprint:"review-fp",ResolvePolicy:domain.ResolvePolicySource,RuleID:"test",Severity:domain.SeverityCritical,Status:domain.StatusFiring,Title:"test",Source:"generic",StartsAt:now,Labels:map[string]string{"sre.entity.key":"review:gateway","sre.fault.kind":"unavailable","sre.evidence.role":"direct_impact"}},"");if e!=nil{return e}
+  sum:=sha256.Sum256([]byte("review:gateway\x00unavailable"));key:="fault:review:gateway:unavailable:"+hex.EncodeToString(sum[:6])
+  f,_,e=faults.Upsert(ctx,tx,domain.Fault{CorrelationKey:key,Scope:domain.FaultScopeCapability,Status:domain.FaultStatusCandidate,Severity:domain.SeverityCritical,Kind:"unavailable",Title:"candidate",ResourceNodeID:node.ID,EntityRef:node.EntityKey,Confidence:1,FirstDetected:now,LastEvaluated:now});return e
+ });if err!=nil{t.Fatal(err)}
+ alert.Source="alertmanager";alert.SourceIntegrationID="source";alert.UpstreamFingerprint="fp";alert.SourceState=domain.SourceStateFiring
+ selected,release:=make(chan struct{}),make(chan struct{});staleDone:=make(chan error,1)
+ go func(){staleDone<-st.WithTx(ctx,func(tx pgx.Tx)error{wrapped:=&notifyReviewTx{Tx:tx,selected:selected,release:release};result,e:=p.Project(ctx,wrapped,alert);if e!=nil{return e};return o.TriggerFromMappingResult(ctx,wrapped,result)})}()
+ select{case <-selected:case <-time.After(3*time.Second):t.Fatal("未读到旧candidate")}
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{result,e:=p.Project(ctx,tx,alert);if e!=nil{return e};return o.TriggerFromMappingResult(ctx,tx,result)});err!=nil{t.Fatal(err)}
+ ch:=&notificationTestChannel{};notify.Register(ch);sender:=notify.NewSender(st,store.NewNotificationLogRepo(),store.NewTimelineRepo());sender.MaxAttempts=1;sender.BeforeFaultSend=o.BeforeSend;sender.OnFaultResult=o.RecordResult
+ sendLatest:=func(){var req notify.SendRequest;var raw []byte;if err:=st.Pool.QueryRow(ctx,`SELECT payload FROM timers WHERE kind='notify_send' AND payload->>'fault_notification_id' IN (SELECT id::text FROM fault_notification_deliveries WHERE status='queued') LIMIT 1`).Scan(&raw);err!=nil{
+ if err!=pgx.ErrNoRows{t.Fatal(err)}
+ if err:=st.Pool.QueryRow(ctx,`SELECT payload FROM timers WHERE kind='notify_send' LIMIT 1`).Scan(&raw);err!=nil{t.Fatal(err)}
+ };if err:=json.Unmarshal(raw,&req);err!=nil{t.Fatal(err)};if err:=sender.Send(ctx,req);err!=nil{t.Fatal(err)}}
+ sendLatest();close(release);if err:=<-staleDone;err!=nil{t.Fatal(err)};sendLatest()
+ if ch.calls.Load()!=1{t.Fatalf("同一candidate→active转移被发送%d次，fault=%s",ch.calls.Load(),f.ID)}
+ var deliveries int
+ if err:=st.Pool.QueryRow(ctx,`SELECT count(*) FROM fault_notification_deliveries WHERE fault_id=$1`,f.ID).Scan(&deliveries);err!=nil{t.Fatal(err)}
+ if deliveries!=1{t.Fatalf("同一激活创建了%d个delivery",deliveries)}
+}
+
+func TestReviewSilentReprocessActivationCanBeExplicitlyNotified(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background();faults:=store.NewFaultRepo();topology:=store.NewTopologyRepo();repo:=store.NewFaultNotificationRepo()
+ p:=mapping.NewProjector(store.NewAlertMappingRepo(),store.NewServiceCatalogRepo(),topology,faults,nil)
+ sched:=scheduler.New(st,time.Millisecond);o:=NewFaultOutbox(sched,faults,&fakeFaultOutboxOpsRepo{},nil,0,"fault-test","secret","");o.deliveries=repo
+ var alert domain.Alert;var f domain.Fault
+ err:=st.WithTx(ctx,func(tx pgx.Tx)error{
+  now:=time.Now().UTC();_,e:=topology.ImportSnapshot(ctx,tx,domain.TopologySnapshot{SchemaVersion:1,Source:"review",ObservedAt:now,Nodes:[]domain.ResourceNode{{ExternalRef:"gateway",Name:"Gateway",Kind:domain.ResourceNodeKindInfrastructureCapability}}});if e!=nil{return e}
+  node,e:=topology.GetByExternalRef(ctx,tx,"review","gateway");if e!=nil{return e}
+  alert,_,e=store.NewAlertRepo().UpsertByFingerprint(ctx,tx,domain.AlertEvent{Fingerprint:"review-fp",ResolvePolicy:domain.ResolvePolicySource,RuleID:"test",Severity:domain.SeverityCritical,Status:domain.StatusFiring,Title:"test",Source:"generic",StartsAt:now,Labels:map[string]string{"sre.entity.key":"review:gateway","sre.fault.kind":"unavailable","sre.evidence.role":"direct_impact"}},"");if e!=nil{return e}
+  sum:=sha256.Sum256([]byte("review:gateway\x00unavailable"));key:="fault:review:gateway:unavailable:"+hex.EncodeToString(sum[:6])
+  f,_,e=faults.Upsert(ctx,tx,domain.Fault{CorrelationKey:key,Scope:domain.FaultScopeCapability,Status:domain.FaultStatusCandidate,Severity:domain.SeverityCritical,Kind:"unavailable",Title:"candidate",ResourceNodeID:node.ID,EntityRef:node.EntityKey,Confidence:1,FirstDetected:now,LastEvaluated:now});return e
+ });if err!=nil{t.Fatal(err)}
+ alert.Source="alertmanager";alert.SourceIntegrationID="source";alert.UpstreamFingerprint="fp";alert.SourceState=domain.SourceStateFiring
+
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{result,e:=p.Project(ctx,tx,alert);if e!=nil{return e};return o.TriggerFromMappingResult(ctx,tx,result)});err!=nil{t.Fatal(err)}
+ ch:=&notificationTestChannel{};notify.Register(ch);sender:=notify.NewSender(st,store.NewNotificationLogRepo(),store.NewTimelineRepo());sender.MaxAttempts=1;sender.BeforeFaultSend=o.BeforeSend;sender.OnFaultResult=o.RecordResult
+ var req notify.SendRequest;var raw []byte
+ if err:=st.Pool.QueryRow(ctx,`SELECT payload FROM timers WHERE kind='notify_send' LIMIT 1`).Scan(&raw);err!=nil{t.Fatal(err)}
+ if err:=json.Unmarshal(raw,&req);err!=nil{t.Fatal(err)};if err:=sender.Send(ctx,req);err!=nil{t.Fatal(err)}
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{_,e:=faults.UpdateLifecycleStatus(ctx,tx,f.ID,domain.FaultStatusActive,domain.FaultStatusMonitoring,time.Now());return e});err!=nil{t.Fatal(err)}
+ // 与HTTP reprocess完全一致：调用Project，不调用通知回调。
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{result,e:=p.Project(ctx,tx,alert);if e==nil&&result.Transition!=domain.FaultTransitionEnteredActive{t.Fatal("fixture未重激活")};return e});err!=nil{t.Fatal(err)}
+ var preview FaultNotificationPreview
+ if err:=st.WithTx(ctx,func(tx pgx.Tx)error{var e error;preview,e=o.Submit(ctx,tx,f.ID,false,"","admin");return e});err!=nil{t.Fatal(err)}
+ if len(preview.Targets)!=1||preview.Targets[0].Action!="queued"{t.Fatalf("新激活批次显式补投错误复用上轮结果: %+v",preview)}
+}
+
+// activation_version 每轮+1，而generation每次retry也+1，Round=epoch+generation非单射。
+func TestReviewNewEpochFallbackIsNotDeduplicatedByPreviousRetry(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background()
+ ch:=&notificationTestChannel{};notify.Register(ch)
+ sender:=notify.NewSender(st,store.NewNotificationLogRepo(),store.NewTimelineRepo());sender.MaxAttempts=1
+ previous:=notify.SendRequest{FaultNotificationID:"11111111-1111-4111-8111-111111111111",FaultNotificationGeneration:1,GroupKey:"fault:same-fault:activated",ChannelKind:"failed-original",Target:"original",Round:2+1}
+ current:=notify.SendRequest{FaultNotificationID:"22222222-2222-4222-8222-222222222222",FaultNotificationGeneration:0,GroupKey:previous.GroupKey,ChannelKind:previous.ChannelKind,Target:previous.Target,Round:3+0}
+ for _,original:=range []notify.SendRequest{previous,current}{
+  meta:=buildMetaAlertRequest(original,"fault-test","fallback",time.Now())
+  if err:=sender.Send(ctx,meta);err!=nil{t.Fatal(err)}
+ }
+ if ch.calls.Load()!=2{t.Fatalf("新epoch的fallback被上一轮retry吞掉: 实际发送=%d",ch.calls.Load())}
+}
+
+func TestReviewMultiTargetFailureMetaTimersDoNotCollapse(t *testing.T){
+ st:=setupTestStore(t);ctx:=context.Background();sched:=scheduler.New(st,time.Millisecond)
+ requests:=[]notify.SendRequest{
+ {FaultNotificationID:"11111111-1111-4111-8111-111111111111",GroupKey:"fault:same:activated",ChannelKind:"original",Target:"target-one",Round:3},
+ {FaultNotificationID:"22222222-2222-4222-8222-222222222222",GroupKey:"fault:same:activated",ChannelKind:"original",Target:"target-two",Round:3},
+ }
+ for _,req:=range requests{if err:=st.WithTx(ctx,func(tx pgx.Tx)error{return scheduleNotifyFailureMetaAlert(ctx,tx,sched,store.NewFaultRepo(),"fallback","same-fallback",time.Now(),req)});err!=nil{t.Fatal(err)}}
+ var count int;if err:=st.Pool.QueryRow(ctx,`SELECT count(*) FROM timers WHERE kind='notify_send' AND status='pending'`).Scan(&count);err!=nil{t.Fatal(err)}
+ if count!=2{t.Fatalf("两个独立目标失败的meta timer被折叠: count=%d",count)}
+}

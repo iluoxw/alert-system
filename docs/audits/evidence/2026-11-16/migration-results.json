@@ -1,0 +1,23 @@
+[
+  {
+    "from": "empty",
+    "to": 32,
+    "upgrade": "passed",
+    "down_up": "passed",
+    "existing_data": "n/a"
+  },
+  {
+    "from": 29,
+    "to": 32,
+    "upgrade": "passed",
+    "down_up": "passed",
+    "existing_data": "preserved"
+  },
+  {
+    "from": 31,
+    "to": 32,
+    "upgrade": "passed",
+    "down_up": "passed",
+    "existing_data": "preserved"
+  }
+]
