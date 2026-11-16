@@ -1,0 +1,18 @@
+# client_id 必须与服务端签发 token 的主体一致。token 由运行环境注入。
+server: https://sre.example.com
+client_id: ops-01
+token_env: AGENT_TOKEN
+concurrency: 2
+shutdown_grace: 30s
+# 可选：保存最多 8 KiB/流的输出；必须预建 0700 目录，并安排保留期清理。
+# result_dir: /var/lib/agent-client/results
+handlers:
+  # 使用本机受信任的只读工具和低权限运行账户，按配置顺序匹配。
+  # handler 从 stdin 读取 JSON，仅继承固定 PATH、MESSAGE_ID、EVENT_TYPE。
+  # 如已安装专用 handler，可在通配规则前增加以下配置。
+  # - match: {event_type: "alert.*", severity: critical}
+  #   exec: ["/opt/handlers/analyze-alert"]
+  #   timeout: 5m
+  - match: {event_type: "alert.*"}
+    exec: ["/bin/cat"]
+    timeout: 10s
