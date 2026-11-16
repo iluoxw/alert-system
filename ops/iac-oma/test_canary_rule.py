@@ -75,6 +75,15 @@ class CanaryTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.run_action()
         self.assertEqual(self.api.mutations(), []); self.assertFalse(self.state.exists())
 
+    def test_server_snake_case_keep_firing_default_is_checked(self):
+        self.run_action()
+        self.api.rules[-1]['keep_firing_for'] = '0s'
+        self.run_action()
+        self.assertEqual(len(self.api.mutations()), 1)
+        self.api.rules[-1]['keep_firing_for'] = '5m'
+        with self.assertRaises(ValueError):
+            self.run_action('resolve')
+
     def test_nonisolated_group_refused_before_creation(self):
         self.api.rules.append({'uid':'someone-else','folderUID':c.FOLDER,'ruleGroup':c.GROUP})
         with self.assertRaises(ValueError): self.run_action()

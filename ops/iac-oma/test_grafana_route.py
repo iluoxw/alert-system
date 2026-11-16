@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from grafana_route import RECEIVER, RULE_IDS, desired_routes, desired_rules
+from grafana_route import RECEIVER, RULE_IDS, desired_routes, desired_rules, policy_semantics, rule_semantics
 
 
 class GrafanaRouteTests(unittest.TestCase):
@@ -40,6 +40,23 @@ class GrafanaRouteTests(unittest.TestCase):
             desired_routes({'receiver': 'IAC-feishu', 'routes': [
                 {'receiver': 'other', 'object_matchers': [['product', '=', 'OTHER']]},
             ]})
+
+    def test_readback_omitted_false_is_not_an_extra_notification(self):
+        expected = {'receiver': 'default', 'routes': [{'receiver': RECEIVER, 'continue': False}]}
+        actual = {'receiver': 'default', 'provenance': 'api', 'routes': [{'receiver': RECEIVER}]}
+        self.assertEqual(policy_semantics(expected), policy_semantics(actual))
+        actual['routes'][0]['continue'] = True
+        self.assertNotEqual(policy_semantics(expected), policy_semantics(actual))
+
+    def test_rule_readback_detects_query_threshold_and_pause_drift(self):
+        expected = {'uid': 'iac-rule', 'data': [{'expr': 'original'}], 'condition': 'C',
+                    'for': '5m', 'isPaused': False, 'labels': {'sre.rule.id': 'iac-rule'}}
+        actual = dict(expected, updated='server-time', provenance='api')
+        self.assertEqual(rule_semantics(expected), rule_semantics(actual))
+        for key, value in [('data', [{'expr': 'changed'}]), ('condition', 'D'),
+                           ('for', '0s'), ('isPaused', True)]:
+            with self.subTest(key=key):
+                self.assertNotEqual(rule_semantics(expected), rule_semantics(dict(actual, **{key: value})))
 
     def test_missing_or_paused_rules_stop_before_writes(self):
         with self.assertRaises(ValueError):

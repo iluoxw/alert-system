@@ -24,7 +24,7 @@ RULE_IDS = (
 )
 
 
-def request(method, path, body=None):
+def request(method, path, body=None, *, editable=False):
     token = os.environ.get('GRAFANA_TOKEN')
     if not token:
         raise ValueError('GRAFANA_TOKEN is required')
@@ -32,6 +32,8 @@ def request(method, path, body=None):
     config = ['url = ' + json.dumps(BASE + path),
               'request = ' + json.dumps(method),
               'header = ' + json.dumps('Authorization: Bearer ' + token)]
+    if editable:
+        config.append('header = "X-Disable-Provenance: true"')
     if body is not None:
         config += ['header = "Content-Type: application/json"',
                    'data = ' + json.dumps(json.dumps(body))]
@@ -74,6 +76,21 @@ def desired_routes(policies):
     return desired
 
 
+def policy_semantics(policy):
+    """Grafana omits false continuation and adds provisioning metadata."""
+    result = copy.deepcopy(policy)
+    result.pop('provenance', None)
+    result['continue'] = result.get('continue', False)
+    if 'routes' in result:
+        result['routes'] = [policy_semantics(r) for r in result['routes']]
+    return result
+
+
+def rule_semantics(rule):
+    return {key: value for key, value in rule.items()
+            if key not in ('updated', 'provenance')}
+
+
 def desired_rules(rules):
     by_id = {r['uid']: r for r in rules}
     updates = []
@@ -110,6 +127,7 @@ def main():
     contacts = request('GET', '/api/v1/provisioning/contact-points')
     rules = request('GET', '/api/v1/provisioning/alert-rules')
     updated = desired_routes(policies)
+    policy_change = policy_semantics(updated) != policy_semantics(policies)
     changes = desired_rules(rules)
     desired_contact = {'uid': UID, 'name': RECEIVER, 'type': 'webhook',
                        'disableResolveMessage': False,
@@ -122,7 +140,7 @@ def main():
         raise ValueError('Existing SRE contact differs; inspect before replacement')
     print(json.dumps({'mode': 'apply' if args.apply else 'plan',
                       'rule_label_updates': [v[0]['uid'] for v in changes],
-                      'create_contact': not matches, 'policy_change': updated != policies,
+                      'create_contact': not matches, 'policy_change': policy_change,
                       'preserved_routes': len([r for r in policies.get('routes', [])
                                                if r.get('receiver') != RECEIVER])}))
     if not args.apply:
@@ -134,9 +152,10 @@ def main():
         path = '/api/v1/provisioning/alert-rules/' + old['uid']
         if request('GET', path) != old:
             raise RuntimeError('Concurrent rule edit: ' + old['uid'])
-        request('PUT', path, new)
+        request('PUT', path, new, editable=not old.get('provenance'))
         actual = request('GET', path)
-        if actual.get('labels') != new['labels']:
+        if (rule_semantics(actual) != rule_semantics(new)
+                or (actual.get('provenance') or '') != (old.get('provenance') or '')):
             raise RuntimeError('Rule label verification failed: ' + old['uid'])
         save(args.state_dir, old['uid'] + '.applied.json', {'uid': old['uid'], 'labels': actual['labels']})
     if request('GET', '/api/v1/provisioning/policies') != policies:
@@ -144,10 +163,12 @@ def main():
     if not matches:
         request('POST', '/api/v1/provisioning/contact-points', desired_contact)
         save(args.state_dir, 'contact-created.json', {'uid': UID})
-    if updated != policies:
-        request('PUT', '/api/v1/provisioning/policies', updated)
+    if policy_change:
+        request('PUT', '/api/v1/provisioning/policies', updated,
+                editable=not policies.get('provenance'))
     actual = request('GET', '/api/v1/provisioning/policies')
-    if actual != updated:
+    if (policy_semantics(actual) != policy_semantics(updated)
+            or (actual.get('provenance') or '') != (policies.get('provenance') or '')):
         raise RuntimeError('Policy read-back differs; inspect before retry')
     actual_contacts = request('GET', '/api/v1/provisioning/contact-points')
     old_by_id = {c['uid']: c for c in contacts if c['uid'] != UID}
