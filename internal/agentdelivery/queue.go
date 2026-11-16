@@ -176,24 +176,28 @@ func lockReceipt(ctx context.Context, tx pgx.Tx, who Principal, r Receipt) (stri
 }
 
 func (q *Queue) Ack(ctx context.Context, who Principal, r Receipt) error {
-	return q.st.WithTx(ctx, func(tx pgx.Tx) error {
-		status, err := lockReceipt(ctx, tx, who, r)
-		if err != nil {
-			return err
-		}
-		if status == "acked" {
-			return nil
-		}
-		tag, err := tx.Exec(ctx, `WITH ack AS (
+	return q.st.WithTx(ctx, func(tx pgx.Tx) error { return q.AckTx(ctx, tx, who, r) })
+}
+
+// AckTx reuses the same receipt checks inside a caller-owned transaction. This lets a
+// server-side durable consumer atomically store its inbox before acknowledging receipt.
+func (q *Queue) AckTx(ctx context.Context, tx pgx.Tx, who Principal, r Receipt) error {
+	status, err := lockReceipt(ctx, tx, who, r)
+	if err != nil {
+		return err
+	}
+	if status == "acked" {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `WITH ack AS (
             UPDATE agent_messages SET status='acked',settled_at=clock_timestamp(),lease_expires_at=NULL
             WHERE id=$1 AND status='leased' AND expires_at>clock_timestamp() AND lease_expires_at>clock_timestamp() RETURNING id
         ) INSERT INTO agent_message_events(message_id,kind,from_status,to_status,actor,detail)
           SELECT id,'ack','leased','acked',$2,jsonb_build_object('attempt',$3::int) FROM ack`, r.MessageID, who.ClientID, r.Attempt)
-		if err == nil && tag.RowsAffected() == 0 {
-			return ErrLeaseConflict
-		}
-		return err
-	})
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrLeaseConflict
+	}
+	return err
 }
 
 const backoffSQL = `least(60, 1 << least(attempts-1, 6))`
