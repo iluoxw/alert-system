@@ -1,0 +1,20 @@
+# IAC Go 版 PRO 资源面。标识来自 2026-11-11 上线当晚的只读实测
+# （thanos 标签、O2 deployment_environment_name、ccloud pods、
+# mysql_threads 的 service_name）。改这里要同步
+# golang/skills/iac-go-inspection/references/resources.md 的 PRO 段。
+env: pro
+selector:
+  # thanos 的 iac 指标没有 service_name/deployment_environment_name 标签
+  # （CCloud 管道剥掉了 OTel 资源属性）；环境选择只能用 app_id 或
+  # namespace。app_tag 不可靠（fat=iac、pro=it-auth-center，命名不一致）。
+  thanos: 'app_id="80beff42ab0b41819f9c1c3c3ac95413308e70eb"'
+  obs: 'deployment_environment_name="pro"'
+resources:
+  cluster_id: "60"
+  iac_app: 80beff42ab0b41819f9c1c3c3ac95413308e70eb
+  namespace: iac-pro-pro
+  service: auth-center
+  mysql_service: iac-shared-prod-mysql
+  log_stream: auth_center
+  trace_stream: auth_center_v2
+  expect_replicas: 5
