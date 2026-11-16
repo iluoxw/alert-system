@@ -20,6 +20,7 @@ func TestGrafanaAuthority_FullChain(t *testing.T) {
 		alertsPath: "/api/alertmanager/grafana/api/v2/alerts",
 		alertname:  "GrafanaAuthorityProbe",
 		labelKey:   "grafana_e2e",
+		cluster:    "prod-a",
 	}
 	upstream := httptest.NewServer(http.HandlerFunc(mock.serveHTTP))
 	defer upstream.Close()
@@ -55,7 +56,7 @@ func TestGrafanaAuthority_FullChain(t *testing.T) {
 			"status": "firing",
 			"labels": map[string]string{
 				"alertname": "GrafanaAuthorityProbe", "severity": "critical", "service": "checkout",
-				"grafana_e2e": fingerprint,
+				"grafana_e2e": fingerprint, "cluster": "prod-a",
 			},
 			"annotations": map[string]string{"summary": "Grafana 权威链路探针"},
 			"startsAt":    startsAt.Format(time.RFC3339Nano), "endsAt": time.Time{}.Format(time.RFC3339Nano),
@@ -83,7 +84,8 @@ func TestGrafanaAuthority_FullChain(t *testing.T) {
 		t.Fatalf("Grafana 权威 Alert 边界异常: %+v", alert)
 	}
 	assertNoLocalNotification(t, alert.ID)
-	if mappingFaultID(t, client, alert.ID) == "" {
+	initialFaultID := mappingFaultID(t, client, alert.ID)
+	if initialFaultID == "" {
 		t.Fatal("Grafana occurrence 应映射出 Fault")
 	}
 
@@ -118,5 +120,8 @@ func TestGrafanaAuthority_FullChain(t *testing.T) {
 	assertAlertAxesEventually(t, client, alert.ID, "unknown", "acknowledged", "silenced", 1)
 	reconcileSourceOK(t, client, sourceID)
 	assertAlertAxesEventually(t, client, alert.ID, "resolved", "acknowledged", "silenced", 2)
+	if got := mappingFaultID(t, client, alert.ID); got != initialFaultID {
+		t.Fatalf("Grafana 对账/解除不得因维度丢失改变映射: %s != %s", got, initialFaultID)
+	}
 	assertNoLocalNotification(t, alert.ID)
 }

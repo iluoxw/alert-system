@@ -65,23 +65,108 @@ func alertLabelView(alert domain.Alert) map[string]string {
 	return view
 }
 
+// Evaluation 是只读评估结果；不写入映射结果、证据、时间线或定时器。
+type Evaluation struct {
+	Result           domain.AlertMappingResult `json:"result"`
+	FaultKind        string                    `json:"fault_kind,omitempty"`
+	WouldCreateFault bool                      `json:"would_create_fault"`
+	contract         resolvedContract
+	bindings         []domain.Fault
+}
+
+// Evaluate 与 Project 共用准入和关联计算，数据库查询只读。
+func (p *Projector) Evaluate(ctx context.Context, tx pgx.Tx, alert domain.Alert) (Evaluation, error) {
+	evaluation := Evaluation{Result: domain.AlertMappingResult{AlertID: alert.ID, EvaluatedAt: p.now()}}
+	contract, status, reason, explanation, err := p.resolveContract(ctx, tx, alert)
+	if err != nil {
+		return evaluation, err
+	}
+	evaluation.contract = contract
+	result := &evaluation.Result
+	result.Status, result.ReasonCode, result.Explanation = status, reason, explanation
+	result.PolicyID, result.EntityID = policyID(contract.Policy), contract.Entity.ID
+	evaluation.FaultKind = contract.FaultKind
+	if status != domain.AlertMappingMapped {
+		return evaluation, nil
+	}
+	if missing := missingCorrelationLabels(contract.CorrelationLabels, alertLabelView(alert)); len(missing) > 0 {
+		result.Status = domain.AlertMappingUnmapped
+		result.ReasonCode = "correlation_label_missing"
+		result.Explanation = "缺少关联维度：" + strings.Join(missing, ", ")
+		evaluation.bindings, err = p.faults.ListBindingsForAlert(ctx, tx, alert.ID)
+		if err != nil {
+			return evaluation, err
+		}
+		if len(evaluation.bindings) == 1 {
+			bound := evaluation.bindings[0]
+			result.FaultID, result.EntityID, result.CorrelationKey = bound.ID, bound.ResourceNodeID, bound.CorrelationKey
+			evaluation.FaultKind = bound.Kind
+			result.Explanation += "；保留 occurrence 已有绑定，禁止按缺失维度创建或合并"
+		}
+		return evaluation, nil
+	}
+	result.CorrelationKey = buildCorrelationKey(contract.Entity.EntityKey, contract.FaultKind, contract.CorrelationLabels, alertLabelView(alert))
+	previous, err := p.faults.GetByCorrelationKey(ctx, tx, result.CorrelationKey)
+	if errors.Is(err, store.ErrFaultNotFound) {
+		evaluation.WouldCreateFault = true
+		return evaluation, nil
+	}
+	if err != nil {
+		return evaluation, err
+	}
+	result.FaultID = previous.ID
+	return evaluation, nil
+}
+
+func missingCorrelationLabels(keys []string, labels map[string]string) []string {
+	missing := []string{}
+	for _, key := range keys {
+		if strings.TrimSpace(labels[key]) == "" {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
 // Project evaluates and persists one Alert in the caller's transaction. It is
 // safe to replay: mapping result, Fault, evidence and impact all use upsert keys.
 func (p *Projector) Project(ctx context.Context, tx pgx.Tx, alert domain.Alert) (domain.AlertMappingResult, error) {
-	result := domain.AlertMappingResult{AlertID: alert.ID, EvaluatedAt: p.now()}
-	contract, status, reason, explanation, err := p.resolveContract(ctx, tx, alert)
+	evaluation, err := p.Evaluate(ctx, tx, alert)
+	result := evaluation.Result
 	if err != nil {
 		return result, err
 	}
+	contract := evaluation.contract
+	status := result.Status
 	if status != domain.AlertMappingMapped {
-		result.Status, result.ReasonCode, result.Explanation = status, reason, explanation
+		// 新准入校验不能切断升级前 occurrence 的解除链路；已有证据是历史事实。
+		if result.ReasonCode == "correlation_label_missing" {
+			if isResolved(alert) {
+				for _, bound := range evaluation.bindings {
+					updated, err := p.faults.MonitorBoundFaultAfterResolvedOccurrence(ctx, tx, bound.ID, alert.ID, result.EvaluatedAt)
+					if err != nil {
+						return result, err
+					}
+					if p.impacts != nil {
+						if err := p.impacts.RebuildFault(ctx, tx, updated); err != nil {
+							return result, err
+						}
+						if err := p.impacts.RebuildUpstreamForConsumer(ctx, tx, updated.ResourceNodeID); err != nil {
+							return result, err
+						}
+					}
+				}
+			}
+			return p.policies.UpsertResult(ctx, tx, result)
+		}
 		if err := p.faults.RemoveAutomatedEvidenceForAlertExcept(ctx, tx, alert.ID, ""); err != nil {
 			return result, err
 		}
 		return p.policies.UpsertResult(ctx, tx, result)
 	}
 
-	correlationKey := buildCorrelationKey(contract.Entity.EntityKey, contract.FaultKind, contract.CorrelationLabels, alertLabelView(alert))
+	correlationKey := result.CorrelationKey
 	faultStatus := domain.FaultStatusCandidate
 	if contract.EvidenceRole == domain.EvidenceRoleDirectImpact {
 		faultStatus = domain.FaultStatusActive

@@ -160,6 +160,17 @@ func (r *FaultRepo) GetByCorrelationKey(ctx context.Context, tx pgx.Tx, key stri
 	return fault, nil
 }
 
+// lockEvidenceFault 为证据读改建立统一的父行屏障。等待结束后，下一条语句
+// 才能取得包含并发已提交证据的新 READ COMMITTED 快照。
+func lockEvidenceFault(ctx context.Context, tx pgx.Tx, id string) error {
+	var locked string
+	err := tx.QueryRow(ctx, `SELECT id::text FROM faults WHERE id=$1 FOR UPDATE`, id).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrFaultNotFound
+	}
+	return err
+}
+
 func (r *FaultRepo) GetByID(ctx context.Context, tx pgx.Tx, id string) (domain.Fault, error) {
 	row := tx.QueryRow(ctx, `SELECT `+faultColumns+` FROM faults WHERE id = $1`, id)
 	fault, err := scanFault(row)
@@ -402,6 +413,7 @@ func (r *FaultRepo) HasConfirmedBusinessImpact(ctx context.Context, tx pgx.Tx, f
 			WHERE i.fault_id = $1
 			  AND i.state = 'confirmed'
 			  AND n.kind = 'business_system'
+			  AND n.lifecycle_state = 'active'
 		)
 	`, faultID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("store: 查询 Fault 已确认业务影响失败: %w", err)
@@ -434,6 +446,9 @@ func (r *FaultRepo) UpdateLifecycleStatus(ctx context.Context, tx pgx.Tx, id str
 // ReplaceAutomatedEvidence 只替换自动判断；人工裁决行不会被删除，也不会被自动结果
 // 覆盖，从存储层保证 human-over-automation 的优先级。
 func (r *FaultRepo) ReplaceAutomatedEvidence(ctx context.Context, tx pgx.Tx, faultID string, evidence []domain.FaultEvidence) error {
+	if err := lockEvidenceFault(ctx, tx, faultID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM fault_alert_links WHERE fault_id = $1 AND decision_origin = 'automation'`, faultID); err != nil {
 		return fmt.Errorf("store: 清理自动 Fault 证据失败: %w", err)
 	}
@@ -461,6 +476,9 @@ func (r *FaultRepo) ReplaceAutomatedEvidence(ctx context.Context, tx pgx.Tx, fau
 // UpsertAutomatedEvidence 供逐条 Alert Mapping 投影使用；它不会删除同一 Fault 的
 // 其他证据，且绝不覆盖人工裁决。
 func (r *FaultRepo) UpsertAutomatedEvidence(ctx context.Context, tx pgx.Tx, faultID string, evidence domain.FaultEvidence) error {
+	if err := lockEvidenceFault(ctx, tx, faultID); err != nil {
+		return err
+	}
 	if evidence.AlertID == "" || !evidence.Role.IsValid() || evidence.Confidence < 0 || evidence.Confidence > 1 {
 		return fmt.Errorf("store: Fault 证据字段非法")
 	}
@@ -620,6 +638,9 @@ func (r *FaultRepo) UpsertHumanEvidence(ctx context.Context, tx pgx.Tx, evidence
 		strings.TrimSpace(evidence.Rationale) == "" || evidence.Confidence < 0 || evidence.Confidence > 1 ||
 		evidence.DecidedBy == "" || evidence.DecidedAt.IsZero() {
 		return domain.FaultEvidence{}, fmt.Errorf("store: 人工 Fault 证据裁决字段非法")
+	}
+	if err := lockEvidenceFault(ctx, tx, evidence.FaultID); err != nil {
+		return domain.FaultEvidence{}, err
 	}
 	var stored domain.FaultEvidence
 	var decidedAt *time.Time
@@ -798,4 +819,41 @@ func (r *FaultRepo) ListImpacts(ctx context.Context, tx pgx.Tx, faultID string) 
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+// ListBindingsForAlert 读取 occurrence 已持久化的映射，不按缺失维度猜测新关联。
+func (r *FaultRepo) ListBindingsForAlert(ctx context.Context, tx pgx.Tx, alertID string) ([]domain.Fault, error) {
+	rows, err := tx.Query(ctx, `SELECT `+faultColumns+` FROM faults WHERE id IN (SELECT fault_id FROM fault_alert_links WHERE alert_id=$1) ORDER BY id`, alertID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.Fault{}
+	for rows.Next() {
+		fault, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, fault)
+	}
+	return result, rows.Err()
+}
+
+// MonitorBoundFaultAfterResolvedOccurrence 只收口已绑定 Fault，绝不按 key 新建或重开历史。
+// 其他 occurrence 尚未解除（包括来源 unknown）时保留现状，不能凭单条解除关闭共享 Fault。
+// 当前 occurrence 的解除事实由接入传入；排除其 ID 也支持事务内尚未回读的 source_state。
+func (r *FaultRepo) MonitorBoundFaultAfterResolvedOccurrence(ctx context.Context, tx pgx.Tx, faultID, alertID string, at time.Time) (domain.Fault, error) {
+	if err := lockEvidenceFault(ctx, tx, faultID); err != nil {
+		return domain.Fault{}, err
+	}
+	_, err := tx.Exec(ctx, `UPDATE faults f SET status='monitoring',last_evaluated_at=GREATEST(last_evaluated_at,$3)
+ WHERE f.id=$1 AND f.status IN ('active','candidate')
+ AND EXISTS (SELECT 1 FROM fault_alert_links l WHERE l.fault_id=f.id AND l.alert_id=$2)
+ AND NOT EXISTS (SELECT 1 FROM fault_alert_links l JOIN alerts a ON a.id=l.alert_id
+ WHERE l.fault_id=f.id AND l.alert_id<>$2 AND
+ ((a.upstream_fingerprint<>'' AND a.source_state<>'resolved') OR (a.upstream_fingerprint='' AND a.status<>'resolved')))`, faultID, alertID, at)
+	if err != nil {
+		return domain.Fault{}, err
+	}
+	return r.GetByID(ctx, tx, faultID)
 }
