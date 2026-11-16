@@ -336,7 +336,18 @@ func TestFaultNotificationCoverageAndCooldown(t *testing.T) {
 			return e
 		}
 		oldReq = notify.SendRequest{FaultNotificationID: ds[0].ID}
-		return repo.Activate(ctx, tx, up.ID, time.Now().UnixNano())
+		if _, e = tx.Exec(ctx, `UPDATE faults SET status='monitoring' WHERE id=$1`, up.ID); e != nil {
+			return e
+		}
+		if _, e = tx.Exec(ctx, `UPDATE faults SET status='active' WHERE id=$1`, up.ID); e != nil {
+			return e
+		}
+		epoch, e := repo.CurrentEpoch(ctx, tx, up.ID)
+		if e != nil {
+			return e
+		}
+		_, e = repo.Enroll(ctx, tx, up.ID, epoch)
+		return e
 	})
 	txfn(func(tx pgx.Tx) error {
 		ok, e := o.BeforeSend(ctx, tx, oldReq)
@@ -515,10 +526,10 @@ func TestFaultNotificationOrphanAndConcurrency(t *testing.T) {
 	bad := nudgeMustFault(t, ctx, st, "notify-bad-item", domain.FaultStatusActive)
 	good := nudgeMustFault(t, ctx, st, "notify-good-item", domain.FaultStatusActive)
 	txfn(func(tx pgx.Tx) error {
-		if _, e := repo.Enroll(ctx, tx, bad.ID, bad.FirstDetected.UnixNano()); e != nil {
+		if _, e := repo.Enroll(ctx, tx, bad.ID, 1); e != nil {
 			return e
 		}
-		_, e := repo.Enroll(ctx, tx, good.ID, good.FirstDetected.UnixNano())
+		_, e := repo.Enroll(ctx, tx, good.ID, 1)
 		return e
 	})
 	o.faults = failingNotificationFaultRepo{faultOutboxFaultRepo: faults, badID: bad.ID}

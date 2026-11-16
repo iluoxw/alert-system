@@ -26,7 +26,7 @@ func (o *FaultOutbox) HandleReconcile(ctx context.Context, tx pgx.Tx, _ string, 
 		}
 		f, itemErr := o.faults.GetByID(ctx, tx, id)
 		if itemErr == nil {
-			itemErr = o.QueueFaultActivated(ctx, tx, f)
+			itemErr = o.queue(ctx, tx, f, false, true)
 		}
 		if itemErr != nil {
 			if _, e = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fault_notify_item"); e != nil {
@@ -87,7 +87,7 @@ func (o *FaultOutbox) Preview(ctx context.Context, tx pgx.Tx, id string, retry b
 	if e != nil {
 		return p, e
 	}
-	epoch, e := o.deliveries.Epoch(ctx, tx, id, f.FirstDetected.UnixNano())
+	epoch, e := o.deliveries.CurrentEpoch(ctx, tx, id)
 	if e != nil {
 		return p, e
 	}
@@ -179,7 +179,7 @@ func (o *FaultOutbox) Submit(ctx context.Context, tx pgx.Tx, id string, retry bo
 		if e != nil {
 			return FaultNotificationPreview{}, e
 		}
-		if e = o.queue(ctx, tx, f, retry); e != nil {
+		if e = o.queue(ctx, tx, f, retry, false); e != nil {
 			return FaultNotificationPreview{}, e
 		}
 		after, e := o.deliveries.List(ctx, tx, id)

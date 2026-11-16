@@ -75,9 +75,9 @@ func faultActivatedGroupKey(faultID string) string {
 // QueueFaultActivated 只持久化意图；owner_notified_at 由发送成功回调更新。
 // 无配置的等待 SLA 时不等待 pending 上游；只按渠道接受且目标完全相同的记录抑制。
 func (o *FaultOutbox) QueueFaultActivated(ctx context.Context, tx pgx.Tx, fault domain.Fault) error {
-	return o.queue(ctx, tx, fault, false)
+	return o.queue(ctx, tx, fault, false, false)
 }
-func (o *FaultOutbox) queue(ctx context.Context, tx pgx.Tx, fault domain.Fault, retry bool) error {
+func (o *FaultOutbox) queue(ctx context.Context, tx pgx.Tx, fault domain.Fault, retry, registeredOnly bool) error {
 	if fault.ID == "" || fault.CorrelationKey == "" {
 		return fmt.Errorf("app: Fault 通知意图字段非法")
 	}
@@ -101,6 +101,19 @@ func (o *FaultOutbox) queue(ctx context.Context, tx pgx.Tx, fault domain.Fault, 
 	epoch := fault.FirstDetected.UnixNano()
 	if o.deliveries != nil {
 		var err error
+		epoch, err = o.deliveries.CurrentEpoch(ctx, tx, fault.ID)
+		if err != nil {
+			return err
+		}
+		if registeredOnly {
+			watched, e := o.deliveries.RegisteredEpoch(ctx, tx, fault.ID)
+			if e != nil {
+				return e
+			}
+			if watched != epoch {
+				return nil
+			}
+		}
 		epoch, err = o.deliveries.Enroll(ctx, tx, fault.ID, epoch)
 		if err != nil {
 			return err
@@ -237,11 +250,7 @@ func (o *FaultOutbox) TriggerFromMappingResult(ctx context.Context, tx pgx.Tx, r
 	if err != nil {
 		return fmt.Errorf("app: 加载待通知 Fault 失败: %w", err)
 	}
-	if o.deliveries != nil && result.Transition == domain.FaultTransitionEnteredActive {
-		if err = o.deliveries.Activate(ctx, tx, fault.ID, o.now().UnixNano()); err != nil {
-			return err
-		}
-	}
+
 	return o.QueueFaultActivated(ctx, tx, fault)
 }
 

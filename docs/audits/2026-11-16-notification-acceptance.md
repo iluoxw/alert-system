@@ -69,3 +69,18 @@ Focused PG 测试使用现有 testcontainers harness 的 PostgreSQL 15。实际�
 - 未做真实进程 kill 或多主机外部 IO 故障注入；恢复测试通过重建服务对象与持久状态故障注入实现。
 - 新 watch 只覆盖已登记对象，历史静默回放结果需要管理员显式补投。旧 owner_notified_at 不能用于推算历史送达率。
 - 回滚 32 会删除新的 watch/delivery 元数据，因此 down/up 只验证结构及原有领域数据保留，不承诺删除后的投递元数据仍可恢复。实际回滚须停止新版本发送器并由运维评估在途通知。
+
+## 独立审查后的激活版本修复
+
+独立审查发现原实现把 Mapper 的 EnteredActive + 当前时间当成新激活依据，可被两个并发事务读到同一旧 candidate 的时序重复触发；同时静默 Project 真正重激活时会错误复用旧通知结果。此处不再依赖 Transition 判断激活身份：迁移 32 增加 `faults.activation_version` 和数据库 BEFORE INSERT/UPDATE 触发器，只有实际 non-active → active 才递增并清除当前 owner_notified_at。通知 epoch 直接使用该领域版本；watch 只在真实通知入口或显式提交登记，静默新版本不会被旧 watch 自动扫描。Due 取候选之后还会在 Fault 行锁内重新比对版本，以覆盖候选读取与静默重激活之间的竞态。
+
+新增真实 PG 回归 `fault_notification_activation_integration_test.go`：使用 Scan 后的同步屏障让一个 Mapper 固定持有旧 candidate 观测；另一个 Mapper 投影、提交并实际发送后，才释放旧事务。严格断言实际发送一次、delivery 总数一、领域与 watch 都保持同一个版本。另测 monitoring → 静默 Project 重激活后，旧 due watch 和过期扫描候选均不能自动补投；Preview 显示新意图，显式 Submit 后才实际发送第二轮。
+
+迁移 32 已因此修改，前文主 Agent 的旧 ledger 结果不能作为此最终结构的验证结论；需要主 Agent 重新执行空库/29/31升级与 down/up 后更新证据。普通单测、focused PG race 与 build/vet 将随本修复重跑。
+
+N4 HTTP E2E 已补 `TestFaultNotify_SilentReprocessPreviewAndBackfill`：真实 webhook 无规则→补规则→HTTP静默reprocess→HTTP GET/POST预览无数据库副作用→显式提交→等待fake渠道sent→重复提交保持相同delivery/timer/审计且目标脱敏。旧E2E timer计数改为持久payload GroupKey，拓扑覆盖改为等待真实delivery sent后再输入下游。已用 `go test -c -o /private/tmp/alert-notify-e2e.test ./test/e2e` 编译通过；未运行固定Compose，由主 Agent 串行执行。
+
+激活版本修复后的本地最终回归已实际完成：上述 `TestFaultNotification*` 五组真实 PG + race 全部通过，包耗时 18.712s，输出 `/private/tmp/alert-notify-version-test.log`；app/api/notify 的普通 race 全部退出 0（1.477s / 6.682s / 2.100s）。E2E 仅编译，未启动 Compose。最终 `go test -c`、`go build ./...` 与 focused `go vet` 均已实际结束并退出 0。
+
+
+主 Agent 已完成新版迁移 32 的真实 ledger 复验并返回全通过，结果 `/private/tmp/alert-iteration-issues/migration-results-final.json`：空库/29/31 → 32 及 down/up；旧 Fault 与历史 owner_notified_at 保留、不误回填 watch/delivery；普通更新不增加激活版本；monitoring → active 恰好加一且清 owner；down 移除新增列/触发器，再 up 保留 Fault。此最终回执取代前文旧迁移结果，最终迁移结构已冻结。

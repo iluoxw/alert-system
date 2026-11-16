@@ -32,7 +32,10 @@ func NotificationTargetHash(channel, target string) string {
 func (r *FaultNotificationRepo) Enroll(ctx context.Context, tx pgx.Tx, id string, epoch int64) (int64, error) {
 	var actual int64
 	err := tx.QueryRow(ctx, `INSERT INTO fault_notification_watches(fault_id,epoch) VALUES($1,$2)
- ON CONFLICT(fault_id) DO UPDATE SET fault_id=EXCLUDED.fault_id RETURNING epoch`, id, epoch).Scan(&actual)
+ ON CONFLICT(fault_id) DO UPDATE SET
+ reason=CASE WHEN fault_notification_watches.epoch=EXCLUDED.epoch THEN fault_notification_watches.reason ELSE 'queued' END,
+ next_check_at=CASE WHEN fault_notification_watches.epoch=EXCLUDED.epoch THEN fault_notification_watches.next_check_at ELSE now() END,
+ epoch=EXCLUDED.epoch RETURNING epoch`, id, epoch).Scan(&actual)
 	return actual, err
 }
 func (r *FaultNotificationRepo) Defer(ctx context.Context, tx pgx.Tx, id, reason string, at time.Time) error {
@@ -78,11 +81,11 @@ func (r *FaultNotificationRepo) List(ctx context.Context, tx pgx.Tx, id string) 
 }
 func (r *FaultNotificationRepo) Covered(ctx context.Context, tx pgx.Tx, ids []string, channel, hash string) (bool, error) {
 	var yes bool
-	e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM fault_notification_deliveries d JOIN faults f ON f.id=d.fault_id JOIN fault_notification_watches w ON w.fault_id=f.id AND w.epoch=d.epoch WHERE f.id=ANY($1::uuid[]) AND f.status='active' AND d.channel=$2 AND d.target_hash=$3 AND d.status='sent')`, ids, channel, hash).Scan(&yes)
+	e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM fault_notification_deliveries d JOIN faults f ON f.id=d.fault_id JOIN fault_notification_watches w ON w.fault_id=f.id AND w.epoch=d.epoch AND w.epoch=f.activation_version WHERE f.id=ANY($1::uuid[]) AND f.status='active' AND d.channel=$2 AND d.target_hash=$3 AND d.status='sent')`, ids, channel, hash).Scan(&yes)
 	return yes, e
 }
 func (r *FaultNotificationRepo) Due(ctx context.Context, tx pgx.Tx, at time.Time) ([]string, error) {
-	rows, e := tx.Query(ctx, `SELECT w.fault_id::text FROM fault_notification_watches w JOIN faults f ON f.id=w.fault_id WHERE w.next_check_at<=$1 AND f.status='active' AND f.acked_at IS NULL ORDER BY w.next_check_at LIMIT 100`, at)
+	rows, e := tx.Query(ctx, `SELECT w.fault_id::text FROM fault_notification_watches w JOIN faults f ON f.id=w.fault_id WHERE w.next_check_at<=$1 AND w.epoch=f.activation_version AND f.status='active' AND f.acked_at IS NULL ORDER BY w.next_check_at LIMIT 100`, at)
 	if e != nil {
 		return nil, e
 	}
@@ -105,7 +108,7 @@ func (r *FaultNotificationRepo) Begin(ctx context.Context, tx pgx.Tx, id string,
 		return false, e
 	}
 	var eligible bool
-	if e := tx.QueryRow(ctx, `SELECT status='active' AND acked_at IS NULL AND EXISTS(SELECT 1 FROM fault_notification_deliveries d JOIN fault_notification_watches w ON w.fault_id=d.fault_id AND w.epoch=d.epoch WHERE d.id=$2) FROM faults WHERE id=$1 FOR UPDATE`, faultID, id).Scan(&eligible); e != nil {
+	if e := tx.QueryRow(ctx, `SELECT status='active' AND acked_at IS NULL AND EXISTS(SELECT 1 FROM fault_notification_deliveries d JOIN fault_notification_watches w ON w.fault_id=d.fault_id AND w.epoch=d.epoch WHERE d.id=$2 AND d.epoch=faults.activation_version) FROM faults WHERE id=$1 FOR UPDATE`, faultID, id).Scan(&eligible); e != nil {
 		return false, e
 	}
 	if !eligible {
@@ -123,7 +126,7 @@ func (r *FaultNotificationRepo) Result(ctx context.Context, tx pgx.Tx, id string
 	if _, e := tx.Exec(ctx, `SELECT id FROM faults WHERE id=$1 FOR UPDATE`, faultID); e != nil {
 		return "", false, e
 	}
-	e := tx.QueryRow(ctx, `UPDATE fault_notification_deliveries SET status=$3,updated_at=now() WHERE id=$1 AND generation=$2 AND status IN ('queued','sending') AND EXISTS(SELECT 1 FROM fault_notification_watches w WHERE w.fault_id=fault_notification_deliveries.fault_id AND w.epoch=fault_notification_deliveries.epoch) RETURNING fault_id::text`, id, generation, status).Scan(&faultID)
+	e := tx.QueryRow(ctx, `UPDATE fault_notification_deliveries SET status=$3,updated_at=now() WHERE id=$1 AND generation=$2 AND status IN ('queued','sending') AND EXISTS(SELECT 1 FROM fault_notification_watches w JOIN faults f ON f.id=w.fault_id AND f.activation_version=w.epoch WHERE w.fault_id=fault_notification_deliveries.fault_id AND w.epoch=fault_notification_deliveries.epoch) RETURNING fault_id::text`, id, generation, status).Scan(&faultID)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return "", false, nil
 	}
@@ -135,24 +138,11 @@ func (r *FaultNotificationRepo) ReleaseCoverage(ctx context.Context, tx pgx.Tx, 
 	return tag.RowsAffected() == 1, e
 }
 
-func (r *FaultNotificationRepo) Epoch(ctx context.Context, tx pgx.Tx, id string, fallback int64) (int64, error) {
+// CurrentEpoch 读取数据库维护的真实激活版本；不依赖通知watch或过期Transition。
+func (r *FaultNotificationRepo) CurrentEpoch(ctx context.Context, tx pgx.Tx, id string) (int64, error) {
 	var epoch int64
-	e := tx.QueryRow(ctx, `SELECT epoch FROM fault_notification_watches WHERE fault_id=$1`, id).Scan(&epoch)
-	if errors.Is(e, pgx.ErrNoRows) {
-		return fallback, nil
-	}
+	e := tx.QueryRow(ctx, `SELECT activation_version FROM faults WHERE id=$1`, id).Scan(&epoch)
 	return epoch, e
-}
-func (r *FaultNotificationRepo) Activate(ctx context.Context, tx pgx.Tx, id string, epoch int64) error {
-	if _, e := tx.Exec(ctx, `UPDATE faults SET owner_notified_at=NULL WHERE id=$1`, id); e != nil {
-		return e
-	}
-	_, e := tx.Exec(ctx, `INSERT INTO fault_notification_watches(fault_id,epoch) VALUES($1,$2) ON CONFLICT(fault_id) DO UPDATE SET epoch=EXCLUDED.epoch,reason='queued',next_check_at=now()`, id, epoch)
-	if e != nil {
-		return e
-	}
-	_, e = tx.Exec(ctx, `UPDATE fault_notification_deliveries SET status='cancelled',updated_at=now() WHERE fault_id=$1 AND epoch<>$2 AND status IN ('queued','sending')`, id, epoch)
-	return e
 }
 
 // Orphaned 把失去可领取 timer 的在途意图收敛为 failed，等待显式且有界补投。
@@ -190,4 +180,13 @@ func (r *FaultNotificationRepo) HasLiveTimer(ctx context.Context, tx pgx.Tx, id 
 	var yes bool
 	e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM timers WHERE kind='notify_send' AND ref_id='fault-delivery:'||$1||':'||$2::integer::text AND status IN ('pending','claimed'))`, id, generation).Scan(&yes)
 	return yes, e
+}
+
+func (r *FaultNotificationRepo) RegisteredEpoch(ctx context.Context, tx pgx.Tx, id string) (int64, error) {
+	var epoch int64
+	e := tx.QueryRow(ctx, `SELECT epoch FROM fault_notification_watches WHERE fault_id=$1`, id).Scan(&epoch)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return epoch, e
 }

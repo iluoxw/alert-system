@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"alert-system/internal/app"
 	"alert-system/internal/domain"
 )
 
@@ -150,14 +152,18 @@ func TestFaultNotify_TopologySuppression(t *testing.T) {
 	providerAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "ProviderDown", "provider-"+suffix, "critical", "provider-"+suffix)
 	providerFaultID := mappingFaultID(t, client, providerAlert.ID)
 	waitFor(t, 8*time.Second, 100*time.Millisecond, func() bool {
-		return countFaultNotifyTimers(t, providerFaultID) == 1
-	}, "上游 Fault 通知")
+		return countFaultDeliveries(t, providerFaultID, "sent") == 1
+	}, "上游渠道接受成功后才允许相同目标覆盖下游")
 
 	consumerAlert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, "ConsumerSymptom", "consumer-"+suffix, "critical", "consumer-"+suffix)
 	consumerFaultID := mappingFaultID(t, client, consumerAlert.ID)
 	if countFaultNotifyTimers(t, consumerFaultID) != 0 {
 		t.Fatalf("上游已通知时下游不得单发, timers=%d", countFaultNotifyTimers(t, consumerFaultID))
 	}
+	if countFaultDeliveries(t, consumerFaultID, "covered") != 1 {
+		t.Fatal("相同目标必须持久记录covered决策")
+	}
+
 }
 
 func TestFaultsAck_Unauthenticated(t *testing.T) {
@@ -198,8 +204,8 @@ func countFaultNotifyTimers(t *testing.T, faultID string) int {
 	t.Helper()
 	var n int
 	if err := sys.Store.Pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM timers WHERE kind = 'notify_send' AND ref_id LIKE $1`,
-		"fault:"+faultID+":activated%",
+		`SELECT count(*) FROM timers WHERE kind = 'notify_send' AND payload->>'GroupKey'=$1 AND COALESCE((payload->>'meta_alert')::boolean,false)=false`,
+		"fault:"+faultID+":activated",
 	).Scan(&n); err != nil {
 		t.Fatalf("查询 Fault notify_send 失败: %v", err)
 	}
@@ -217,5 +223,126 @@ func resolveFault(t *testing.T, faultID string) {
 		return err
 	}); err != nil {
 		t.Fatalf("推进 Fault 到 resolved 失败: %v", err)
+	}
+}
+
+func countFaultDeliveries(t *testing.T, faultID, status string) int {
+	t.Helper()
+	var n int
+	if e := sys.Store.Pool.QueryRow(context.Background(), `SELECT count(*) FROM fault_notification_deliveries WHERE fault_id=$1 AND status=$2`, faultID, status).Scan(&n); e != nil {
+		t.Fatal(e)
+	}
+	return n
+}
+
+// TestFaultNotify_SilentReprocessPreviewAndBackfill 通过真实HTTP完成N4：
+// 缺规则→补规则静默回放→只读预览→显式提交→幂等提交及送达审计。
+func TestFaultNotify_SilentReprocessPreviewAndBackfill(t *testing.T) {
+	client := newLoggedInClient(t)
+	suffix := uniqueSuffix()
+	name := "fault-backfill-" + suffix
+	teamID := createNotifyTeam(t, client, name)
+	entity := adminCreate(t, client, "/api/v1/admin/entities", map[string]any{
+		"entity_key": "platform/fault-backfill/" + suffix, "layer": "platform", "name": "Backfill Cluster", "provider": "test", "environment": "prod", "owner_team_id": teamID,
+	}, http.StatusCreated)
+	entityID, _ := entity["id"].(string)
+	source := adminCreate(t, client, "/api/v1/admin/integrations", map[string]any{
+		"kind": "alertmanager", "name": "fault-backfill-source-" + suffix, "default_severity": "warning", "enabled": true,
+		"config": map[string]any{"reconcile_interval_seconds": 3600, "stale_after_seconds": 7200, "missing_confirmations": 2},
+	}, http.StatusCreated)
+	sourceID, _ := source["id"].(string)
+	webhookPath, _ := source["webhook_path"].(string)
+	alertname := "LateFaultMapping" + suffix
+	alert := postAuthorityMappingAlert(t, client, sourceID, webhookPath, alertname, "late-"+suffix, "critical", "late-"+suffix)
+	assertMappingStatus(t, client, alert.ID, "unmapped", "no_policy")
+	createFixedTargetMappingPolicy(t, client, 30200, "late-map-"+suffix, alertname, entityID, "backfill_probe")
+	status, body, err := client.doJSON(http.MethodPost, "/api/v1/admin/alert-mapping/results/"+alert.ID+"/reprocess", nil, nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("静默回放 status=%d body=%s err=%v", status, body, err)
+	}
+	faultID := mappingFaultID(t, client, alert.ID)
+	snapshot := func() [4]int {
+		t.Helper()
+		var n [4]int
+		if e := sys.Store.Pool.QueryRow(context.Background(), `SELECT
+   (SELECT count(*) FROM fault_notification_watches WHERE fault_id=$1),
+   (SELECT count(*) FROM fault_notification_deliveries WHERE fault_id=$1),
+   (SELECT count(*) FROM fault_timeline_entries WHERE fault_id=$1),
+   (SELECT count(*) FROM timers WHERE kind='notify_send' AND payload->>'GroupKey'=$2)`, faultID, "fault:"+faultID+":activated").Scan(&n[0], &n[1], &n[2], &n[3]); e != nil {
+			t.Fatal(e)
+		}
+		return n
+	}
+	before := snapshot()
+	if before[0] != 0 || before[1] != 0 || before[3] != 0 {
+		t.Fatalf("静默回放产生投递副作用: %v", before)
+	}
+	var ownerNotified bool
+	if e := sys.Store.Pool.QueryRow(context.Background(), `SELECT owner_notified_at IS NOT NULL FROM faults WHERE id=$1`, faultID).Scan(&ownerNotified); e != nil {
+		t.Fatal(e)
+	}
+	if ownerNotified {
+		t.Fatal("回放不能成为渠道接受证明")
+	}
+	base := "/api/v1/admin/faults/" + faultID + "/notifications"
+	secretTarget := "chat:" + name
+	assertMasked := func(body []byte) {
+		t.Helper()
+		if strings.Contains(string(body), secretTarget) {
+			t.Fatal("管理响应泄露目标")
+		}
+	}
+	for _, endpoint := range []struct{ method, path string }{{http.MethodPost, base + "/preview"}, {http.MethodGet, base}} {
+		var p app.FaultNotificationPreview
+		status, body, err = client.doJSON(endpoint.method, endpoint.path, nil, &p)
+		if err != nil || status != http.StatusOK || !p.Eligible || p.Reason != "ready" || len(p.Targets) != 1 || p.Targets[0].Action != "queue" {
+			t.Fatalf("预览 status=%d body=%s err=%v", status, body, err)
+		}
+		assertMasked(body)
+		if after := snapshot(); after != before {
+			t.Fatalf("预览写入数据库 before=%v after=%v", before, after)
+		}
+	}
+	var submitted app.FaultNotificationPreview
+	status, body, err = client.doJSON(http.MethodPost, base+"/submit", nil, &submitted)
+	if err != nil || status != http.StatusOK || len(submitted.Deliveries) != 1 {
+		t.Fatalf("补投 status=%d body=%s err=%v", status, body, err)
+	}
+	assertMasked(body)
+	deliveryID := submitted.Deliveries[0].ID
+	waitFor(t, 8*time.Second, 100*time.Millisecond, func() bool { return countFaultDeliveries(t, faultID, "sent") == 1 }, "补投经fake渠道接受并持久记录sent")
+	for i := 0; i < 2; i++ {
+		status, body, err = client.doJSON(http.MethodPost, base+"/submit", nil, &submitted)
+		if err != nil || status != http.StatusOK || len(submitted.Deliveries) != 1 || submitted.Deliveries[0].ID != deliveryID || submitted.Deliveries[0].Status != "sent" {
+			t.Fatalf("重复补投不是幂等: status=%d body=%s err=%v", status, body, err)
+		}
+		assertMasked(body)
+	}
+	if countFaultNotifyTimers(t, faultID) != 1 {
+		t.Fatal("重复补投新增timer")
+	}
+	var audits int
+	var auditText string
+	if e := sys.Store.Pool.QueryRow(context.Background(), `SELECT count(*) FILTER(WHERE action='notify_backfill'),COALESCE(jsonb_agg(detail)::text,'[]') FROM fault_timeline_entries WHERE fault_id=$1`, faultID).Scan(&audits, &auditText); e != nil {
+		t.Fatal(e)
+	}
+	if audits != 1 || strings.Contains(auditText, secretTarget) {
+		t.Fatalf("补投审计应幂等且脱敏: count=%d", audits)
+	}
+	var acknowledged bool
+	if e := sys.Store.Pool.QueryRow(context.Background(), `SELECT owner_notified_at IS NOT NULL,acked_at IS NOT NULL FROM faults WHERE id=$1`, faultID).Scan(&ownerNotified, &acknowledged); e != nil {
+		t.Fatal(e)
+	}
+	if !ownerNotified || acknowledged {
+		t.Fatal("渠道接受与人工ACK语义混淆")
+	}
+	sends := 0
+	for _, send := range mockLark.Sent() {
+		if send.Msg.ResourceID == faultID {
+			sends++
+		}
+	}
+	if sends != 1 {
+		t.Fatalf("补投物理发送次数=%d,want1", sends)
 	}
 }
