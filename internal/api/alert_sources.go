@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"alert-system/internal/alertsource"
+	"alert-system/internal/domain"
 	"alert-system/internal/store"
 )
 
@@ -97,6 +98,8 @@ func (h *alertSourceHandlers) reconcile(c *gin.Context) {
 func alertSourceJSON(source store.AlertSource, now time.Time) gin.H {
 	config := gin.H{
 		"api_url":                    source.Config.APIURL,
+		"label_scope":                append([]domain.Matcher{}, source.Config.LabelScope...),
+		"rule_id_allowlist":          append([]string{}, source.Config.RuleIDAllowlist...),
 		"bearer_token_env":           source.Config.BearerTokenEnv,
 		"reconcile_interval_seconds": source.Config.ReconcileIntervalSeconds,
 		"stale_after_seconds":        source.Config.StaleAfterSeconds,

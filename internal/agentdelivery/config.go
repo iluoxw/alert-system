@@ -64,6 +64,16 @@ func (c *ServerConfig) validate() error {
 	if len(c.Routing.SourceIDs) == 0 || len(c.Clients) == 0 {
 		return errors.New("agent config needs source_ids and clients")
 	}
+	if len(c.Routing.PublicRuleIDs) > 128 {
+		return errors.New("too many public rule references")
+	}
+	ids := map[string]bool{}
+	for _, id := range c.Routing.PublicRuleIDs {
+		if !namePattern.MatchString(id) || ids[id] {
+			return errors.New("invalid or repeated public rule reference")
+		}
+		ids[id] = true
+	}
 	sources := make(map[string]bool)
 	for _, id := range c.Routing.SourceIDs {
 		if !validID(id) || sources[id] {
@@ -105,7 +115,7 @@ func (c *ServerConfig) validate() error {
 			return errors.New("invalid route name, duplicate name, or invalid role")
 		}
 		names[r.Name] = true
-		if r.Source != "" && r.Source != "alertmanager" || r.SourceID != "" && !sources[r.SourceID] {
+		if r.Source != "" && r.Source != "alertmanager" && r.Source != "grafana" || r.SourceID != "" && !sources[r.SourceID] {
 			return fmt.Errorf("invalid source in route %s", r.Name)
 		}
 		if r.EventType != "" && r.EventType != "alert.resolved" && r.EventType != "alert.firing" {

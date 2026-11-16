@@ -2,7 +2,10 @@
 package agentprotocol
 
 import (
+	"alert-system/internal/domain"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -38,4 +41,32 @@ type Delivery struct {
 	Envelope       Envelope  `json:"envelope"`
 	LeaseExpiresAt time.Time `json:"lease_expires_at"`
 	AckMode        string    `json:"ack_mode"`
+}
+
+// Member 只包含公开稳定规则引用和 occurrence 哈希，不暴露标签全集或链接。
+type Member struct {
+	Ref       string          `json:"ref"`
+	RuleID    string          `json:"rule_id,omitempty"`
+	Alertname string          `json:"alertname,omitempty"`
+	Status    domain.Status   `json:"status"`
+	Severity  domain.Severity `json:"severity"`
+	StartsAt  time.Time       `json:"startsAt"`
+	EndsAt    *time.Time      `json:"endsAt,omitempty"`
+}
+type GroupPayload struct {
+	Origin          string   `json:"origin,omitempty"`
+	ReceiverRef     string   `json:"receiver_ref"`
+	GroupRef        string   `json:"group_ref"`
+	TruncatedAlerts int      `json:"truncatedAlerts"`
+	Alerts          []Member `json:"alerts"`
+}
+
+// OccurrenceRef 与存储时间精度一致，Grafana快照恢复从PG读取starts_at时不能
+// 因纳秒被舍去而产生新的member身份。Alertmanager沿用原有纳秒契约。
+func OccurrenceRef(source, sourceID, fingerprint string, startsAt time.Time) string {
+	if source == domain.SourceKindGrafana {
+		startsAt = startsAt.Truncate(time.Microsecond)
+	}
+	b, _ := json.Marshal([]string{sourceID, fingerprint, startsAt.UTC().Format(time.RFC3339Nano)})
+	return fmt.Sprintf("%x", sha256.Sum256(b))
 }

@@ -101,3 +101,37 @@ func TestProjectionIdentitiesAndTruncatedFiring(t *testing.T) {
 		t.Fatal("different keyless occurrences collapsed")
 	}
 }
+
+func TestGrafanaProjectionPreservesNativeSourceAndPublicRule(t *testing.T) {
+	raw := json.RawMessage(`{"status":"firing","groupKey":"secret-group","receiver":"secret-receiver","commonLabels":{"product":"OTHER","secret":"secret-label"}}`)
+	events := []domain.AlertEvent{{Source: "grafana", RuleID: "IAC Go 系统错误率超过 1%", Status: domain.StatusResolved, Severity: domain.SeverityCritical, StartsAt: time.Unix(10, 0), Labels: map[string]string{"product": "IAC", "sre.rule.id": "iac-go-system-errors", "token": "secret-token"}}}
+	r := Routing{PublicRuleIDs: []string{"iac-go-system-errors"}, Routes: []Rule{{Name: "iac", Source: "grafana", Role: "iac", Labels: map[string]string{"product": "IAC"}}}}
+	env, policies, err := projectGroup("source", raw, events, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Source != "grafana" || env.EventType != "alert.resolved" || len(policies) != 1 || policies[0].Role != "iac" {
+		t.Fatalf("%+v %+v", env, policies)
+	}
+	var p projectedPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Alerts[0].RuleID != "iac-go-system-errors" || p.Alerts[0].Alertname != "" {
+		t.Fatalf("稳定引用不应依赖中文title: %+v", p)
+	}
+	b, _ := json.Marshal(env)
+	for _, secret := range []string{"secret-group", "secret-receiver", "secret-label", "secret-token", "OTHER"} {
+		if strings.Contains(string(b), secret) {
+			t.Fatal("leaked " + secret)
+		}
+	}
+	r.PublicRuleIDs = nil
+	env, _, err = projectGroup("source", raw, events, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(env.Payload), "iac-go-system-errors") {
+		t.Fatal("非白名单规则不应导出")
+	}
+}
