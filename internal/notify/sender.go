@@ -61,9 +61,11 @@ type txRunner interface {
 
 // SendRequest 是一次具体的发送请求：某个告警/分组的某一级升级序列，要发到哪个渠道的哪个 target。
 type SendRequest struct {
-	AlertID    string // AlertID、GroupKey、IncidentID 三选一
-	GroupKey   string
-	IncidentID string `json:"incident_id,omitempty"`
+	FaultNotificationID         string `json:"fault_notification_id,omitempty"`
+	FaultNotificationGeneration int    `json:"fault_notification_generation,omitempty"`
+	AlertID                     string // AlertID、GroupKey、IncidentID 三选一
+	GroupKey                    string
+	IncidentID                  string `json:"incident_id,omitempty"`
 
 	// Step 对应升级序列的第几级；不属于升级序列的发送传 nil。用指针而非 int 是对齐
 	// store.NotificationLogEntry.Step 的既有约定——0 是合法的第 0 级，nil 才表示"无关序列"。
@@ -100,9 +102,11 @@ type SendRequest struct {
 // 调用 Channel 发送并按指数退避重试，最终把结果（成功/耗尽重试后失败）回写状态，
 // 失败时补一条时间线记录。
 type Sender struct {
-	tx       txRunner
-	logs     logStore
-	timeline timelineAppender
+	BeforeFaultSend func(context.Context, pgx.Tx, SendRequest) (bool, error)
+	OnFaultResult   func(context.Context, pgx.Tx, SendRequest, string) error
+	tx              txRunner
+	logs            logStore
+	timeline        timelineAppender
 
 	// IncidentTimeline 可选注入。Incident 通报沿用相同可靠发送器，但发送结果写入
 	// Incident 自己的统一时间线，而不是伪造一条 Alert 时间线。
@@ -158,6 +162,9 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 // 要暴露的失败，也让送达类指标把失败计成成功。只在 MetaAlert 为真时追加尾段，
 // 在途旧 payload 反序列化出 false，键与改动前逐字节一致。
 func idempotencyKey(req SendRequest) string {
+	if req.FaultNotificationID != "" {
+		return "fault-delivery:" + req.FaultNotificationID + ":" + strconv.Itoa(req.FaultNotificationGeneration)
+	}
 	resourceKey := req.AlertID
 	if resourceKey == "" {
 		resourceKey = req.IncidentID
@@ -194,6 +201,16 @@ func idempotencyKey(req SendRequest) string {
 // 无法参与数据库事务的固有代价，MVP 阶段已经过 team-lead 裁决接受，不指望唯一键堵住
 // 这个窗口。
 func (s *Sender) Send(ctx context.Context, req SendRequest) error {
+	if req.FaultNotificationID != "" && s.BeforeFaultSend != nil {
+		allowed := false
+		err := s.tx.WithTx(ctx, func(tx pgx.Tx) error { var e error; allowed, e = s.BeforeFaultSend(ctx, tx, req); return e })
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return nil
+		}
+	}
 	resolveErr := s.resolveTarget(ctx, &req)
 
 	key := idempotencyKey(req)
@@ -225,7 +242,13 @@ func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 			if err := s.logs.UpdateStatus(ctx, tx, logID, "sent", totalAttempts, ""); err != nil {
 				return err
 			}
-			return s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifySent, totalAttempts, "sent", "")
+			if err := s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifySent, totalAttempts, "sent", ""); err != nil {
+				return err
+			}
+			if req.FaultNotificationID != "" && s.OnFaultResult != nil {
+				return s.OnFaultResult(ctx, tx, req, "sent")
+			}
+			return nil
 		})
 	}
 	return s.markFailed(ctx, req, logID, totalAttempts, sendErr)
@@ -321,6 +344,11 @@ func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, 
 		}
 		if err := s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifyFailed, totalAttempts, "failed", detailError); err != nil {
 			return err
+		}
+		if req.FaultNotificationID != "" && s.OnFaultResult != nil {
+			if err := s.OnFaultResult(ctx, tx, req, "failed"); err != nil {
+				return err
+			}
 		}
 		if req.MetaAlert {
 			log.Printf("notify: 元告警最终失败，不再调度新的 notify_send resource=%s group=%s", req.AlertID, req.GroupKey)

@@ -117,6 +117,9 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 		Faults:               faults,
 	}, cfg, defaultTeamID)
 	sched, pl, stopper, lifecycle := a.Scheduler, a.Pipeline, a.Stopper, a.Lifecycle
+	if err := app.ReconcileFaultNotificationTimer(context.Background(), st, sched); err != nil {
+		return nil, fmt.Errorf("Fault 通知启动对账失败: %w", err)
+	}
 
 	// 启动对账（design.md R2），与生产 main.go 共用同一个 app.ReconcileOpsTimers；
 	// E2E 场景目前不预置 ops 设置，通常是空操作，保留是为了不让两处装配出现分叉。
@@ -172,6 +175,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 	router.RegisterRunbookRoutes(runbookService)
 	router.RegisterInfrastructureRoutes(topology, faults, incidents, alerts)
 	router.RegisterFaultRoutes(faults)
+	router.RegisterFaultNotificationRoutes(a.FaultOutbox)
 	router.RegisterTopologyAdminRoutes(topology)
 	router.RegisterServiceCatalogRoutes(serviceCatalog, alertMappings, a.AlertProjector, a.ImpactProjector, alerts)
 	router.RegisterOpsSettingsRoutes(teams, opsRepo, sched)

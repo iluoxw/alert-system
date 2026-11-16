@@ -105,6 +105,9 @@ func (o *notifyOutbox) scheduleSend(ctx context.Context, tx pgx.Tx, req notify.S
 // 制造出并行的多个定时器——这个"防抖折叠"的粒度必须停留在业务元组层面。Round 只
 // 影响 notify.Sender 的幂等键（sender.go），不影响这里的定时器去重粒度。
 func notifySendRefID(req notify.SendRequest) string {
+	if req.FaultNotificationID != "" {
+		return "fault-delivery:" + req.FaultNotificationID + ":" + strconv.Itoa(req.FaultNotificationGeneration)
+	}
 	resourceKey := req.AlertID
 	if resourceKey == "" {
 		resourceKey = req.IncidentID

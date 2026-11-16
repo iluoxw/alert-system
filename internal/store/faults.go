@@ -519,9 +519,9 @@ func (r *FaultRepo) Ack(ctx context.Context, tx pgx.Tx, id, actorID, actorName s
 	return fault, true, nil
 }
 
-// SetOwnerNotified 记录 Fault owner 团队通知意图已产生的时刻（R5.6）。语义取舍见
-// app.FaultOutbox.QueueFaultActivated 的文档：这里是"意图已调度"而非"确认发送
-// 成功"，因为拓扑抑制需要在意图时刻就能看到"已通知"。
+// SetOwnerNotified 记录当前激活批次中至少一个目标已被渠道接受的时刻。
+// 不表示人工已读或 ACK，也不证明所有目标送达。抑制必须查询目标级 delivery，
+// 历史版本曾写入意图时间，因此不能单凭此字段推断送达。
 func (r *FaultRepo) SetOwnerNotified(ctx context.Context, tx pgx.Tx, id string, at time.Time) error {
 	ct, err := tx.Exec(ctx, `UPDATE faults SET owner_notified_at = $2 WHERE id = $1`, id, at)
 	if err != nil {
