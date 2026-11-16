@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"alert-system/internal/alertsource"
 	"alert-system/internal/ingest"
 	"alert-system/internal/store"
 
@@ -91,4 +92,9 @@ func (rt *Runtime) listen(ctx context.Context) {
 		}
 		delay = min(30*time.Second, delay*2)
 	}
+}
+
+// AttachReconciler 补偿丢失的 Grafana webhook；只登记发生状态变化的 occurrence。
+func (rt *Runtime) AttachReconciler(r *alertsource.Reconciler) {
+	r.WithBatchRecorder(rt.projector.RecordSnapshot)
 }

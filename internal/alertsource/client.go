@@ -53,6 +53,9 @@ func ValidateConfig(kind string, cfg store.AlertmanagerSourceConfig) error {
 		return err
 	}
 	cfg = cfg.WithDefaults()
+	if err := cfg.ValidateScope(); err != nil {
+		return err
+	}
 	if cfg.APIURL == "" {
 		return fmt.Errorf("api_url 不能为空")
 	}

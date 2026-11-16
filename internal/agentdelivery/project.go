@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"alert-system/internal/agentprotocol"
 	"alert-system/internal/domain"
 	"alert-system/internal/store"
 )
@@ -39,12 +40,51 @@ func NewProjector(st *store.Store, queue messageWriter, routing Routing, logger 
 
 // Record receives an authenticated source ID and the validated, normalized members of one webhook.
 func (p *Projector) Record(ctx context.Context, tx pgx.Tx, sourceID string, raw json.RawMessage, events []domain.AlertEvent) error {
+	return p.record(ctx, tx, sourceID, raw, events, "webhook")
+}
+func (p *Projector) RecordSnapshot(ctx context.Context, tx pgx.Tx, sourceID string, raw json.RawMessage, events []domain.AlertEvent) error {
+	return p.record(ctx, tx, sourceID, raw, events, "snapshot")
+}
+func (p *Projector) record(ctx context.Context, tx pgx.Tx, sourceID string, raw json.RawMessage, events []domain.AlertEvent, origin string) error {
 	if !slices.Contains(p.routing.SourceIDs, sourceID) {
 		return nil
+	}
+	if len(events) > 0 && events[0].Source == domain.SourceKindGrafana {
+		// 唯一收据与batch同事务；不依赖消息留存，ACK或retention后迟到也不再分析。
+		ordered := slices.Clone(events)
+		receiptKey := func(e domain.AlertEvent) string {
+			return agentprotocol.OccurrenceRef(e.Source, sourceID, e.UpstreamFingerprint, e.StartsAt) + string(e.Status)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return receiptKey(ordered[i]) < receiptKey(ordered[j]) })
+		freshCount := int64(0)
+		for _, e := range ordered {
+			ref := agentprotocol.OccurrenceRef(e.Source, sourceID, e.UpstreamFingerprint, e.StartsAt)
+			tag, err := tx.Exec(ctx, `INSERT INTO agent_grafana_occurrences(source_id,occurrence_ref,phase) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, sourceID, ref, string(e.Status))
+			if err != nil {
+				return err
+			}
+			freshCount += tag.RowsAffected()
+		}
+		// 有新阶段时保留整个已通过scope的上游组上下文；不能把仍firing的组
+		// 因仅剩一条新resolved成员而伪装成完整恢复。
+		if freshCount == 0 {
+			return nil
+		}
 	}
 	env, policies, err := projectGroup(sourceID, raw, events, p.routing)
 	if err != nil {
 		return err
+	}
+	if env.Source == domain.SourceKindGrafana {
+		var payload agentprotocol.GroupPayload
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			return err
+		}
+		payload.Origin = origin
+		env.Payload, err = json.Marshal(payload)
+		if err != nil {
+			return err
+		}
 	}
 	env.TraceID = uuid.NewString()
 	_, err = tx.Exec(ctx, `INSERT INTO agent_batches (dedup_key, raw_webhook, envelope, policies)
@@ -62,21 +102,8 @@ type groupFields struct {
 }
 
 // The internal copy retains the full webhook. Only these explicit fields cross the machine API.
-type projectedMember struct {
-	Ref       string          `json:"ref"`
-	Alertname string          `json:"alertname,omitempty"`
-	Status    domain.Status   `json:"status"`
-	Severity  domain.Severity `json:"severity"`
-	StartsAt  time.Time       `json:"startsAt"`
-	EndsAt    *time.Time      `json:"endsAt,omitempty"`
-}
-
-type projectedPayload struct {
-	ReceiverRef     string            `json:"receiver_ref"`
-	GroupRef        string            `json:"group_ref"`
-	TruncatedAlerts int               `json:"truncatedAlerts"`
-	Alerts          []projectedMember `json:"alerts"`
-}
+type projectedMember = agentprotocol.Member
+type projectedPayload = agentprotocol.GroupPayload
 
 func digestFields(values ...string) string {
 	// JSON array encoding includes field boundaries (group names may themselves contain separators).
@@ -92,11 +119,37 @@ func projectGroup(sourceID string, raw json.RawMessage, events []domain.AlertEve
 	labels := make(map[string]string, len(fields.CommonLabels)+len(fields.GroupLabels))
 	maps.Copy(labels, fields.CommonLabels)
 	maps.Copy(labels, fields.GroupLabels)
+	sourceKind := events[0].Source
+	if sourceKind == "" {
+		sourceKind = domain.SourceKindAlertmanager
+	} // 兼容旧测试/历史内部调用
+	if !domain.IsAuthoritativeSourceKind(sourceKind) {
+		return Envelope{}, nil, errors.New("unsupported analysis source")
+	}
+	for _, event := range events {
+		if event.Source != "" && event.Source != sourceKind {
+			return Envelope{}, nil, errors.New("mixed analysis sources")
+		}
+	}
+	if sourceKind == domain.SourceKindGrafana {
+		// 范围过滤后不可继续用原始混合组的 commonLabels 来挑选角色。
+		labels = make(map[string]string)
+		for k, v := range events[0].Labels {
+			labels[k] = v
+		}
+		for _, event := range events[1:] {
+			for k, v := range labels {
+				if event.Labels[k] != v {
+					delete(labels, k)
+				}
+			}
+		}
+	}
 	env := Envelope{
-		SchemaVersion: 1, SourceID: sourceID, Source: domain.SourceKindAlertmanager,
+		SchemaVersion: 1, SourceID: sourceID, Source: sourceKind,
 		EventType: "alert.resolved", Severity: string(domain.SeverityInfo), Labels: map[string]string{},
 	}
-	if fields.Status == "firing" {
+	if fields.Status == "firing" && fields.TruncatedAlerts > 0 {
 		// A firing member may have been omitted by Alertmanager's max_alerts.
 		env.EventType = "alert.firing"
 	}
@@ -109,12 +162,16 @@ func projectGroup(sourceID string, raw json.RawMessage, events []domain.AlertEve
 			env.Severity = string(event.Severity)
 		}
 		member := projectedMember{
-			Ref:    digestFields(sourceID, event.UpstreamFingerprint, event.StartsAt.UTC().Format(time.RFC3339Nano)),
+			Ref:    agentprotocol.OccurrenceRef(sourceKind, sourceID, event.UpstreamFingerprint, event.StartsAt),
 			Status: event.Status, StartsAt: event.StartsAt, Severity: event.Severity,
 		}
 		if !event.EndsAt.IsZero() {
 			endsAt := event.EndsAt
 			member.EndsAt = &endsAt
+		}
+		ruleID := event.Labels["sre.rule.id"]
+		if namePattern.MatchString(ruleID) && slices.Contains(routing.PublicRuleIDs, ruleID) {
+			member.RuleID = ruleID
 		}
 		if namePattern.MatchString(event.RuleID) {
 			member.Alertname = event.RuleID
