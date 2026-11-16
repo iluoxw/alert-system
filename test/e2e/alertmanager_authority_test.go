@@ -18,6 +18,7 @@ type alertmanagerMock struct {
 	alertsPath string
 	alertname  string
 	labelKey   string
+	cluster    string
 }
 
 func (m *alertmanagerMock) setMode(mode string, updatedAt time.Time) {
@@ -57,6 +58,12 @@ func (m *alertmanagerMock) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		status["state"] = "suppressed"
 		status["silencedBy"] = []string{"e2e-silence-01"}
 	}
+	labels := map[string]string{
+		"alertname": firstNonEmpty(m.alertname, "SREControlAuthorityProbe"), "severity": "critical", "service": "cch", firstNonEmpty(m.labelKey, "authority_e2e"): fp,
+	}
+	if m.cluster != "" {
+		labels["cluster"] = m.cluster
+	}
 	_ = json.NewEncoder(w).Encode([]map[string]any{{
 		"annotations":  map[string]string{"summary": "Alertmanager 权威链路探针"},
 		"receivers":    []map[string]string{{"name": "e2e"}},
@@ -65,11 +72,8 @@ func (m *alertmanagerMock) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		"updatedAt":    updatedAt.Format(time.RFC3339Nano),
 		"endsAt":       time.Time{}.Format(time.RFC3339Nano),
 		"generatorURL": "http://prometheus.test/graph",
-		"labels": map[string]string{
-			"alertname": firstNonEmpty(m.alertname, "SREControlAuthorityProbe"), "severity": "critical", "service": "cch",
-			firstNonEmpty(m.labelKey, "authority_e2e"): fp,
-		},
-		"status": status,
+		"labels":       labels,
+		"status":       status,
 	}})
 }
 

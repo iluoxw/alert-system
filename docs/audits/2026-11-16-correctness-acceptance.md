@@ -5,7 +5,7 @@
 ## 交付行为
 
 - `FaultRepo.HasConfirmedBusinessImpact` 只认可 lifecycle active 的 business_system。总览既有 SQL 已使用同一过滤，保持不变；Fault 工作区的宣布门槛同步过滤下线应用。Impact 历史明细保留人工裁决，不把下线改写为恢复，不自动关闭历史 Incident。
-- `mapping.Projector.Evaluate` 提供只读评估，`Project` 复用同一解析/关联计算。显式策略或标准标签声明的关联维度缺少值（包括纯空白）返回 `unmapped / correlation_label_missing`，不创建或合并 Fault；未声明维度保留旧聚合方式。真实投影会移除该 Alert 的旧自动证据并持久化治理原因，预览没有任何写入。
+- `mapping.Projector.Evaluate` 提供只读评估，`Project` 复用同一解析/关联计算。显式策略或标准标签声明的关联维度缺少值（包括纯空白）返回 `unmapped / correlation_label_missing`，不创建或合并 Fault；未声明维度保留旧聚合方式。真实投影持久化治理原因；缺维度时保留该 occurrence 的既有绑定与历史证据，预览没有任何写入。
 - 新增管理员 `POST /api/v1/admin/alert-mapping/preview`，批量 1–100 个 Alert UUID；返回 `items[].result`（实体、关联 key、已有 Fault、缺失原因）、`fault_kind` 和 `would_create_fault`。使用 PG READ ONLY 事务从数据库层阻断副作用。它评估已发布规则，现有 `/admin/alert-mappings/preview` 继续只预览草稿策略的匹配告警。
 - 新增管理员 `GET /api/v1/admin/alert-mapping/governance`。仅统计当前 firing，按 source、source_integration_id、severity、status、reason_code 分桶；未评估为 unmapped/not_evaluated，ignored 单独保留，空集为 `items: []`。已有 `/alert-mapping/summary` 仍为全历史映射汇总。
 - 跨节点 confirmed 文案表达应用退化已确认、Fault 归因未确认，不修改 direct evidence 规则或 ccloud trace 方向。stale 关系即使有直接证据也只得到 potential。
@@ -50,3 +50,21 @@ preview 不回放，真实回放仍使用既有管理员 `POST /api/v1/admin/ale
 | C6 firing 治理 | legacy 空 fingerprint、权威 firing/unknown/resolved、ignored 与 mapped、空集真 PG | 同 kind 双 source_id 分桶由 SQL 明确实现，未另建双来源 fixture；状态为最近持久化映射判断，不自动补跑历史评估 |
 | C7 拓扑 | 真 PG 显式 App→Gateway 反向可达、过期边 stale、下线 Gateway 阻断；纯函数 stale+direct 不 confirmed | 不宣称真实平台采样或因果归因已验证 |
 | C8 权限/输出 | API 单测未登录 401、member 403、空批/超100/非法UUID 400；返回无通知目标字段 | 不涉及对外发送，不部署、不合并 |
+
+
+## 独立审查 P1 修复：升级前空维度 occurrence 的解除
+
+独立审查 `review-correctness.md` 发现旧版本已绑定的空维度 occurrence，在新 guard 下解除时会被改为 unmapped 并删除证据，导致旧 Fault 遗留 active。已按持久化绑定修复，未放宽新准入：
+
+- Evaluate 缺维度时只读查询已有 `fault_alert_links`，包括后续被人工裁决过的证据，不按空维度 key 猜测新绑定。单一既有绑定在预览返回原 Fault ID/entity/key，`would_create_fault=false`；reason 仍为 `correlation_label_missing`。
+- Project 对缺维度 occurrence 不创建、合并或重开 Fault，不删除或覆盖自动/人工历史证据。重复 firing 保持原状态，不产生激活转移。
+- 收到明确 resolved 时，按持久绑定 Fault ID 条件推进 active/candidate→monitoring；其他关联 occurrence 仍 firing 或来源 unknown 时保留状态。monitoring/resolved 历史重放不重开。这里只确认开始观察，不自动 resolved 或关闭 Incident。
+- `TestMappingUpgradeMissingDimensionPreservesBoundLifecycle` 用旧版精确 SHA256 空维度 key、active Fault 和历史 evidence 构造真实 PG 升级 fixture，覆盖重复 firing、共享 Fault 另一条 firing、最后解除、自动/人工证据保留、人工裁决过的当前绑定、resolved 历史及缺维度 firing 重放。
+
+原独立复现 overlay 已从退出 1 转为退出 0（4.077s）。新增强断言 fixture 与原只读评估测试一起运行 integration race 退出 0（7.457s；补人工当前绑定分支后最终同命令退出 0，9.683s）。mapping/impact/api 全包 race 分别退出 0（1.496s/2.303s/6.553s）；`go build ./...` 与 focused store/mapping/incident vet 退出 0。
+
+### Grafana CI 夹具修正
+
+PR #18 backend CI 的 `TestGrafanaAuthority_FullChain` 失败根因：通用固定目标策略帮助函数声明了 `cluster` 关联维度，而 Grafana webhook 和对账 mock 都未提供值。此为新 guard 正确拒绝，不放宽产品约束。Grafana webhook 与 mock 现在显式携带相同 `cluster=prod-a`，并新增对账/解除后仍引用初始 Fault ID 的断言。其他 mock 不凭空增加维度。
+
+已执行 `go test -c -o /private/tmp/alert-iteration-issues/correctness-e2e-compile.test ./test/e2e` 仅编译，退出 0；未执行 TestMain、未启动固定 Compose。真实 E2E 由主 Agent 串行执行，不能把本次编译当成 Grafana E2E 通过。

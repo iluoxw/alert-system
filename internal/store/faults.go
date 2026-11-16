@@ -800,3 +800,37 @@ func (r *FaultRepo) ListImpacts(ctx context.Context, tx pgx.Tx, faultID string) 
 	}
 	return result, rows.Err()
 }
+
+// ListBindingsForAlert 读取 occurrence 已持久化的映射，不按缺失维度猜测新关联。
+func (r *FaultRepo) ListBindingsForAlert(ctx context.Context, tx pgx.Tx, alertID string) ([]domain.Fault, error) {
+	rows, err := tx.Query(ctx, `SELECT `+faultColumns+` FROM faults WHERE id IN (SELECT fault_id FROM fault_alert_links WHERE alert_id=$1) ORDER BY id`, alertID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []domain.Fault{}
+	for rows.Next() {
+		fault, err := scanFault(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, fault)
+	}
+	return result, rows.Err()
+}
+
+// MonitorBoundFaultAfterResolvedOccurrence 只收口已绑定 Fault，绝不按 key 新建或重开历史。
+// 其他 occurrence 尚未解除（包括来源 unknown）时保留现状，不能凭单条解除关闭共享 Fault。
+// 当前 occurrence 的解除事实由接入传入；排除其 ID 也支持事务内尚未回读的 source_state。
+func (r *FaultRepo) MonitorBoundFaultAfterResolvedOccurrence(ctx context.Context, tx pgx.Tx, faultID, alertID string, at time.Time) (domain.Fault, error) {
+	_, err := tx.Exec(ctx, `UPDATE faults f SET status='monitoring',last_evaluated_at=GREATEST(last_evaluated_at,$3)
+ WHERE f.id=$1 AND f.status IN ('active','candidate')
+ AND EXISTS (SELECT 1 FROM fault_alert_links l WHERE l.fault_id=f.id AND l.alert_id=$2)
+ AND NOT EXISTS (SELECT 1 FROM fault_alert_links l JOIN alerts a ON a.id=l.alert_id
+ WHERE l.fault_id=f.id AND l.alert_id<>$2 AND
+ ((a.upstream_fingerprint<>'' AND a.source_state<>'resolved') OR (a.upstream_fingerprint='' AND a.status<>'resolved')))`, faultID, alertID, at)
+	if err != nil {
+		return domain.Fault{}, err
+	}
+	return r.GetByID(ctx, tx, faultID)
+}

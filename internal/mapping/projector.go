@@ -71,6 +71,7 @@ type Evaluation struct {
 	FaultKind        string                    `json:"fault_kind,omitempty"`
 	WouldCreateFault bool                      `json:"would_create_fault"`
 	contract         resolvedContract
+	bindings         []domain.Fault
 }
 
 // Evaluate 与 Project 共用准入和关联计算，数据库查询只读。
@@ -92,6 +93,16 @@ func (p *Projector) Evaluate(ctx context.Context, tx pgx.Tx, alert domain.Alert)
 		result.Status = domain.AlertMappingUnmapped
 		result.ReasonCode = "correlation_label_missing"
 		result.Explanation = "缺少关联维度：" + strings.Join(missing, ", ")
+		evaluation.bindings, err = p.faults.ListBindingsForAlert(ctx, tx, alert.ID)
+		if err != nil {
+			return evaluation, err
+		}
+		if len(evaluation.bindings) == 1 {
+			bound := evaluation.bindings[0]
+			result.FaultID, result.EntityID, result.CorrelationKey = bound.ID, bound.ResourceNodeID, bound.CorrelationKey
+			evaluation.FaultKind = bound.Kind
+			result.Explanation += "；保留 occurrence 已有绑定，禁止按缺失维度创建或合并"
+		}
 		return evaluation, nil
 	}
 	result.CorrelationKey = buildCorrelationKey(contract.Entity.EntityKey, contract.FaultKind, contract.CorrelationLabels, alertLabelView(alert))
@@ -129,6 +140,26 @@ func (p *Projector) Project(ctx context.Context, tx pgx.Tx, alert domain.Alert) 
 	contract := evaluation.contract
 	status := result.Status
 	if status != domain.AlertMappingMapped {
+		// 新准入校验不能切断升级前 occurrence 的解除链路；已有证据是历史事实。
+		if result.ReasonCode == "correlation_label_missing" {
+			if isResolved(alert) {
+				for _, bound := range evaluation.bindings {
+					updated, err := p.faults.MonitorBoundFaultAfterResolvedOccurrence(ctx, tx, bound.ID, alert.ID, result.EvaluatedAt)
+					if err != nil {
+						return result, err
+					}
+					if p.impacts != nil {
+						if err := p.impacts.RebuildFault(ctx, tx, updated); err != nil {
+							return result, err
+						}
+						if err := p.impacts.RebuildUpstreamForConsumer(ctx, tx, updated.ResourceNodeID); err != nil {
+							return result, err
+						}
+					}
+				}
+			}
+			return p.policies.UpsertResult(ctx, tx, result)
+		}
 		if err := p.faults.RemoveAutomatedEvidenceForAlertExcept(ctx, tx, alert.ID, ""); err != nil {
 			return result, err
 		}
