@@ -173,3 +173,21 @@ func TestOfficialCLIColdCacheThroughAdapter(t *testing.T) {
 		t.Fatalf("unexpected cold-cache chain: %v", paths)
 	}
 }
+
+func TestRedirectCannotForwardPrivilegedCredential(t *testing.T) {
+	var calls atomic.Int32
+	h, e := New(Options{ProxyToken: proxyTestToken, CloudAPIKey: cloudTestKey, Client: &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{"https://other.invalid/"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	r := httptest.NewRequest("GET", podsPath+"?appId="+AppID+"&clusterId=60", nil)
+	r.Header.Set("Authorization", "Bearer "+proxyTestToken)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if calls.Load() != 1 || w.Code != 502 {
+		t.Fatal("redirect followed or treated as observation")
+	}
+}
