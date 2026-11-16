@@ -767,3 +767,27 @@ func TestSender_MetaAlertToSameTarget_DoesNotOverwriteOriginalLog(t *testing.T) 
 		t.Fatalf("元告警记录状态应为 sent，实际 %q", metaEntry.Status)
 	}
 }
+
+func TestFaultMetaIdentitySeparatesSourceGenerationAndTarget(t *testing.T) {
+	base := SendRequest{MetaAlert: true, MetaSourceDeliveryID: "delivery-a", MetaSourceGeneration: 1, ChannelKind: "test", Target: "secret", Round: 3}
+	seen := map[string]bool{}
+	for _, req := range []SendRequest{base, func() SendRequest { r := base; r.MetaSourceDeliveryID = "delivery-b"; return r }(), func() SendRequest { r := base; r.MetaSourceGeneration++; return r }(), func() SendRequest { r := base; r.Target = "another-secret"; return r }()} {
+		key := idempotencyKey(req)
+		if seen[key] {
+			t.Fatal("元告警幂等冲突")
+		}
+		seen[key] = true
+	}
+	same := base
+	same.Round++
+	if idempotencyKey(base) != idempotencyKey(same) {
+		t.Fatal("元告警身份不应依赖round")
+	}
+	primary := base
+	primary.MetaAlert = false
+	primary.FaultNotificationID = base.MetaSourceDeliveryID
+	primary.FaultNotificationGeneration = base.MetaSourceGeneration
+	if idempotencyKey(primary) == idempotencyKey(base) {
+		t.Fatal("fallback与主delivery身份冲突")
+	}
+}

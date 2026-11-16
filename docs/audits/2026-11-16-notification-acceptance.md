@@ -84,3 +84,32 @@ N4 HTTP E2E 已补 `TestFaultNotify_SilentReprocessPreviewAndBackfill`：真实 
 
 
 主 Agent 已完成新版迁移 32 的真实 ledger 复验并返回全通过，结果 `/private/tmp/alert-iteration-issues/migration-results-final.json`：空库/29/31 → 32 及 down/up；旧 Fault 与历史 owner_notified_at 保留、不误回填 watch/delivery；普通更新不增加激活版本；monitoring → active 恰好加一且清 owner；down 移除新增列/触发器，再 up 保留 Fault。此最终回执取代前文旧迁移结果，最终迁移结构已冻结。
+
+## 独立审查后的 fallback 身份修复
+
+第二次审查发现：Fault 主通知虽按 delivery UUID/generation 去重，fallback 元告警却只继承数值 round，`epoch=2,generation=1` 和 `epoch=3,generation=0` 都会得到 round=3；同一 Fault 多目标失败也会折叠发往同一 fallback 的 pending timer。修复前已独立运行原 overlay `TestReviewNewEpochFallback`，真实 PG 退出 1（4.193s，`/private/tmp/alert-notify-meta-before.log`）。
+
+元告警现持久化独立 `MetaSourceDeliveryID/MetaSourceGeneration`，Sender 幂等键与 timer ref 共同使用 `fault-meta` 源身份及 fallback 目标哈希。它不继承 `FaultNotificationID`，并在发送器显式排除元告警的主 delivery 前置检查/结果回写。这样新 epoch、显式重试和不同原目标都各自保留独立元告警；同一源意图重放仍去重，fallback 成功不能把主 failed 改成 sent，元告警失败不递归。旧无 source 字段的在途 payload 保持原解码/幂等语义。本修复无 schema 变化，前述最终迁移 ledger 结论继续有效。
+
+已实际执行并退出 0：
+
+```sh
+GOCACHE=/private/tmp/alert-notify-gocache go test \
+  -overlay /private/tmp/alert-iteration-issues/notify-review-overlay.json \
+  -tags=integration -race ./internal/app \
+  -run 'TestReviewNewEpochFallback|TestReviewMultiTargetFailure' -count=1 -v
+# 两项原独立复现均通过，11.520s；alert-notify-meta-review-after.log
+
+GOCACHE=/private/tmp/alert-notify-gocache go test -tags=integration -race ./internal/app \
+  -run TestFaultNotificationMetaIdentityAndPrincipalIsolation -count=1 -v
+# 通过，4.275s；alert-notify-meta-test.log
+
+GOCACHE=/private/tmp/alert-notify-gocache go test -race ./internal/app ./internal/notify ./internal/api -count=1
+# 全通过：1.478s / 1.970s / 6.368s
+
+GOCACHE=/private/tmp/alert-notify-gocache go test -c -o /private/tmp/alert-notify-e2e.test ./test/e2e
+GOCACHE=/private/tmp/alert-notify-gocache go build ./...
+GOCACHE=/private/tmp/alert-notify-gocache go vet ./internal/app ./internal/notify
+```
+
+新增 unit 测试验证 payload 序列化不改变源身份、不同源/代次/目标不碰撞、元告警 timer 不泄露目标。新增真 PG 测试同时验证两个独立 pending timer、真实 Sender 各外发一次、重放幂等、主 failed/owner 汇总保持、fallback 失败不再次调度。所有出站依旧是 fake Channel；日志均位于 `/private/tmp`，未执行固定 Compose。

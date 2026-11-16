@@ -61,6 +61,9 @@ type txRunner interface {
 
 // SendRequest 是一次具体的发送请求：某个告警/分组的某一级升级序列，要发到哪个渠道的哪个 target。
 type SendRequest struct {
+	// MetaSource* 只标识元告警源意图，不参与主delivery发送前门槛或结果回写。
+	MetaSourceDeliveryID        string `json:"meta_source_delivery_id,omitempty"`
+	MetaSourceGeneration        int    `json:"meta_source_generation,omitempty"`
 	FaultNotificationID         string `json:"fault_notification_id,omitempty"`
 	FaultNotificationGeneration int    `json:"fault_notification_generation,omitempty"`
 	AlertID                     string // AlertID、GroupKey、IncidentID 三选一
@@ -150,6 +153,14 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 	}
 }
 
+// FaultMetaIdentity 独立区分原delivery、重试代次与fallback目标；不依赖可能碰撞的round和主delivery状态。
+func FaultMetaIdentity(req SendRequest) string {
+	if !req.MetaAlert || req.MetaSourceDeliveryID == "" {
+		return ""
+	}
+	return "fault-meta:" + req.MetaSourceDeliveryID + ":" + strconv.Itoa(req.MetaSourceGeneration) + ":" + store.NotificationTargetHash(req.ChannelKind, req.Target)
+}
+
 // idempotencyKey 拼接出确定性的幂等键：同一告警/分组 + 同一级 + 同一渠道 + 同一
 // target + 同一 Round（同一次"发送意图"，见 SendRequest.Round 的文档），无论调用方
 // 重试多少次、进程崩溃后重投多少次，都能算出同一个键，从而命中 notification_log 的
@@ -161,8 +172,12 @@ func NewSender(tx txRunner, logs logStore, timeline timelineAppender) *Sender {
 // 幂等键，把"从未送达"的那条 notification_log 改写成 sent（实测复现），既抹掉了
 // 要暴露的失败，也让送达类指标把失败计成成功。只在 MetaAlert 为真时追加尾段，
 // 在途旧 payload 反序列化出 false，键与改动前逐字节一致。
+
 func idempotencyKey(req SendRequest) string {
-	if req.FaultNotificationID != "" {
+	if key := FaultMetaIdentity(req); key != "" {
+		return key
+	}
+	if req.FaultNotificationID != "" && !req.MetaAlert {
 		return "fault-delivery:" + req.FaultNotificationID + ":" + strconv.Itoa(req.FaultNotificationGeneration)
 	}
 	resourceKey := req.AlertID
@@ -201,7 +216,7 @@ func idempotencyKey(req SendRequest) string {
 // 无法参与数据库事务的固有代价，MVP 阶段已经过 team-lead 裁决接受，不指望唯一键堵住
 // 这个窗口。
 func (s *Sender) Send(ctx context.Context, req SendRequest) error {
-	if req.FaultNotificationID != "" && s.BeforeFaultSend != nil {
+	if req.FaultNotificationID != "" && !req.MetaAlert && s.BeforeFaultSend != nil {
 		allowed := false
 		err := s.tx.WithTx(ctx, func(tx pgx.Tx) error { var e error; allowed, e = s.BeforeFaultSend(ctx, tx, req); return e })
 		if err != nil {
@@ -245,7 +260,7 @@ func (s *Sender) Send(ctx context.Context, req SendRequest) error {
 			if err := s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifySent, totalAttempts, "sent", ""); err != nil {
 				return err
 			}
-			if req.FaultNotificationID != "" && s.OnFaultResult != nil {
+			if req.FaultNotificationID != "" && !req.MetaAlert && s.OnFaultResult != nil {
 				return s.OnFaultResult(ctx, tx, req, "sent")
 			}
 			return nil
@@ -345,7 +360,7 @@ func (s *Sender) markFailed(ctx context.Context, req SendRequest, logID string, 
 		if err := s.appendResultTimeline(ctx, tx, req, domain.TimelineActionNotifyFailed, totalAttempts, "failed", detailError); err != nil {
 			return err
 		}
-		if req.FaultNotificationID != "" && s.OnFaultResult != nil {
+		if req.FaultNotificationID != "" && !req.MetaAlert && s.OnFaultResult != nil {
 			if err := s.OnFaultResult(ctx, tx, req, "failed"); err != nil {
 				return err
 			}
