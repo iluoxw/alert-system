@@ -1,0 +1,64 @@
+{
+  "id": "depl_laadNaS7VtUk6B3pGSWLltxT",
+  "read_only": true,
+  "http": 200,
+  "top_keys": [
+    "agent",
+    "archived_at",
+    "budget",
+    "created_at",
+    "description",
+    "environment_id",
+    "id",
+    "initial_events",
+    "metadata",
+    "name",
+    "paused_reason",
+    "resources",
+    "schedule",
+    "status",
+    "type",
+    "updated_at",
+    "vault_ids"
+  ],
+  "agent": {
+    "id": "agent_cmJ2nCWWiB8yNKuSgThWlkYc",
+    "type": "agent",
+    "version": 1
+  },
+  "environment_id": "env_pwlE8ULfRTexjMcqEAL1zI3Z",
+  "schedule": {
+    "type": "cron",
+    "expression": "30 8 * * 1-5",
+    "timezone": "Asia/Shanghai",
+    "last_run_at": "2026-11-16T00:30:00Z",
+    "upcoming_runs_at": [
+      "2026-11-17T00:30:00Z",
+      "2026-11-18T00:30:00Z",
+      "2026-11-19T00:30:00Z",
+      "2026-11-20T00:30:00Z",
+      "2026-11-23T00:30:00Z"
+    ]
+  },
+  "vault_ids": [
+    "vlt_Y5QgprvFUfgzHsy4doOIyDcu"
+  ],
+  "resources": [
+    {
+      "access": "read_only",
+      "memory_store_id": "memstore_jY01BppNLmo9X7ADMc318fFf",
+      "type": "memory_store"
+    },
+    {
+      "access": "read_write",
+      "memory_store_id": "memstore_gDk1aBFVpBpialS6WBlavUBC",
+      "type": "memory_store"
+    },
+    {
+      "file_id": "file_F2RcaRBCaXP0XNJWquxSmQY3",
+      "mount_path": "/uploads/iacctl-go",
+      "type": "file"
+    }
+  ],
+  "status": "active"
+}

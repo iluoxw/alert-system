@@ -1,0 +1,83 @@
+{
+  "read_only": true,
+  "credential_env_present": {
+    "CCLOUD_API_KEY": false,
+    "OMA_API_KEY": true
+  },
+  "environments": {
+    "id": "env_pwlE8ULfRTexjMcqEAL1zI3Z",
+    "keys": [
+      "archived_at",
+      "config",
+      "created_at",
+      "description",
+      "id",
+      "metadata",
+      "name",
+      "scope",
+      "state",
+      "type",
+      "updated_at"
+    ],
+    "config_keys": [
+      "environment",
+      "init_script",
+      "networking",
+      "packages",
+      "resources",
+      "type"
+    ],
+    "version": null,
+    "environment_type": "cloud",
+    "networking": {
+      "allow_mcp_servers": false,
+      "allow_package_managers": false,
+      "allowed_hosts": [
+        "thanos-inner.test.seewo.com",
+        "obs.test.seewo.com",
+        "open.feishu.cn"
+      ],
+      "type": "limited"
+    },
+    "packages": {
+      "type": "packages",
+      "apt": [],
+      "cargo": [],
+      "gem": [],
+      "go": [],
+      "npm": [],
+      "pip": []
+    },
+    "env_var_names": []
+  },
+  "agents": {
+    "id": "agent_cmJ2nCWWiB8yNKuSgThWlkYc",
+    "keys": [
+      "archived_at",
+      "created_at",
+      "description",
+      "id",
+      "mcp_servers",
+      "metadata",
+      "model",
+      "multiagent",
+      "name",
+      "skills",
+      "system",
+      "tools",
+      "type",
+      "updated_at",
+      "version"
+    ],
+    "config_keys": [],
+    "version": 1,
+    "tool_types": [
+      "agent_toolset_20260401"
+    ],
+    "has_ccloud_in_system": true,
+    "model": {
+      "id": "default/deepseek-flash",
+      "speed": "standard"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "credential_file_exists": true,
+  "credential_file_keys": [
+    "apiKey",
+    "expiresAt",
+    "keyId",
+    "keyName"
+  ],
+  "api_key_present": true,
+  "credential_env_present": false,
+  "credential_scope": {
+    "expiresAt": 1805417609000
+  },
+  "identity_http": 200,
+  "identity_top_keys": [
+    "code",
+    "data",
+    "k8sApiInvokeTimes",
+    "k8sApiTotalTimeCost",
+    "message",
+    "serverIp",
+    "serverTimeCost",
+    "traceId"
+  ],
+  "identity_data_keys": [
+    "admin",
+    "currentKey",
+    "userId",
+    "userLoginName",
+    "userName"
+  ],
+  "identity_admin": true,
+  "current_key_fields": [
+    "expiresAt",
+    "keyId",
+    "keyName"
+  ],
+  "current_key_scope": {},
+  "identity_scope_metadata": {}
+}
