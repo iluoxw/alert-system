@@ -30,19 +30,41 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w" \
       -o /out/seed-admin ./cmd/seed-admin
 
+# 固定的脱敏源码快照随仓库构建，运行时不下载 CLI 或读取凭据文件。
+FROM ${GO_BASE_IMAGE} AS iacctl-build
+ARG TARGETOS
+ARG TARGETARCH
+ARG GO111MODULE=on
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+ENV GO111MODULE=$GO111MODULE GOPROXY=$GOPROXY GOSUMDB=$GOSUMDB
+WORKDIR /iacctl
+COPY tools/iacctl-go/go.mod tools/iacctl-go/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY tools/iacctl-go/ ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+      -trimpath -buildvcs=false \
+      -ldflags="-s -w -X github.com/luoxw/iacctl-go/cmd.version=source-643ddf7aaec314a438f052a719b3741f2eef71ff" \
+      -o /out/iacctl-go .
+
 FROM ${ALPINE_BASE_IMAGE} AS api
 ARG VERSION=dev
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="SRE Control API" \
       org.opencontainers.image.version=$VERSION \
       org.opencontainers.image.revision=$VCS_REF \
-      org.opencontainers.image.source="alert-system"
+      org.opencontainers.image.source="alert-system" \
+      io.sre-control.iacctl.revision="643ddf7aaec314a438f052a719b3741f2eef71ff"
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S -g 10001 sre-control && \
     adduser -S -D -H -u 10001 -G sre-control sre-control
 WORKDIR /app
 COPY --from=go-build --chown=10001:10001 /out/alert-system /app/alert-system
 COPY --from=go-build --chown=10001:10001 /out/seed-admin /app/seed-admin
+COPY --from=iacctl-build --chown=10001:10001 /out/iacctl-go /app/iacctl-go
+COPY --chown=10001:10001 tools/iacctl-go/SOURCE.json /app/iacctl-source.json
 USER 10001:10001
 EXPOSE 8080 8081
 ENTRYPOINT ["/app/alert-system"]
