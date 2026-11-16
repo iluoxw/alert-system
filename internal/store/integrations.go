@@ -1,6 +1,7 @@
 package store
 
 import (
+	"alert-system/internal/domain"
 	"context"
 	"encoding/json"
 	"errors"
@@ -114,6 +115,35 @@ func (r *IntegrationRepo) Update(ctx context.Context, tx pgx.Tx, in Integration)
 	config := in.Config
 	if config == nil {
 		config = json.RawMessage(`{}`)
+	}
+	// 配置变更与 webhook/快照提交共享来源锁。已有 occurrence 后范围不可变，
+	// 防止一次缩小过滤把原范围中的告警误判为多次缺失并解除。
+	var previousConfig []byte
+	var previousKind string
+	if err := tx.QueryRow(ctx, `SELECT kind,config FROM integrations WHERE id=$1 FOR UPDATE`, in.ID).Scan(&previousKind, &previousConfig); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if domain.IsAuthoritativeSourceKind(previousKind) || domain.IsAuthoritativeSourceKind(in.Kind) {
+		before, err := ParseAlertmanagerSourceConfig(previousConfig)
+		if err != nil {
+			return err
+		}
+		after, err := ParseAlertmanagerSourceConfig(config)
+		if err != nil {
+			return err
+		}
+		if before.ScopeKey() != after.ScopeKey() || previousKind != in.Kind {
+			var exists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM alerts WHERE source_integration_id=$1) OR EXISTS(SELECT 1 FROM alert_events WHERE integration_id=$1)`, in.ID).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return ErrSourceScopeChanged
+			}
+		}
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE integrations SET kind = $2, name = $3, default_severity = $4, enabled = $5, config = $6 WHERE id = $1

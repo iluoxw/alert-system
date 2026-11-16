@@ -1,0 +1,9 @@
+{
+  "network": "loopback mock only",
+  "obs_auth_present": false,
+  "real_cli_thanos_zero_result_ok": true,
+  "sources_obs_missing_reported": true,
+  "source_revision": "643ddf7aaec314a438f052a719b3741f2eef71ff",
+  "darwin_binary_sha256": "f768d0d899899d45fd25cbc788d2ab98875e3d6531fa0e795f8828870438c768",
+  "linux_amd64_binary_sha256": "09e6c0aaec0c6b565698fc48431837fca484990ec1f6d70f896032a1fd2e305e"
+}

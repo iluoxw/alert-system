@@ -1,0 +1,105 @@
+{
+  "repository": "iacctl (local source snapshot; no remote credentials bundled)",
+  "source_revision": "643ddf7aaec314a438f052a719b3741f2eef71ff",
+  "source_subdirectory": "golang/iacctl",
+  "tracked_source_clean": true,
+  "credential_policy": "runtime OBS_AUTH only; no environment/dotfiles/binaries copied",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "55b9feb0d2ef888ec5c17af97357f1b53ef592d95f87d8627a0ab921c96d8f49"
+    },
+    {
+      "path": "cmd/inspect.go",
+      "sha256": "9a4ed711a1908f11f820ef90f0ae9af282bb4b0c822b044123eed73c5561a98c"
+    },
+    {
+      "path": "cmd/query.go",
+      "sha256": "c3533a3c5e03f8622eff11a2dc3657679912eeb59d12af9381227cee2cac8d43"
+    },
+    {
+      "path": "cmd/root.go",
+      "sha256": "d3ba758049c85192de1015a3da5b1b4f804a4db9bc673dd2916cff10de3988e4"
+    },
+    {
+      "path": "cmd/skills.go",
+      "sha256": "2dd3190f79275733dd87ef6306d40023dd466d90b918b181d3770b5248b2637f"
+    },
+    {
+      "path": "cmd/sources.go",
+      "sha256": "976ae43422137bc457a8737e0041bd1433c4d05b8c3b06613dd8fb357b7866e4"
+    },
+    {
+      "path": "cmd/tools.go",
+      "sha256": "e3e6ccb2b9e40f85fd6f223886fd766c42f3ef26cc7853a9aaf38c8aae7bdece"
+    },
+    {
+      "path": "go.mod",
+      "sha256": "5c588a5e24e7ae8a7269cf6360421d36bd26a3a9cba86554deb00c45d1d4a795"
+    },
+    {
+      "path": "go.sum",
+      "sha256": "712639224ec1047f7de35c8b35bfab76d8abba972ff5bc63668c74ed13942b25"
+    },
+    {
+      "path": "internal/inspect/inspect.go",
+      "sha256": "e8cb354cad39db9faa68e59589e4678efa754ec313ca66c07fe04fbbb24a4aa5"
+    },
+    {
+      "path": "internal/prom/client.go",
+      "sha256": "c8051ab34871d276d8156ad750cdfe2b7b9d10388ab3dce90ab3b85045e0aafe"
+    },
+    {
+      "path": "internal/prom/client_test.go",
+      "sha256": "7a0c0e6567a9c5cf293fec53544710b19e90e33369d6c3c79d10a44fb799f27f"
+    },
+    {
+      "path": "internal/runtimecfg/config.go",
+      "sha256": "6f06a1af0de174bfebcf2cc642ace4110fbc809e08dedb52602ede70155f131a"
+    },
+    {
+      "path": "internal/runtimecfg/config_test.go",
+      "sha256": "708484b97421d66ae13334b914c62fae55739f0cdf9cec9cb387eab73e8d11b4"
+    },
+    {
+      "path": "internal/series/series.go",
+      "sha256": "bea88b42007d7d6fec8b3aec3802975f209b33c2fd96d93e6c4f5c83b19db0be"
+    },
+    {
+      "path": "internal/series/series_test.go",
+      "sha256": "7f9d41b627cd90ebab381dcb79499b7b5d4be07281532d9bdce319f6bfd941e5"
+    },
+    {
+      "path": "main.go",
+      "sha256": "5cf91ba3dee73ba55bea633cf961cf9f3eb3b581902cd0959a373c7d0f44abd1"
+    },
+    {
+      "path": "packs/embed.go",
+      "sha256": "32a741aa29456d6d61977fcdbe1d5a3a3316d14d9a2e298f339a014f9c9dddfe"
+    },
+    {
+      "path": "packs/iac-go/pack.yaml",
+      "sha256": "f0970be7654c36f136fa00722b90e807165ce575b9d2fc55cd8b91ed40a51544"
+    },
+    {
+      "path": "packs/iac-go/resources.yaml",
+      "sha256": "7eabfa472e73bc8ba86f5271756640591d64f18af0ec7fa9993254205d3a8cef"
+    },
+    {
+      "path": "packs/loader.go",
+      "sha256": "1bbcffd11706a97101c6d5052388aec7d896b490713972f314c3688d0919c4dc"
+    },
+    {
+      "path": "skills/embed.go",
+      "sha256": "7492aa938d42ca45aa13efdba5485e3e2ad5bf14e8ffb2b39d61b5eaaa29d25c"
+    },
+    {
+      "path": "skills/iac-go-ops/SKILL.md",
+      "sha256": "c98f55c3d7140d14656f3d2a14102be5c06f0668769d452b68cb9270dcd8b770"
+    },
+    {
+      "path": "skills/iac-go-ops/references/known-items.md",
+      "sha256": "d4b6a9502416f98324aa93b3449fd04c610e63846dc1b04a87aed5e2cb159655"
+    }
+  ]
+}

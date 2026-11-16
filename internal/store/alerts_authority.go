@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -178,6 +179,7 @@ func (r *AlertRepo) MarkMissingAfterSnapshot(
 	generation int64,
 	missingConfirmations int,
 	at time.Time,
+	uncertainRuleIDs ...string,
 ) ([]domain.Alert, error) {
 	if missingConfirmations < 2 {
 		missingConfirmations = 2
@@ -209,11 +211,20 @@ func (r *AlertRepo) MarkMissingAfterSnapshot(
 
 	changed := make([]domain.Alert, 0, len(missing))
 	for _, a := range missing {
+		uncertain := slices.Contains(uncertainRuleIDs, "*") || slices.Contains(uncertainRuleIDs, a.Labels[StableRuleIDLabel])
+		// 合成NoData/Error不是“业务已恢复”的证据。缺失计数归零并保持unknown，
+		// 恢复完整可解释快照后再重新累计真正的缺失确认。
+		if uncertain && a.SourceState == domain.SourceStateUnknown && a.ReconcileMissCount == 0 {
+			continue
+		}
 		nextMiss := a.ReconcileMissCount + 1
 		nextSource := domain.SourceStateUnknown
 		reason := any(nil)
 		endsAt := nullableTime(a.EndsAt)
-		if nextMiss >= missingConfirmations {
+		if uncertain {
+			nextMiss = 0
+		}
+		if !uncertain && nextMiss >= missingConfirmations {
 			nextSource = domain.SourceStateResolved
 			reason = "source_reconciled_absence"
 			endsAt = &at

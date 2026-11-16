@@ -228,6 +228,8 @@ func queryLimit(c *gin.Context) int {
 // 其余视为基础设施故障→500（并记日志；500 之外的分支不记日志，属预期内的客户端错误）。
 func (h *configHandlers) handleStoreErr(c *gin.Context, err error, op string) {
 	switch {
+	case errors.Is(err, store.ErrSourceScopeChanged):
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 	case errors.Is(err, store.ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 	case errors.Is(err, store.ErrRoutePriorityConflict),

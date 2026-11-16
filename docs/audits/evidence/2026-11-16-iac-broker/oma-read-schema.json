@@ -1,0 +1,103 @@
+{
+  "base_url": "https://oma.test.seewo.com",
+  "read_only": true,
+  "credential_present": true,
+  "requests": [
+    {
+      "path": "/v1/sessions?limit=1",
+      "http": 200,
+      "keys": [
+        "data",
+        "next_page"
+      ],
+      "item_keys": [
+        "agent",
+        "archived_at",
+        "budget",
+        "created_at",
+        "deployment_id",
+        "environment_id",
+        "id",
+        "metadata",
+        "outcome_evaluations",
+        "resources",
+        "stats",
+        "status",
+        "title",
+        "type",
+        "updated_at",
+        "usage",
+        "vault_ids"
+      ],
+      "next_page_present": true,
+      "next_page_null": false
+    },
+    {
+      "path": "/v1/sessions/sesn_WAiFL8YjTWUSQY9VAjylZcOG",
+      "http": 200,
+      "keys": [
+        "agent",
+        "archived_at",
+        "budget",
+        "created_at",
+        "environment_id",
+        "id",
+        "metadata",
+        "outcome_evaluations",
+        "resources",
+        "stats",
+        "status",
+        "title",
+        "type",
+        "updated_at",
+        "usage",
+        "vault_ids"
+      ],
+      "session_status": "idle",
+      "metadata_keys": [
+        "claude_code_public_session_id",
+        "claude_code_sdk_url_path",
+        "claude_code_session_id",
+        "runtime"
+      ],
+      "agent_model": {
+        "id": "default/deepseek-flash",
+        "speed": "standard"
+      }
+    },
+    {
+      "path": "/v1/sessions/sesn_WAiFL8YjTWUSQY9VAjylZcOG/events?limit=1",
+      "http": 200,
+      "keys": [
+        "data",
+        "next_page"
+      ],
+      "item_keys": [
+        "id",
+        "processed_at",
+        "session_thread_id",
+        "type"
+      ],
+      "next_page_present": true,
+      "next_page_null": false
+    },
+    {
+      "path": "/v1/sessions/sesn_WAiFL8YjTWUSQY9VAjylZcOG/events/stream",
+      "last_event_id_header": false,
+      "http": 200,
+      "content_type": "text/event-stream",
+      "sse_frames": [
+        ": connected"
+      ]
+    },
+    {
+      "path": "/v1/sessions/sesn_WAiFL8YjTWUSQY9VAjylZcOG/events/stream",
+      "last_event_id_header": true,
+      "http": 200,
+      "content_type": "text/event-stream",
+      "sse_frames": [
+        ": connected"
+      ]
+    }
+  ]
+}
