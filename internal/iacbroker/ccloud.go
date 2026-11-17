@@ -31,6 +31,8 @@ func newCCloud(o CCloudOptions, hash string) *ccloudRuntime {
 	if o.PackageDir == "" {
 		o.PackageDir = "/opt/ccloud-cli"
 	}
+	o.NodeBinary = filepath.Clean(o.NodeBinary)
+	o.PackageDir = filepath.Clean(o.PackageDir)
 	return &ccloudRuntime{options: o, manifestHash: hash, baseURL: ccloudBaseURL}
 }
 func fileDigest(ctx context.Context, path string) (string, error) {
@@ -68,6 +70,8 @@ func fileDigest(ctx context.Context, path string) (string, error) {
 // No token, HOME/config, native addon or arbitrary executable is discovered from the environment.
 func (c *ccloudRuntime) verify(ctx context.Context) (string, error) {
 	o := c.options
+	// Keep the traversal comparison in the same lexical form as Join/Dir, even for direct callers.
+	o.PackageDir = filepath.Clean(o.PackageDir)
 	if !filepath.IsAbs(o.NodeBinary) || !filepath.IsAbs(o.PackageDir) {
 		return "", fmt.Errorf("invalid runtime path")
 	}
@@ -116,6 +120,12 @@ func (c *ccloudRuntime) verify(ctx context.Context) (string, error) {
 		files[f.Path] = true
 		path := filepath.Join(o.PackageDir, f.Path)
 		for parent := filepath.Dir(path); parent != o.PackageDir; parent = filepath.Dir(parent) {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			if parent == filepath.Dir(parent) {
+				return "", fmt.Errorf("package path outside root")
+			}
 			i, e := os.Lstat(parent)
 			if e != nil || !i.IsDir() {
 				return "", fmt.Errorf("unsafe file parent")
