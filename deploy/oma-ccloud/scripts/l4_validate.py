@@ -5,7 +5,8 @@ APP='80beff42ab0b41819f9c1c3c3ac95413308e70eb'
 result={'mode':'l4_validation_only','app_id':APP,'cluster_id':60,'source':'official ccloud-cli via fixed read-only proxy','observed_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'status':'unknown','desired_replicas':None,'expectation_status':'unknown','note':'historical expect_replicas=5 is not current desired evidence'}
 proc=None
 try:
- env={k:v for k,v in os.environ.items() if k in {'PATH','HOME','CCLOUD_API_KEY','CCLOUD_API_BASE_URL','SSL_CERT_FILE','NODE_EXTRA_CA_CERTS'}}
+ # Preserve the host's controlled egress path for the CLI; do not forward unrelated runtime options.
+ env={k:v for k,v in os.environ.items() if k in {'PATH','HOME','CCLOUD_API_KEY','CCLOUD_API_BASE_URL','SSL_CERT_FILE','NODE_EXTRA_CA_CERTS','HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY','https_proxy','http_proxy','all_proxy','no_proxy'}}
  env['CCLOUD_API_MODE']='real';env['CCLOUD_DISABLE_UPDATE_CHECK']='1'
  proc=subprocess.Popen(['/tmp/oma-ccloud/bin/ccloud-cli','app','pods','--app-id',APP,'--cluster-id','60'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
  sel=selectors.DefaultSelector();sel.register(proc.stdout,selectors.EVENT_READ);raw=bytearray();deadline=time.monotonic()+45
