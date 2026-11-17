@@ -19,6 +19,10 @@ DOCKER_PUSH_PLATFORMS ?= linux/amd64
 GO_BASE_IMAGE ?= registry.gz.cvte.cn/library/golang:1.25-alpine
 ALPINE_BASE_IMAGE ?= registry.gz.cvte.cn/library/alpine:3.22
 NODE_BASE_IMAGE ?= registry.gz.cvte.cn/library/node:22-alpine
+CCLOUD_NODE_BASE_IMAGE ?= registry.gz.cvte.cn/library/node:22-alpine@sha256:dd31daf8a971114cd1084bb815d45a81cbc58081496149de97bd8ba814a8ab4e
+CCLOUD_RUNTIME_ARCHIVE ?=
+CCLOUD_RUNTIME_CONTEXT ?= $(CURDIR)/bin/ccloud-runtime
+CCLOUD_CONTEXT_ARGS = --build-arg "CCLOUD_NODE_BASE_IMAGE=$(CCLOUD_NODE_BASE_IMAGE)" --build-context "ccloud_runtime=$(CCLOUD_RUNTIME_CONTEXT)"
 GO111MODULE ?= on
 GOPROXY ?= https://goproxy.cn,direct
 GOSUMDB ?= sum.golang.google.cn
@@ -99,13 +103,22 @@ release-check: ci web-audit docker-check docker-build docker-smoke k8s-validate 
 tidy: ## 整理 Go modules
 	go mod tidy
 
+.PHONY: ccloud-runtime-prepare ccloud-runtime-check
+ccloud-runtime-prepare: ## 从已审计归档准备离线 CCloud 构建 context
+	@test -n "$(CCLOUD_RUNTIME_ARCHIVE)" || { printf '%s\n' 'Specify CCLOUD_RUNTIME_ARCHIVE=/path/to/audited.tgz'; exit 2; }
+	python3 deploy/ccloud-runtime/prepare_context.py --archive "$(CCLOUD_RUNTIME_ARCHIVE)" --output "$(CCLOUD_RUNTIME_CONTEXT)"
+
+ccloud-runtime-check: ## API 构建前强制验证离线 CCloud 归档
+	@test -n "$(CCLOUD_NODE_BASE_IMAGE)" || { printf '%s\n' 'Specify CCLOUD_NODE_BASE_IMAGE as an audited Node22 image digest compatible with final Alpine3.22 (internal mirror for internal builds)'; exit 2; }
+	python3 deploy/ccloud-runtime/prepare_context.py --check --output "$(CCLOUD_RUNTIME_CONTEXT)"
+
 docker-check: ## 解析 Dockerfile 并列出全部构建 target（无需拉取基础镜像）
 	docker buildx build $(BUILDX_BUILDER_ARG) $(DOCKER_BUILD_ARGS) --call=targets --progress=$(DOCKER_BUILD_PROGRESS) .
 
 docker-build: docker-build-api docker-build-web docker-build-migrate ## 构建全部本地镜像
 
-docker-build-api: ## 构建 API 镜像
-	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
+docker-build-api: ccloud-runtime-check ## 构建 API 镜像
+	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) $(CCLOUD_CONTEXT_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
 
 docker-build-web: ## 构建 Web 镜像
 	docker buildx build $(BUILDX_BUILDER_ARG) $(BUILDX_LOCAL_PLATFORM_ARG) $(DOCKER_BUILD_ARGS) --load --progress=$(DOCKER_BUILD_PROGRESS) --target web -t $(WEB_IMAGE) .
@@ -129,8 +142,8 @@ docker-push-check:
 
 docker-push: docker-push-api docker-push-web docker-push-migrate ## 使用 buildx 构建并推送镜像
 
-docker-push-api: docker-push-check ## 构建并推送 API 镜像
-	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
+docker-push-api: docker-push-check ccloud-runtime-check ## 构建并推送 API 镜像
+	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) $(CCLOUD_CONTEXT_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target api -t $(API_IMAGE) .
 
 docker-push-web: docker-push-check ## 构建并推送 Web 镜像
 	docker buildx build $(BUILDX_BUILDER_ARG) --platform $(DOCKER_PUSH_PLATFORMS) $(DOCKER_BUILD_ARGS) --push --progress=$(DOCKER_BUILD_PROGRESS) --target web -t $(WEB_IMAGE) .

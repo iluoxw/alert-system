@@ -16,6 +16,7 @@ import (
 )
 
 type Options struct {
+	CCloudL4                                      bool
 	QueryProfile                                  func(string) []string
 	Principal                                     agentdelivery.Principal
 	WorkerID                                      string
@@ -229,6 +230,16 @@ func (w *Worker) process(ctx context.Context, run Run) error {
 	}
 	required := requiredCoverage(group)
 	forcePartial := observationFault || len(required) > 0 || group.TruncatedAlerts > 0
+	ccloudCanary := false
+	if w.Options.CCloudL4 && !observationFault {
+		for _, m := range group.Alerts {
+			if m.RuleID == "iac-sre-oma-canary" {
+				required = append(required, "ccloud_l4")
+				ccloudCanary = true
+				break
+			}
+		}
+	}
 	if observationFault {
 		allowed = []string{}
 		for _, id := range []string{"sources", "freshness"} {
@@ -244,6 +255,9 @@ func (w *Worker) process(ctx context.Context, run Run) error {
 		input := map[string]any{"schema": "sre.analysis-request/v1", "role": run.Role, "event_type": run.EventType, "source": run.Envelope.Source,
 			"scope": "IAC Go PRO; broker-enforced fixed resources", "group": group, "allowed_query_ids": allowed, "observation_fault": observationFault,
 			"constraints": []string{"read-only", "unknown is not healthy", "current samples do not prove historical cause", "no domain lifecycle writes"}}
+		if ccloudCanary {
+			input["constraints"] = append(input["constraints"].([]string), "This synthetic chain acceptance requires ccloud_l4: cite its current successful evidence_id in facts; if unknown, report the gap without fabricating a fact. Pod counts/Ready are observations only; desired_replicas=null never proves intended replicas or full health.")
+		}
 		var action Action
 		e = w.tx(ctx, func(tx pgx.Tx) error {
 			var e error

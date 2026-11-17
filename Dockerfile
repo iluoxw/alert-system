@@ -1,6 +1,7 @@
 ARG GO_BASE_IMAGE=golang:1.25-alpine
 ARG ALPINE_BASE_IMAGE=alpine:3.22
 ARG NODE_BASE_IMAGE=node:22-alpine
+ARG CCLOUD_NODE_BASE_IMAGE=registry.gz.cvte.cn/library/node:22-alpine@sha256:dd31daf8a971114cd1084bb815d45a81cbc58081496149de97bd8ba814a8ab4e
 ARG MIGRATE_VERSION=v4.18.3
 
 FROM ${GO_BASE_IMAGE} AS go-build
@@ -49,6 +50,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X github.com/luoxw/iacctl-go/cmd.version=source-643ddf7aaec314a438f052a719b3741f2eef71ff" \
       -o /out/iacctl-go .
 
+# ccloud_runtime 是操作员显式提供的离线 named context，仅含 runtime.tgz。
+FROM ${CCLOUD_NODE_BASE_IMAGE} AS ccloud-build
+COPY --from=ccloud_runtime /runtime.tgz /tmp/ccloud-runtime.tgz
+COPY deploy/ccloud-runtime/prepare.mjs /tmp/prepare.mjs
+RUN node /tmp/prepare.mjs /tmp/ccloud-runtime.tgz /verified
+
 FROM ${ALPINE_BASE_IMAGE} AS api
 ARG VERSION=dev
 ARG VCS_REF=unknown
@@ -57,9 +64,11 @@ LABEL org.opencontainers.image.title="SRE Control API" \
       org.opencontainers.image.revision=$VCS_REF \
       org.opencontainers.image.source="alert-system" \
       io.sre-control.iacctl.revision="643ddf7aaec314a438f052a719b3741f2eef71ff"
-RUN apk add --no-cache ca-certificates tzdata && \
+RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && \
     addgroup -S -g 10001 sre-control && \
-    adduser -S -D -H -u 10001 -G sre-control sre-control
+    adduser -S -D -H -h /tmp/sre-control -u 10001 -G sre-control sre-control
+COPY --from=ccloud-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=ccloud-build /verified/ccloud-cli /opt/ccloud-cli
 WORKDIR /app
 COPY --from=go-build --chown=10001:10001 /out/alert-system /app/alert-system
 COPY --from=go-build --chown=10001:10001 /out/seed-admin /app/seed-admin

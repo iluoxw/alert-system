@@ -58,6 +58,17 @@ func LoadConfig(get func(string) string) (Config, error) {
 	}
 	c.Model = HTTPModelConfig{BaseURL: env("OMA_BASE_URL", "https://oma.test.seewo.com"), APIKey: get("OMA_API_KEY"), AgentID: get("OMA_AGENT_ID"), EnvironmentID: get("OMA_ENVIRONMENT_ID")}
 	c.Broker = iacbroker.Options{Binary: env("IACCTL_BINARY", "/app/iacctl-go"), SourceRevision: env("IACCTL_SOURCE_REVISION", "643ddf7aaec314a438f052a719b3741f2eef71ff"), Timeout: 45 * time.Second}
+	if flag := get("IAC_CCLOUD_PROXY_ENABLED"); flag != "" {
+		enabled, e := strconv.ParseBool(flag)
+		if e != nil {
+			return Config{}, errors.New("invalid IAC_CCLOUD_PROXY_ENABLED")
+		}
+		if enabled {
+			c.Broker.CCloud = &iacbroker.CCloudOptions{NodeBinary: env("IAC_CCLOUD_NODE_BINARY", "/usr/local/bin/node"), PackageDir: env("IAC_CCLOUD_PACKAGE_DIR", "/opt/ccloud-cli"), ProxyToken: get("IAC_CCLOUD_PROXY_TOKEN")}
+			c.Worker.CCloudL4 = true
+			c.Worker.QueryProfile = iacbroker.ProfileWithCCloud
+		}
+	}
 	c.HealthAddr = env("OMA_HEALTH_ADDR", ":8080")
 	return c, nil
 }

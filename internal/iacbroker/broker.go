@@ -36,10 +36,11 @@ type Scope struct {
 	Namespace   string `json:"namespace"`
 }
 type Provenance struct {
-	CLIHash        string `json:"cli_sha256"`
-	SourceRevision string `json:"source_revision"`
-	Query          string `json:"query"`
-	Window         string `json:"window"`
+	PackageManifestSHA256 string `json:"package_manifest_sha256,omitempty"`
+	CLIHash               string `json:"cli_sha256"`
+	SourceRevision        string `json:"source_revision"`
+	Query                 string `json:"query"`
+	Window                string `json:"window"`
 }
 type Evidence struct {
 	Schema     string          `json:"schema"`
@@ -57,6 +58,7 @@ type Bundle struct {
 	Partial bool       `json:"partial"`
 }
 type Options struct {
+	CCloud         *CCloudOptions
 	Binary         string
 	SourceRevision string
 	Timeout        time.Duration
@@ -65,6 +67,7 @@ type command struct{ source, expr string }
 
 var catalog = map[string]command{
 	"sources":        {},
+	"ccloud_l4":      {},
 	"entry_coverage": {},
 	"vip_coverage":   {},
 	"freshness":      {"thanos", `max(time()-timestamp(iac_http_requests_total{` + selector + `}))`},
@@ -80,7 +83,7 @@ var catalog = map[string]command{
 
 // QueryIDs are the complete public command allowlist; a new ID needs code review.
 func QueryIDs() []string {
-	return []string{"sources", "freshness", "traffic", "errors", "latency", "commit_unknown", "audit_dead", "audit_lag", "redis_timeouts", "mysql_running", "entry_coverage", "vip_coverage"}
+	return []string{"sources", "freshness", "traffic", "errors", "latency", "commit_unknown", "audit_dead", "audit_lag", "redis_timeouts", "mysql_running", "entry_coverage", "vip_coverage", "ccloud_l4"}
 }
 
 // Profile is advice for the worker prompt; Query independently enforces the allowlist.
@@ -109,7 +112,21 @@ func Profile(rule string) []string {
 	}
 }
 
+// ProfileWithCCloud preserves the six-query budget and shared coverage placeholders.
+func ProfileWithCCloud(rule string) []string {
+	out := Profile(rule)
+	if len(out) == 0 {
+		return out
+	}
+	out = append([]string{}, out...)
+	if len(out) == MaxQueries {
+		out = out[1:]
+	}
+	return append(out, "ccloud_l4")
+}
+
 type Broker struct {
+	ccloud                 *ccloudRuntime
 	binary, revision, hash string
 	timeout                time.Duration
 	gate                   chan struct{}
@@ -138,7 +155,11 @@ func New(o Options) (*Broker, error) {
 	if _, err := io.Copy(h, f); err != nil {
 		return nil, fmt.Errorf("iacbroker: executable hash failed")
 	}
-	return &Broker{binary: o.Binary, revision: o.SourceRevision, hash: hex.EncodeToString(h.Sum(nil)), timeout: o.Timeout, gate: make(chan struct{}, 1)}, nil
+	b := &Broker{binary: o.Binary, revision: o.SourceRevision, hash: hex.EncodeToString(h.Sum(nil)), timeout: o.Timeout, gate: make(chan struct{}, 1)}
+	if o.CCloud != nil {
+		b.ccloud = newCCloud(*o.CCloud, CCloudManifestSHA256)
+	}
+	return b, nil
 }
 
 func (b *Broker) Collect(ctx context.Context, ids []string) (Bundle, error) {
@@ -169,7 +190,10 @@ func (b *Broker) Query(ctx context.Context, id string) (Evidence, error) {
 	if !ok {
 		return Evidence{}, fmt.Errorf("iacbroker: query ID is not allowed")
 	}
-	item := Evidence{Schema: Schema, QueryID: id, Scope: Scope{"pro", AppID, "prd60", "iac-pro-pro"}, ObservedAt: time.Now().UTC(), Status: "unknown", Data: json.RawMessage(`null`), Provenance: Provenance{b.hash, b.revision, spec.expr, "instant observation; fixed 5m PromQL rate/increase where applicable"}}
+	item := Evidence{Schema: Schema, QueryID: id, Scope: Scope{"pro", AppID, "prd60", "iac-pro-pro"}, ObservedAt: time.Now().UTC(), Status: "unknown", Data: json.RawMessage(`null`), Provenance: Provenance{CLIHash: b.hash, SourceRevision: b.revision, Query: spec.expr, Window: "instant observation; fixed 5m PromQL rate/increase where applicable"}}
+	if id == "ccloud_l4" {
+		return b.queryCCloud(ctx, item)
+	}
 	if id == "entry_coverage" || id == "vip_coverage" {
 		item.ReasonCode = "shared_probe_not_collected"
 		item.Data = json.RawMessage(`{"coverage":"not_collected","note":"Go PRO application metrics do not establish five-site probe or Redis VIP availability"}`)
