@@ -9,6 +9,11 @@ python3 /mnt/session/uploads/install_ccloud_runtime.py \
   --archive /mnt/session/uploads/ccloud-cli-2.2.1-runtime.tgz \
   --sha256 df4b64b268017e3e5a94fa20741e94ca0d3d26fc591abe5e841f2437c3fb1e87 \
   --guard /mnt/session/uploads/ccloud-cli-guard
+```
+
+每次执行既有 `iacctl-go inspect`（保留原命令与参数）或 `python3 /mnt/session/uploads/l4_validate.py`，都必须在**同一次 bash 工具调用内**先设置下面三行，再紧接本次执行命令；将三行与执行命令作为同一个 bash 输入，禁止拆到不同调用。不能依赖安装步骤或前一次 bash 中的 export，也不声称它们会跨调用持久化。正常日报的其他步骤保持原流程。
+
+```bash
 export PATH=/tmp/oma-ccloud/bin:$PATH
 export CCLOUD_API_BASE_URL=https://sre-control.test.seewo.com/api/v1/iac-ccloud
 export CCLOUD_DISABLE_UPDATE_CHECK=1
@@ -26,7 +31,7 @@ Go pack 内 expect_replicas=5 是历史默认，不是当前 desired 副本证�
 
 仅当本次初始事件的结构化 mode 精确为 `l4_validation_only` 时：
 
-1. 仅执行上面的校验安装/PATH，并运行 `python3 /mnt/session/uploads/l4_validate.py`。
+1. 仅执行上面的校验安装；随后在运行 `python3 /mnt/session/uploads/l4_validate.py` 的同一次 bash 调用内先设置上述三行环境，不能依赖前一次调用的 export。
 2. 不读飞书 webhook，不发送飞书或其他通知，不写任何 memory、bookmarks、ledger 或 runs 文件，不执行日常全巡检/下钻。
 3. 最终原样给出验证脚本 JSON；不要补造 desired、健康结论或过去状态。执行失败只能给出 unknown 与失败阶段。
 4. 该模式只允许人工受控验证；正常 cron 初始事件没有此 mode，仍执行原日报流程。

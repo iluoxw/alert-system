@@ -69,6 +69,10 @@ python3 scripts/render_additions.py \
 
 该模式仅安装并执行固定 `l4_validate.py`，最终给出只读 JSON；原 cron 事件不带此 mode，继续日常报告。读取工具输出与最终报告核对一致，确认实际调用 ccloud-cli，source 是只读代理；失败必须 unknown，不能靠旧结果通过。人工回查 memory/ledger 未新增验证记录、未发送飞书。随后在正常日报执行中核对 L4 来源已切到 ccloud-cli，并保留原业务报告能力。
 
+每次执行原有 `iacctl-go inspect` 或 `l4_validate.py`，必须在同一次 bash 调用内先按 [system-append.md](system-append.md) 设置 PATH、固定代理 base URL 和 disable-update-check 三行，再紧接原执行命令；前一次调用的 export 不保证保留，正常日报其他流程不变。
+
+L4 校验器向官方 CLI 子进程保留受控出站代理变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`、`NO_PROXY` 及各自小写形式，同时保留原有凭据和 CA 白名单。两种大小写原样传递，不自行改写代理地址或绕过出站控制；变量未提供时不伪造默认值。不会继承 `NODE_OPTIONS`、OMA key 等其他环境。环境值和 CLI 原始 stderr 不进入校验结果，CLI 非零退出仍报告 `unknown/query_failed`；不能仅据此猜测认证或网络根因。
+
 pods 列表只证明当前观测数量、Ready 与重启。没有当前 desired 副本证据，因此 desired_replicas 必须 null/unknown；旧 Go pack 的 expect_replicas=5 不证明当前应有5个，也不能把列表4/4 Ready等同于当前 desired 已满足。
 
 ## 本地验证
