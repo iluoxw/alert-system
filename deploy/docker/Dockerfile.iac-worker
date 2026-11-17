@@ -1,6 +1,7 @@
 # Use the same explicit internal mirrors/proxies as the main release recipe.
 ARG GO_BASE_IMAGE=golang:1.25-alpine
 ARG ALPINE_BASE_IMAGE=alpine:3.22
+ARG CCLOUD_NODE_BASE_IMAGE=registry.gz.cvte.cn/library/node:22-alpine@sha256:dd31daf8a971114cd1084bb815d45a81cbc58081496149de97bd8ba814a8ab4e
 FROM ${GO_BASE_IMAGE} AS cli-build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -29,14 +30,21 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -buildvcs=false \
     -ldflags="-s -w" -o /out/oma-worker "$WORKER_PACKAGE"
 
+FROM ${CCLOUD_NODE_BASE_IMAGE} AS ccloud-build
+COPY --from=ccloud_runtime /runtime.tgz /tmp/ccloud-runtime.tgz
+COPY deploy/ccloud-runtime/prepare.mjs /tmp/prepare.mjs
+RUN node /tmp/prepare.mjs /tmp/ccloud-runtime.tgz /verified
+
 FROM ${ALPINE_BASE_IMAGE} AS iac-worker
 ARG VCS_REF=unknown
 ARG IACCTL_REVISION=643ddf7aaec314a438f052a719b3741f2eef71ff
 LABEL org.opencontainers.image.title="SRE Control IAC OMA worker" \
       org.opencontainers.image.revision=$VCS_REF \
       io.sre-control.iacctl.revision=$IACCTL_REVISION
-RUN apk add --no-cache ca-certificates tzdata && addgroup -S -g 10001 sre-worker && \
-    adduser -S -D -H -u 10001 -G sre-worker sre-worker
+RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && addgroup -S -g 10001 sre-worker && \
+    adduser -S -D -H -h /tmp/sre-control -u 10001 -G sre-worker sre-worker
+COPY --from=ccloud-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=ccloud-build /verified/ccloud-cli /opt/ccloud-cli
 COPY --from=worker-build --chown=10001:10001 /out/oma-worker /app/oma-worker
 COPY --from=cli-build --chown=10001:10001 /out/iacctl-go /app/iacctl-go
 COPY --chown=10001:10001 tools/iacctl-go/SOURCE.json /app/iacctl-source.json
