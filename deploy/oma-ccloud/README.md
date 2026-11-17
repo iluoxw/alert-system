@@ -42,7 +42,7 @@ python3 scripts/verify_runtime.py \
 
 以上参数均有对应挂载默认值，目标固定为 `/tmp/oma-ccloud`。任何版本、文件或 guard 不符、缺少 Node 均失败退出；不能忽略失败继续。归档更新后须同时更新可信 SHA；guard 变更须审核并更新安装器中的 guard 摘要。
 
-**本地安装、metadata 认证和 L4 取证是三个独立验收阶段。** 官方 `node .../dist/ccloud-cli.js --version` 也可能初始化动态 metadata，无凭据时返回 403；这不等于离线包安装失败，因此不得将其作为安装判据。仅 `node --version` 检查 Node 运行时本身。metadata 认证通过后，还必须以冷缓存核对真实三请求链与 L4 返回值，才能认定本次只读取证完成。专用只读身份未提供、代理未启用时，不能声称 L4 已完成；缺 token 的 L4 返回 unknown，desired_replicas 为 null。禁止自动配置凭据、使用管理员 key 或新增 Kubernetes Secret。
+**本地安装、metadata 连通与认证、L4 取证是三个独立验收阶段。** 官方 `node .../dist/ccloud-cli.js --version` 也可能初始化动态 metadata，在无凭据的受限网络环境中可能返回 403，单凭状态码不能区分网络策略和上游鉴权拒绝；这不等于离线包安装失败，因此不得将其作为安装判据。仅 `node --version` 检查 Node 运行时本身。metadata 连通与认证通过后，还必须以冷缓存核对真实三请求链与 L4 返回值，才能认定本次只读取证完成。专用只读身份未提供、代理未启用时，不能声称 L4 已完成；缺 token 的 L4 返回 unknown，desired_replicas 为 null。禁止自动配置凭据、使用管理员 key 或新增 Kubernetes Secret。
 
 ## 更新现有 Go 日报
 
