@@ -109,6 +109,22 @@ class VerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Node'): runtime.node_version()
 
 
+class MountedLayoutTests(unittest.TestCase):
+    def test_verifier_imports_repository_or_existing_mount_installer_name(self):
+        for name in ('install_runtime.py', 'install_ccloud_runtime.py'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                (directory / name).write_bytes((ROOT / 'scripts/install_runtime.py').read_bytes())
+                verifier = directory / 'verify_runtime.py'
+                verifier.write_bytes((ROOT / 'scripts/verify_runtime.py').read_bytes())
+                result = subprocess.run([sys.executable, str(verifier), '--help'],
+                                        env={'PATH': os.defpath},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, 'mounted installer module was not found')
+                self.assertIn('--archive', result.stdout)
+                self.assertEqual({p.name for p in directory.iterdir()}, {name, 'verify_runtime.py'})
+
+
 class RealPackageTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('CCLOUD_TEST_PACKAGE_DIR'), 'operator must select public npm package')
     def test_real_offline_bundle_install_and_verify(self):

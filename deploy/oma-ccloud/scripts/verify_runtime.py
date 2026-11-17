@@ -2,9 +2,18 @@
 """Verify installed offline runtime. No official CLI entrypoint, credentials, or network."""
 import json
 import subprocess
+import sys
 import tarfile
 
-from install_runtime import arguments, verify_runtime
+sys.dont_write_bytecode = True
+
+try:
+    from install_runtime import arguments, verify_runtime
+except ModuleNotFoundError as error:
+    if error.name != 'install_runtime':
+        raise
+    # The existing OMA resource deliberately mounts the same installer under this name.
+    from install_ccloud_runtime import arguments, verify_runtime
 
 if __name__ == '__main__':
     args = arguments(__doc__, verification=True)
