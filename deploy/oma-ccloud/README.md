@@ -29,7 +29,20 @@
 | scripts/install_runtime.py | /uploads/install_ccloud_runtime.py | /mnt/session/uploads/install_ccloud_runtime.py |
 | scripts/l4_validate.py | /uploads/l4_validate.py | /mnt/session/uploads/l4_validate.py |
 
-安装器校验归档 SHA、每个文件 SHA、Node 版本及安全路径；解包至 `/tmp/oma-ccloud`，在 bin 放固定 argv guard。guard 不是安全边界，代理在服务端再次强制范围。保持 CLI metadata 冷缓存可验证真实三请求链。
+安装器校验受信归档 SHA、清单完整性、`package.json` 与 `BUNDLE.json` 的 name/version、每个文件内容、Node >=18.15 及安全路径；解包至 `/tmp/oma-ccloud`，在 bin 放固定 argv guard。安装后再次回读所有文件，确认 guard 内容、可执行权限及空参数拒绝行为。子进程只运行宿主 `node --version` 与无参数 guard 拒绝自检，使用最小环境，不传递凭据、HOME 或 NODE_OPTIONS；不执行官方 CLI 的 JavaScript 入口，不联网。保留 `installed=true` / `file_hashes_verified=true` 输出，并增加 `guard_verified=true`。guard 不是安全边界，代理在服务端再次强制范围。
+
+离线安装验收已整合进原安装器，不需要增加 OMA resource。`scripts/verify_runtime.py` 提供可选的**只读复验**，复用同目录安装器函数；默认读取原四文件布局的受信归档与 guard，检查 `/tmp/oma-ccloud`。将两脚本放在同一目录时可运行：
+
+```bash
+python3 scripts/verify_runtime.py \
+  --archive /mnt/session/uploads/ccloud-cli-2.2.1-runtime.tgz \
+  --sha256 df4b64b268017e3e5a94fa20741e94ca0d3d26fc591abe5e841f2437c3fb1e87 \
+  --guard /mnt/session/uploads/ccloud-cli-guard
+```
+
+以上参数均有对应挂载默认值，目标固定为 `/tmp/oma-ccloud`。任何版本、文件或 guard 不符、缺少 Node 均失败退出；不能忽略失败继续。归档更新后须同时更新可信 SHA；guard 变更须审核并更新安装器中的 guard 摘要。
+
+**本地安装、metadata 连通与认证、L4 取证是三个独立验收阶段。** 官方 `node .../dist/ccloud-cli.js --version` 也可能初始化动态 metadata，在无凭据的受限网络环境中可能返回 403，单凭状态码不能区分网络策略和上游鉴权拒绝；这不等于离线包安装失败，因此不得将其作为安装判据。仅 `node --version` 检查 Node 运行时本身。metadata 连通与认证通过后，还必须以冷缓存核对真实三请求链与 L4 返回值，才能认定本次只读取证完成。专用只读身份未提供、代理未启用时，不能声称 L4 已完成；缺 token 的 L4 返回 unknown，desired_replicas 为 null。禁止自动配置凭据、使用管理员 key 或新增 Kubernetes Secret。
 
 ## 更新现有 Go 日报
 
@@ -61,9 +74,11 @@ pods 列表只证明当前观测数量、Ready 与重启。没有当前 desired 
 ## 本地验证
 
 ```bash
-python3 scripts/test_package.py -v
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+# 可选：指定仅含公开 npm 包的目录，执行真实离线包验收；不读取用户认证目录
+CCLOUD_TEST_PACKAGE_DIR=/path/to/public/@cvte/ccloud-cli python3 scripts/test_verify_runtime.py -v
 IAC_CCLOUD_CLI_PATH=/tmp/oma-ccloud/ccloud-cli/dist/ccloud-cli.js GOCACHE=/private/tmp/alert-iac-gocache go test -race ./internal/iacccloudproxy -count=1 -v
 GOCACHE=/private/tmp/alert-iac-gocache go vet ./internal/iacccloudproxy
 ```
 
-第二、三条在仓库根目录执行。未设置 CLI path 时真实 CLI 测试会跳过，不能把该跳过当作冷缓存链已验收。
+Go 命令在仓库根目录执行；Python 命令在本目录执行。未提供 `CCLOUD_TEST_PACKAGE_DIR` 时真实包用例会跳过，不能把跳过当作真实包已验收。未设置 CLI path 时真实 CLI 测试会跳过，不能把该跳过当作冷缓存链已验收。

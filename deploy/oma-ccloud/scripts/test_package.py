@@ -21,5 +21,5 @@ class PackageTests(unittest.TestCase):
   with tempfile.NamedTemporaryFile() as f:
    f.write(b'not-an-archive');f.flush()
    result=subprocess.run([sys.executable,str(ROOT/'scripts/install_runtime.py'),'--archive',f.name,'--sha256','0'*64,'--guard',str(ROOT/'ccloud-cli')],capture_output=True,text=True)
-   self.assertNotEqual(result.returncode,0);self.assertIn('sha256 mismatch',result.stderr)
+   self.assertNotEqual(result.returncode,0);self.assertIn('Offline installation failed',result.stderr)
 if __name__=='__main__':unittest.main()
