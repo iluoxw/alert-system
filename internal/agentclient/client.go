@@ -160,12 +160,20 @@ func (c *Client) handle(pollCtx, handlerCtx context.Context, d agentprotocol.Del
 		reason = "no_matching_handler"
 	}
 	if reason != "" {
+		c.log.Warn("delivery rejected before execution", "message_id", d.MessageID, "reason", reason)
 		return c.settle(pollCtx, "nack", agentprotocol.NegativeReceipt{Receipt: d.Receipt, Reason: reason})
 	}
 	if err := c.settle(pollCtx, "ack", d.Receipt); err != nil {
 		return err
 	}
-	c.execute(handlerCtx, *h, d)
+	result := c.execute(handlerCtx, *h, d)
+	if d.ReportSupported {
+		ctx, cancel := context.WithTimeout(handlerCtx, 5*time.Second)
+		defer cancel()
+		if err := c.settle(ctx, "report", agentprotocol.HandlerReport{Receipt: d.Receipt, Result: result}); err != nil {
+			c.log.Warn("handler report not confirmed", "message_id", d.MessageID, "outcome", result.Outcome, "error", err)
+		}
+	}
 	return nil
 }
 

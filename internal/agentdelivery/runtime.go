@@ -34,7 +34,7 @@ func (rt *Runtime) AttachIngest(s *ingest.PGStore) {
 }
 
 func (rt *Runtime) Mount(register func(string, string, http.Handler)) {
-	for _, op := range []string{"poll", "ack", "nack"} {
+	for _, op := range []string{"poll", "ack", "nack", "report"} {
 		register(http.MethodPost, "/api/v1/agent/"+op, rt.api)
 	}
 }

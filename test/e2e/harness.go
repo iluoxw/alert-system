@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 
+	"alert-system/internal/agentdelivery"
 	"alert-system/internal/alertsource"
 	"alert-system/internal/api"
 	"alert-system/internal/app"
@@ -154,6 +155,7 @@ func buildSystem(cfg config.Config, defaultTeamID string, logger *slog.Logger) (
 
 	auth := api.NewPasswordAuthenticator(users)
 	router := api.NewRouter(cfg, users, sessions, memberships, st, auth, larkServer.Handler(), logger)
+	router.RegisterAgentDeliveryDetails(agentdelivery.NewQueue(st))
 	router.RegisterConfigRoutes(api.ConfigDeps{
 		Teams:                teams,
 		Users:                users,

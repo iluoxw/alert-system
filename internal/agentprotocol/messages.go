@@ -36,11 +36,33 @@ type NegativeReceipt struct {
 	RetryAfter int    `json:"retry_after,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 }
+
+type HandlerOutcome string
+
+const (
+	HandlerSucceeded HandlerOutcome = "succeeded"
+	HandlerFailed    HandlerOutcome = "failed"
+	HandlerTimedOut  HandlerOutcome = "timed_out"
+	HandlerCanceled  HandlerOutcome = "canceled"
+)
+
+type HandlerResult struct {
+	Outcome    HandlerOutcome `json:"outcome"`
+	ExitCode   *int           `json:"exit_code,omitempty"`
+	DurationMS int64          `json:"duration_ms"`
+}
+
+type HandlerReport struct {
+	Receipt
+	Result HandlerResult `json:"result"`
+}
+
 type Delivery struct {
 	Receipt
-	Envelope       Envelope  `json:"envelope"`
-	LeaseExpiresAt time.Time `json:"lease_expires_at"`
-	AckMode        string    `json:"ack_mode"`
+	Envelope        Envelope  `json:"envelope"`
+	LeaseExpiresAt  time.Time `json:"lease_expires_at"`
+	AckMode         string    `json:"ack_mode"`
+	ReportSupported bool      `json:"report_supported,omitempty"`
 }
 
 // Member 只包含公开稳定规则引用和 occurrence 哈希，不暴露标签全集或链接。
