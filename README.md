@@ -229,7 +229,9 @@ go build -o ./agent-client ./cmd/agent-client
 
 客户端需要支持进程组的 Unix 环境。每次领取至多 8 条，每条租约最长 30 秒。handler 输入包含来源 ID、事件类型、接收器和告警组的标识摘要，以及各成员的标识摘要、告警名、状态、级别、起止时间和截断数量。同一来源的 firing 与 resolved 可通过 `group_ref` 对照。上游缺少 `groupKey` 时，组标识按已收到的成员计算。自由文本 annotations、任意 labels 和内部 URL 留在服务端。默认日志只记录消息 ID、退出码、耗时和输出字节数。需要查看输出时，配置仅运行用户可访问的 `result_dir`，每次执行分别保留 stdout 和 stderr 的前 8 KiB。
 
-排查积压或未执行的任务时，可使用只读数据库账号执行以下查询。终态任务及其审计事件保留 7 天。
+支持执行报告的服务端会在 Poll 响应中声明 `report_supported`。新版客户端在 ACK 后回传执行状态、退出码和耗时。管理员使用 `GET /api/v1/admin/agent-deliveries/{message_id}` 区分投递状态和执行结果。没有执行结果表示尚未收到报告。托管 OMA 的执行恢复和结构化分析结果见 [OMA 运行文档](docs/ops/oma-runtime.md)。
+
+排查积压或未执行的任务时，可使用只读数据库账号执行以下查询。终态任务及其审计与执行报告保留 7 天。
 
 ```sql
 SELECT role, status, count(*) AS messages, min(created_at) AS oldest_enqueued_at
@@ -237,6 +239,10 @@ FROM agent_messages GROUP BY role, status ORDER BY role, status;
 
 SELECT status, count(*) AS batches, max(failures) AS most_failures
 FROM agent_batches GROUP BY status;
+
+-- 两分钟用于排查示例，请按客户端的长轮询与典型执行时长调整阈值。
+SELECT role, count(*) FILTER (WHERE last_seen_at >= now() - interval '2 minutes') AS recently_seen
+FROM agent_consumers GROUP BY role;
 
 -- $1 为客户端日志中的 message_id
 SELECT at, kind, from_status, to_status, actor, detail

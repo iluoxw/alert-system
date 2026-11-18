@@ -11,11 +11,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"alert-system/internal/agentprotocol"
 )
 
 type stubQueue struct {
-	claim func(context.Context, Principal, string, int) ([]Delivery, error)
-	ack   func(context.Context, Principal, Receipt) error
+	claim  func(context.Context, Principal, string, int) ([]Delivery, error)
+	ack    func(context.Context, Principal, Receipt) error
+	report func(context.Context, Principal, agentprotocol.HandlerReport) error
 }
 
 func (q stubQueue) Claim(c context.Context, p Principal, v string, n int) ([]Delivery, error) {
@@ -24,6 +27,9 @@ func (q stubQueue) Claim(c context.Context, p Principal, v string, n int) ([]Del
 func (q stubQueue) Ack(c context.Context, p Principal, r Receipt) error { return q.ack(c, p, r) }
 func (q stubQueue) Nack(context.Context, Principal, NegativeReceipt) error {
 	return errors.New("unexpected nack")
+}
+func (q stubQueue) Report(ctx context.Context, p Principal, r agentprotocol.HandlerReport) error {
+	return q.report(ctx, p, r)
 }
 
 func testAPI(ctx context.Context, q deliveryQueue) *API {
@@ -60,6 +66,31 @@ func TestPollAuthorityAndReceipts(t *testing.T) {
 	} {
 		if w := postAPI(a, tcase.path, tcase.token, tcase.body); w.Code != tcase.want {
 			t.Errorf("%s got %d, want %d", tcase.body, w.Code, tcase.want)
+		}
+	}
+}
+
+func TestReportRejectsUntrustedFieldsAndInvalidResults(t *testing.T) {
+	a := testAPI(t.Context(), stubQueue{report: func(_ context.Context, p Principal, rep agentprotocol.HandlerReport) error {
+		if p.Role != "ops" || p.ClientID != "worker" || rep.Result.Outcome != agentprotocol.HandlerSucceeded {
+			t.Fatalf("unexpected identity or report: %v %+v", p, rep)
+		}
+		return ErrReportConflict
+	}})
+	const prefix = `{"message_id":"00000000-0000-4000-8000-000000000003","lease_id":"00000000-0000-4000-8000-000000000002","attempt":1,"result":`
+	const success = `{"outcome":"succeeded","exit_code":0,"duration_ms":30}}`
+	for _, tc := range []struct {
+		token, body string
+		want        int
+	}{
+		{"wrong", success, 401},
+		{"test-token", `{"outcome":"succeeded","exit_code":0,"stdout":"untrusted"}}`, 400},
+		{"test-token", `{"outcome":"succeeded","exit_code":1}}`, 400},
+		{"test-token", `{"outcome":"failed","duration_ms":-1}}`, 400},
+		{"test-token", success, 409},
+	} {
+		if w := postAPI(a, "report", tc.token, prefix+tc.body); w.Code != tc.want {
+			t.Errorf("request %s: got %d want %d", tc.body, w.Code, tc.want)
 		}
 	}
 }

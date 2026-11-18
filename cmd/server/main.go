@@ -230,6 +230,7 @@ func run(ctx context.Context, cfg config.Config, defaultTeamID string, runbookEx
 	router.RegisterDirectoryRoutes(teams, users)
 	router.RegisterEventRoutes(bus)
 	registerAnalysisRoutes(router, analysis)
+	router.RegisterAgentDeliveryDetails(agentdelivery.NewQueue(st))
 	registerCCloudProxy(router, cloudProxy)
 	router.RegisterHealthRoutes(api.ComposeReady(
 		api.DatabaseReady(st.Pool.Ping),

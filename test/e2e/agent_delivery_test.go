@@ -16,6 +16,7 @@ import (
 
 	"alert-system/internal/agentclient"
 	"alert-system/internal/agentdelivery"
+	"alert-system/internal/agentprotocol"
 	"alert-system/internal/domain"
 	"alert-system/internal/ingest"
 )
@@ -123,6 +124,18 @@ func TestAgentDelivery_WebhookSurvivesRestartAndRunsHandler(t *testing.T) {
 	var status string
 	if err := sys.Store.Pool.QueryRow(ctx, "SELECT status FROM agent_messages WHERE id=$1", env.ID).Scan(&status); err != nil || status != "acked" {
 		t.Fatalf("delivery status %q, err %v", status, err)
+	}
+	waitFor(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		var detail agentdelivery.MessageDetail
+		status, _, err := admin.doJSON(http.MethodGet, "/api/v1/admin/agent-deliveries/"+env.ID, nil, &detail)
+		return err == nil && status == http.StatusOK && detail.DeliveryStatus == "acked" &&
+			detail.ReportedAt != nil && detail.HandlerResult != nil && detail.HandlerResult.Outcome == agentprotocol.HandlerSucceeded &&
+			detail.HandlerResult.ExitCode != nil && *detail.HandlerResult.ExitCode == 0
+	}, "管理员可区分客户端已接收和执行成功")
+	anonymous := *admin
+	anonymous.http = &http.Client{Timeout: time.Second}
+	if status, _, err := anonymous.doJSON(http.MethodGet, "/api/v1/admin/agent-deliveries/"+env.ID, nil, nil); err != nil || status != http.StatusUnauthorized {
+		t.Fatalf("anonymous request: HTTP %d, %v", status, err)
 	}
 	waitFor(t, 5*time.Second, 100*time.Millisecond, func() bool {
 		alert, ok, err := findAlertByLabel(admin, "agent_e2e", id)

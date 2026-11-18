@@ -40,7 +40,8 @@ func (f transportFunc) RoundTrip(req *http.Request) (*http.Response, error) { re
 
 func TestLostAckResponseRetriesReceiptAndRunsOnce(t *testing.T) {
 	d := delivery()
-	var acks, polls atomic.Int32
+	d.ReportSupported = true
+	var acks, polls, reports atomic.Int32
 	marker := filepath.Join(t.TempDir(), "count")
 	input := filepath.Join(t.TempDir(), "stdin")
 	t.Setenv("AGENT_TOKEN", "secret-never-in-child")
@@ -72,6 +73,14 @@ func TestLostAckResponseRetriesReceiptAndRunsOnce(t *testing.T) {
 			}
 			acks.Add(1)
 			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/agent/report":
+			var report agentprotocol.HandlerReport
+			if err := json.NewDecoder(r.Body).Decode(&report); err != nil || report.Receipt != d.Receipt ||
+				report.Result.Outcome != agentprotocol.HandlerSucceeded || report.Result.ExitCode == nil || *report.Result.ExitCode != 0 {
+				t.Errorf("invalid handler report %+v: %v", report, err)
+			}
+			reports.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Error("unexpected path", r.URL.Path)
 			w.WriteHeader(404)
@@ -82,10 +91,11 @@ func TestLostAckResponseRetriesReceiptAndRunsOnce(t *testing.T) {
 	h.Match.EventType = "alert.*"
 	c := clientFor(t, srv, h)
 	tr := c.http.Transport
-	var lost atomic.Bool
+	var lostAck, lostReport atomic.Bool
 	c.http.Transport = transportFunc(func(req *http.Request) (*http.Response, error) {
 		res, err := tr.RoundTrip(req)
-		if err == nil && req.URL.Path == "/api/v1/agent/ack" && lost.CompareAndSwap(false, true) {
+		if err == nil && ((req.URL.Path == "/api/v1/agent/ack" && lostAck.CompareAndSwap(false, true)) ||
+			(req.URL.Path == "/api/v1/agent/report" && lostReport.CompareAndSwap(false, true))) {
 			res.Body.Close()
 			return nil, io.ErrUnexpectedEOF
 		}
@@ -97,8 +107,8 @@ func TestLostAckResponseRetriesReceiptAndRunsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(marker)
-	if err != nil || string(b) != d.MessageID+"\n" || acks.Load() != 2 {
-		t.Fatalf("handler=%q, err=%v, acks=%d", b, err, acks.Load())
+	if err != nil || string(b) != d.MessageID+"\n" || acks.Load() != 2 || reports.Load() != 2 {
+		t.Fatalf("handler=%q, err=%v, acks=%d, reports=%d", b, err, acks.Load(), reports.Load())
 	}
 	var got agentprotocol.Envelope
 	b, err = os.ReadFile(input)
@@ -164,7 +174,9 @@ func TestHandlerTimeoutKillsProcessGroup(t *testing.T) {
 	srv := httptest.NewTLSServer(http.NotFoundHandler())
 	defer srv.Close()
 	c := clientFor(t, srv, h)
-	c.execute(context.Background(), h, delivery())
+	if result := c.execute(context.Background(), h, delivery()); result.Outcome != agentprotocol.HandlerTimedOut {
+		t.Fatalf("timeout was misclassified: %+v", result)
+	}
 	if _, err := os.Stat(started); err != nil {
 		t.Fatal("handler did not start", err)
 	}

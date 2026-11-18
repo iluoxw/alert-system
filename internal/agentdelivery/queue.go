@@ -88,7 +88,7 @@ func (q *Queue) Enqueue(ctx context.Context, tx pgx.Tx, env Envelope, p Policy) 
 	return err
 }
 
-// UUID、代次、RFC3339 时间、固定字段名、逗号等占用的保守上界。
+// UUID、代次、RFC3339 时间、report_supported、固定字段名和逗号的保守上界。
 const pollItemOverhead = 256
 const pollWrapperBytes = len("{\"messages\":[]}\n")
 

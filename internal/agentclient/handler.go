@@ -26,18 +26,19 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *Client) execute(parent context.Context, h Handler, d agentprotocol.Delivery) {
+func (c *Client) execute(parent context.Context, h Handler, d agentprotocol.Delivery) agentprotocol.HandlerResult {
 	ctx, cancel := context.WithTimeout(parent, h.Timeout)
 	defer cancel()
+	result := agentprotocol.HandlerResult{Outcome: agentprotocol.HandlerFailed}
 	input, err := json.Marshal(d.Envelope)
 	if err != nil {
 		c.log.Error("encode handler input", "message_id", d.MessageID)
-		return
+		return result
 	}
 	cmd := exec.CommandContext(ctx, h.Exec[0], h.Exec[1:]...)
 	if err := prepareGroup(cmd); err != nil {
 		c.log.Error("prepare handler", "message_id", d.MessageID, "error", err)
-		return
+		return result
 	}
 	// Only local config selects argv. Child processes receive neither client token nor ambient credentials.
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "MESSAGE_ID=" + d.MessageID, "EVENT_TYPE=" + d.Envelope.EventType}
@@ -55,13 +56,24 @@ func (c *Client) execute(parent context.Context, h Handler, d agentprotocol.Deli
 	code := -1
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
+		result.ExitCode = &code
 	}
-	c.log.Info("handler finished", "message_id", d.MessageID, "exit_code", code, "success", err == nil, "timeout", errors.Is(ctx.Err(), context.DeadlineExceeded), "duration_ms", time.Since(start).Milliseconds(), "stdout_bytes", stdout.total, "stderr_bytes", stderr.total)
+	switch {
+	case err == nil:
+		result.Outcome = agentprotocol.HandlerSucceeded
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		result.Outcome = agentprotocol.HandlerTimedOut
+	case errors.Is(ctx.Err(), context.Canceled):
+		result.Outcome = agentprotocol.HandlerCanceled
+	}
+	result.DurationMS = time.Since(start).Milliseconds()
+	c.log.Info("handler finished", "message_id", d.MessageID, "exit_code", code, "success", err == nil, "timeout", result.Outcome == agentprotocol.HandlerTimedOut, "duration_ms", result.DurationMS, "stdout_bytes", stdout.total, "stderr_bytes", stderr.total)
 	if c.cfg.ResultDir != "" {
 		if err := c.saveOutput(d, stdout, stderr, code); err != nil {
 			c.log.Error("save private handler output", "message_id", d.MessageID)
 		}
 	}
+	return result
 }
 
 func (c *Client) saveOutput(d agentprotocol.Delivery, stdout, stderr boundedOutput, code int) error {

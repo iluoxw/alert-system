@@ -11,12 +11,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"alert-system/internal/agentprotocol"
 )
 
 type deliveryQueue interface {
 	Claim(context.Context, Principal, string, int) ([]Delivery, error)
 	Ack(context.Context, Principal, Receipt) error
 	Nack(context.Context, Principal, NegativeReceipt) error
+	Report(context.Context, Principal, agentprotocol.HandlerReport) error
 }
 
 // The channel for a role is replaced on each signal. A poll takes a snapshot
@@ -97,11 +100,20 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		err = a.queue.Nack(r.Context(), who, req)
+	case "/api/v1/agent/report":
+		var req agentprotocol.HandlerReport
+		if !readRequest(r, &req) || !validReceipt(req.Receipt) || !validResult(req.Result) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+		err = a.queue.Report(ctx, who, req)
 	default:
 		http.NotFound(w, r)
 		return
 	}
-	if errors.Is(err, ErrLeaseConflict) {
+	if errors.Is(err, ErrLeaseConflict) || errors.Is(err, ErrReportConflict) {
 		w.WriteHeader(http.StatusConflict)
 		return
 	}
@@ -110,6 +122,23 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validResult(r agentprotocol.HandlerResult) bool {
+	if r.DurationMS < 0 || r.DurationMS > (25*time.Hour).Milliseconds() {
+		return false
+	}
+	if r.ExitCode != nil && (*r.ExitCode < -1 || *r.ExitCode > 255) {
+		return false
+	}
+	switch r.Outcome {
+	case agentprotocol.HandlerSucceeded:
+		return r.ExitCode != nil && *r.ExitCode == 0
+	case agentprotocol.HandlerFailed, agentprotocol.HandlerTimedOut, agentprotocol.HandlerCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 func readRequest(r *http.Request, dst any) bool {
@@ -171,6 +200,9 @@ func (a *API) poll(w http.ResponseWriter, r *http.Request, who Principal) {
 			return
 		}
 		if len(items) > 0 {
+			for i := range items {
+				items[i].ReportSupported = true
+			}
 			w.Header().Set("Content-Type", "application/json")
 			// A broken response leaves the committed leases for the reaper.
 			_ = json.NewEncoder(w).Encode(struct {
